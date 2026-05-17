@@ -1,45 +1,29 @@
 //! Stage 4 of the development spike — see `CLAUDE.md`.
 //!
-//! Dispatches MLX's `affine_qmv_fast_bfloat16_t_gs_64_b_4_batch_0` kernel
-//! (bf16 input/output, int4 weights packed into `uint32`, `group_size`=64,
-//! per-group scale + bias) and compares the output against MLX's own
+//! Dispatches MLX's `affine_qmv_fast` (bf16 / int4 / `group_size=64`) via
+//! [`kernels::qmv::affine_qmv_bf16`] and compares against MLX's own
 //! `mx.quantized_matmul` reference at bf16 tolerance.
 //!
-//! The binding order, buffer layout, and dispatch geometry here are
-//! transcribed from `mlx/backend/metal/quantized.cpp::qmv()`. Any drift
-//! from that file will produce silent garbage rather than a compile
-//! error — so when MLX bumps the kernel signature, the fixture file
-//! becomes the canary.
+//! With the typed dispatch fn in place, this test is the regression
+//! canary for both:
+//!   - cider-press kernel layer drift (parameters, geometry), and
+//!   - upstream MLX kernel-source drift (the mlx-sync workflow gates
+//!     PRs on this test).
 
 #![cfg(target_os = "macos")]
-#![allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::too_many_lines
-)]
+#![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 
-use std::ffi::c_void;
 use std::path::PathBuf;
-use std::ptr::NonNull;
 
-use cider_press_kernels::{Buffer, Device, KernelLibrary};
+use cider_press_kernels::{Buffer, Device, KernelLibrary, kernels};
 use half::bf16;
-use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
-};
 use safetensors::SafeTensors;
 
 // Test dims — must match scripts/gen_stage4_fixtures.py.
-const K: i32 = 512;
-const N: i32 = 512;
-const GROUP_SIZE: usize = 64;
-const BITS: usize = 4;
-// Kernel-side tile sizes from mlx/backend/metal/quantized.cpp::qmv():
-//   bn = 8, bk = 32
-//   group_dims = (bk, 2, 1) = (32, 2, 1)
-//   grid_dims  = (M, (N + bn - 1) / bn, B) = (1, N/8, 1) in threadgroups
-const BN: i32 = 8;
-const BK: i32 = 32;
+const K: usize = 512;
+const N: usize = 512;
+const GROUP_SIZE: u32 = 64;
+const BITS: u32 = 4;
 
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -68,64 +52,31 @@ fn parity_affine_qmv_fast_bf16_gs64_b4() {
     let x = read_bf16(&st, "x");
     let y_ref = read_bf16(&st, "y_ref");
 
-    // Sanity-check shapes against the constants.
-    assert_eq!(w_q.len(), (N as usize) * (K as usize) * BITS / 32);
-    assert_eq!(scales.len(), (N as usize) * (K as usize) / GROUP_SIZE);
-    assert_eq!(biases.len(), scales.len());
-    assert_eq!(x.len(), K as usize);
-    assert_eq!(y_ref.len(), N as usize);
+    assert_eq!(x.len(), K);
+    assert_eq!(y_ref.len(), N);
 
     let device = Device::system_default().expect("Metal device");
     let library = KernelLibrary::quantized(&device).expect("compile quantized.metal");
-    // Kernel name from the `instantiate_quantized_batched` macro in
-    // mlx/backend/metal/kernels/quantized.metal — the type token is the
-    // MSL type spelling (`bfloat16_t`), not MLX's `Dtype::bfloat16` name.
-    let pipeline = library
-        .pipeline("affine_qmv_fast_bfloat16_t_gs_64_b_4_batch_0")
-        .expect("affine_qmv_fast pipeline");
 
     let w_buf: Buffer<u32> = device.upload(&w_q).expect("upload w_q");
     let s_buf: Buffer<bf16> = device.upload(&scales).expect("upload scales");
     let b_buf: Buffer<bf16> = device.upload(&biases).expect("upload biases");
     let x_buf: Buffer<bf16> = device.upload(&x).expect("upload x");
-    let mut y_buf: Buffer<bf16> = device.alloc_buffer(N as usize).expect("alloc y");
+    let mut y_buf: Buffer<bf16> = device.alloc_buffer(N).expect("alloc y");
 
-    let cmd = device.metal_queue().commandBuffer().expect("commandBuffer");
-    let encoder = cmd.computeCommandEncoder().expect("encoder");
-    encoder.setComputePipelineState(pipeline.metal_pipeline_state());
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(w_buf.metal_buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(s_buf.metal_buffer()), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(b_buf.metal_buffer()), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(x_buf.metal_buffer()), 0, 3);
-        encoder.setBuffer_offset_atIndex(Some(y_buf.metal_buffer()), 0, 4);
-        // K (in_vec_size) and N (out_vec_size) are passed as int32 constants.
-        let k_ptr: NonNull<c_void> = NonNull::from(&K).cast();
-        let n_ptr: NonNull<c_void> = NonNull::from(&N).cast();
-        encoder.setBytes_length_atIndex(k_ptr, std::mem::size_of::<i32>(), 5);
-        encoder.setBytes_length_atIndex(n_ptr, std::mem::size_of::<i32>(), 6);
-    }
-    let grid = MTLSize {
-        width: 1,
-        height: ((N + BN - 1) / BN) as usize,
-        depth: 1,
-    };
-    let threadgroup = MTLSize {
-        width: BK as usize,
-        height: 2,
-        depth: 1,
-    };
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, threadgroup);
-    encoder.endEncoding();
-    cmd.commit();
-    cmd.waitUntilCompleted();
+    let mut cmds = device.commands().expect("commands");
+    kernels::qmv::affine_qmv_bf16(
+        &mut cmds, &library, &w_buf, &s_buf, &b_buf, &x_buf, &mut y_buf, GROUP_SIZE, BITS,
+    )
+    .expect("dispatch");
+    cmds.commit_and_wait().expect("commit");
 
-    // SAFETY: waitUntilCompleted returned; GPU has finished writing y_buf.
+    // SAFETY: commit_and_wait blocked until the GPU finished writing y_buf.
     let y_out: Vec<bf16> = unsafe { y_buf.as_mut_slice() }.to_vec();
 
-    // Compare against MLX reference. bf16 has ~3 decimal digits of mantissa,
-    // so relative tolerance ~1e-2 is the right bound; fall back to absolute
-    // tolerance for values near zero where relative error is meaningless.
+    // bf16 has ~3 decimal digits of mantissa; ~1e-2 relative is the right
+    // bound. Near-zero values use absolute tolerance instead since
+    // relative error is meaningless there.
     let mut max_rel: f32 = 0.0;
     let mut max_abs: f32 = 0.0;
     let mut worst_idx = 0usize;

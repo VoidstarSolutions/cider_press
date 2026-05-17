@@ -10,3 +10,4 @@
 //! in `CLAUDE.md`) so the per-kernel work is mostly mechanical.
 
 pub mod copy;
+pub mod qmv;
