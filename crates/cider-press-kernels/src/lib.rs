@@ -24,6 +24,10 @@ compile_error!(
      Build on an aarch64-apple-darwin host."
 );
 
+mod buffer;
+mod device;
 mod error;
 
+pub use buffer::Buffer;
+pub use device::Device;
 pub use error::{Error, Result};
