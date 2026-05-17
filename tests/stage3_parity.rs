@@ -16,7 +16,7 @@ use std::ffi::c_void;
 use std::path::PathBuf;
 use std::ptr::NonNull;
 
-use approx::assert_relative_eq;
+use approx::relative_eq;
 use half::f16;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -70,9 +70,10 @@ fn parity_v_copy_f32() {
     let actual = run_copy(&ctx, &pipeline, &src);
 
     for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
-        assert_relative_eq!(*a, *e, max_relative = 1e-6, epsilon = 1e-7);
-        // index i is included on assert failure via panic context below
-        let _ = i;
+        assert!(
+            relative_eq!(*a, *e, max_relative = 1e-6, epsilon = 1e-7),
+            "f32 mismatch at index {i}: actual={a} expected={e}",
+        );
     }
 }
 
@@ -101,10 +102,13 @@ fn parity_v_copy_f16() {
     let pipeline = ctx.pipeline("v_copyfloat16float16");
     let actual = run_copy(&ctx, &pipeline, &src);
 
-    for (a, e) in actual.iter().zip(expected.iter()) {
+    for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
         let a32 = a.to_f32();
         let e32 = e.to_f32();
-        assert_relative_eq!(a32, e32, max_relative = 1e-3, epsilon = 1e-4);
+        assert!(
+            relative_eq!(a32, e32, max_relative = 1e-3, epsilon = 1e-4),
+            "f16 mismatch at index {i}: actual={a32} expected={e32}",
+        );
     }
 }
 
