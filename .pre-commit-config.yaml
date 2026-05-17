@@ -1,0 +1,48 @@
+# Pre-commit hooks for cider-press.
+#
+# Install once with:  pre-commit install
+# Run manually with:  pre-commit run --all-files
+#
+# Hooks are macOS-only (the crate is macOS-only); skip locally with
+# SKIP=<hook-id> git commit ... if you need to bypass one in a pinch.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: mixed-line-ending
+        args: [--fix=lf]
+
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all -- --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy -D warnings
+        entry: cargo clippy --all-targets --all-features -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-test
+        name: cargo test
+        entry: cargo test --all-features
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-doc
+        name: cargo doc (deny warnings)
+        entry: bash -c 'RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features'
+        language: system
+        types: [rust]
+        pass_filenames: false
