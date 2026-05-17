@@ -233,7 +233,42 @@ f32, `1e-3` for f16, `1e-2` for bf16/quantized.
 
 **Acceptance:** the Stage 2 copy kernel passes the parity harness.
 
-#### Stage 4 — target: one quantized matmul (≈1 weekend)
+#### Stage 4 — target: one quantized matmul (≈1 weekend) — **done**
+
+See `tests/stage4_qmv.rs`, `scripts/gen_stage4_fixtures.py`,
+`tests/fixtures/stage4_qmv.safetensors` (150 KB; K=N=512). Output
+matches MLX's `mx.quantized_matmul` **bit-exactly**
+(`max_relative=0, max_absolute=0`) on every element — far beyond the
+acceptance bar of ~1e-2 relative. Findings:
+
+- Spike hypothesis fully validated for one kernel. MLX's MSL sources
+  compile and dispatch verbatim from Rust with no porting.
+- Kernel name token gotcha: the `instantiate_quantized_batched` macro
+  stringifies `#type` from the C++ template arg, so for bf16 the name
+  is `..._bfloat16_t_...` (with the `_t_`), **not** `..._bfloat16_...`
+  as MLX's `Dtype` label suggests. The C++ dispatcher uses
+  `get_type_string()` which returns the matching MSL spelling.
+- Used the *fast* variant since K=512 satisfies `K % 512 == 0 &&
+  N % bn == 0`. MLX picks `affine_qmv` (generic) for smaller K.
+- Buffer/dispatch transcription from `mlx/backend/metal/quantized.cpp`
+  is the spike's main risk surface. For batch=1, no shape/stride
+  bindings follow — `add_strides_and_shapes` returns early. Order:
+  w(uint32), scales(bf16), biases(bf16), x(bf16), y(bf16), K(int32),
+  N(int32). Dispatch is `dispatch_threadgroups` (grid in tg count,
+  not threads) with grid `(M, N/bn, B)` and threadgroup `(bk, 2, 1)`.
+- **Open question 2 (cross-process JIT cache) confirmed:** cold first
+  run of `newLibraryWithSource:` on the 5865-line flattened source
+  took ~29 s (debug). Subsequent test-binary runs (even fresh
+  processes) drop to sub-100 ms total. Metal definitely caches
+  compiled libraries to disk persistently; we don't need to manage
+  `.metallib` ourselves for spike purposes (production may still
+  want explicit precompilation to amortize the cold-start cost).
+- Three Stage tests now duplicate `MetalCtx`-style boilerplate.
+  Did not factor — the Stage 4 binding shape is materially different
+  (7 buffers, mixed setBuffer/setBytes) from Stages 2/3 (3 buffers).
+  A shared helper would have to be generic enough to be useless.
+
+#### Stage 4 — original plan
 
 Pick **`qmv`** (quantized matrix-vector, batch=1) from
 `mlx/backend/metal/kernels/quantized.{h,metal}`.
