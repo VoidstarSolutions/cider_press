@@ -12,16 +12,11 @@
 #![cfg(target_os = "macos")]
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 
-use std::ffi::c_void;
 use std::path::PathBuf;
-use std::ptr::NonNull;
 
 use approx::assert_relative_eq;
-use cider_press_kernels::{Buffer, Device, KernelLibrary, Pipeline};
+use cider_press_kernels::{Buffer, Device, KernelLibrary, kernels};
 use half::f16;
-use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
-};
 use safetensors::SafeTensors;
 
 fn fixture_path() -> PathBuf {
@@ -50,9 +45,16 @@ fn parity_v_copy_f32() {
 
     let device = Device::system_default().expect("Metal device");
     let library = KernelLibrary::copy(&device).expect("compile copy.metal");
-    let pipeline = library.pipeline("v_copyfloat32float32").expect("kernel");
-    let actual = run_copy(&device, &pipeline, &src);
 
+    let src_buf: Buffer<f32> = device.upload(&src).expect("upload src");
+    let mut dst_buf: Buffer<f32> = device.alloc_buffer(src.len()).expect("alloc dst");
+
+    let mut commands = device.commands().expect("commands");
+    kernels::copy::copy_v_f32(&mut commands, &library, &src_buf, &mut dst_buf).expect("dispatch");
+    commands.commit_and_wait().expect("commit");
+
+    // SAFETY: commit_and_wait blocked until the GPU finished writing dst_buf.
+    let actual = unsafe { dst_buf.as_mut_slice() };
     for (a, e) in actual.iter().zip(expected.iter()) {
         assert_relative_eq!(*a, *e, max_relative = 1e-6, epsilon = 1e-7);
     }
@@ -77,9 +79,16 @@ fn parity_v_copy_f16() {
 
     let device = Device::system_default().expect("Metal device");
     let library = KernelLibrary::copy(&device).expect("compile copy.metal");
-    let pipeline = library.pipeline("v_copyfloat16float16").expect("kernel");
-    let actual = run_copy(&device, &pipeline, &src);
 
+    let src_buf: Buffer<f16> = device.upload(&src).expect("upload src");
+    let mut dst_buf: Buffer<f16> = device.alloc_buffer(src.len()).expect("alloc dst");
+
+    let mut commands = device.commands().expect("commands");
+    kernels::copy::copy_v_f16(&mut commands, &library, &src_buf, &mut dst_buf).expect("dispatch");
+    commands.commit_and_wait().expect("commit");
+
+    // SAFETY: commit_and_wait blocked until the GPU finished writing dst_buf.
+    let actual = unsafe { dst_buf.as_mut_slice() };
     for (a, e) in actual.iter().zip(expected.iter()) {
         assert_relative_eq!(a.to_f32(), e.to_f32(), max_relative = 1e-3, epsilon = 1e-4);
     }
@@ -109,40 +118,4 @@ fn read_tensor_f16(st: &SafeTensors, name: &str) -> Vec<f16> {
         .chunks_exact(2)
         .map(|c| f16::from_le_bytes([c[0], c[1]]))
         .collect()
-}
-
-fn run_copy<T: Copy + Default>(device: &Device, pipeline: &Pipeline, src: &[T]) -> Vec<T> {
-    let in_buf: Buffer<T> = device.upload(src).expect("upload src");
-    let mut out_buf: Buffer<T> = device.alloc_buffer(src.len()).expect("alloc dst");
-    let size = u32::try_from(src.len()).expect("size fits in u32");
-
-    let cmd = device.metal_queue().commandBuffer().expect("commandBuffer");
-    let encoder = cmd.computeCommandEncoder().expect("computeCommandEncoder");
-    encoder.setComputePipelineState(pipeline.metal_pipeline_state());
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(in_buf.metal_buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(out_buf.metal_buffer()), 0, 1);
-        let bytes_ptr: NonNull<c_void> = NonNull::from(&size).cast();
-        encoder.setBytes_length_atIndex(bytes_ptr, std::mem::size_of::<u32>(), 2);
-    }
-    let grid = MTLSize {
-        width: src.len(),
-        height: 1,
-        depth: 1,
-    };
-    let threadgroup = MTLSize {
-        width: 64,
-        height: 1,
-        depth: 1,
-    };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
-    encoder.endEncoding();
-
-    cmd.commit();
-    cmd.waitUntilCompleted();
-
-    let mut out = vec![T::default(); src.len()];
-    // SAFETY: waitUntilCompleted returned; GPU has finished writing out_buf.
-    unsafe { out.copy_from_slice(out_buf.as_mut_slice()) };
-    out
 }

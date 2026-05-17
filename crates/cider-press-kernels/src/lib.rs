@@ -25,11 +25,14 @@ compile_error!(
 );
 
 mod buffer;
+mod commands;
 mod device;
 mod error;
+pub mod kernels;
 mod library;
 
 pub use buffer::Buffer;
+pub use commands::Commands;
 pub use device::Device;
 pub use error::{Error, Result};
 pub use library::{KernelLibrary, Pipeline};
