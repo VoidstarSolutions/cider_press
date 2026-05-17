@@ -1,21 +1,16 @@
-//! Spike build script — flattens MLX Metal kernel sources into self-
-//! contained MSL strings consumable by `tests/stage*` integration tests.
+//! Build script — flattens vendored MLX Metal kernel sources into self-
+//! contained MSL strings consumable by this crate's integration tests
+//! (and, eventually, by the runtime layer).
 //!
 //! Metal's runtime compiler (`newLibraryWithSource:`) has no notion of a
 //! filesystem, so any `#include "..."` directives must be resolved
-//! offline. For each MLX entry-point kernel, we recursively inline every
-//! project-relative include and leave system includes (`<metal_stdlib>`
-//! etc.) for the Metal compiler. Each output lands at
-//! `$OUT_DIR/<name>_inlined.metal`.
+//! offline. For each entry-point kernel we recursively inline every
+//! project-relative include and leave system includes (`<metal_stdlib>`,
+//! `<metal_simdgroup>`, etc.) for the Metal compiler. Each output lands
+//! at `$OUT_DIR/<name>_inlined.metal`.
 //!
-//! MLX checkout location must be supplied via the `CIDER_MLX_DIR`
-//! environment variable. If it is unset or points at a path with no
-//! MLX kernel sources, the script writes a stub for each entry point
-//! and the dependent integration tests skip with a clear message.
-//!
-//! Vendoring MLX into the repo (see the follow-up workspace
-//! restructure) removes this build-time requirement entirely; this
-//! script is the spike-era arrangement.
+//! Sources live in `kernels-mlx/` at the workspace root; see
+//! `kernels-mlx/VENDORED.md` for the file list and sync procedure.
 
 use std::collections::HashSet;
 use std::env;
@@ -23,36 +18,36 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// (entry-relative-to-MLX, output-file-stem). The output filename will be
-/// `<stem>_inlined.metal` in `OUT_DIR`.
+/// (entry-relative-to-MLX-root, output-file-stem). The output filename
+/// will be `<stem>_inlined.metal` in `OUT_DIR`.
 const ENTRY_POINTS: &[(&str, &str)] = &[
     ("mlx/backend/metal/kernels/copy.metal", "copy"),
     ("mlx/backend/metal/kernels/quantized.metal", "quantized"),
 ];
 
 fn main() {
-    println!("cargo:rerun-if-env-changed=CIDER_MLX_DIR");
     println!("cargo:rerun-if-changed=build.rs");
 
-    let mlx_dir = env::var_os("CIDER_MLX_DIR").map(PathBuf::from);
+    // kernels-mlx/ lives at the workspace root, two levels up from this
+    // crate's manifest directory.
+    let mlx_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("kernels-mlx");
 
     for (rel, stem) in ENTRY_POINTS {
-        let dest_name = format!("{stem}_inlined.metal");
-
-        let Some(dir) = mlx_dir.as_ref() else {
-            skip(&dest_name, "CIDER_MLX_DIR is not set");
-            continue;
-        };
-        let entry = dir.join(rel);
-        if !entry.exists() {
-            skip(&dest_name, &format!("entry not found: {}", entry.display()));
-            continue;
-        }
+        let entry = mlx_dir.join(rel);
+        assert!(
+            entry.exists(),
+            "vendored MLX source missing: {}\n\
+             Did you run `scripts/sync_mlx_kernels.sh`? See kernels-mlx/VENDORED.md.",
+            entry.display()
+        );
 
         let mut seen: HashSet<PathBuf> = HashSet::new();
         let mut flat = String::new();
-        flatten(&entry, dir, &mut seen, &mut flat);
-        write_output(&dest_name, &flat);
+        flatten(&entry, &mlx_dir, &mut seen, &mut flat);
+        write_output(&format!("{stem}_inlined.metal"), &flat);
     }
 }
 
