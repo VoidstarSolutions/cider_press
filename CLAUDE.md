@@ -312,7 +312,33 @@ constants, row/column conventions.
 **Acceptance:** `qmv_bfloat16_gs64_b4` matches MLX's `quantized_matmul`
 to bf16 tolerance on `[4096, 4096] @ [4096]`.
 
-#### Stage 5 — measure (≈1 hour)
+#### Stage 5 — measure (≈1 hour) — **done**
+
+See `tests/stage5_perf.rs` and `scripts/measure_stage5_mlx.py`.
+
+Measured on the development machine (release build, warmup=50,
+timed=1000):
+
+|             | cider-press | MLX Python | ratio |
+|-------------|------------:|-----------:|------:|
+| K=N=512     | ~170 µs/d   | ~118 µs/d  | 1.44× |
+| K=N=4096    | ~180 µs/d   | ~121 µs/d  | 1.49× |
+
+Findings:
+
+- Per-dispatch latency is nearly flat across a 64× shape jump on
+  both sides — dispatch overhead, not compute, dominates at qmv
+  scale. Expected; qmv is memory-bound and the matrices fit in cache.
+- We are **~1.5× slower than MLX**. That's between the spike's
+  "validated" (≤10%) and "investigate" (≥2×) thresholds. Kernels are
+  bit-exact (Stage 4), so the gap is in the dispatch layer — which is
+  exactly what the lazy-graph design is supposed to address.
+- The naive Rust path does `commit + waitUntilCompleted` per
+  dispatch. MLX presumably pipelines command buffers within
+  `mx.eval`. Closing the gap is a problem for the dispatch layer
+  design, not the kernel layer.
+
+#### Stage 5 — original plan
 
 - Time 1000 dispatches of the same `qmv` call on the same buffers.
 - Report tok/s-equivalent: `1 / (time per dispatch)`.
@@ -358,14 +384,86 @@ Non-blocking, but record findings:
 
 ### Findings (post-spike)
 
-Once acceptance criteria are evaluated, append a Findings section here
-(or split to `docs/SPIKE_RESULTS.md`) covering:
+**TL;DR:** spike succeeds. Every stage's acceptance criterion passed.
+The central hypothesis — that MLX's Metal kernels can be reused
+verbatim and the perf gap to MLX lives in the dispatch layer — is
+validated by `qmv` matching MLX bit-exactly while running ~1.5×
+slower under naive synchronous per-dispatch. **Recommendation:
+proceed to lazy-graph design.**
 
-1. Did each stage's acceptance criterion pass? If not, why?
-2. Surprises in the `objc2-metal` API or MLX kernel sources.
-3. Measured `qmv` throughput vs MLX Python.
-4. Concrete recommendation: proceed to lazy-graph design / proceed to
-   eager-only design / abandon and contribute to candle instead.
+#### Acceptance criteria
+
+| Stage | Bar | Outcome |
+|-------|-----|---------|
+| 0     | `cargo build` succeeds | ✓ |
+| 1     | inline add_one round-trip < 5 ms | ✓ (~240 µs) |
+| 2     | MLX copy.metal bit-identical f32+f16 | ✓ |
+| 3     | parity harness passes for copy | ✓ |
+| 4     | qmv within bf16 tolerance of MLX | ✓ — **bit-exact** (max_rel=max_abs=0) |
+| 5     | throughput vs MLX documented | ✓ — 1.44–1.49× slower |
+
+#### Surprises worth carrying forward
+
+- **`objc2-metal 0.3.x` API drift.** The spike doc's listed versions
+  (0.5 / 0.2) are stale; current is 0.6.4 / 0.3.2. Default features
+  are heavy but cover everything; minimization is post-spike work.
+  Documented in [[Stage 0]].
+- **`MTLCreateSystemDefaultDevice` needs `CoreGraphics` linked.**
+  Resolved via `#[link(name = "CoreGraphics", kind = "framework")]`
+  in the test file; avoids dragging in `objc2-core-graphics`.
+- **Metal does cache JIT'd libraries cross-process.** Cold first
+  `newLibraryWithSource:` on the 5865-line flattened `quantized.metal`:
+  ~29 s. Subsequent runs (even fresh processes): sub-100 ms total
+  test time. We can defer `.metallib` management; for production,
+  shipping a precompiled `.metallib` would just amortize the
+  cold-start cost. Answers open question 2.
+- **Zero MSL dialect drift.** MLX's `bfloat` shim, `metal_stdlib`,
+  `metal_math`, `metal_logging` all coexist on the current macOS
+  Metal toolchain. `logging.h`'s `__METAL_VERSION__ >= 320` fallback
+  never fires. Answers open questions 1 and 4.
+- **`instantiate_kernel` macro stringifies the C++ type token
+  literally.** For bf16 the kernel name is `..._bfloat16_t_...` (with
+  `_t_`), not `..._bfloat16_...` as the `Dtype` label suggests. Easy
+  to get wrong; the parity safetensors is the canary.
+- **MLX `qmv` binding/dispatch transcription was the spike's only real
+  risk surface,** and it worked. For batch=1, no shape/stride
+  bindings follow K and N — `add_strides_and_shapes` returns early.
+  Order: w(uint32), scales(bf16), biases(bf16), x(bf16), y(bf16),
+  K(int32), N(int32). Dispatch via `dispatch_threadgroups` (grid in
+  threadgroup count, not threads) with grid `(M, N/bn, B)` and
+  threadgroup `(bk, 2, 1)`, bn=8, bk=32.
+- **Build/test ergonomics.** PEP 723 + `uv run` made Python a
+  zero-friction one-shot tool with no requirements.txt or venv to
+  maintain. `safetensors 0.7` is friction-free from Rust;
+  `bytemuck` is unnecessary at spike scale (manual `from_le_bytes`
+  on a `chunks_exact` view is enough).
+
+#### Measured throughput vs MLX
+
+See [[Stage 5]] table. ~1.5× slower across both small (512²) and
+production (4096²) dims; dispatch overhead dominates compute.
+
+#### Recommendation
+
+**Proceed to lazy-graph + eager-eval design.** The kernels are
+known-good and the perf gap lives where we predicted, which is also
+where this project intends to add value. Specifically:
+
+1. Design the lazy `Tensor` + graph + `eval()` semantics in a separate
+   planning doc. Reference: MLX's `array` + lazy eval model.
+2. Sketch the buffer pool / allocator (see
+   `mlx/backend/metal/allocator.cpp`).
+3. Pick the second kernel: `scaled_dot_product_attention` — next
+   inference hot path, very different dispatch pattern (per-head
+   tiling, KV cache layout). Validate the same way with a parity
+   safetensors.
+4. Set up cross-process command-buffer batching (multiple ops per
+   `MTLCommandBuffer`, multiple buffers in flight via fences /
+   completion handlers) — this is the lever that should close the
+   1.5× gap.
+5. Decide on `.metallib` precompilation strategy for shipping. JIT
+   caching is good enough for the dev loop; cold-start matters for
+   first-token latency in production.
 
 ### After the spike
 
