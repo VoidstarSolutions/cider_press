@@ -1,9 +1,9 @@
 //! Stage 2 of the development spike — see `CLAUDE.md`.
 //!
-//! Loads the real MLX `copy.metal` source (flattened by `build.rs`),
-//! compiles it at runtime, and dispatches the simplest vector-copy
-//! instantiation against 1D `f32` and `f16` inputs. Asserts the output
-//! is bit-identical to the input — the kernel is an identity copy.
+//! Loads MLX's `copy.metal` (vendored under `kernels-mlx/`, flattened by
+//! `build.rs`), compiles it at runtime, and dispatches the simplest
+//! vector-copy instantiation against 1D `f32` and `f16` inputs. Asserts
+//! the output is bit-identical to the input — the kernel is identity.
 //!
 //! Acceptance: passes under `cargo test --release` for both dtypes.
 
@@ -13,40 +13,25 @@
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
+use cider_press_kernels::{Buffer, Device, KernelLibrary, Pipeline};
 use half::f16;
-use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
-use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary,
-    MTLResourceOptions, MTLSize,
+    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
 };
-
-#[link(name = "CoreGraphics", kind = "framework")]
-unsafe extern "C" {}
-
-/// MLX `copy.metal` plus all its transitive project-relative includes,
-/// flattened by `build.rs` into one self-contained source string.
-const COPY_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/copy_inlined.metal"));
 
 const N: usize = 1024;
 
 #[test]
 fn copy_v_f32_identity() {
-    if mlx_source_unavailable() {
-        eprintln!("skipping: MLX checkout not found at build time (set CIDER_MLX_DIR)");
-        return;
-    }
-
-    let ctx = MetalCtx::new();
-    let pipeline = ctx.pipeline("v_copyfloat32float32");
+    let device = Device::system_default().expect("Metal device");
+    let library = KernelLibrary::copy(&device).expect("compile copy.metal");
+    let pipeline = library.pipeline("v_copyfloat32float32").expect("kernel");
 
     let mut src = vec![0_f32; N];
     for (i, v) in src.iter_mut().enumerate() {
         *v = i as f32 * 0.5 - 17.0;
     }
-    let dst = run_copy(&ctx, &pipeline, &src);
+    let dst = run_copy(&device, &pipeline, &src);
 
     for (i, (&a, &b)) in src.iter().zip(dst.iter()).enumerate() {
         assert_eq!(a.to_bits(), b.to_bits(), "f32 mismatch at index {i}");
@@ -55,108 +40,38 @@ fn copy_v_f32_identity() {
 
 #[test]
 fn copy_v_f16_identity() {
-    if mlx_source_unavailable() {
-        eprintln!("skipping: MLX checkout not found at build time (set CIDER_MLX_DIR)");
-        return;
-    }
-
-    let ctx = MetalCtx::new();
-    let pipeline = ctx.pipeline("v_copyfloat16float16");
+    let device = Device::system_default().expect("Metal device");
+    let library = KernelLibrary::copy(&device).expect("compile copy.metal");
+    let pipeline = library.pipeline("v_copyfloat16float16").expect("kernel");
 
     let mut src = vec![f16::ZERO; N];
     for (i, v) in src.iter_mut().enumerate() {
         *v = f16::from_f32(i as f32 * 0.25 - 8.0);
     }
-    let dst = run_copy(&ctx, &pipeline, &src);
+    let dst = run_copy(&device, &pipeline, &src);
 
     for (i, (&a, &b)) in src.iter().zip(dst.iter()).enumerate() {
         assert_eq!(a.to_bits(), b.to_bits(), "f16 mismatch at index {i}");
     }
 }
 
-fn mlx_source_unavailable() -> bool {
-    // build.rs writes a stub when the MLX checkout is missing; detect that.
-    COPY_SOURCE.trim().starts_with("// MLX checkout not found")
-}
+/// Run one dispatch of `copy_v<T, T, 1>` and return the destination
+/// slice. `T` must match the MSL scalar type of `pipeline`.
+fn run_copy<T: Copy + Default>(device: &Device, pipeline: &Pipeline, src: &[T]) -> Vec<T> {
+    let in_buf: Buffer<T> = device.upload(src).expect("upload src");
+    let mut out_buf: Buffer<T> = device.alloc_buffer(src.len()).expect("alloc dst");
+    let size = u32::try_from(src.len()).expect("size fits in u32");
 
-struct MetalCtx {
-    device: Retained<ProtocolObject<dyn MTLDevice>>,
-    queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
-    library: Retained<ProtocolObject<dyn MTLLibrary>>,
-}
-
-impl MetalCtx {
-    fn new() -> Self {
-        let device = MTLCreateSystemDefaultDevice().expect("no Metal device available");
-        let queue = device
-            .newCommandQueue()
-            .expect("failed to create command queue");
-        let source = NSString::from_str(COPY_SOURCE);
-        let library = device
-            .newLibraryWithSource_options_error(&source, None)
-            .unwrap_or_else(|err| panic!("MLX copy.metal failed to compile: {err}"));
-        Self {
-            device,
-            queue,
-            library,
-        }
-    }
-
-    fn pipeline(&self, name: &str) -> Retained<ProtocolObject<dyn MTLComputePipelineState>> {
-        let ns_name = NSString::from_str(name);
-        let function = self
-            .library
-            .newFunctionWithName(&ns_name)
-            .unwrap_or_else(|| panic!("kernel {name} not found in compiled library"));
-        self.device
-            .newComputePipelineStateWithFunction_error(&function)
-            .unwrap_or_else(|err| panic!("pipeline build for {name} failed: {err}"))
-    }
-}
-
-/// Run one dispatch of `copy_v<T, T, 1>` and return the destination slice.
-/// `T` must be `Copy + Default` and have the same memory layout as the MSL
-/// scalar type associated with `pipeline`.
-fn run_copy<T: Copy + Default>(
-    ctx: &MetalCtx,
-    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
-    src: &[T],
-) -> Vec<T> {
-    let bytes = std::mem::size_of_val(src);
-
-    let in_buf = ctx
-        .device
-        .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
-        .expect("failed to allocate input buffer");
-    let out_buf = ctx
-        .device
-        .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
-        .expect("failed to allocate output buffer");
-
+    let cmd = device.metal_queue().commandBuffer().expect("commandBuffer");
+    let encoder = cmd.computeCommandEncoder().expect("computeCommandEncoder");
+    encoder.setComputePipelineState(pipeline.metal_pipeline_state());
     unsafe {
-        let ptr: NonNull<T> = in_buf.contents().cast();
-        std::slice::from_raw_parts_mut(ptr.as_ptr(), src.len()).copy_from_slice(src);
-    }
-
-    let size: u32 = u32::try_from(src.len()).expect("size fits in u32");
-
-    let cmd = ctx
-        .queue
-        .commandBuffer()
-        .expect("commandBuffer returned nil");
-    let encoder = cmd
-        .computeCommandEncoder()
-        .expect("computeCommandEncoder returned nil");
-
-    encoder.setComputePipelineState(pipeline);
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(&in_buf), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(&out_buf), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(in_buf.metal_buffer()), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(out_buf.metal_buffer()), 0, 1);
         // `constant uint& size` auto-binds to the next free buffer slot (2).
         let bytes_ptr: NonNull<c_void> = NonNull::from(&size).cast();
         encoder.setBytes_length_atIndex(bytes_ptr, std::mem::size_of::<u32>(), 2);
     }
-
     let grid = MTLSize {
         width: src.len(),
         height: 1,
@@ -174,9 +89,7 @@ fn run_copy<T: Copy + Default>(
     cmd.waitUntilCompleted();
 
     let mut out = vec![T::default(); src.len()];
-    unsafe {
-        let ptr: NonNull<T> = out_buf.contents().cast();
-        out.copy_from_slice(std::slice::from_raw_parts(ptr.as_ptr(), src.len()));
-    }
+    // SAFETY: waitUntilCompleted returned; GPU has finished writing out_buf.
+    unsafe { out.copy_from_slice(out_buf.as_mut_slice()) };
     out
 }

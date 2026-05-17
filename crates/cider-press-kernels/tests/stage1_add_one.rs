@@ -6,15 +6,11 @@
 //! Acceptance: passes under `cargo test --release`, and a single dispatch
 //! round-trip (after JIT warm-up) completes in well under 5 ms.
 //!
-//! Post-spike: uses [`Device`] + [`Buffer`] from the crate. The library
-//! compile / pipeline lookup / dispatch path still lives inline in this
-//! file pending [`KernelLibrary`] and [`kernels`] modules in later
-//! commits of the port series.
+//! Post-spike: uses `Device` + `Buffer` + `KernelLibrary` from the crate.
+//! The dispatch path itself still lives inline pending the `Commands`
+//! handle and `kernels::` modules in upcoming commits.
 
 #![cfg(target_os = "macos")]
-// Test code values clarity over the pedantic numeric-cast lints.
-// Bit-exact f32 comparison is intentional here: `add_one` on integer-valued
-// inputs produces results that are exactly representable.
 #![allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
@@ -23,12 +19,9 @@
 
 use std::time::Instant;
 
-use cider_press_kernels::{Buffer, Device};
-use objc2::runtime::ProtocolObject;
-use objc2_foundation::NSString;
+use cider_press_kernels::{Buffer, Device, KernelLibrary, Pipeline};
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLDevice, MTLLibrary, MTLSize,
+    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
 };
 
 const KERNEL_SOURCE: &str = "
@@ -46,36 +39,22 @@ const N: usize = 1024;
 #[test]
 fn add_one_round_trip() {
     let device = Device::system_default().expect("no Metal device available");
-
-    // KernelLibrary + per-kernel dispatch fns are upcoming in this port
-    // series; for now compile inline against the underlying MTLDevice.
-    let source = NSString::from_str(KERNEL_SOURCE);
-    let library = device
-        .metal_device()
-        .newLibraryWithSource_options_error(&source, None)
-        .expect("kernel compilation failed");
-    let function = library
-        .newFunctionWithName(&NSString::from_str("add_one"))
-        .expect("add_one not found in compiled library");
-    let pipeline = device
-        .metal_device()
-        .newComputePipelineStateWithFunction_error(&function)
-        .expect("failed to build compute pipeline");
+    let library = KernelLibrary::from_source(&device, KERNEL_SOURCE).expect("compile kernel");
+    let pipeline = library.pipeline("add_one").expect("look up add_one");
 
     let input: Vec<f32> = (0..N).map(|i| i as f32).collect();
     let in_buf: Buffer<f32> = device.upload(&input).expect("upload input");
     let mut out_buf: Buffer<f32> = device.alloc_buffer(N).expect("alloc output");
 
-    // Warm-up dispatch so the timing below excludes one-time costs
-    // (driver setup, GPU power-up, command-buffer caches).
+    // Warm-up dispatch — excludes one-time costs (driver setup,
+    // pipeline cache miss, GPU power-up) from the timing below.
     dispatch(&device, &pipeline, &in_buf, &out_buf);
 
     let start = Instant::now();
     dispatch(&device, &pipeline, &in_buf, &out_buf);
     let elapsed = start.elapsed();
 
-    // SAFETY: dispatch above is sync (commit + waitUntilCompleted), so the
-    // GPU is done writing out_buf before we read.
+    // SAFETY: dispatch() above is sync; GPU has finished writing out_buf.
     let out = unsafe { out_buf.as_mut_slice() };
     for (i, &v) in out.iter().enumerate() {
         assert_eq!(v, i as f32 + 1.0, "mismatch at index {i}");
@@ -88,12 +67,7 @@ fn add_one_round_trip() {
     );
 }
 
-fn dispatch(
-    device: &Device,
-    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
-    in_buf: &Buffer<f32>,
-    out_buf: &Buffer<f32>,
-) {
+fn dispatch(device: &Device, pipeline: &Pipeline, in_buf: &Buffer<f32>, out_buf: &Buffer<f32>) {
     let cmd = device
         .metal_queue()
         .commandBuffer()
@@ -102,7 +76,7 @@ fn dispatch(
         .computeCommandEncoder()
         .expect("computeCommandEncoder returned nil");
 
-    encoder.setComputePipelineState(pipeline);
+    encoder.setComputePipelineState(pipeline.metal_pipeline_state());
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(in_buf.metal_buffer()), 0, 0);
         encoder.setBuffer_offset_atIndex(Some(out_buf.metal_buffer()), 0, 1);

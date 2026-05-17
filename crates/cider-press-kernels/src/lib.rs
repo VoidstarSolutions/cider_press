@@ -27,7 +27,9 @@ compile_error!(
 mod buffer;
 mod device;
 mod error;
+mod library;
 
 pub use buffer::Buffer;
 pub use device::Device;
 pub use error::{Error, Result};
+pub use library::{KernelLibrary, Pipeline};

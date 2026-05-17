@@ -22,20 +22,12 @@ use std::ffi::c_void;
 use std::path::PathBuf;
 use std::ptr::NonNull;
 
+use cider_press_kernels::{Buffer, Device, KernelLibrary};
 use half::bf16;
-use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
-use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLSize,
 };
 use safetensors::SafeTensors;
-
-#[link(name = "CoreGraphics", kind = "framework")]
-unsafe extern "C" {}
-
-const QUANTIZED_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/quantized_inlined.metal"));
 
 // Test dims — must match scripts/gen_stage4_fixtures.py.
 const K: i32 = 512;
@@ -56,18 +48,8 @@ fn fixture_path() -> PathBuf {
         .join("stage4_qmv.safetensors")
 }
 
-fn mlx_source_unavailable() -> bool {
-    QUANTIZED_SOURCE
-        .trim()
-        .starts_with("// MLX checkout not found")
-}
-
 #[test]
 fn parity_affine_qmv_fast_bf16_gs64_b4() {
-    if mlx_source_unavailable() {
-        eprintln!("skipping: MLX checkout not found at build time");
-        return;
-    }
     let path = fixture_path();
     if !path.exists() {
         eprintln!(
@@ -93,53 +75,36 @@ fn parity_affine_qmv_fast_bf16_gs64_b4() {
     assert_eq!(x.len(), K as usize);
     assert_eq!(y_ref.len(), N as usize);
 
-    let device = MTLCreateSystemDefaultDevice().expect("no Metal device");
-    let queue = device.newCommandQueue().expect("command queue");
-    let source = NSString::from_str(QUANTIZED_SOURCE);
-    let library = device
-        .newLibraryWithSource_options_error(&source, None)
-        .unwrap_or_else(|err| panic!("quantized.metal compile: {err}"));
-
-    // Name comes from the `instantiate_quantized_batched` macro in
+    let device = Device::system_default().expect("Metal device");
+    let library = KernelLibrary::quantized(&device).expect("compile quantized.metal");
+    // Kernel name from the `instantiate_quantized_batched` macro in
     // mlx/backend/metal/kernels/quantized.metal — the type token is the
     // MSL type spelling (`bfloat16_t`), not MLX's `Dtype::bfloat16` name.
-    let kernel_name = "affine_qmv_fast_bfloat16_t_gs_64_b_4_batch_0";
-    let ns_name = NSString::from_str(kernel_name);
-    let function = library
-        .newFunctionWithName(&ns_name)
-        .unwrap_or_else(|| panic!("kernel {kernel_name} not in library"));
-    let pipeline = device
-        .newComputePipelineStateWithFunction_error(&function)
-        .unwrap_or_else(|err| panic!("pipeline {kernel_name}: {err}"));
+    let pipeline = library
+        .pipeline("affine_qmv_fast_bfloat16_t_gs_64_b_4_batch_0")
+        .expect("affine_qmv_fast pipeline");
 
-    // Device buffers, host-writable (unified memory).
-    let w_buf = make_buffer(&device, &w_q);
-    let s_buf = make_buffer(&device, &scales);
-    let b_buf = make_buffer(&device, &biases);
-    let x_buf = make_buffer(&device, &x);
-    let y_buf = device
-        .newBufferWithLength_options(
-            std::mem::size_of_val(y_ref.as_slice()),
-            MTLResourceOptions::StorageModeShared,
-        )
-        .expect("y buffer");
+    let w_buf: Buffer<u32> = device.upload(&w_q).expect("upload w_q");
+    let s_buf: Buffer<bf16> = device.upload(&scales).expect("upload scales");
+    let b_buf: Buffer<bf16> = device.upload(&biases).expect("upload biases");
+    let x_buf: Buffer<bf16> = device.upload(&x).expect("upload x");
+    let mut y_buf: Buffer<bf16> = device.alloc_buffer(N as usize).expect("alloc y");
 
-    let cmd = queue.commandBuffer().expect("commandBuffer");
+    let cmd = device.metal_queue().commandBuffer().expect("commandBuffer");
     let encoder = cmd.computeCommandEncoder().expect("encoder");
-    encoder.setComputePipelineState(&pipeline);
+    encoder.setComputePipelineState(pipeline.metal_pipeline_state());
     unsafe {
-        encoder.setBuffer_offset_atIndex(Some(&w_buf), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(&s_buf), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(&b_buf), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(&x_buf), 0, 3);
-        encoder.setBuffer_offset_atIndex(Some(&y_buf), 0, 4);
+        encoder.setBuffer_offset_atIndex(Some(w_buf.metal_buffer()), 0, 0);
+        encoder.setBuffer_offset_atIndex(Some(s_buf.metal_buffer()), 0, 1);
+        encoder.setBuffer_offset_atIndex(Some(b_buf.metal_buffer()), 0, 2);
+        encoder.setBuffer_offset_atIndex(Some(x_buf.metal_buffer()), 0, 3);
+        encoder.setBuffer_offset_atIndex(Some(y_buf.metal_buffer()), 0, 4);
         // K (in_vec_size) and N (out_vec_size) are passed as int32 constants.
         let k_ptr: NonNull<c_void> = NonNull::from(&K).cast();
         let n_ptr: NonNull<c_void> = NonNull::from(&N).cast();
         encoder.setBytes_length_atIndex(k_ptr, std::mem::size_of::<i32>(), 5);
         encoder.setBytes_length_atIndex(n_ptr, std::mem::size_of::<i32>(), 6);
     }
-
     let grid = MTLSize {
         width: 1,
         height: ((N + BN - 1) / BN) as usize,
@@ -152,17 +117,11 @@ fn parity_affine_qmv_fast_bf16_gs64_b4() {
     };
     encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, threadgroup);
     encoder.endEncoding();
-
     cmd.commit();
     cmd.waitUntilCompleted();
 
-    // Read y from shared memory.
-    let len = N as usize;
-    let mut y_out = vec![bf16::ZERO; len];
-    unsafe {
-        let ptr: NonNull<bf16> = y_buf.contents().cast();
-        y_out.copy_from_slice(std::slice::from_raw_parts(ptr.as_ptr(), len));
-    }
+    // SAFETY: waitUntilCompleted returned; GPU has finished writing y_buf.
+    let y_out: Vec<bf16> = unsafe { y_buf.as_mut_slice() }.to_vec();
 
     // Compare against MLX reference. bf16 has ~3 decimal digits of mantissa,
     // so relative tolerance ~1e-2 is the right bound; fall back to absolute
@@ -193,21 +152,6 @@ fn parity_affine_qmv_fast_bf16_gs64_b4() {
         max_rel < 1e-2 && max_abs < 1e-1,
         "parity exceeded bf16 tolerance: max_rel={max_rel:.3e}, max_abs={max_abs:.3e}",
     );
-}
-
-fn make_buffer<T: Copy>(
-    device: &ProtocolObject<dyn MTLDevice>,
-    data: &[T],
-) -> Retained<ProtocolObject<dyn MTLBuffer>> {
-    let bytes = std::mem::size_of_val(data);
-    let buf = device
-        .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
-        .expect("allocate buffer");
-    unsafe {
-        let ptr: NonNull<T> = buf.contents().cast();
-        std::slice::from_raw_parts_mut(ptr.as_ptr(), data.len()).copy_from_slice(data);
-    }
-    buf
 }
 
 fn read_u32(st: &SafeTensors, name: &str) -> Vec<u32> {
