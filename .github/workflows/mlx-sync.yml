@@ -1,0 +1,91 @@
+name: MLX upstream sync
+
+# Watches MLX upstream for changes to the kernel files we vendor in
+# `kernels-mlx/`. When upstream drifts, opens a PR with the new files
+# and the new commit SHA in VENDORED.md. CI on the PR re-runs the
+# parity tests, which act as the canary for MLX-side changes that
+# break us.
+#
+# Schedule: weekly on Sunday at midnight UTC. Trigger manually any
+# time via the Actions UI ("Run workflow").
+#
+# NOTE: PRs opened with the default GITHUB_TOKEN do not trigger
+# downstream workflows (CI in this case). For full automation, swap
+# GITHUB_TOKEN for a `secrets.CIDER_BOT_TOKEN` PAT with `repo` scope.
+# Until then, manually close+reopen the sync PR to fire CI.
+
+on:
+  schedule:
+    - cron: "0 0 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone MLX upstream
+        run: |
+          git clone --depth=1 https://github.com/ml-explore/mlx.git /tmp/mlx
+          cd /tmp/mlx
+          echo "MLX_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "MLX_DATE=$(git log -1 --format=%cs)" >> "$GITHUB_ENV"
+
+      - name: Sync vendored sources
+        env:
+          MLX_DIR: /tmp/mlx
+        run: ./scripts/sync_mlx_kernels.sh
+
+      - name: Update vendored-commit SHA in VENDORED.md
+        run: |
+          sed -i.bak -E \
+            "s/^[0-9a-f]{40} +\(.+\)$/${MLX_SHA}  (${MLX_DATE})/" \
+            kernels-mlx/VENDORED.md
+          rm kernels-mlx/VENDORED.md.bak
+
+      - name: Detect drift
+        id: drift
+        run: |
+          if [ -z "$(git status --porcelain kernels-mlx/)" ]; then
+            echo "drift=false" >> "$GITHUB_OUTPUT"
+            echo "No upstream changes — nothing to sync."
+          else
+            echo "drift=true" >> "$GITHUB_OUTPUT"
+            git status --short kernels-mlx/
+          fi
+
+      - name: Open pull request
+        if: steps.drift.outputs.drift == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: mlx-sync/${{ env.MLX_SHA }}
+          base: main
+          title: "chore(mlx-sync): bump vendored kernels to ${{ env.MLX_SHA }}"
+          commit-message: |
+            chore(mlx-sync): bump vendored kernels to ${{ env.MLX_SHA }}
+
+            Synced from ml-explore/mlx@${{ env.MLX_SHA }} (${{ env.MLX_DATE }}).
+            CI's Stage 4 parity test is the canary; merge if green.
+          body: |
+            Automated MLX upstream sync.
+
+            **Upstream:** [`${{ env.MLX_SHA }}`](https://github.com/ml-explore/mlx/commit/${{ env.MLX_SHA }}) (${{ env.MLX_DATE }})
+
+            Files in `kernels-mlx/` have drifted from upstream. The
+            Stage 4 `qmv` bit-exact-parity test in
+            `crates/cider-press-kernels/tests/stage4_qmv.rs` is the
+            canary: green means MLX's changes did not break us.
+
+            If CI is red, do **not** merge — triage what changed
+            upstream (kernel signature, layout, dispatch convention)
+            and decide whether to adapt cider-press, pin to the
+            previous SHA, or skip this bump entirely.
+          labels: |
+            mlx-sync
+            automated
