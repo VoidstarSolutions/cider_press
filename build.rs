@@ -1,15 +1,15 @@
-//! Spike build script — flattens MLX Metal kernel sources into a single
-//! self-contained MSL string for `tests/stage2_copy.rs`.
+//! Spike build script — flattens MLX Metal kernel sources into self-
+//! contained MSL strings consumable by `tests/stage*` integration tests.
 //!
 //! Metal's runtime compiler (`newLibraryWithSource:`) has no notion of a
-//! filesystem, so any `#include "..."` directives must be resolved offline.
-//! This script reads `mlx/backend/metal/kernels/copy.metal`, recursively
-//! inlines every project-relative include (anything with a quoted path),
-//! and leaves system includes (`<metal_stdlib>` etc.) for the Metal
-//! compiler. The result lands at `$OUT_DIR/copy_inlined.metal`.
+//! filesystem, so any `#include "..."` directives must be resolved
+//! offline. For each MLX entry-point kernel, we recursively inline every
+//! project-relative include and leave system includes (`<metal_stdlib>`
+//! etc.) for the Metal compiler. Each output lands at
+//! `$OUT_DIR/<name>_inlined.metal`.
 //!
-//! MLX checkout location is resolved from `CIDER_MLX_DIR` if set, otherwise
-//! the documented default in CLAUDE.md.
+//! MLX checkout location is resolved from `CIDER_MLX_DIR` if set,
+//! otherwise the documented default in CLAUDE.md.
 
 use std::collections::HashSet;
 use std::env;
@@ -18,7 +18,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const DEFAULT_MLX_DIR: &str = "/Users/zacharyheylmun/dev/llm/mlx";
-const ENTRY_POINT: &str = "mlx/backend/metal/kernels/copy.metal";
+
+/// (entry-relative-to-MLX, output-file-stem). The output filename will be
+/// `<stem>_inlined.metal` in `OUT_DIR`.
+const ENTRY_POINTS: &[(&str, &str)] = &[
+    ("mlx/backend/metal/kernels/copy.metal", "copy"),
+    ("mlx/backend/metal/kernels/quantized.metal", "quantized"),
+];
 
 fn main() {
     println!("cargo:rerun-if-env-changed=CIDER_MLX_DIR");
@@ -27,25 +33,30 @@ fn main() {
     let mlx_dir =
         env::var("CIDER_MLX_DIR").map_or_else(|_| PathBuf::from(DEFAULT_MLX_DIR), PathBuf::from);
 
-    let entry = mlx_dir.join(ENTRY_POINT);
-    if !entry.exists() {
-        // Don't hard-fail the whole build — Stage 1 doesn't need this. The
-        // Stage 2 test will skip with a clear message when the inlined file
-        // is missing or empty.
-        let stub = "// MLX checkout not found at build time. Set CIDER_MLX_DIR.\n";
-        write_output(stub);
-        println!(
-            "cargo:warning=cider-press: MLX checkout not found at {}; \
-             stage 2 test will skip. Set CIDER_MLX_DIR to override.",
-            entry.display()
-        );
-        return;
-    }
+    for (rel, stem) in ENTRY_POINTS {
+        let entry = mlx_dir.join(rel);
+        let dest_name = format!("{stem}_inlined.metal");
 
-    let mut seen: HashSet<PathBuf> = HashSet::new();
-    let mut flat = String::new();
-    flatten(&entry, &mlx_dir, &mut seen, &mut flat);
-    write_output(&flat);
+        if !entry.exists() {
+            let stub = format!(
+                "// MLX checkout not found at build time. Set CIDER_MLX_DIR.\n\
+                 // Missing entry: {}\n",
+                entry.display()
+            );
+            write_output(&dest_name, &stub);
+            println!(
+                "cargo:warning=cider-press: MLX checkout not found at {}; \
+                 dependent tests will skip. Set CIDER_MLX_DIR to override.",
+                entry.display()
+            );
+            continue;
+        }
+
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        let mut flat = String::new();
+        flatten(&entry, &mlx_dir, &mut seen, &mut flat);
+        write_output(&dest_name, &flat);
+    }
 }
 
 fn flatten(path: &Path, root: &Path, seen: &mut HashSet<PathBuf>, out: &mut String) {
@@ -87,8 +98,8 @@ fn flatten(path: &Path, root: &Path, seen: &mut HashSet<PathBuf>, out: &mut Stri
     writeln!(out, "// ===== end {} =====", canon.display()).unwrap();
 }
 
-fn write_output(content: &str) {
+fn write_output(name: &str, content: &str) {
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
-    let dest = Path::new(&out_dir).join("copy_inlined.metal");
+    let dest = Path::new(&out_dir).join(name);
     fs::write(&dest, content).unwrap_or_else(|e| panic!("cannot write {}: {e}", dest.display()));
 }
