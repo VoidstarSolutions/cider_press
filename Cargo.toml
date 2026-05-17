@@ -1,0 +1,22 @@
+[package]
+name = "cider-press"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Cold-pressed LLM inference for Apple Silicon."
+license = "MIT"
+repository = "https://github.com/zheylmun/cider-press"
+readme = "README.md"
+keywords = ["llm", "inference", "apple-silicon", "metal", "mlx"]
+categories = ["science"]
+
+[lib]
+
+[features]
+default = []
+
+[dependencies]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+
+[dev-dependencies]
