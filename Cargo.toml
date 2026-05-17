@@ -20,6 +20,7 @@ half = "=2.7.1"
 objc2 = "=0.6.4"
 objc2-foundation = "=0.3.2"
 objc2-metal = "=0.3.2"
+thiserror = "=2.0.18"
 approx = "=0.5.1"
 safetensors = "=0.7.0"
 
