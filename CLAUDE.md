@@ -141,7 +141,36 @@ ownership under `objc2`'s `Retained<T>`.
 
 **Acceptance:** `cargo test --release` passes; round-trip < 5 ms.
 
-#### Stage 2 — load a real MLX `.metal` file (≈2 hours)
+#### Stage 2 — load a real MLX `.metal` file (≈2 hours) — **done**
+
+See `build.rs` and `tests/stage2_copy.rs`. Both `v_copyfloat32float32`
+and `v_copyfloat16float16` produce bit-identical output on 1024
+elements. Findings:
+
+- Offline-inlining approach worked. `build.rs` flattens `copy.metal`
+  plus 6 transitive headers (1418 lines total) into one MSL string in
+  `OUT_DIR`. Recursion handles `#pragma once` via a canonicalized-path
+  seen-set; system `#include <...>` directives are left for the Metal
+  compiler.
+- Zero MSL dialect drift. The MLX `bf16` shim and the
+  `metal_stdlib`/`metal_math`/`metal_logging` system headers coexist
+  on the current macOS / Metal toolchain without modification. The
+  `logging.h` `__METAL_VERSION__ >= 320` fallback never fires (system
+  Metal is new enough).
+- `instantiate_kernel` macro: produces `[[host_name(N)]] kernel ...`,
+  so `newFunctionWithName:` lookup name is literally the first macro
+  argument — no mangling. Big plus for Stage 4.
+- `constant T&` MSL parameters auto-bind to the next free buffer slot
+  after explicit `[[buffer(N)]]` attributes. Use
+  `setBytes:length:atIndex:` for small scalars rather than allocating
+  an `MTLBuffer`.
+- JIT cost data: first run of `cargo test --test stage2_copy --release`
+  takes ~1.5 s, dominated by `newLibraryWithSource:` for the full
+  flattened source. Repeat runs of the same binary are sub-50 ms,
+  hinting at driver-level library caching across processes (partially
+  addresses open question 2; Stage 4 cold-run will confirm).
+
+#### Stage 2 — original plan
 
 Pick `mlx/backend/metal/kernels/copy.metal`. Small, minimal includes,
 trivial reference output (identity), exercises the include resolver
@@ -167,9 +196,28 @@ assumed compiler and the system Metal compiler; MLX macros
 **Acceptance:** copy kernel produces bit-identical output for f32 and
 f16 (use `half::f16`).
 
-#### Stage 3 — reference parity harness (≈1 hour)
+#### Stage 3 — reference parity harness (≈1 hour) — **done**
 
-Stand up the comparison rig before tackling quantized matmul.
+See `scripts/gen_stage3_fixtures.py` (one-shot PEP 723 `uv run` script
+— no requirements.txt, no venv), `tests/fixtures/stage3_copy.safetensors`
+(12.5 KB, deterministic via seed=0), and `tests/stage3_parity.rs`. Both
+f32 and f16 `v_copy` outputs match the MLX-generated reference at
+1e-6 / 1e-3 tolerance respectively. Findings:
+
+- `safetensors 0.7` is friction-free: `SafeTensors::deserialize(&bytes)`
+  → `.tensor(name)?.data()` returns raw `&[u8]`, cast manually. No
+  `bytemuck` needed for spike scope.
+- Python is treated as a one-shot fixture generator, **not** project
+  infrastructure. There is no long-term Python support intended; the
+  script exists so Stage 4 can compare against real MLX output.
+- Test harness duplicates `MetalCtx` + `run_copy` from Stage 2. Stage 4
+  will be the third copy — factor to `tests/common/mod.rs` then, not
+  before.
+- MSRV trap: `usize::is_multiple_of` is Rust 1.87+ and our
+  `rust-version = "1.85"` declares older. Clippy catches it. Use
+  `% N == 0` or bump `rust-version`.
+
+#### Stage 3 — original plan
 
 ```python
 import mlx.core as mx
