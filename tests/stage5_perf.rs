@@ -52,7 +52,12 @@ fn mlx_source_unavailable() -> bool {
         .starts_with("// MLX checkout not found")
 }
 
+// Perf measurement, not a regression test: 2 shapes × 1050 sync
+// dispatches each adds ~1 s of noise to default `cargo test`. Run
+// explicitly with `cargo test --release --test stage5_perf -- --ignored
+// --nocapture`.
 #[test]
+#[ignore = "perf benchmark; run with --ignored"]
 fn perf_affine_qmv_fast_bf16_gs64_b4() {
     if mlx_source_unavailable() {
         eprintln!("skipping: MLX checkout not found at build time");
