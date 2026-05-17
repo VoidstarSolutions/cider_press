@@ -73,31 +73,40 @@ only — target < 500 lines of Rust.
 Each stage isolates one risk. Combining stages blinds you to which
 thing broke — resist the urge to skip ahead.
 
-#### Stage 0 — environment + dependencies (≈30 min)
+#### Stage 0 — environment + dependencies (≈30 min) — **done**
 
-Add to `Cargo.toml`:
+Currently pinned in `Cargo.toml`:
 
 ```toml
+[dependencies]
+half = "=2.7.1"
+
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "0.5"
-objc2-foundation = { version = "0.2", features = ["NSString", "NSError", "NSData", "NSURL"] }
-objc2-metal = { version = "0.2", features = [
-    "MTLDevice", "MTLLibrary", "MTLCommandQueue", "MTLCommandBuffer",
-    "MTLComputeCommandEncoder", "MTLComputePipeline", "MTLBuffer",
-    "MTLResource",
-] }
-half = "2"
+objc2 = "=0.6.4"
+objc2-foundation = "=0.3.2"
+objc2-metal = "=0.3.2"
 
 [dev-dependencies]
-approx = "0.5"
+approx = "=0.5.1"
 ```
 
-Verify versions on crates.io at start-of-spike — the `objc2-*` ecosystem
-moves quickly. Pin exact versions once it builds.
+Notes from doing it:
 
-**Acceptance:** `cargo build` succeeds on aarch64-apple-darwin.
+- The `objc2-*` ecosystem has moved past the original suggestions
+  (`0.5` → `0.6`, `0.2` → `0.3`); feature names shifted too.
+- Default features on `objc2-metal 0.3.x` activate 60+ items and cover
+  everything the spike needs without manual curation. Worth revisiting
+  feature minimization once dispatch is proven, if binary size matters.
+- `MTLCreateSystemDefaultDevice` requires `CoreGraphics` at link time.
+  Linking it directly via `#[link(name = "CoreGraphics", kind = "framework")]`
+  in the test/example file is lighter than pulling in `objc2-core-graphics`.
 
-#### Stage 1 — device + queue + trivial inline kernel (≈2 hours)
+**Acceptance:** `cargo build` succeeds on aarch64-apple-darwin. ✓
+
+#### Stage 1 — device + queue + trivial inline kernel (≈2 hours) — **done**
+
+See `tests/stage1_add_one.rs`. Round-trip after warm-up measured at
+~237 µs on the development machine; acceptance was < 5 ms.
 
 Before touching MLX, prove the dispatch loop with a kernel typed inline:
 
