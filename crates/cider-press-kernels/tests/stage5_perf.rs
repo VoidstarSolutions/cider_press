@@ -7,7 +7,10 @@
 //! the ratio between the two is the spike's headline number.
 //!
 //! Stage 4 already validated correctness; this test only measures, so
-//! buffers are zero-initialized.
+//! buffers are left at whatever values `Device::alloc_buffer` produced
+//! (Metal does not zero shared-storage allocations). The qmv kernel is
+//! data-independent in its runtime cost, so the resulting outputs are
+//! garbage but the timings are still meaningful.
 
 #![cfg(target_os = "macos")]
 #![allow(

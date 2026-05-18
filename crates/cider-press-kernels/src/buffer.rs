@@ -60,8 +60,12 @@ impl<T> Buffer<T> {
         self.len == 0
     }
 
-    /// Length in bytes of the underlying allocation. May exceed
-    /// `len * size_of::<T>()` if Metal rounded up.
+    /// Logical length of the buffer in bytes: `len * size_of::<T>()`.
+    ///
+    /// This is the byte count cider-press requested from Metal. The
+    /// underlying `MTLBuffer`'s page-aligned allocation may be larger,
+    /// but that rounded-up size is not exposed here. Use
+    /// `self.metal_buffer().length()` if you need it.
     #[must_use]
     pub fn byte_len(&self) -> usize {
         self.len * size_of::<T>()
