@@ -50,6 +50,13 @@ pub enum Error {
     /// `context` is a short literal identifying the call site.
     #[error("Apple Metal API returned nil from {context}")]
     AppleApi { context: &'static str },
+
+    /// A dispatch function was called with arguments that violate its
+    /// preconditions (shape mismatch, divisibility, out-of-range
+    /// constants, etc.). The message identifies the dispatcher and the
+    /// specific violation.
+    #[error("{0}")]
+    InvalidArgument(String),
 }
 
 /// Convenience `Result` alias for the `cider-press-kernels` API.

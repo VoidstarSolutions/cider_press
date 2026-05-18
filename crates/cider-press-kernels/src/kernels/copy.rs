@@ -20,7 +20,7 @@ use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
 
 use crate::buffer::Buffer;
 use crate::commands::Commands;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::library::KernelLibrary;
 
 /// Identity-copy `src` into `dst`, both `f32`.
@@ -60,16 +60,21 @@ fn encode_v_copy<T>(
     src: &Buffer<T>,
     dst: &mut Buffer<T>,
 ) -> Result<()> {
-    assert_eq!(
-        src.len(),
-        dst.len(),
-        "copy_v: src.len() ({}) != dst.len() ({})",
-        src.len(),
-        dst.len(),
-    );
+    if src.len() != dst.len() {
+        return Err(Error::InvalidArgument(format!(
+            "copy_v: src.len() ({}) != dst.len() ({})",
+            src.len(),
+            dst.len(),
+        )));
+    }
+    let size = u32::try_from(src.len()).map_err(|_| {
+        Error::InvalidArgument(format!(
+            "copy_v: element count {} does not fit in u32",
+            src.len(),
+        ))
+    })?;
 
     let pipeline = library.pipeline(kernel_name)?;
-    let size = u32::try_from(src.len()).expect("element count fits in u32");
     let encoder = commands.encoder()?;
 
     encoder.setComputePipelineState(pipeline.metal_pipeline_state());

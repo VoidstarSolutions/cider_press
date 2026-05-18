@@ -28,7 +28,7 @@ use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
 
 use crate::buffer::Buffer;
 use crate::commands::Commands;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::library::KernelLibrary;
 
 /// Kernel-side tile sizes from `mlx/backend/metal/quantized.cpp::qmv()`.
@@ -76,38 +76,51 @@ pub fn affine_qmv_bf16(
     group_size: u32,
     bits: u32,
 ) -> Result<()> {
-    let k = i32::try_from(x.len()).expect("K fits in i32");
-    let n = i32::try_from(y.len()).expect("N fits in i32");
-
-    // Shape sanity-checks. These mirror the kernel's expectations; failing
-    // any of them produces silent garbage on the GPU side, so assert here.
-    assert!(k > 0 && n > 0, "K and N must be positive");
-    // Guard the modulo and the divisor below — `k % 0` would panic with a
-    // generic "divisor of zero" otherwise.
-    assert!(
-        group_size > 0,
-        "group_size must be positive (got {group_size})",
-    );
-    assert!(
-        k as u32 % group_size == 0,
-        "K ({k}) must be a multiple of group_size ({group_size})",
-    );
+    // Shape validation. Failing any of these would produce silent garbage
+    // on the GPU side (or a div-by-zero panic on `group_size == 0`); reject
+    // them with a typed error so callers can recover.
+    let k = i32::try_from(x.len()).map_err(|_| {
+        Error::InvalidArgument(format!("affine_qmv: K={} does not fit in i32", x.len()))
+    })?;
+    let n = i32::try_from(y.len()).map_err(|_| {
+        Error::InvalidArgument(format!("affine_qmv: N={} does not fit in i32", y.len()))
+    })?;
+    if k <= 0 || n <= 0 {
+        return Err(Error::InvalidArgument(format!(
+            "affine_qmv: K ({k}) and N ({n}) must be positive"
+        )));
+    }
+    if group_size == 0 {
+        return Err(Error::InvalidArgument(
+            "affine_qmv: group_size must be positive".to_owned(),
+        ));
+    }
+    if k as u32 % group_size != 0 {
+        return Err(Error::InvalidArgument(format!(
+            "affine_qmv: K ({k}) must be a multiple of group_size ({group_size})"
+        )));
+    }
     let groups_per_row = (k as usize) / (group_size as usize);
-    assert_eq!(
-        w_q.len(),
-        (n as usize) * (k as usize) * (bits as usize) / 32,
-        "w_q length doesn't match N*K*bits/32",
-    );
-    assert_eq!(
-        scales.len(),
-        (n as usize) * groups_per_row,
-        "scales length doesn't match N*K/group_size",
-    );
-    assert_eq!(
-        biases.len(),
-        (n as usize) * groups_per_row,
-        "biases length doesn't match N*K/group_size",
-    );
+    let expected_w_q = (n as usize) * (k as usize) * (bits as usize) / 32;
+    if w_q.len() != expected_w_q {
+        return Err(Error::InvalidArgument(format!(
+            "affine_qmv: w_q.len()={} != N*K*bits/32 ({expected_w_q})",
+            w_q.len(),
+        )));
+    }
+    let expected_groups = (n as usize) * groups_per_row;
+    if scales.len() != expected_groups {
+        return Err(Error::InvalidArgument(format!(
+            "affine_qmv: scales.len()={} != N*K/group_size ({expected_groups})",
+            scales.len(),
+        )));
+    }
+    if biases.len() != expected_groups {
+        return Err(Error::InvalidArgument(format!(
+            "affine_qmv: biases.len()={} != N*K/group_size ({expected_groups})",
+            biases.len(),
+        )));
+    }
 
     // Mirror MLX's dispatcher: fast variant when both K is a 512-multiple
     // and N is a bn-multiple. See quantized.cpp::qmv.
