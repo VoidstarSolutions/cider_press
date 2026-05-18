@@ -18,6 +18,8 @@ compile_error!(
      Build on an aarch64-apple-darwin host."
 );
 
+mod dtype;
 mod error;
 
+pub use dtype::{DType, Scalar};
 pub use error::{Error, Result};
