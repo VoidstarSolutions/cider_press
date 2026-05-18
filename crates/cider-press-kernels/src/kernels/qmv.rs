@@ -42,7 +42,7 @@ const BK: i32 = 32;
 ///
 /// `library` must be a [`KernelLibrary::quantized`]. Encodes one
 /// dispatch into `commands`; caller flushes via
-/// [`Commands::commit_and_wait`](crate::Commands::commit_and_wait).
+/// [`Commands::commit_and_wait`].
 ///
 /// # Shape requirements
 ///
@@ -54,7 +54,7 @@ const BK: i32 = 32;
 /// `group_size` must be in `{32, 64, 128}` and `bits` must be in
 /// `{2, 3, 4, 5, 6, 8}` — these are the combinations MLX's
 /// `instantiate_quantized_all` macro emits. Calling with other values
-/// returns [`Error::KernelNotFound`](crate::Error::KernelNotFound) at
+/// returns [`Error::KernelNotFound`] at
 /// the pipeline lookup, because the matching kernel was never
 /// instantiated.
 ///

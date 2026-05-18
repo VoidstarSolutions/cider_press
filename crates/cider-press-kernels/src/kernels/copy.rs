@@ -26,7 +26,7 @@ use crate::library::KernelLibrary;
 /// Identity-copy `src` into `dst`, both `f32`.
 ///
 /// Encodes one dispatch into `commands`; the caller must invoke
-/// [`Commands::commit_and_wait`](crate::Commands::commit_and_wait) to
+/// [`Commands::commit_and_wait`] to
 /// flush it to the GPU.
 ///
 /// `library` must be a [`KernelLibrary::copy`].
