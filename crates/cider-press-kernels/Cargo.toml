@@ -1,0 +1,29 @@
+[package]
+name = "cider-press-kernels"
+description = "Low-level Metal kernel dispatch surface for cider-press, built on vendored MLX kernel sources."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+
+[dependencies]
+half.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-metal.workspace = true
+
+[dev-dependencies]
+approx.workspace = true
+safetensors.workspace = true
+
+[lints]
+workspace = true

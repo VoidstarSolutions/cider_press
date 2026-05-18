@@ -1,0 +1,19 @@
+[package]
+name = "cider-press-runtime"
+description = "Lazy tensor, graph, and command-buffer-batching runtime layered over cider-press-kernels."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lib]
+
+[dependencies]
+cider-press-kernels = { path = "../cider-press-kernels" }
+
+[lints]
+workspace = true

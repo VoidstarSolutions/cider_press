@@ -37,13 +37,52 @@ file derived from MLX must retain the MIT copyright header.
 
 ---
 
-## Current state: development spike
+## Repository layout
 
-The repo is in **Stage 0** of a staged spike. The public API surface is
-intentionally empty (`src/lib.rs` exports nothing yet) until the spike
-informs the design. Do **not** add `Device`, `Tensor`, op modules, or
-error types ahead of the spike's findings — the spike doc below
-explicitly forbids it.
+The crate is a Cargo workspace; each layer is its own member crate so
+the dispatch surface, the runtime, and the model layer can be depended
+on independently (and published independently down the road).
+
+```
+cider-press/
+├── Cargo.toml                          # workspace manifest only
+├── kernels-mlx/                        # vendored MLX kernel sources (MIT)
+│   ├── COPYING                         # MLX MIT notice
+│   ├── VENDORED.md                     # file list, upstream SHA, sync procedure
+│   └── mlx/backend/metal/kernels/      # full upstream path preserved
+├── crates/
+│   ├── cider-press-kernels/            # vendored MLX dispatch surface
+│   │   ├── build.rs                    # flattener: kernels-mlx/ → OUT_DIR/*_inlined.metal
+│   │   ├── src/lib.rs                  # device/buffer/library + per-kernel dispatch (TBD)
+│   │   └── tests/{stage*,fixtures}     # spike parity + perf tests
+│   ├── cider-press-runtime/            # scaffold: lazy Tensor + graph + eval
+│   ├── cider-press-models/             # scaffold: transformer architectures
+│   └── cider-press/                    # scaffold: facade + CLI
+├── scripts/                            # one-shot uv scripts (fixtures, MLX sync, perf)
+└── .github/workflows/{ci,mlx-sync}.yml
+```
+
+Dependencies flow strictly upward: `cider-press-models` depends on
+`cider-press-runtime` depends on `cider-press-kernels`. The facade
+crate re-exports from runtime + models. Workspace-level
+`[workspace.lints]` and `[workspace.dependencies]` keep settings and
+version pins in one place; each member uses `lints.workspace = true`
+and `dep.workspace = true`.
+
+## Current state: spike complete, scaffolding in place
+
+The development spike (Stages 0–5 below) passed every acceptance bar,
+including bit-exact `qmv` parity with MLX's own `quantized_matmul`.
+The workspace restructure (this section's layout) followed
+immediately after. **The next concrete step is to design the lazy
+`Tensor` + graph + `eval()` semantics in `cider-press-runtime`** —
+see the post-spike Findings at the bottom for the recommendation.
+
+Do **not** add public types to `cider-press-kernels` ahead of the
+runtime-layer design — its dispatch surface should be shaped by what
+the runtime actually needs to call. Similarly, do not start on
+`cider-press-models` until at least one architecture's needs inform
+the runtime's op coverage.
 
 ### Spike goal
 
@@ -63,20 +102,26 @@ only — target < 500 lines of Rust.
 
 ### Reference paths
 
-The build script reads MLX kernel sources from the directory pointed
-to by the `CIDER_MLX_DIR` environment variable; if it is unset (or
-points at a missing checkout) the dependent tests skip with a clear
-warning. The contributor workflow is:
+- **Vendored MLX kernels (canonical):** `kernels-mlx/mlx/backend/metal/kernels/`
+- **MLX C++ dispatch reference (your local MLX checkout):**
+  `$MLX_DIR/mlx/backend/metal/{device,kernels,matmul,quantized}.cpp`
 
-1. Clone MLX somewhere: `git clone https://github.com/ml-explore/mlx ~/src/mlx`.
-2. Export `CIDER_MLX_DIR=~/src/mlx` in your shell (or pass it to
-   `cargo` directly: `CIDER_MLX_DIR=~/src/mlx cargo test --release`).
+The vendored copy is the source of truth at build time, so no MLX
+checkout is needed for `cargo build`/`test`. A local MLX checkout is
+only needed when bumping the vendored sources, or when reading MLX's
+C++ side as reference while porting new dispatch routines.
 
-Paths inside MLX referenced repeatedly below:
+To bump vendored kernels:
 
-- MLX Metal kernels: `$CIDER_MLX_DIR/mlx/backend/metal/kernels/`
-- MLX Metal C++ dispatch reference:
-  `$CIDER_MLX_DIR/mlx/backend/metal/{device,kernels,matmul,quantized}.cpp`
+```sh
+git clone https://github.com/ml-explore/mlx.git ~/src/mlx     # one-time
+MLX_DIR=~/src/mlx ./scripts/sync_mlx_kernels.sh
+# then update the upstream-commit SHA in kernels-mlx/VENDORED.md
+cargo test --workspace --release    # Stage 4 parity is the canary
+```
+
+The `.github/workflows/mlx-sync.yml` workflow does this automatically
+on a weekly schedule and opens a PR when upstream drifts.
 
 ### Staged plan
 
@@ -85,20 +130,18 @@ thing broke — resist the urge to skip ahead.
 
 #### Stage 0 — environment + dependencies (≈30 min) — **done**
 
-Currently pinned in `Cargo.toml`:
+Currently pinned in the workspace manifest's `[workspace.dependencies]`:
 
 ```toml
-[dependencies]
 half = "=2.7.1"
-
-[target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "=0.6.4"
 objc2-foundation = "=0.3.2"
 objc2-metal = "=0.3.2"
-
-[dev-dependencies]
 approx = "=0.5.1"
+safetensors = "=0.7.0"
 ```
+
+Member crates pull what they need via `dep.workspace = true`.
 
 Notes from doing it:
 
@@ -115,7 +158,7 @@ Notes from doing it:
 
 #### Stage 1 — device + queue + trivial inline kernel (≈2 hours) — **done**
 
-See `tests/stage1_add_one.rs`. Round-trip after warm-up measured at
+See `crates/cider-press-kernels/tests/stage1_add_one.rs`. Round-trip after warm-up measured at
 ~237 µs on the development machine; acceptance was < 5 ms.
 
 Before touching MLX, prove the dispatch loop with a kernel typed inline:
@@ -153,7 +196,7 @@ ownership under `objc2`'s `Retained<T>`.
 
 #### Stage 2 — load a real MLX `.metal` file (≈2 hours) — **done**
 
-See `build.rs` and `tests/stage2_copy.rs`. Both `v_copyfloat32float32`
+See `crates/cider-press-kernels/build.rs` and `crates/cider-press-kernels/tests/stage2_copy.rs`. Both `v_copyfloat32float32`
 and `v_copyfloat16float16` produce bit-identical output on 1024
 elements. Findings:
 
@@ -209,8 +252,8 @@ f16 (use `half::f16`).
 #### Stage 3 — reference parity harness (≈1 hour) — **done**
 
 See `scripts/gen_stage3_fixtures.py` (one-shot PEP 723 `uv run` script
-— no requirements.txt, no venv), `tests/fixtures/stage3_copy.safetensors`
-(12.5 KB, deterministic via seed=0), and `tests/stage3_parity.rs`. Both
+— no requirements.txt, no venv), `crates/cider-press-kernels/tests/fixtures/stage3_copy.safetensors`
+(12.5 KB, deterministic via seed=0), and `crates/cider-press-kernels/tests/stage3_parity.rs`. Both
 f32 and f16 `v_copy` outputs match the MLX-generated reference at
 1e-6 / 1e-3 tolerance respectively. Findings:
 
@@ -245,8 +288,8 @@ f32, `1e-3` for f16, `1e-2` for bf16/quantized.
 
 #### Stage 4 — target: one quantized matmul (≈1 weekend) — **done**
 
-See `tests/stage4_qmv.rs`, `scripts/gen_stage4_fixtures.py`,
-`tests/fixtures/stage4_qmv.safetensors` (150 KB; K=N=512). Output
+See `crates/cider-press-kernels/tests/stage4_qmv.rs`, `scripts/gen_stage4_fixtures.py`,
+`crates/cider-press-kernels/tests/fixtures/stage4_qmv.safetensors` (150 KB; K=N=512). Output
 matches MLX's `mx.quantized_matmul` **bit-exactly**
 (`max_relative=0, max_absolute=0`) on every element — far beyond the
 acceptance bar of ~1e-2 relative. Findings:
@@ -324,7 +367,7 @@ to bf16 tolerance on `[4096, 4096] @ [4096]`.
 
 #### Stage 5 — measure (≈1 hour) — **done**
 
-See `tests/stage5_perf.rs` and `scripts/measure_stage5_mlx.py`.
+See `crates/cider-press-kernels/tests/stage5_perf.rs` and `scripts/measure_stage5_mlx.py`.
 
 Measured on the development machine (release build, warmup=50,
 timed=1000):
@@ -498,8 +541,9 @@ If acceptance criteria fail:
 
 ## Conventions
 
-- **macOS / Apple Silicon only.** `src/lib.rs` has a `compile_error!`
-  for non-macOS targets. Don't add cross-platform shims.
+- **macOS / Apple Silicon only.** Each member crate's `src/lib.rs` has
+  a `compile_error!` for non-macOS targets. Don't add cross-platform
+  shims.
 - **No premature abstractions.** Until the spike concludes, prefer
   `pub(crate)` free functions and raw `MTLBuffer` over types. The cost
   of building the wrong abstraction first is high.
