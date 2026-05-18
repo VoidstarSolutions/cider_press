@@ -63,10 +63,20 @@ only — target < 500 lines of Rust.
 
 ### Reference paths
 
-- MLX checkout: `/Users/zacharyheylmun/dev/llm/mlx/`
-- MLX Metal kernels: `mlx/backend/metal/kernels/`
-- MLX Metal C++ dispatch reference: `mlx/backend/metal/{device,kernels,matmul}.cpp`
-- cider-press repo: `/Users/zacharyheylmun/dev/llm/cider-press/`
+The build script reads MLX kernel sources from the directory pointed
+to by the `CIDER_MLX_DIR` environment variable; if it is unset (or
+points at a missing checkout) the dependent tests skip with a clear
+warning. The contributor workflow is:
+
+1. Clone MLX somewhere: `git clone https://github.com/ml-explore/mlx ~/src/mlx`.
+2. Export `CIDER_MLX_DIR=~/src/mlx` in your shell (or pass it to
+   `cargo` directly: `CIDER_MLX_DIR=~/src/mlx cargo test --release`).
+
+Paths inside MLX referenced repeatedly below:
+
+- MLX Metal kernels: `$CIDER_MLX_DIR/mlx/backend/metal/kernels/`
+- MLX Metal C++ dispatch reference:
+  `$CIDER_MLX_DIR/mlx/backend/metal/{device,kernels,matmul,quantized}.cpp`
 
 ### Staged plan
 
