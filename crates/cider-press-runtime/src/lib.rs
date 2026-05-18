@@ -20,6 +20,10 @@ compile_error!(
 
 mod dtype;
 mod error;
+mod shape;
+mod strides;
 
 pub use dtype::{DType, Scalar};
 pub use error::{Error, Result};
+pub use shape::Shape;
+pub use strides::Strides;
