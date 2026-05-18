@@ -8,16 +8,20 @@
 //! etc.) for the Metal compiler. Each output lands at
 //! `$OUT_DIR/<name>_inlined.metal`.
 //!
-//! MLX checkout location is resolved from `CIDER_MLX_DIR` if set,
-//! otherwise the documented default in CLAUDE.md.
+//! MLX checkout location must be supplied via the `CIDER_MLX_DIR`
+//! environment variable. If it is unset or points at a path with no
+//! MLX kernel sources, the script writes a stub for each entry point
+//! and the dependent integration tests skip with a clear message.
+//!
+//! Vendoring MLX into the repo (see the follow-up workspace
+//! restructure) removes this build-time requirement entirely; this
+//! script is the spike-era arrangement.
 
 use std::collections::HashSet;
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
-
-const DEFAULT_MLX_DIR: &str = "/Users/zacharyheylmun/dev/llm/mlx";
 
 /// (entry-relative-to-MLX, output-file-stem). The output filename will be
 /// `<stem>_inlined.metal` in `OUT_DIR`.
@@ -30,33 +34,39 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CIDER_MLX_DIR");
     println!("cargo:rerun-if-changed=build.rs");
 
-    let mlx_dir =
-        env::var("CIDER_MLX_DIR").map_or_else(|_| PathBuf::from(DEFAULT_MLX_DIR), PathBuf::from);
+    let mlx_dir = env::var_os("CIDER_MLX_DIR").map(PathBuf::from);
 
     for (rel, stem) in ENTRY_POINTS {
-        let entry = mlx_dir.join(rel);
         let dest_name = format!("{stem}_inlined.metal");
 
+        let Some(dir) = mlx_dir.as_ref() else {
+            skip(&dest_name, "CIDER_MLX_DIR is not set");
+            continue;
+        };
+        let entry = dir.join(rel);
         if !entry.exists() {
-            let stub = format!(
-                "// MLX checkout not found at build time. Set CIDER_MLX_DIR.\n\
-                 // Missing entry: {}\n",
-                entry.display()
-            );
-            write_output(&dest_name, &stub);
-            println!(
-                "cargo:warning=cider-press: MLX checkout not found at {}; \
-                 dependent tests will skip. Set CIDER_MLX_DIR to override.",
-                entry.display()
-            );
+            skip(&dest_name, &format!("entry not found: {}", entry.display()));
             continue;
         }
 
         let mut seen: HashSet<PathBuf> = HashSet::new();
         let mut flat = String::new();
-        flatten(&entry, &mlx_dir, &mut seen, &mut flat);
+        flatten(&entry, dir, &mut seen, &mut flat);
         write_output(&dest_name, &flat);
     }
+}
+
+fn skip(dest_name: &str, detail: &str) {
+    let stub = format!(
+        "// MLX kernel sources unavailable at build time.\n\
+         // {detail}\n\
+         // Set CIDER_MLX_DIR to a local MLX checkout to enable.\n"
+    );
+    write_output(dest_name, &stub);
+    println!(
+        "cargo:warning=cider-press: MLX sources unavailable ({detail}); \
+         dependent tests will skip. Set CIDER_MLX_DIR to enable."
+    );
 }
 
 fn flatten(path: &Path, root: &Path, seen: &mut HashSet<PathBuf>, out: &mut String) {
