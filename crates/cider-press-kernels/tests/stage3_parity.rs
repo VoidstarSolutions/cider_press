@@ -14,7 +14,7 @@
 
 use std::path::PathBuf;
 
-use approx::assert_relative_eq;
+use approx::relative_eq;
 use cider_press_kernels::{Buffer, Device, KernelLibrary, kernels};
 use half::f16;
 use safetensors::SafeTensors;
@@ -55,8 +55,11 @@ fn parity_v_copy_f32() {
 
     // SAFETY: commit_and_wait blocked until the GPU finished writing dst_buf.
     let actual = unsafe { dst_buf.as_mut_slice() };
-    for (a, e) in actual.iter().zip(expected.iter()) {
-        assert_relative_eq!(*a, *e, max_relative = 1e-6, epsilon = 1e-7);
+    for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            relative_eq!(*a, *e, max_relative = 1e-6, epsilon = 1e-7),
+            "f32 mismatch at index {i}: actual={a} expected={e}",
+        );
     }
 }
 
@@ -89,8 +92,13 @@ fn parity_v_copy_f16() {
 
     // SAFETY: commit_and_wait blocked until the GPU finished writing dst_buf.
     let actual = unsafe { dst_buf.as_mut_slice() };
-    for (a, e) in actual.iter().zip(expected.iter()) {
-        assert_relative_eq!(a.to_f32(), e.to_f32(), max_relative = 1e-3, epsilon = 1e-4);
+    for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+        let a32 = a.to_f32();
+        let e32 = e.to_f32();
+        assert!(
+            relative_eq!(a32, e32, max_relative = 1e-3, epsilon = 1e-4),
+            "f16 mismatch at index {i}: actual={a32} expected={e32}",
+        );
     }
 }
 

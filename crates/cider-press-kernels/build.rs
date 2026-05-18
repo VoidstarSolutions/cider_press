@@ -51,19 +51,6 @@ fn main() {
     }
 }
 
-fn skip(dest_name: &str, detail: &str) {
-    let stub = format!(
-        "// MLX kernel sources unavailable at build time.\n\
-         // {detail}\n\
-         // Set CIDER_MLX_DIR to a local MLX checkout to enable.\n"
-    );
-    write_output(dest_name, &stub);
-    println!(
-        "cargo:warning=cider-press: MLX sources unavailable ({detail}); \
-         dependent tests will skip. Set CIDER_MLX_DIR to enable."
-    );
-}
-
 fn flatten(path: &Path, root: &Path, seen: &mut HashSet<PathBuf>, out: &mut String) {
     let canon = path
         .canonicalize()
