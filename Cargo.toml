@@ -16,10 +16,19 @@ categories = ["science"]
 default = []
 
 [dependencies]
+half = "=2.7.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# objc2-* ecosystem moves fast; pin exact for spike reproducibility.
+# Default features are heavy (>60 features each) but cover everything
+# the spike needs — revisit minimization once dispatch is proven.
+objc2 = "=0.6.4"
+objc2-foundation = "=0.3.2"
+objc2-metal = "=0.3.2"
 
 [dev-dependencies]
+approx = "=0.5.1"
+safetensors = "=0.7.0"
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
