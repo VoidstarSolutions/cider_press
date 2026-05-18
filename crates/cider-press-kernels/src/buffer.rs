@@ -90,6 +90,12 @@ impl<T: Copy> Buffer<T> {
     /// `Commands::commit_and_wait`).
     #[must_use]
     pub unsafe fn as_slice(&self) -> &[T] {
+        // Metal's `contents()` is documented to return non-null for
+        // any successfully-allocated buffer, but defending against an
+        // empty backing allocation costs nothing.
+        if self.len == 0 {
+            return &[];
+        }
         let ptr = self.raw.contents().cast::<T>().as_ptr();
         unsafe { std::slice::from_raw_parts(ptr, self.len) }
     }
@@ -101,6 +107,9 @@ impl<T: Copy> Buffer<T> {
     /// Same constraint as [`Buffer::as_slice`]: no GPU dispatch may be
     /// reading or writing this buffer concurrently.
     pub unsafe fn as_mut_slice(&mut self) -> &mut [T] {
+        if self.len == 0 {
+            return &mut [];
+        }
         let ptr = self.raw.contents().cast::<T>().as_ptr();
         unsafe { std::slice::from_raw_parts_mut(ptr, self.len) }
     }

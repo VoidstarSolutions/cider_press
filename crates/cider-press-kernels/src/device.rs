@@ -43,9 +43,18 @@ impl Device {
     /// Contents are not initialized. Use [`Device::upload`] when the
     /// initial contents matter.
     pub fn alloc_buffer<T>(&self, len: usize) -> Result<Buffer<T>> {
+        // ZSTs don't have a sensible Metal-buffer representation; reject
+        // at compile time so the generic only monomorphizes for real types.
+        const {
+            assert!(
+                size_of::<T>() > 0,
+                "Buffer<T>: zero-sized element types are not supported"
+            );
+        }
+        let elem_size = size_of::<T>();
         let bytes = len
-            .checked_mul(size_of::<T>())
-            .expect("byte length overflow");
+            .checked_mul(elem_size)
+            .ok_or(Error::BufferTooLarge { len, elem_size })?;
         let raw = self
             .device
             .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)

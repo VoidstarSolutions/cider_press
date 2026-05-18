@@ -78,6 +78,12 @@ pub fn affine_qmv_bf16(
     // Shape sanity-checks. These mirror the kernel's expectations; failing
     // any of them produces silent garbage on the GPU side, so assert here.
     assert!(k > 0 && n > 0, "K and N must be positive");
+    // Guard the modulo and the divisor below — `k % 0` would panic with a
+    // generic "divisor of zero" otherwise.
+    assert!(
+        group_size > 0,
+        "group_size must be positive (got {group_size})",
+    );
     assert!(
         k as u32 % group_size == 0,
         "K ({k}) must be a multiple of group_size ({group_size})",

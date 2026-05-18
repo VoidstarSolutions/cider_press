@@ -39,6 +39,12 @@ pub enum Error {
     #[error("failed to allocate Metal buffer of {bytes} bytes")]
     BufferAllocation { bytes: usize },
 
+    /// Requested buffer length is too large to express in bytes
+    /// (`len * size_of::<T>()` overflows `usize`). Hit before any
+    /// Metal API call.
+    #[error("buffer length {len} elements × {elem_size}-byte stride overflows usize")]
+    BufferTooLarge { len: usize, elem_size: usize },
+
     /// An Apple framework call returned nil from somewhere we expected
     /// it not to (e.g. `commandBuffer`, `computeCommandEncoder`). The
     /// `context` is a short literal identifying the call site.
