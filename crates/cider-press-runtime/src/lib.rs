@@ -20,10 +20,14 @@ compile_error!(
 
 mod dtype;
 mod error;
+mod layout;
+mod quantization;
 mod shape;
 mod strides;
 
 pub use dtype::{DType, Scalar};
 pub use error::{Error, Result};
+pub use layout::Layout;
+pub use quantization::Quantization;
 pub use shape::Shape;
 pub use strides::Strides;
