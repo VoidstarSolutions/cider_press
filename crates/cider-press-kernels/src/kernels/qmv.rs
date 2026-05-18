@@ -1,3 +1,7 @@
+// Dispatch routine derived from MLX (https://github.com/ml-explore/mlx).
+// Copyright © 2023-2024 Apple Inc. Released under the MIT license — see
+// the full upstream notice at `kernels-mlx/COPYING`.
+
 //! Quantized matrix-vector dispatch over MLX's `quantized.metal`.
 //!
 //! Wraps the `affine_qmv` family — matrix-vector multiply against an
