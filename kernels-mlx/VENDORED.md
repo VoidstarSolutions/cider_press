@@ -9,7 +9,7 @@ preserved here as `COPYING` and applies to every file in this directory.
 
 ## Upstream commit
 
-```
+```text
 7b7c12407f85b494e3e6d1cd3888650d224f362c  (2026-05-15)
 ```
 
@@ -40,10 +40,15 @@ vendored — they're resolved by Apple's Metal compiler at JIT time.
 
 `scripts/sync_mlx_kernels.sh` copies the canonical file list from a
 local MLX checkout into this directory. Set `MLX_DIR` to the checkout
-path (defaults to `/Users/zacharyheylmun/dev/llm/mlx`). After syncing,
+path; the script errors out cleanly if it is unset. After syncing,
 update the "Upstream commit" SHA above and run
 `cargo test --workspace --release` — Stage 4's bit-exact parity test
 is the canary for MLX-side changes that break us.
+
+```sh
+git clone https://github.com/ml-explore/mlx.git ~/src/mlx
+MLX_DIR=~/src/mlx ./scripts/sync_mlx_kernels.sh
+```
 
 The `.github/workflows/mlx-sync.yml` GitHub Actions workflow runs this
 on a schedule against the upstream `main` branch and opens a pull

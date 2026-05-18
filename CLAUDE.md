@@ -103,17 +103,25 @@ only — target < 500 lines of Rust.
 ### Reference paths
 
 - **Vendored MLX kernels (canonical):** `kernels-mlx/mlx/backend/metal/kernels/`
-- **Local MLX checkout (for re-sync only):** `/Users/zacharyheylmun/dev/llm/mlx/`
-- **MLX Metal C++ dispatch reference:** `<MLX-checkout>/mlx/backend/metal/{device,kernels,matmul,quantized}.cpp`
-- **cider-press repo:** `/Users/zacharyheylmun/dev/llm/cider-press/`
+- **MLX C++ dispatch reference (your local MLX checkout):**
+  `$MLX_DIR/mlx/backend/metal/{device,kernels,matmul,quantized}.cpp`
 
-The vendored copy is the source of truth at build time. Bump it via
-`MLX_DIR=<checkout> ./scripts/sync_mlx_kernels.sh`, then update the
-upstream-commit SHA in `kernels-mlx/VENDORED.md` and run
-`cargo test --workspace --release` to verify Stage 4 parity is still
-bit-exact. The `.github/workflows/mlx-sync.yml` workflow does this
-automatically on a weekly schedule and opens a PR when upstream
-drifts.
+The vendored copy is the source of truth at build time, so no MLX
+checkout is needed for `cargo build`/`test`. A local MLX checkout is
+only needed when bumping the vendored sources, or when reading MLX's
+C++ side as reference while porting new dispatch routines.
+
+To bump vendored kernels:
+
+```sh
+git clone https://github.com/ml-explore/mlx.git ~/src/mlx     # one-time
+MLX_DIR=~/src/mlx ./scripts/sync_mlx_kernels.sh
+# then update the upstream-commit SHA in kernels-mlx/VENDORED.md
+cargo test --workspace --release    # Stage 4 parity is the canary
+```
+
+The `.github/workflows/mlx-sync.yml` workflow does this automatically
+on a weekly schedule and opens a PR when upstream drifts.
 
 ### Staged plan
 

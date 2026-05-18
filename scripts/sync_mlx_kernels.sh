@@ -10,7 +10,11 @@
 
 set -euo pipefail
 
-MLX_DIR=${MLX_DIR:-/Users/zacharyheylmun/dev/llm/mlx}
+if [ -z "${MLX_DIR:-}" ]; then
+    echo "error: MLX_DIR is not set." >&2
+    echo "       Usage: MLX_DIR=/path/to/mlx ./scripts/sync_mlx_kernels.sh" >&2
+    exit 1
+fi
 DEST=$(cd "$(dirname "$0")/.." && pwd)/kernels-mlx
 
 if [ ! -d "$MLX_DIR/mlx/backend/metal/kernels" ]; then
