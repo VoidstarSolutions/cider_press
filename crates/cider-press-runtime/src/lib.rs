@@ -6,9 +6,9 @@
 //! dispatch is delegated downward to `cider-press-kernels`; model
 //! architectures are layered upward in `cider-press-models`.
 //!
-//! Status: scaffolded only. The next step (per `CLAUDE.md`) is to
-//! design the lazy-tensor + `eval()` semantics and the buffer pool,
-//! using MLX's `array` and `allocator.cpp` as references.
+//! Status: data primitives in progress. This module currently lands
+//! the runtime [`Error`] / [`Result`] surface; subsequent commits add
+//! the dtype/shape/layout/tensor types.
 
 #![cfg_attr(not(target_os = "macos"), allow(unused))]
 
@@ -17,3 +17,7 @@ compile_error!(
     "cider-press currently targets macOS / Apple Silicon only. \
      Build on an aarch64-apple-darwin host."
 );
+
+mod error;
+
+pub use error::{Error, Result};
