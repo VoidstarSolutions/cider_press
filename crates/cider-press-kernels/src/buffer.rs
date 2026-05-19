@@ -27,6 +27,15 @@ pub struct Buffer<T> {
     _marker: PhantomData<T>,
 }
 
+// SAFETY: Apple's documentation guarantees `MTLBuffer` (and its parent
+// `MTLResource`) is safe to reference from multiple threads. The unsafe
+// `as_slice` / `as_mut_slice` accessors below carry the explicit data-race
+// contract against GPU dispatch; Send+Sync on the handle just lets it cross
+// thread boundaries, which is needed for the runtime layer's
+// `Arc<TensorInner>` to itself be `Send+Sync`.
+unsafe impl<T: Send> Send for Buffer<T> {}
+unsafe impl<T: Sync> Sync for Buffer<T> {}
+
 impl<T> Buffer<T> {
     /// Construct a typed handle from a freshly-allocated raw buffer.
     ///
