@@ -452,15 +452,111 @@ both example ops are wired through the runtime).
   is the next obvious follow-up; reserve the file slot for it
   (`src/pool.rs`) once `eval()` lands.
 
-## After this slice
+## After this slice: framework gaps for inference
 
-Per `CLAUDE.md` post-spike Findings:
+The target use case for the next several branches is **Qwen2.5-0.5B-Instruct**
+running end-to-end (see `docs/QWEN_PATH.md` for the branch-by-branch
+roadmap). It's the smallest published dense Qwen — same architecture
+family as the eventual MoE target minus the router and expert
+dispatch, so every op carries forward. Picking a concrete target now
+keeps the gap-fill work honest: each addition has a known consumer.
 
-- Second kernel: `scaled_dot_product_attention`. Different
-  dispatch pattern; will exercise the op trait/enum question and
-  the multi-output node question (sdpa returns one tensor but
-  often pairs with KV-cache updates).
-- Buffer pool / allocator.
+Two framework primitives we know we'll need before the op flood:
+
+### Views (covers reshape, transpose, slicing, *and* broadcasting)
+
+Attention needs per-head reshape + transpose of `[B, T, H_q*D_h]`
+into `[B, H_q, T, D_h]` without a copy. KV cache reads need slicing
+the populated prefix `[..T_cache, ...]`. RMSNorm and elementwise ops
+need to broadcast `[D]` gamma over `[B, T, D]` — which is just a
+view with 0 strides on the leading dims, the MLX answer.
+
+Recommended shape: a third option alongside `op` and host-leaf
+construction. Sketch:
+
+```rust
+struct TensorInner {
+    shape, dtype, layout, device,
+    op: Option<OpNode>,
+    view: Option<ViewSource>,        // new
+    cache: OnceLock<LeafStorage>,
+}
+
+struct ViewSource {
+    source: Tensor,
+    byte_offset: usize,
+}
+```
+
+`cpu_bytes()` on a view follows the chain to a materialized buffer
+and slices. Dispatchers that require contiguous inputs trigger an
+internal `Copy` to materialize a strided view; later, strided-aware
+kernels (MLX's `g_copy` family etc.) can be wired in for perf.
+Mutually exclusive with `op` at construction; `cache` populates
+only for materialized leaves, never for pure views.
+
+**Trigger to land**: first op that needs reshape (any attention
+work) — likely the SDPA branch.
+
+### `KvCache` type (separate from `Tensor`)
+
+The decode loop appends one (K, V) row per token to a pre-allocated
+slab. Semantics are *set-by-position-monotonically*, which doesn't
+fit the `OnceLock<LeafStorage>` "set once" model. Recommended
+shape: a separate type, not a `Tensor` variant.
+
+```rust
+pub struct KvCache {
+    device: Device,
+    keys: Buffer<u8>,          // [max_T, H_kv, D_h]
+    values: Buffer<u8>,        // [max_T, H_kv, D_h]
+    dtype: DType,
+    head_dim: usize,
+    n_heads: usize,
+    position: usize,           // how many slots are filled
+}
+
+impl KvCache {
+    pub fn new(device: &Device, max_tokens: usize,
+               n_heads: usize, head_dim: usize, dtype: DType) -> Result<Self>;
+    pub fn update(&mut self, k: &Tensor, v: &Tensor) -> Result<()>;
+    pub fn keys_view(&self) -> Tensor;     // view of populated prefix
+    pub fn values_view(&self) -> Tensor;
+}
+```
+
+`update` runs a `Copy` (or a fused write kernel later) into the
+slab. The views read by SDPA piggyback on the Views primitive
+above. The `update` op is *eager* — it commits to the GPU
+immediately — because the decode loop blocks on the result anyway;
+no graph value to gain from laziness.
+
+**Trigger to land**: SDPA branch (Views must come first).
+
+### Smaller framework choices that follow from the above
+
+- **Multi-output ops**: not needed for dense Qwen2.5 (SDPA can be
+  split into matmul + softmax + matmul; KV updates happen
+  out-of-graph). Defer until the first fused op that needs it.
+- **Op trait vs. enum**: enum keeps winning for now. Revisit if/when
+  the variant count gets unwieldy (>~20) or third-party ops become
+  a real requirement.
+- **In-place ops**: `KvCache::update` is the only in-place case in
+  Qwen, and it lives outside the graph. Defer broader in-place
+  semantics until needed.
+
+## After Qwen2.5-0.5B runs
+
+These are the perf and ergonomic follow-ups the spike already
+identified — landing them only matters once we have something
+running to measure:
+
+- Buffer pool / allocator (reference: MLX's `allocator.cpp`).
 - Cross-`eval()` command-buffer batching — the lever that should
-  close the 1.5× perf gap to MLX.
-- `.metallib` precompilation strategy for shipping.
+  close the 1.5× per-dispatch perf gap to MLX. Within a single
+  `eval()` we already batch; this would batch across the decode
+  loop's per-token `eval()` calls.
+- `.metallib` precompilation strategy for shipping (cold-start
+  matters for first-token latency in production).
+- The full MoE story: top-k routing, expert dispatch (MLX's
+  `gather_qmm`), the loop-or-fuse decision.

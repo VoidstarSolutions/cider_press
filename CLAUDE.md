@@ -80,19 +80,26 @@ runtime slice planned in `docs/RUNTIME_DESIGN.md`:
 - Lazy `Tensor` with materialization-state-via-`OnceLock` (no Mutex
   on the read path; see the design doc's "Materialization state"
   section for the why).
-- Two ops wired through the runtime: `Tensor::copy` for `f32`/`f16`
-  and `QuantizedWeight::matvec` for bf16. The latter has a runtime-
-  level parity test against the same Stage-4 fixture the spike used.
+- Two ops wired through the runtime: `Tensor::copy` for all
+  five dtypes the runtime models and `QuantizedWeight::matvec`
+  for bf16. The latter has a runtime-level parity test against
+  the same Stage-4 fixture the spike used.
 - `Tensor::eval`: sync public API, single `Commands` per call,
   synchronous commit + wait. Internal pipelining is deferred (see
   the design doc's "What pipelining needs" section).
 
-**Next concrete step: pick the next op to drive into the runtime.**
-The design doc's post-slice list points at attention (per-head
-tiling, KV-cache layout — a meaningfully different dispatch shape
-from copy/qmv). Buffer pool / command-buffer batching are the
-performance follow-ups but are runtime-internal and won't change
-the API.
+**Concrete target: Qwen2.5-0.5B-Instruct running interactively.**
+Smallest published dense Qwen; same architecture family as the
+eventual MoE target minus the router. `docs/QWEN_PATH.md` is the
+branch-by-branch roadmap; `docs/RUNTIME_DESIGN.md` has the
+framework-gap analysis for the two structural additions we know
+we'll need (Views, `KvCache` type) before the op flood.
+
+**Next concrete step: branch 2 of the roadmap — `feat/runtime-views`.**
+Adds a `ViewSource` field on `TensorInner` plus `Tensor::reshape`
+/ `::transpose` / `::slice` / `::broadcast_to`. Self-contained
+(no new ops, no model code) and unblocks every subsequent branch
+that needs attention, RMSNorm broadcasting, or KV-cache reads.
 
 Do **not** start on `cider-press-models` until at least one
 architecture's needs inform the runtime's op coverage — even with
