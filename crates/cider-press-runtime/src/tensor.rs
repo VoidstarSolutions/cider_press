@@ -4,8 +4,10 @@
 //! [`Arc`]), carries [`Shape`] + [`DType`] + [`Layout`], and refers to
 //! a node in the computation graph. A node is one of: a *placeholder*
 //! (metadata only — test scaffolding), a *host-constructed leaf* (a
-//! materialized buffer with no op lineage), or an *op* (an [`OpKind`]
-//! plus its input tensors, possibly already evaluated).
+//! materialized buffer with no op lineage), an *op* (an [`OpKind`]
+//! plus its input tensors, possibly already evaluated), or a *view*
+//! (a different shape / stride / byte-offset window onto another
+//! tensor's storage; see [`ViewSource`]).
 //!
 //! Construction is always lazy: building an op tensor does no GPU
 //! work and allocates no output buffer. Both happen at [`Tensor::eval`]
@@ -20,6 +22,13 @@
 //! sketched in `docs/RUNTIME_DESIGN.md`: no lock on the read path,
 //! no race window between mutations, and [`Tensor::cpu_bytes`] can
 //! return `&[u8]` directly.
+//!
+//! **View invariants.** `view` and `op` are mutually exclusive: a
+//! tensor either describes its own op lineage or it points at another
+//! tensor's storage, never both. View tensors never populate their own
+//! `cache`; their bytes come from chasing [`ViewSource::source`] to
+//! the backing leaf. This means `cpu_bytes()` on a view follows the
+//! chain rather than reading the view's own (always-empty) cache.
 
 use std::sync::{Arc, OnceLock};
 
@@ -42,17 +51,40 @@ pub(crate) struct TensorInner {
     /// will ever exist. Every other tensor carries a real device.
     pub(crate) device: Option<Device>,
     /// Op lineage. `Some` for tensors produced by an op (whether
-    /// evaluated or not); `None` for placeholders and host-constructed
-    /// leaves. Set at construction and never mutated thereafter — the
-    /// `OnceLock` cache below is what records evaluation.
+    /// evaluated or not); `None` for placeholders, host-constructed
+    /// leaves, and views. Set at construction and never mutated
+    /// thereafter — the `OnceLock` cache below is what records
+    /// evaluation.
+    ///
+    /// Mutually exclusive with `view`: a tensor either has its own op
+    /// lineage or it's a view onto another tensor, never both.
     pub(crate) op: Option<OpNode>,
-    /// Materialized storage. Empty for placeholders and unevaluated
-    /// op nodes; populated either at construction (host-constructed
-    /// leaves) or by [`Tensor::eval`] (op outputs). Once populated,
-    /// the storage is immutable for the lifetime of the inner —
-    /// that's what makes [`Tensor::cpu_bytes`] safe to expose as
-    /// `&[u8]`.
+    /// View lineage. `Some` for tensors that share storage with
+    /// another tensor (`reshape`, `permute`, `slice`, `broadcast_to`). View
+    /// tensors never populate their own `cache` — they chase
+    /// [`ViewSource::source`] to find the backing leaf at read time.
+    pub(crate) view: Option<ViewSource>,
+    /// Materialized storage. Empty for placeholders, unevaluated op
+    /// nodes, and views; populated either at construction
+    /// (host-constructed leaves) or by [`Tensor::eval`] (op outputs).
+    /// Once populated, the storage is immutable for the lifetime of
+    /// the inner — that's what makes [`Tensor::cpu_bytes`] safe to
+    /// expose as `&[u8]`.
     pub(crate) cache: OnceLock<LeafStorage>,
+}
+
+/// A view onto another tensor's storage.
+///
+/// View tensors carry their own `shape` / `layout` (strides) /
+/// `byte_offset` while sharing the backing buffer with `source`.
+/// `source` may itself be a view (chains collapse at read time) or a
+/// leaf / op tensor.
+pub(crate) struct ViewSource {
+    /// The tensor whose backing leaf this view ultimately reads from.
+    pub(crate) source: Tensor,
+    /// Byte offset into the backing leaf where this view's element
+    /// `[0, 0, …]` lives. Cumulative across a view-of-view chain.
+    pub(crate) byte_offset: usize,
 }
 
 /// Materialized backing storage for a [`Tensor`].
@@ -155,6 +187,7 @@ impl Tensor {
                 layout: Layout::Dense { strides },
                 device: None,
                 op: None,
+                view: None,
                 cache: OnceLock::new(),
             }),
         }
@@ -175,6 +208,7 @@ impl Tensor {
                 layout: Layout::Quantized(quantization),
                 device: None,
                 op: None,
+                view: None,
                 cache: OnceLock::new(),
             }),
         }
@@ -296,6 +330,7 @@ impl Tensor {
                 layout,
                 device: Some(device.clone()),
                 op: None,
+                view: None,
                 cache,
             }),
         }
@@ -318,6 +353,7 @@ impl Tensor {
                 layout,
                 device: Some(device.clone()),
                 op: Some(OpNode { kind, inputs }),
+                view: None,
                 cache: OnceLock::new(),
             }),
         }
@@ -426,10 +462,11 @@ impl Tensor {
 
     /// Whether this tensor's backing buffer has been materialized
     /// and can be read host-side. `true` for host-constructed leaves
-    /// (always) and for op tensors after [`Tensor::eval`].
+    /// (always), for op tensors after [`Tensor::eval`], and for views
+    /// whose source chain terminates at a materialized leaf.
     #[must_use]
     pub fn is_materialized(&self) -> bool {
-        self.inner.cache.get().is_some()
+        self.resolve_leaf().is_some()
     }
 
     /// Whether this tensor was produced by an op (regardless of
@@ -463,26 +500,71 @@ impl Tensor {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 
-    /// Host-readable view of the tensor's raw bytes, or `None` if the
-    /// backing buffer hasn't been materialized yet *or* if the tensor
-    /// is quantized (quantized tensors carry three byte-erased
-    /// buffers — packed weights, scales, biases — that don't
-    /// collapse into a single contiguous `&[u8]` view; the runtime
-    /// reads them by-component at dispatch time via the
-    /// `LeafStorage::Quantized` variant).
+    /// Host-readable view of the tensor's logical contiguous byte
+    /// window, or `None` if it isn't observable as a contiguous slice.
     ///
-    /// Safe to call: a populated `cache` carries the invariant that
-    /// no GPU dispatch is concurrently writing the buffer.
-    /// Host-constructed leaves uphold this trivially; op outputs
-    /// uphold it because [`Tensor::eval`] populates the cache only
-    /// after `waitUntilCompleted`.
+    /// Returns `Some` iff every condition below holds:
+    /// - the backing leaf is materialized (host-constructed leaf, or
+    ///   an op output after [`Tensor::eval`]);
+    /// - the layout is [`Layout::Dense`] with contiguous (row-major)
+    ///   strides for the tensor's current shape;
+    /// - the leaf storage is dense (quantized leaves carry three
+    ///   byte-erased buffers — packed weights, scales, biases — that
+    ///   don't collapse into a single contiguous `&[u8]` view; the
+    ///   runtime reads them by-component at dispatch time via the
+    ///   `LeafStorage::Quantized` variant).
+    ///
+    /// For non-contiguous views (transpose, broadcast, sliced along
+    /// an inner dim) this returns `None`; the strided host iterator
+    /// landing in the next commit (`cpu_iter`) provides element-wise
+    /// access regardless of stride pattern.
+    ///
+    /// Safe to call: a populated `cache` on the backing leaf carries
+    /// the invariant that no GPU dispatch is concurrently writing the
+    /// buffer. Host-constructed leaves uphold this trivially; op
+    /// outputs uphold it because [`Tensor::eval`] populates the cache
+    /// only after `waitUntilCompleted`.
     #[must_use]
     pub fn cpu_bytes(&self) -> Option<&[u8]> {
-        match self.inner.cache.get()? {
-            // SAFETY: see method docs — the cache invariant rules out
-            // concurrent GPU writes.
-            LeafStorage::Dense(buffer) => Some(unsafe { buffer.as_slice() }),
-            LeafStorage::Quantized { .. } => None,
+        if !self.inner.layout.is_dense_contiguous(&self.inner.shape) {
+            return None;
+        }
+        let (storage, byte_offset) = self.resolve_leaf()?;
+        let buffer = match storage {
+            LeafStorage::Dense(buffer) => buffer,
+            LeafStorage::Quantized { .. } => return None,
+        };
+        // SAFETY: the cache invariant on the backing leaf rules out
+        // concurrent GPU writes (see method docs).
+        let bytes = unsafe { buffer.as_slice() };
+        let elem_count = self.inner.shape.elem_count();
+        let byte_count = elem_count.checked_mul(self.inner.dtype.size_bytes())?;
+        let end = byte_offset.checked_add(byte_count)?;
+        bytes.get(byte_offset..end)
+    }
+
+    /// Whether this tensor is a view onto another tensor's storage.
+    /// Views share their backing leaf with their `source`; they never
+    /// allocate their own buffer.
+    #[must_use]
+    pub fn is_view(&self) -> bool {
+        self.inner.view.is_some()
+    }
+
+    /// Walk the view chain to the backing leaf, accumulating
+    /// byte-offset. Returns `(leaf_storage, total_byte_offset)`. None
+    /// if any link in the chain is unmaterialized (placeholder or an
+    /// op that hasn't been evaluated yet).
+    pub(crate) fn resolve_leaf(&self) -> Option<(&LeafStorage, usize)> {
+        let mut current = &self.inner;
+        let mut offset: usize = 0;
+        loop {
+            if let Some(storage) = current.cache.get() {
+                return Some((storage, offset));
+            }
+            let view = current.view.as_ref()?;
+            offset = offset.checked_add(view.byte_offset)?;
+            current = &view.source.inner;
         }
     }
 
@@ -874,6 +956,139 @@ mod tests {
         dst.eval().expect("eval");
         let read_back = dst.cpu_slice::<i32>().expect("cpu_slice");
         assert_eq!(read_back, data.as_slice());
+    }
+
+    /// Test-only constructor for a view tensor pointing at `source`
+    /// with an explicit `byte_offset`, `shape`, and (dense) `strides`.
+    /// The public view-building API lands in subsequent commits;
+    /// this helper exists so commit 1 can verify the chain-walking
+    /// plumbing in isolation.
+    fn manual_view(source: &Tensor, byte_offset: usize, shape: Shape, strides: Strides) -> Tensor {
+        let layout = Layout::Dense { strides };
+        Tensor {
+            inner: Arc::new(TensorInner {
+                shape,
+                dtype: source.dtype(),
+                layout,
+                device: source.device().cloned(),
+                op: None,
+                view: Some(ViewSource {
+                    source: source.clone(),
+                    byte_offset,
+                }),
+                cache: OnceLock::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn view_chain_walks_to_materialized_leaf() {
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..16)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [16]).expect("from_slice");
+
+        // Full-window view: byte_offset = 0, same shape, contiguous strides.
+        let v = manual_view(
+            &leaf,
+            0,
+            Shape::from([16]),
+            Strides::contiguous(&Shape::from([16])),
+        );
+
+        assert!(v.is_view());
+        assert!(v.is_materialized());
+        let bytes = v.cpu_bytes().expect("view cpu_bytes");
+        assert_eq!(bytes.len(), 16 * 4);
+        let typed = v.cpu_slice::<f32>().expect("view cpu_slice");
+        assert_eq!(typed, data.as_slice());
+    }
+
+    #[test]
+    fn view_with_byte_offset_reads_logical_window() {
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..16)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [16]).expect("from_slice");
+
+        // View the second half: skip 8 f32 (32 bytes), shape [8].
+        let v = manual_view(
+            &leaf,
+            32,
+            Shape::from([8]),
+            Strides::contiguous(&Shape::from([8])),
+        );
+
+        let typed = v.cpu_slice::<f32>().expect("view cpu_slice");
+        assert_eq!(typed, &data[8..]);
+    }
+
+    #[test]
+    fn non_contiguous_view_returns_none_from_cpu_bytes() {
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..6)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [2, 3]).expect("from_slice");
+
+        // Transposed view: shape [3, 2], strides [1, 3] (non-contiguous).
+        let v = manual_view(&leaf, 0, Shape::from([3, 2]), Strides::from([1isize, 3]));
+
+        assert!(v.is_materialized());
+        assert!(v.cpu_bytes().is_none());
+        assert!(v.cpu_slice::<f32>().is_none());
+    }
+
+    #[test]
+    fn view_of_view_accumulates_byte_offset() {
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..16)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [16]).expect("from_slice");
+
+        let outer = manual_view(
+            &leaf,
+            16,
+            Shape::from([12]),
+            Strides::contiguous(&Shape::from([12])),
+        );
+        // Take a further [8] sub-window starting 8 bytes in.
+        let inner = manual_view(
+            &outer,
+            8,
+            Shape::from([6]),
+            Strides::contiguous(&Shape::from([6])),
+        );
+
+        // Total byte_offset = 16 + 8 = 24 → f32 index 6, length 6.
+        let typed = inner.cpu_slice::<f32>().expect("view cpu_slice");
+        assert_eq!(typed, &data[6..12]);
+    }
+
+    #[test]
+    fn view_of_unevaluated_op_is_not_materialized() {
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = vec![0.0; 8];
+        let leaf = Tensor::from_slice(&device, &data, [8]).expect("from_slice");
+        let op = leaf.copy().expect("copy");
+
+        let v = manual_view(
+            &op,
+            0,
+            Shape::from([8]),
+            Strides::contiguous(&Shape::from([8])),
+        );
+        assert!(!v.is_materialized());
+        assert!(v.cpu_bytes().is_none());
+
+        // After evaluating the op, the view becomes readable.
+        op.eval().expect("eval");
+        assert!(v.is_materialized());
+        let typed = v.cpu_slice::<f32>().expect("view cpu_slice");
+        assert_eq!(typed, data.as_slice());
     }
 
     #[test]
