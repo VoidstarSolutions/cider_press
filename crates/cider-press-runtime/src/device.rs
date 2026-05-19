@@ -30,6 +30,10 @@ struct DeviceInner {
     /// JIT'd MLX `copy.metal` library. Populated on first `eval()`
     /// that needs it; subsequent calls reuse the cached library.
     copy_library: OnceLock<kernels::KernelLibrary>,
+    /// JIT'd MLX `quantized.metal` library (cold-start ~29 s, warm
+    /// ~100 ms thanks to Metal's cross-process compiled-library
+    /// cache). Populated on first qmv/qmm dispatch.
+    quantized_library: OnceLock<kernels::KernelLibrary>,
 }
 
 /// Refcounted handle to the system's default Metal device.
@@ -52,6 +56,7 @@ impl Device {
             inner: Arc::new(DeviceInner {
                 kernels: kernels::Device::system_default()?,
                 copy_library: OnceLock::new(),
+                quantized_library: OnceLock::new(),
             }),
         })
     }
@@ -74,6 +79,7 @@ impl Device {
         let fresh = Arc::new(DeviceInner {
             kernels: kernels::Device::system_default()?,
             copy_library: OnceLock::new(),
+            quantized_library: OnceLock::new(),
         });
         let stored = SHARED.get_or_init(|| fresh);
         Ok(Self {
@@ -108,6 +114,21 @@ impl Device {
         // Race-safe: if another thread already populated the slot, the
         // value we just built is dropped and the stored one is returned.
         Ok(self.inner.copy_library.get_or_init(|| lib))
+    }
+
+    /// Lazily JIT-compile and cache MLX's `quantized.metal` library.
+    ///
+    /// Cold-start cost is significant (~29 s on first compile, per
+    /// Stage-4 spike findings); Metal caches the result to disk
+    /// across processes, so subsequent runs are sub-100 ms. Cached
+    /// in-process so a long-running session pays the warm cost only
+    /// once.
+    pub(crate) fn quantized_library(&self) -> Result<&kernels::KernelLibrary> {
+        if let Some(lib) = self.inner.quantized_library.get() {
+            return Ok(lib);
+        }
+        let lib = kernels::KernelLibrary::quantized(&self.inner.kernels)?;
+        Ok(self.inner.quantized_library.get_or_init(|| lib))
     }
 }
 

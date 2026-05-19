@@ -12,11 +12,14 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use cider_press_kernels::{Buffer, Commands, kernels::copy};
+use cider_press_kernels::{
+    Buffer, Commands,
+    kernels::{copy, qmv},
+};
 
 use crate::dtype::DType;
 use crate::error::{Error, Result};
-use crate::tensor::{OpKind, OpNode, Tensor, TensorInner};
+use crate::tensor::{LeafStorage, OpKind, OpNode, Tensor, TensorInner};
 
 pub(crate) fn eval(root: &Tensor) -> Result<()> {
     // Step 1: topological order of unevaluated op nodes reachable from
@@ -65,9 +68,11 @@ pub(crate) fn eval(root: &Tensor) -> Result<()> {
     // Step 6: populate caches. Race-safe: if another thread also
     // evaluated this node (no concurrent-eval story yet, but the
     // structure already supports it), one set wins and the other's
-    // buffer is dropped.
+    // buffer is dropped. Op outputs are always dense — no op
+    // currently produces a quantized tensor (no `mx.quantize`
+    // analogue yet).
     for (inner, buffer) in order.into_iter().zip(outputs) {
-        let _ = inner.cache.set(buffer);
+        let _ = inner.cache.set(LeafStorage::Dense(buffer));
     }
 
     Ok(())
@@ -95,7 +100,7 @@ fn visit(
     // catches the broken case at step 2 if the root needs dispatching.
 }
 
-/// Resolve an op input's backing buffer.
+/// Resolve a dense op input's backing buffer.
 ///
 /// Returns a fresh `Buffer<u8>` handle (refcount bump via
 /// `reinterpret_as::<u8>`) so the caller doesn't have to juggle
@@ -103,7 +108,7 @@ fn visit(
 /// `outputs` vec and the input's `OnceLock` cache). The handle
 /// references the same underlying `MTLBuffer`; the original storage
 /// stays alive via the input's `Arc<TensorInner>`.
-fn input_buffer(
+fn dense_input_buffer(
     input: &Tensor,
     outputs: &[Buffer<u8>],
     index_of: &HashMap<*const TensorInner, usize>,
@@ -121,19 +126,51 @@ fn input_buffer(
     } else {
         // Not in this eval's dispatch set ⇒ must already be cached
         // (host-constructed leaf or previously-evaluated op).
-        input.inner.cache.get().ok_or_else(|| {
-            Error::InvalidArgument(
-                "eval: op input is neither cached nor being dispatched in this eval \
-                 (placeholder used as input?)"
-                    .into(),
-            )
-        })?
+        match input.inner.cache.get() {
+            Some(LeafStorage::Dense(buf)) => buf,
+            Some(LeafStorage::Quantized { .. }) => {
+                return Err(Error::InvalidArgument(
+                    "eval: dense input expected, got quantized leaf".into(),
+                ));
+            }
+            None => {
+                return Err(Error::InvalidArgument(
+                    "eval: op input is neither cached nor being dispatched in this eval \
+                     (placeholder used as input?)"
+                        .into(),
+                ));
+            }
+        }
     };
     // SAFETY: `Buffer<u8>` → `Buffer<u8>` reinterpret is trivially
     // valid (any bit pattern is a valid `u8`, lengths match). This
     // just bumps the Metal-buffer refcount so the caller can own a
     // typed handle independent of where the source borrow came from.
     Ok(unsafe { src_ref.reinterpret_as::<u8>() })
+}
+
+/// Borrow the three buffers of a quantized leaf, with refcount-bumped
+/// handles so the caller doesn't deal with `OnceLock` lifetimes.
+fn quantized_input_buffers(input: &Tensor) -> Result<(Buffer<u8>, Buffer<u8>, Buffer<u8>)> {
+    match input.inner.cache.get() {
+        Some(LeafStorage::Quantized {
+            weights,
+            scales,
+            biases,
+        }) => {
+            // SAFETY: u8 → u8 refcount bumps, as in `dense_input_buffer`.
+            let w = unsafe { weights.reinterpret_as::<u8>() };
+            let s = unsafe { scales.reinterpret_as::<u8>() };
+            let b = unsafe { biases.reinterpret_as::<u8>() };
+            Ok((w, s, b))
+        }
+        Some(LeafStorage::Dense(_)) => Err(Error::InvalidArgument(
+            "eval: Qmv expected a quantized weight leaf, found dense".into(),
+        )),
+        None => Err(Error::InvalidArgument(
+            "eval: Qmv weight input is not materialized (placeholder or unevaluated op?)".into(),
+        )),
+    }
 }
 
 fn dispatch(
@@ -149,6 +186,9 @@ fn dispatch(
         .expect("topo invariant: only op nodes here");
     match op.kind {
         OpKind::Copy => dispatch_copy(inner, op, commands, outputs, dst, index_of),
+        OpKind::Qmv { group_size, bits } => dispatch_qmv(
+            inner, op, commands, outputs, dst, index_of, group_size, bits,
+        ),
     }
 }
 
@@ -168,7 +208,7 @@ fn dispatch_copy(
         .inputs
         .first()
         .expect("Copy has exactly one input by construction");
-    let src = input_buffer(input, outputs, index_of)?;
+    let src = dense_input_buffer(input, outputs, index_of)?;
 
     let library = device.copy_library()?;
 
@@ -196,6 +236,59 @@ fn dispatch_copy(
             )));
         }
     }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_qmv(
+    inner: &Arc<TensorInner>,
+    op: &OpNode,
+    commands: &mut Commands<'_>,
+    outputs: &[Buffer<u8>],
+    dst: &mut Buffer<u8>,
+    index_of: &HashMap<*const TensorInner, usize>,
+    group_size: u32,
+    bits: u8,
+) -> Result<()> {
+    let device = inner
+        .device
+        .as_ref()
+        .expect("op nodes are always constructed with a device");
+    let weight = op
+        .inputs
+        .first()
+        .ok_or_else(|| Error::InvalidArgument("Qmv: missing weight input (inputs[0])".into()))?;
+    let x_tensor = op.inputs.get(1).ok_or_else(|| {
+        Error::InvalidArgument("Qmv: missing activation input (inputs[1])".into())
+    })?;
+
+    let (w_bytes, scales_bytes, biases_bytes) = quantized_input_buffers(weight)?;
+    let x_bytes = dense_input_buffer(x_tensor, outputs, index_of)?;
+
+    let library = device.quantized_library()?;
+
+    // SAFETY: dtype tags are the source of truth for what's in each
+    // byte buffer. `Quantization::from_bytes` validated the byte
+    // counts at construction; the kernel wraps further validation
+    // around the typed lengths.
+    let w_typed = unsafe { w_bytes.reinterpret_as::<u32>() };
+    let scales_typed = unsafe { scales_bytes.reinterpret_as::<half::bf16>() };
+    let biases_typed = unsafe { biases_bytes.reinterpret_as::<half::bf16>() };
+    let x_typed = unsafe { x_bytes.reinterpret_as::<half::bf16>() };
+    let mut y_typed = unsafe { dst.reinterpret_as::<half::bf16>() };
+
+    qmv::affine_qmv_bf16(
+        commands,
+        library,
+        &w_typed,
+        &scales_typed,
+        &biases_typed,
+        &x_typed,
+        &mut y_typed,
+        group_size,
+        u32::from(bits),
+    )?;
 
     Ok(())
 }

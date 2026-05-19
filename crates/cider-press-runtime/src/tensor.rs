@@ -46,12 +46,40 @@ pub(crate) struct TensorInner {
     /// leaves. Set at construction and never mutated thereafter — the
     /// `OnceLock` cache below is what records evaluation.
     pub(crate) op: Option<OpNode>,
-    /// Materialized buffer. Empty for placeholders and unevaluated op
-    /// nodes; populated either at construction (host-constructed
+    /// Materialized storage. Empty for placeholders and unevaluated
+    /// op nodes; populated either at construction (host-constructed
     /// leaves) or by [`Tensor::eval`] (op outputs). Once populated,
-    /// the buffer is immutable for the lifetime of the inner — that's
-    /// what makes [`Tensor::cpu_bytes`] safe to expose as `&[u8]`.
-    pub(crate) cache: OnceLock<Buffer<u8>>,
+    /// the storage is immutable for the lifetime of the inner —
+    /// that's what makes [`Tensor::cpu_bytes`] safe to expose as
+    /// `&[u8]`.
+    pub(crate) cache: OnceLock<LeafStorage>,
+}
+
+/// Materialized backing storage for a [`Tensor`].
+///
+/// Dense tensors carry a single byte-erased buffer; quantized
+/// tensors carry the three buffers MLX's `qmv` family needs (packed
+/// weights, per-group scales, per-group biases). Kept as an enum
+/// rather than three optional fields because the variants are
+/// disjoint by construction — a dense leaf never has scales/biases,
+/// a quantized leaf never has a dense byte view.
+pub(crate) enum LeafStorage {
+    /// Byte-erased dense buffer. The dtype tag on
+    /// [`TensorInner::dtype`] is the source of truth for what's in
+    /// the bytes; op dispatch sites reinterpret at call time.
+    Dense(Buffer<u8>),
+    /// Three-buffer storage for affine-quantized weights. Layout
+    /// matches what `cider_press_kernels::kernels::qmv` expects.
+    Quantized {
+        /// Packed lanes (e.g. int4 lanes packed eight-per-uint32 for
+        /// `bits=4`). Stored byte-erased; reinterpret as
+        /// `Buffer<u32>` at dispatch.
+        weights: Buffer<u8>,
+        /// Per-group scales, bf16. One scale per group.
+        scales: Buffer<u8>,
+        /// Per-group biases, bf16. One bias per group.
+        biases: Buffer<u8>,
+    },
 }
 
 /// A lazy operation node: the op kind plus its input tensors.
@@ -77,6 +105,20 @@ pub enum OpKind {
     /// the same shape, dtype, and values as the input. Mirrors MLX's
     /// `mx.copy` and dispatches to the vendored `v_copy` kernel.
     Copy,
+    /// Affine-quantized matrix-vector multiply: `y = x · dequant(w)ᵀ`.
+    /// Inputs (in [`Tensor::op_inputs`] order) are `[w, x]` where `w`
+    /// is a [`Layout::Quantized`] tensor and `x` is a dense bf16
+    /// vector. `group_size` and `bits` are duplicated from `w`'s
+    /// [`Quantization`](crate::Quantization) descriptor so the
+    /// dispatcher doesn't have to introspect the input's layout.
+    Qmv {
+        /// Quantization group size (elements per scale/bias). Must
+        /// match the input weight's [`Quantization::group_size`].
+        group_size: u32,
+        /// Quantization bit-width (e.g. 4 for int4 weights). Must
+        /// match the input weight's [`Quantization::bits`].
+        bits: u8,
+    },
 }
 
 /// User-facing lazy tensor handle.
@@ -209,9 +251,42 @@ impl Tensor {
         layout: Layout,
         buffer: Buffer<u8>,
     ) -> Self {
+        Self::host_leaf_storage(device, shape, dtype, layout, LeafStorage::Dense(buffer))
+    }
+
+    /// Crate-private constructor for quantized leaves (used by
+    /// [`QuantizedWeight::from_bytes`](crate::QuantizedWeight::from_bytes)).
+    pub(crate) fn host_quantized_leaf(
+        device: &Device,
+        shape: Shape,
+        layout: Layout,
+        weights: Buffer<u8>,
+        scales: Buffer<u8>,
+        biases: Buffer<u8>,
+    ) -> Self {
+        Self::host_leaf_storage(
+            device,
+            shape,
+            DType::U32,
+            layout,
+            LeafStorage::Quantized {
+                weights,
+                scales,
+                biases,
+            },
+        )
+    }
+
+    fn host_leaf_storage(
+        device: &Device,
+        shape: Shape,
+        dtype: DType,
+        layout: Layout,
+        storage: LeafStorage,
+    ) -> Self {
         let cache = OnceLock::new();
         cache
-            .set(buffer)
+            .set(storage)
             .ok()
             .expect("freshly-constructed OnceLock");
         Self {
@@ -222,6 +297,28 @@ impl Tensor {
                 device: Some(device.clone()),
                 op: None,
                 cache,
+            }),
+        }
+    }
+
+    /// Crate-private constructor for op tensors (used by op builders
+    /// like [`Tensor::copy`] and [`QuantizedWeight::matvec`](crate::QuantizedWeight::matvec)).
+    pub(crate) fn op_tensor(
+        device: &Device,
+        shape: Shape,
+        dtype: DType,
+        layout: Layout,
+        kind: OpKind,
+        inputs: Vec<Tensor>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(TensorInner {
+                shape,
+                dtype,
+                layout,
+                device: Some(device.clone()),
+                op: Some(OpNode { kind, inputs }),
+                cache: OnceLock::new(),
             }),
         }
     }
@@ -248,19 +345,14 @@ impl Tensor {
             ));
         }
         let layout = dense_layout(&self.inner.shape);
-        Ok(Self {
-            inner: Arc::new(TensorInner {
-                shape: self.inner.shape.clone(),
-                dtype: self.inner.dtype,
-                layout,
-                device: Some(device.clone()),
-                op: Some(OpNode {
-                    kind: OpKind::Copy,
-                    inputs: vec![self.clone()],
-                }),
-                cache: OnceLock::new(),
-            }),
-        })
+        Ok(Self::op_tensor(
+            device,
+            self.inner.shape.clone(),
+            self.inner.dtype,
+            layout,
+            OpKind::Copy,
+            vec![self.clone()],
+        ))
     }
 
     /// Materialize this tensor and every unevaluated op node it
@@ -372,7 +464,10 @@ impl Tensor {
     }
 
     /// Host-readable view of the tensor's raw bytes, or `None` if the
-    /// backing buffer hasn't been materialized yet.
+    /// backing buffer hasn't been materialized yet *or* if the tensor
+    /// is quantized (quantized tensors are composite — use the
+    /// accessors on [`QuantizedWeight`](crate::QuantizedWeight) to
+    /// reach the individual buffers).
     ///
     /// Safe to call: a populated `cache` carries the invariant that
     /// no GPU dispatch is concurrently writing the buffer.
@@ -381,10 +476,12 @@ impl Tensor {
     /// after `waitUntilCompleted`.
     #[must_use]
     pub fn cpu_bytes(&self) -> Option<&[u8]> {
-        let buffer = self.inner.cache.get()?;
-        // SAFETY: see method docs — the cache invariant rules out
-        // concurrent GPU writes.
-        Some(unsafe { buffer.as_slice() })
+        match self.inner.cache.get()? {
+            // SAFETY: see method docs — the cache invariant rules out
+            // concurrent GPU writes.
+            LeafStorage::Dense(buffer) => Some(unsafe { buffer.as_slice() }),
+            LeafStorage::Quantized { .. } => None,
+        }
     }
 
     /// Typed host-readable view of a dense materialized tensor.
