@@ -17,5 +17,9 @@
 //! [`HF_REVISION`].
 
 mod config;
+mod weights;
 
 pub use config::{HF_REPO, HF_REVISION, Qwen2Config, Qwen2QuantizationConfig};
+pub use weights::{
+    Qwen2AttentionWeights, Qwen2LayerWeights, Qwen2MlpWeights, Qwen2Weights, load_qwen2_weights,
+};
