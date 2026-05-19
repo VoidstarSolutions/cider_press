@@ -89,6 +89,46 @@ impl<T> Buffer<T> {
     pub fn metal_buffer(&self) -> &ProtocolObject<dyn MTLBuffer> {
         &self.raw
     }
+
+    /// Reinterpret this buffer as one with element type `U`, sharing
+    /// the same underlying `MTLBuffer` storage (Retained clone — a
+    /// refcount bump, no copy).
+    ///
+    /// Intended as the byte-erasure escape hatch for callers that
+    /// store buffers dtype-erased (typically the runtime layer's
+    /// `Buffer<u8>` leaf) and need a typed view at op-dispatch time.
+    /// The original buffer remains valid; both views co-own the
+    /// `MTLBuffer` for as long as either is alive.
+    ///
+    /// # Safety
+    ///
+    /// The caller asserts:
+    ///
+    /// - the buffer's byte length is a multiple of `size_of::<U>()`
+    ///   (the new `len()` is `byte_len() / size_of::<U>()`);
+    /// - the bytes contain a valid sequence of `U` values, or `U` is
+    ///   a type for which any bit pattern is well-defined (the scalar
+    ///   types `cider-press` uses — `f32`, `f16`, `bf16`, `i32`,
+    ///   `u32` — all qualify).
+    ///
+    /// Alignment is provided by Metal: shared-storage allocations are
+    /// page-aligned (≥ 4 KiB), which exceeds any scalar `U`'s
+    /// requirement.
+    #[must_use]
+    pub unsafe fn reinterpret_as<U>(&self) -> Buffer<U> {
+        const {
+            assert!(
+                size_of::<U>() > 0,
+                "Buffer<U>: zero-sized element types are not supported"
+            );
+        }
+        let new_len = self.byte_len() / size_of::<U>();
+        Buffer {
+            raw: self.raw.clone(),
+            len: new_len,
+            _marker: PhantomData,
+        }
+    }
 }
 
 impl<T: Copy> Buffer<T> {
