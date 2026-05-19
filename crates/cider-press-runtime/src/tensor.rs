@@ -31,6 +31,7 @@
 //! chain rather than reading the view's own (always-empty) cache.
 
 use std::marker::PhantomData;
+use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
 use cider_press_kernels::Buffer;
@@ -561,6 +562,99 @@ impl Tensor {
             byte_offset,
             Shape::from(new_dims),
             Strides::from(new_strides_vec),
+        ))
+    }
+
+    /// Build a sliced view of this tensor.
+    ///
+    /// `ranges` provides one half-open `start..end` per axis; the
+    /// result's shape is `[end - start, ...]` per axis and the strides
+    /// are unchanged from the source. The view's `byte_offset` shifts
+    /// by `Σ(start_i × stride_i × dtype_bytes)`.
+    ///
+    /// Zero-copy. Slicing along the leading axis preserves contiguity;
+    /// slicing along an inner axis produces a non-contiguous view
+    /// readable via [`Tensor::cpu_iter`].
+    pub fn slice(&self, ranges: &[Range<usize>]) -> Result<Self> {
+        if self.inner.device.is_none() {
+            return Err(Error::InvalidArgument(
+                "slice: cannot apply a view to a placeholder (no device)".into(),
+            ));
+        }
+        let cur_strides = match self.layout() {
+            Layout::Dense { strides } => strides,
+            Layout::Quantized(_) => {
+                return Err(Error::InvalidArgument(
+                    "slice: quantized tensors are not supported".into(),
+                ));
+            }
+        };
+
+        let rank = self.rank();
+        if ranges.len() != rank {
+            return Err(Error::InvalidArgument(format!(
+                "slice: expected {rank} ranges (one per axis), got {}",
+                ranges.len(),
+            )));
+        }
+
+        let cur_dims = self.shape().dims();
+        let cur_strides_slice = cur_strides.as_slice();
+        let dtype_bytes = self.inner.dtype.size_bytes();
+        let elem_size_signed = isize::try_from(dtype_bytes).expect("dtype size fits in isize");
+
+        let mut new_dims = Vec::with_capacity(rank);
+        let mut byte_delta: isize = 0;
+        for (axis, range) in ranges.iter().enumerate() {
+            let dim = cur_dims[axis];
+            if range.start > range.end {
+                return Err(Error::InvalidArgument(format!(
+                    "slice: axis {axis} range {}..{} has start > end",
+                    range.start, range.end,
+                )));
+            }
+            if range.end > dim {
+                return Err(Error::InvalidArgument(format!(
+                    "slice: axis {axis} range {}..{} exceeds dimension {dim}",
+                    range.start, range.end,
+                )));
+            }
+            new_dims.push(range.end - range.start);
+
+            let start_signed = isize::try_from(range.start).expect("slice start fits in isize");
+            let step = start_signed
+                .checked_mul(cur_strides_slice[axis])
+                .and_then(|s| s.checked_mul(elem_size_signed))
+                .ok_or_else(|| {
+                    Error::InvalidArgument(format!(
+                        "slice: byte-offset arithmetic overflowed isize for axis {axis}",
+                    ))
+                })?;
+            byte_delta = byte_delta.checked_add(step).ok_or_else(|| {
+                Error::InvalidArgument("slice: cumulative byte offset overflowed isize".into())
+            })?;
+        }
+
+        let (source, source_offset) = self.flatten_view();
+        let source_offset_signed = isize::try_from(source_offset)
+            .expect("source byte offset fits in isize (Metal allocations bounded)");
+        let combined = source_offset_signed
+            .checked_add(byte_delta)
+            .ok_or_else(|| {
+                Error::InvalidArgument("slice: combined byte offset overflowed isize".into())
+            })?;
+        let new_byte_offset = usize::try_from(combined).map_err(|_| {
+            Error::InvalidArgument(
+                "slice: resulting byte offset is negative (would underrun the backing leaf)".into(),
+            )
+        })?;
+
+        let new_strides = Strides::from(cur_strides_slice.to_vec());
+        Ok(Self::view(
+            source,
+            new_byte_offset,
+            Shape::from(new_dims),
+            new_strides,
         ))
     }
 
@@ -1737,6 +1831,138 @@ mod tests {
         assert!(t.cpu_bytes().is_none());
         // But cpu_iter still works.
         assert!(t.cpu_iter::<f32>().is_some());
+    }
+
+    #[test]
+    fn slice_leading_axis_is_contiguous() {
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..12)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [4, 3]).expect("from_slice");
+
+        let v = leaf.slice(&[1..3, 0..3]).expect("slice leading");
+        assert_eq!(v.shape().dims(), &[2, 3]);
+        // Leading slice [1..3] is contiguous in row-major.
+        let bytes = v.cpu_bytes().expect("contiguous via leading slice");
+        assert_eq!(bytes.len(), 6 * 4);
+        assert_eq!(v.cpu_to_vec::<f32>().unwrap(), data[3..9].to_vec());
+    }
+
+    #[test]
+    fn slice_inner_axis_is_non_contiguous() {
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..12)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [4, 3]).expect("from_slice");
+
+        // Take columns 1..3 of every row.
+        let v = leaf.slice(&[0..4, 1..3]).expect("slice inner");
+        assert_eq!(v.shape().dims(), &[4, 2]);
+        // Inner-axis slice is non-contiguous: stride is still 3, but
+        // shape's row-major contiguous would require stride 2.
+        assert!(v.cpu_bytes().is_none());
+
+        let mut expected: Vec<f32> = Vec::with_capacity(8);
+        for row in 0..4 {
+            for col in 1..3 {
+                expected.push(data[row * 3 + col]);
+            }
+        }
+        assert_eq!(v.cpu_iter::<f32>().unwrap().collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn slice_chain_accumulates_byte_offset() {
+        // Slice twice; the second slice should fold into a single view
+        // pointing directly at the leaf with combined offset.
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..16)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [16]).expect("from_slice");
+
+        let a = leaf.slice(std::slice::from_ref(&(4..12))).expect("slice 1");
+        let b = a.slice(std::slice::from_ref(&(2..6))).expect("slice 2");
+        assert_eq!(b.shape().dims(), &[4]);
+        assert_eq!(b.cpu_to_vec::<f32>().unwrap(), data[6..10].to_vec());
+
+        let view_node = b.inner.view.as_ref().expect("view");
+        assert!(view_node.source.ptr_eq(&leaf));
+        // 4 + 2 = 6 f32s, × 4 bytes = 24.
+        assert_eq!(view_node.byte_offset, 24);
+    }
+
+    #[test]
+    fn slice_of_permute_reads_logical_values() {
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..12)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [3, 4]).expect("from_slice");
+
+        // Transpose to [4, 3], then take the middle two rows.
+        let t = leaf.permute(&[1, 0]).expect("permute");
+        let v = t.slice(&[1..3, 0..3]).expect("slice");
+        assert_eq!(v.shape().dims(), &[2, 3]);
+
+        // Permuted logical layout columns (col 1, col 2 of original):
+        // col 1: [1, 5, 9]; col 2: [2, 6, 10].
+        let expected = vec![1.0, 5.0, 9.0, 2.0, 6.0, 10.0];
+        assert_eq!(v.cpu_iter::<f32>().unwrap().collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn slice_empty_range_yields_zero_count() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [4, 3], DType::F32).expect("zeros");
+        let v = leaf.slice(&[2..2, 0..3]).expect("empty slice");
+        assert_eq!(v.shape().dims(), &[0, 3]);
+        assert_eq!(v.elem_count(), 0);
+        assert_eq!(v.cpu_to_vec::<f32>().unwrap(), Vec::<f32>::new());
+    }
+
+    #[test]
+    fn slice_rejects_wrong_range_count() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [2, 3], DType::F32).expect("zeros");
+        let err = leaf.slice(std::slice::from_ref(&(0..2))).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn slice_rejects_out_of_bounds() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [2, 3], DType::F32).expect("zeros");
+        let err = leaf.slice(&[0..2, 0..5]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn slice_rejects_inverted_range() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [2, 3], DType::F32).expect("zeros");
+        // Construct an inverted range via the struct literal so clippy
+        // doesn't reject `1..0` — the whole point of this test is to
+        // assert slice itself rejects start > end.
+        let inverted = Range { start: 1, end: 0 };
+        let err = leaf.slice(&[inverted, 0..3]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn slice_rejects_quantized() {
+        let t = Tensor::quantized_placeholder([4096, 4096], Quantization::Q4_GS64);
+        let err = t.slice(&[0..1024, 0..1024]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn slice_rejects_placeholder() {
+        let p = Tensor::placeholder::<f32>([2, 3]);
+        let err = p.slice(&[0..2, 0..3]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
     }
 
     #[test]
