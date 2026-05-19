@@ -14,6 +14,12 @@ categories.workspace = true
 
 [dependencies]
 cider-press-kernels = { path = "../cider-press-kernels" }
+half = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }
+safetensors = { workspace = true }
 
 [lints]
 workspace = true

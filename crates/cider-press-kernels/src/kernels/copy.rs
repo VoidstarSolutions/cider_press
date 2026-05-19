@@ -4,10 +4,11 @@
 
 //! Vector-copy dispatch over MLX's `copy.metal`.
 //!
-//! Currently exposes only the same-dtype identity-copy variants the
-//! spike used (`v_copyfloat32float32`, `v_copyfloat16float16`).
-//! Additional dtype combinations from MLX's instantiate macros can be
-//! added the same way as the runtime layer needs them.
+//! Exposes the same-dtype identity-copy variants the runtime layer
+//! needs: `f32`, `f16`, `bf16`, `i32`, `u32`. Additional dtype
+//! combinations from MLX's `instantiate_copy_*` macros (cross-dtype
+//! casts, complex, smaller integer widths) can be added the same way
+//! when callers ask for them.
 //!
 //! Analogue of MLX's `mlx::core::metal::copy_gpu_inplace` (the
 //! `CopyType::Vector` branch).
@@ -15,7 +16,7 @@
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
-use half::f16;
+use half::{bf16, f16};
 use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
 
 use crate::buffer::Buffer;
@@ -50,6 +51,45 @@ pub fn copy_v_f16(
     dst: &mut Buffer<f16>,
 ) -> Result<()> {
     encode_v_copy(commands, library, "v_copyfloat16float16", src, dst)
+}
+
+/// Identity-copy `src` into `dst`, both `bf16`.
+///
+/// See [`copy_v_f32`] for semantics; `library` must be a
+/// [`KernelLibrary::copy`].
+pub fn copy_v_bf16(
+    commands: &mut Commands<'_>,
+    library: &KernelLibrary,
+    src: &Buffer<bf16>,
+    dst: &mut Buffer<bf16>,
+) -> Result<()> {
+    encode_v_copy(commands, library, "v_copybfloat16bfloat16", src, dst)
+}
+
+/// Identity-copy `src` into `dst`, both `i32`.
+///
+/// See [`copy_v_f32`] for semantics; `library` must be a
+/// [`KernelLibrary::copy`].
+pub fn copy_v_i32(
+    commands: &mut Commands<'_>,
+    library: &KernelLibrary,
+    src: &Buffer<i32>,
+    dst: &mut Buffer<i32>,
+) -> Result<()> {
+    encode_v_copy(commands, library, "v_copyint32int32", src, dst)
+}
+
+/// Identity-copy `src` into `dst`, both `u32`.
+///
+/// See [`copy_v_f32`] for semantics; `library` must be a
+/// [`KernelLibrary::copy`].
+pub fn copy_v_u32(
+    commands: &mut Commands<'_>,
+    library: &KernelLibrary,
+    src: &Buffer<u32>,
+    dst: &mut Buffer<u32>,
+) -> Result<()> {
+    encode_v_copy(commands, library, "v_copyuint32uint32", src, dst)
 }
 
 /// Shared encoder for the `copy_v<T, T, 1>` template family.

@@ -69,20 +69,42 @@ crate re-exports from runtime + models. Workspace-level
 version pins in one place; each member uses `lints.workspace = true`
 and `dep.workspace = true`.
 
-## Current state: spike complete, scaffolding in place
+## Current state: runtime slice landed end-to-end
 
 The development spike (Stages 0–5 below) passed every acceptance bar,
 including bit-exact `qmv` parity with MLX's own `quantized_matmul`.
-The workspace restructure (this section's layout) followed
-immediately after. **The next concrete step is to design the lazy
-`Tensor` + graph + `eval()` semantics in `cider-press-runtime`** —
-see the post-spike Findings at the bottom for the recommendation.
+The workspace restructure followed immediately after, then the
+runtime slice planned in `docs/RUNTIME_DESIGN.md`:
 
-Do **not** add public types to `cider-press-kernels` ahead of the
-runtime-layer design — its dispatch surface should be shaped by what
-the runtime actually needs to call. Similarly, do not start on
-`cider-press-models` until at least one architecture's needs inform
-the runtime's op coverage.
+- `Device` handle with cached kernel libraries (`copy`, `quantized`).
+- Lazy `Tensor` with materialization-state-via-`OnceLock` (no Mutex
+  on the read path; see the design doc's "Materialization state"
+  section for the why).
+- Two ops wired through the runtime: `Tensor::copy` for all
+  five dtypes the runtime models and `QuantizedWeight::matvec`
+  for bf16. The latter has a runtime-level parity test against
+  the same Stage-4 fixture the spike used.
+- `Tensor::eval`: sync public API, single `Commands` per call,
+  synchronous commit + wait. Internal pipelining is deferred (see
+  the design doc's "What pipelining needs" section).
+
+**Concrete target: Qwen2.5-0.5B-Instruct running interactively.**
+Smallest published dense Qwen; same architecture family as the
+eventual MoE target minus the router. `docs/QWEN_PATH.md` is the
+branch-by-branch roadmap; `docs/RUNTIME_DESIGN.md` has the
+framework-gap analysis for the two structural additions we know
+we'll need (Views, `KvCache` type) before the op flood.
+
+**Next concrete step: branch 2 of the roadmap — `feat/runtime-views`.**
+Adds a `ViewSource` field on `TensorInner` plus `Tensor::reshape`
+/ `::transpose` / `::slice` / `::broadcast_to`. Self-contained
+(no new ops, no model code) and unblocks every subsequent branch
+that needs attention, RMSNorm broadcasting, or KV-cache reads.
+
+Do **not** start on `cider-press-models` until at least one
+architecture's needs inform the runtime's op coverage — even with
+qmv landing, that bar isn't met yet (need attention + a few
+element-wise/normalization ops).
 
 ### Spike goal
 

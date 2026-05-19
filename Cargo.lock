@@ -76,7 +76,11 @@ dependencies = [
 name = "cider-press-runtime"
 version = "0.1.0"
 dependencies = [
+ "approx",
  "cider-press-kernels",
+ "half",
+ "safetensors",
+ "thiserror",
 ]
 
 [[package]]
