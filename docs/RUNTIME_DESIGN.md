@@ -372,41 +372,29 @@ before the API ossifies.
 
 ## File layout in `cider-press-runtime`
 
-Current:
+What actually landed (the planning sketch in earlier drafts was a
+finer-grained split with an `ops/` subdir; the implementation kept
+it flatter because the per-op dispatcher is small enough to live
+inline in `eval.rs` for now):
 
-```
+```text
 src/
+├── device.rs        # Arc<DeviceInner> handle, shared(), kernel-lib caches
 ├── dtype.rs
 ├── error.rs
+├── eval.rs          # topo walk + per-OpKind dispatcher
 ├── layout.rs
 ├── lib.rs
 ├── quantization.rs
+├── quantized.rs     # QuantizedWeight newtype + matvec op builder
 ├── shape.rs
 ├── strides.rs
-└── tensor.rs        # skeleton, Source::Placeholder only
+└── tensor.rs        # Tensor + TensorInner + OpKind + op_tensor builder
 ```
 
-After this slice (sketch — actual filenames decided as we go):
-
-```
-src/
-├── device.rs        # Arc<Device> handle, shared()
-├── dtype.rs
-├── error.rs
-├── eval.rs          # topo walk + dispatcher table
-├── layout.rs
-├── lib.rs
-├── ops/
-│   ├── mod.rs       # OpKind enum + Tensor op constructors
-│   ├── copy.rs      # Copy dispatcher
-│   └── qmv.rs       # Qmv dispatcher
-├── quantization.rs
-├── shape.rs
-├── source.rs        # Source enum + OpNode
-├── storage.rs       # Source::Leaf helpers, allocation
-├── strides.rs
-└── tensor.rs        # Tensor + TensorInner, slimmed
-```
+A finer split (per-op file under `ops/`) becomes worth it when the
+op count grows past the point where a single match in `eval.rs` is
+unwieldy — probably around SDPA + attention prerequisites.
 
 ## Commit plan
 
