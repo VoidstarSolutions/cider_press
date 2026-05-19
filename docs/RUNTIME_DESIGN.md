@@ -313,21 +313,26 @@ readiness.
 
 ## `eval()` algorithm (first cut)
 
-```
+```text
 fn eval(&self):
     1. Collect topological order of unevaluated Op nodes reachable
        from self. Reverse post-order DFS, dedup by Arc pointer
-       identity. Skip Leaf and Placeholder nodes (already terminal).
+       identity. Skip nodes whose OnceLock cache is already
+       populated (host leaves and previously-evaluated ops) and
+       Placeholders (no op, no cache).
     2. For each Op node in order:
-         a. Allocate output Buffer (via Device::new_buffer).
+         a. Allocate output Buffer (via Device::alloc_buffer).
          b. Look up the dispatcher for OpKind in a match.
          c. Dispatcher encodes into the shared Commands, given:
-              - input Buffers (already materialized by prior iters)
+              - input Buffers (already materialized by prior iters,
+                resolved via the side-table of in-progress outputs
+                or the input's OnceLock cache)
               - output Buffer
               - shape/dtype/layout from TensorInner
     3. Commands.commit_and_wait().
-    4. For each Op node in order, swap Source::Op → Source::Leaf
-       under the Mutex.
+    4. For each Op node in order, populate its OnceLock<LeafStorage>
+       cache with the now-valid output buffer. The op metadata
+       (Option<OpNode>) stays put — lineage is preserved.
 ```
 
 Simplicity choices:

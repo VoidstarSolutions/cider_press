@@ -7,10 +7,11 @@
 //! - [`Layout::Quantized`]: packed quantized scalars per
 //!   [`Quantization`]. The tensor's [`DType`](crate::DType) is
 //!   [`U32`](crate::DType::U32) (the packing word type) and the
-//!   quantization descriptor lives here. Scales and biases are
-//!   *separate* tensors, not bundled into this layout — that mirrors
-//!   MLX's `quantized_matmul` ABI, where the three buffers are bound
-//!   independently.
+//!   quantization descriptor lives here. The accompanying scales and
+//!   biases buffers live on the tensor's leaf storage (see
+//!   `LeafStorage::Quantized` in `tensor.rs`) and are bound
+//!   alongside the packed weights at dispatch time, the same way
+//!   MLX's `quantized_matmul` ABI takes all three buffers.
 //!
 //! Keeping quantization at the layout layer (rather than as a
 //! [`DType`](crate::DType) variant) means dispatch code can match on a

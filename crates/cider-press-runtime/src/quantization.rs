@@ -11,7 +11,11 @@
 //!
 //! The matrix is divided into groups of `group_size` scalars along
 //! the inner (K) axis; each group has one scale and one bias
-//! (typically as bf16). Dequantization is
+//! (typically as bf16). At the runtime layer these three buffers
+//! (packed weights, scales, biases) live together on a single
+//! [`Tensor`](crate::Tensor) in `LeafStorage::Quantized`, and are
+//! bound side-by-side at dispatch time the way MLX's
+//! `quantized_matmul` ABI expects. Dequantization is
 //! `x = w * scale + bias` per group.
 //!
 //! This descriptor lives on [`Layout::Quantized`](crate::Layout::Quantized);

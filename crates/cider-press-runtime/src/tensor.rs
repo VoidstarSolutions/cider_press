@@ -465,9 +465,11 @@ impl Tensor {
 
     /// Host-readable view of the tensor's raw bytes, or `None` if the
     /// backing buffer hasn't been materialized yet *or* if the tensor
-    /// is quantized (quantized tensors are composite — use the
-    /// accessors on [`QuantizedWeight`](crate::QuantizedWeight) to
-    /// reach the individual buffers).
+    /// is quantized (quantized tensors carry three byte-erased
+    /// buffers — packed weights, scales, biases — that don't
+    /// collapse into a single contiguous `&[u8]` view; the runtime
+    /// reads them by-component at dispatch time via the
+    /// `LeafStorage::Quantized` variant).
     ///
     /// Safe to call: a populated `cache` carries the invariant that
     /// no GPU dispatch is concurrently writing the buffer.
