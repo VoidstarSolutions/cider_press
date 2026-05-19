@@ -37,12 +37,11 @@ impl Strides {
         }
         let mut strides = vec![1isize; dims.len()];
         for axis in (0..dims.len() - 1).rev() {
-            // `as isize` is fine: dims are typed `usize` but tensors
-            // we can materialize have to fit in machine memory, so any
-            // value we'll encounter in practice fits in `isize`.
-            #[allow(clippy::cast_possible_wrap)]
-            let next = dims[axis + 1] as isize;
-            strides[axis] = strides[axis + 1] * next;
+            let next =
+                isize::try_from(dims[axis + 1]).expect("shape dimension does not fit in isize");
+            strides[axis] = strides[axis + 1]
+                .checked_mul(next)
+                .expect("contiguous stride computation overflowed isize");
         }
         Self(strides)
     }

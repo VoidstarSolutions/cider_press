@@ -185,7 +185,7 @@ impl Tensor {
     /// host-side reads via [`Tensor::cpu_bytes`] are safe immediately.
     pub fn zeros(device: &Device, shape: impl Into<Shape>, dtype: DType) -> Result<Self> {
         let shape = shape.into();
-        let byte_count = shape.elem_count() * dtype.size_bytes();
+        let byte_count = checked_byte_count(&shape, dtype)?;
         let mut buffer = device.kernels().alloc_buffer::<u8>(byte_count)?;
         // SAFETY: just allocated, no GPU dispatch has referenced it.
         unsafe { buffer.as_mut_slice() }.fill(0);
@@ -231,7 +231,7 @@ impl Tensor {
         dtype: DType,
     ) -> Result<Self> {
         let shape = shape.into();
-        let expected = shape.elem_count() * dtype.size_bytes();
+        let expected = checked_byte_count(&shape, dtype)?;
         if bytes.len() != expected {
             return Err(Error::InvalidArgument(format!(
                 "from_bytes: expected {expected} bytes for shape {:?} dtype {dtype}, got {}",
@@ -506,6 +506,23 @@ impl Tensor {
     }
 }
 
+/// Compute the byte count of a dense tensor with `shape` and `dtype`,
+/// rejecting overflow with [`Error::InvalidArgument`] rather than
+/// silently wrapping. `Shape::elem_count` already panics on its own
+/// product overflowing — this catches the secondary overflow when
+/// multiplying by `dtype.size_bytes()`.
+pub(crate) fn checked_byte_count(shape: &Shape, dtype: DType) -> Result<usize> {
+    shape
+        .elem_count()
+        .checked_mul(dtype.size_bytes())
+        .ok_or_else(|| {
+            Error::InvalidArgument(format!(
+                "byte count overflows usize: shape {shape:?} × {} bytes per {dtype} element",
+                dtype.size_bytes(),
+            ))
+        })
+}
+
 fn dense_layout(shape: &Shape) -> Layout {
     Layout::Dense {
         strides: Strides::contiguous(shape),
@@ -639,6 +656,17 @@ mod tests {
         let device = Device::shared().expect("system default device");
         let raw: Vec<u8> = vec![0; 31];
         let err = Tensor::from_bytes(&device, &raw, [8], DType::F32).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn from_bytes_rejects_byte_count_overflow() {
+        // shape.elem_count fits in usize, but elem_count * size_bytes
+        // overflows. The checked byte_count helper should reject
+        // before allocation is attempted, with no slice-length read.
+        let device = Device::shared().expect("system default device");
+        let huge = usize::MAX / 2; // F32 size_bytes = 4 → huge * 4 overflows.
+        let err = Tensor::from_bytes(&device, &[], [huge], DType::F32).unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)));
     }
 

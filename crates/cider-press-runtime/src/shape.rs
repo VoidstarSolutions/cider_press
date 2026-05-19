@@ -53,10 +53,17 @@ impl Shape {
 
     /// Total element count = product of dimensions.
     ///
-    /// Returns `1` for the scalar shape (empty product).
+    /// Returns `1` for the scalar shape (empty product). Panics if
+    /// the product overflows `usize` — an `elem_count` that doesn't
+    /// fit in a machine word can't be allocated anyway, and
+    /// downstream `from_raw_parts` paths assume this value is
+    /// faithful (silent wrap would be unsound, not just slow).
     #[must_use]
     pub fn elem_count(&self) -> usize {
-        self.0.iter().product()
+        self.0
+            .iter()
+            .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+            .expect("shape element count overflowed usize")
     }
 }
 
@@ -123,5 +130,15 @@ mod tests {
     fn display() {
         assert_eq!(Shape::scalar().to_string(), "[]");
         assert_eq!(Shape::from([2, 3, 4]).to_string(), "[2, 3, 4]");
+    }
+
+    #[test]
+    #[should_panic(expected = "overflowed")]
+    fn elem_count_panics_on_overflow() {
+        // usize::MAX × 2 overflows; checked accumulator panics rather
+        // than silently wrapping (which would yield an under-sized
+        // allocation downstream).
+        let s = Shape::from([usize::MAX, 2]);
+        let _ = s.elem_count();
     }
 }

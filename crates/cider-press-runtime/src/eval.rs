@@ -19,7 +19,7 @@ use cider_press_kernels::{
 
 use crate::dtype::DType;
 use crate::error::{Error, Result};
-use crate::tensor::{LeafStorage, OpKind, OpNode, Tensor, TensorInner};
+use crate::tensor::{LeafStorage, OpKind, OpNode, Tensor, TensorInner, checked_byte_count};
 
 pub(crate) fn eval(root: &Tensor) -> Result<()> {
     // Step 1: topological order of unevaluated op nodes reachable from
@@ -55,7 +55,7 @@ pub(crate) fn eval(root: &Tensor) -> Result<()> {
     // exclusive `&mut dst` to the fresh local.
     let mut outputs: Vec<Buffer<u8>> = Vec::with_capacity(order.len());
     for inner in &order {
-        let byte_count = inner.shape.elem_count() * inner.dtype.size_bytes();
+        let byte_count = checked_byte_count(&inner.shape, inner.dtype)?;
         let mut dst = device.kernels().alloc_buffer::<u8>(byte_count)?;
         dispatch(inner, &mut commands, &outputs, &mut dst, &index_of)?;
         outputs.push(dst);
