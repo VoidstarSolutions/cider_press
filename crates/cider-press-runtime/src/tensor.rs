@@ -30,6 +30,7 @@
 //! the backing leaf. This means `cpu_bytes()` on a view follows the
 //! chain rather than reading the view's own (always-empty) cache.
 
+use std::marker::PhantomData;
 use std::sync::{Arc, OnceLock};
 
 use cider_press_kernels::Buffer;
@@ -568,6 +569,58 @@ impl Tensor {
         }
     }
 
+    /// Element-wise host iterator over the tensor's logical values.
+    ///
+    /// Works for *any* stride pattern (contiguous, transposed,
+    /// broadcast, sliced). The iterator walks the logical shape in
+    /// row-major order, computing each element's byte offset from
+    /// the view's strides and reading the typed scalar from the
+    /// backing leaf via `ptr::read_unaligned`.
+    ///
+    /// Returns `Some` iff the backing leaf is materialized, the
+    /// tensor is dense (not quantized), and the dtype matches `T`.
+    /// Test-grade performance only — production kernels do the same
+    /// indexing on the GPU.
+    #[must_use]
+    pub fn cpu_iter<T: Scalar>(&self) -> Option<CpuIter<'_, T>> {
+        if self.dtype() != T::DTYPE {
+            return None;
+        }
+        let strides = match self.layout() {
+            Layout::Dense { strides } => strides.as_slice(),
+            Layout::Quantized(_) => return None,
+        };
+        let (storage, byte_offset) = self.resolve_leaf()?;
+        let buffer = match storage {
+            LeafStorage::Dense(buffer) => buffer,
+            LeafStorage::Quantized { .. } => return None,
+        };
+        // SAFETY: the cache invariant on the backing leaf rules out
+        // concurrent GPU writes; same as cpu_bytes.
+        let bytes = unsafe { buffer.as_slice() };
+        let dims = self.inner.shape.dims();
+        let remaining = self.inner.shape.elem_count();
+        Some(CpuIter {
+            bytes,
+            base_offset: byte_offset,
+            shape: dims,
+            strides,
+            elem_size: T::DTYPE.size_bytes(),
+            indices: vec![0; dims.len()],
+            remaining,
+            _t: PhantomData,
+        })
+    }
+
+    /// Collect the tensor's logical values into a fresh `Vec<T>` in
+    /// row-major order. Thin wrapper over [`Tensor::cpu_iter`] for
+    /// tests where the vec is the assertion target. Returns `None`
+    /// under the same conditions as `cpu_iter`.
+    #[must_use]
+    pub fn cpu_to_vec<T: Scalar>(&self) -> Option<Vec<T>> {
+        Some(self.cpu_iter::<T>()?.collect())
+    }
+
     /// Typed host-readable view of a dense materialized tensor.
     /// Returns `None` if the tensor isn't materialized, isn't dense,
     /// or has a dtype other than `T`.
@@ -610,6 +663,87 @@ pub(crate) fn checked_byte_count(shape: &Shape, dtype: DType) -> Result<usize> {
 fn dense_layout(shape: &Shape) -> Layout {
     Layout::Dense {
         strides: Strides::contiguous(shape),
+    }
+}
+
+/// Element-wise host iterator returned by [`Tensor::cpu_iter`].
+///
+/// Walks the logical shape in row-major order, reading each typed
+/// scalar from the backing leaf via stride arithmetic. Yields `T` by
+/// value (every [`Scalar`] is `Copy`).
+///
+/// The iterator borrows the backing leaf bytes; the leaf stays alive
+/// for the iterator's lifetime via the source tensor's `Arc`.
+pub struct CpuIter<'a, T: Scalar> {
+    bytes: &'a [u8],
+    base_offset: usize,
+    shape: &'a [usize],
+    strides: &'a [isize],
+    elem_size: usize,
+    indices: Vec<usize>,
+    remaining: usize,
+    _t: PhantomData<T>,
+}
+
+impl<T: Scalar> Iterator for CpuIter<'_, T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        if self.remaining == 0 {
+            return None;
+        }
+
+        let mut signed_off: isize = isize::try_from(self.base_offset)
+            .expect("base_offset fits in isize (Metal allocations are well under isize::MAX)");
+        for (idx, stride) in self.indices.iter().zip(self.strides.iter()) {
+            let idx_signed = isize::try_from(*idx).expect("index fits in isize");
+            let elem_signed = isize::try_from(self.elem_size).expect("dtype size fits in isize");
+            let step = idx_signed
+                .checked_mul(*stride)
+                .and_then(|s| s.checked_mul(elem_signed))
+                .expect("stride arithmetic overflowed isize");
+            signed_off = signed_off
+                .checked_add(step)
+                .expect("byte offset overflowed isize");
+        }
+        let byte_off = usize::try_from(signed_off).expect("computed byte offset is non-negative");
+        debug_assert!(byte_off + self.elem_size <= self.bytes.len());
+
+        // SAFETY: byte_off + elem_size ≤ bytes.len() (asserted in debug;
+        // the public view-building APIs guarantee this in release by
+        // bounds-checking shape × strides at construction). Metal
+        // shared-storage allocations are page-aligned, but we still use
+        // read_unaligned so mid-buffer offsets are sound for any T.
+        let val = unsafe {
+            self.bytes
+                .as_ptr()
+                .add(byte_off)
+                .cast::<T>()
+                .read_unaligned()
+        };
+
+        // Advance odometer: increment last axis, carry up. Rank-0
+        // tensors have an empty `indices` and bail out via the
+        // `remaining` counter alone.
+        for axis in (0..self.indices.len()).rev() {
+            self.indices[axis] += 1;
+            if self.indices[axis] < self.shape[axis] {
+                break;
+            }
+            self.indices[axis] = 0;
+        }
+        self.remaining -= 1;
+        Some(val)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl<T: Scalar> ExactSizeIterator for CpuIter<'_, T> {
+    fn len(&self) -> usize {
+        self.remaining
     }
 }
 
@@ -1066,6 +1200,107 @@ mod tests {
         // Total byte_offset = 16 + 8 = 24 → f32 index 6, length 6.
         let typed = inner.cpu_slice::<f32>().expect("view cpu_slice");
         assert_eq!(typed, &data[6..12]);
+    }
+
+    #[test]
+    fn cpu_iter_matches_cpu_slice_for_contiguous_leaf() {
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..24)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [2, 3, 4]).expect("from_slice");
+
+        let iter_vec: Vec<f32> = leaf.cpu_iter::<f32>().expect("cpu_iter").collect();
+        let slice = leaf.cpu_slice::<f32>().expect("cpu_slice");
+        assert_eq!(iter_vec, slice);
+        assert_eq!(iter_vec, data);
+    }
+
+    #[test]
+    fn cpu_to_vec_round_trips_contiguous() {
+        let device = Device::shared().expect("system default device");
+        let data: Vec<i32> = (-8..8).collect();
+        let leaf = Tensor::from_slice(&device, &data, [4, 4]).expect("from_slice");
+        let v = leaf.cpu_to_vec::<i32>().expect("cpu_to_vec");
+        assert_eq!(v, data);
+    }
+
+    #[test]
+    fn cpu_iter_walks_transposed_view_in_logical_order() {
+        // Build a [2, 3] f32 leaf and view it as [3, 2] with swapped
+        // strides — the manual "transpose." cpu_iter should yield the
+        // elements in row-major order of the transposed shape.
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..6)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [2, 3]).expect("from_slice");
+
+        // Original strides for [2,3] are [3, 1]; transpose swaps to [1, 3].
+        let v = manual_view(&leaf, 0, Shape::from([3, 2]), Strides::from([1isize, 3]));
+
+        let collected: Vec<f32> = v.cpu_iter::<f32>().expect("cpu_iter").collect();
+        // Original layout: [[0,1,2],[3,4,5]]; transposed: [[0,3],[1,4],[2,5]].
+        assert_eq!(collected, vec![0.0, 3.0, 1.0, 4.0, 2.0, 5.0]);
+    }
+
+    #[test]
+    fn cpu_iter_respects_byte_offset_window() {
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..12)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [12]).expect("from_slice");
+
+        // Skip the first 4 f32 (16 bytes), shape [8] contiguous.
+        let v = manual_view(
+            &leaf,
+            16,
+            Shape::from([8]),
+            Strides::contiguous(&Shape::from([8])),
+        );
+        let collected: Vec<f32> = v.cpu_iter::<f32>().expect("cpu_iter").collect();
+        assert_eq!(collected, data[4..].to_vec());
+    }
+
+    #[test]
+    fn cpu_iter_handles_broadcast_zero_strides() {
+        // Three-element vector broadcast to [2, 3] via stride [0, 1].
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = vec![10.0, 20.0, 30.0];
+        let leaf = Tensor::from_slice(&device, &data, [3]).expect("from_slice");
+
+        let v = manual_view(&leaf, 0, Shape::from([2, 3]), Strides::from([0isize, 1]));
+        let collected: Vec<f32> = v.cpu_iter::<f32>().expect("cpu_iter").collect();
+        assert_eq!(collected, vec![10.0, 20.0, 30.0, 10.0, 20.0, 30.0]);
+    }
+
+    #[test]
+    fn cpu_iter_returns_none_for_dtype_mismatch() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [4], DType::F32).expect("zeros");
+        assert!(leaf.cpu_iter::<i32>().is_none());
+        assert!(leaf.cpu_iter::<f32>().is_some());
+    }
+
+    #[test]
+    fn cpu_iter_returns_none_for_unmaterialized_op() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [4], DType::F32).expect("zeros");
+        let op = leaf.copy().expect("copy");
+        assert!(op.cpu_iter::<f32>().is_none());
+
+        op.eval().expect("eval");
+        assert!(op.cpu_iter::<f32>().is_some());
+    }
+
+    #[test]
+    fn cpu_iter_size_hint_and_len_match_elem_count() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [2, 3, 5], DType::F32).expect("zeros");
+        let iter = leaf.cpu_iter::<f32>().expect("cpu_iter");
+        assert_eq!(iter.len(), 30);
+        assert_eq!(iter.size_hint(), (30, Some(30)));
     }
 
     #[test]
