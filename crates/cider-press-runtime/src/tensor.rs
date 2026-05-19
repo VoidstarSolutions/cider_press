@@ -2,16 +2,13 @@
 //!
 //! [`Tensor`] is the user-facing handle: cheap to clone (it's an
 //! [`Arc`]), carries [`Shape`] + [`DType`] + [`Layout`], and refers to
-//! a node in the computation graph. The node is either a *leaf* (a
-//! materialized buffer) or — in later commits — an *op* (an operation
-//! plus its input tensors). Construction is always lazy: no GPU work
-//! runs until `eval()` is called (op variant lands in a follow-up).
-//!
-//! This commit lands the **storage** layer: real Metal buffers behind
-//! [`Source::Leaf`], allocated via [`Device`] and accessible host-side
-//! through [`Tensor::cpu_bytes`] / [`Tensor::cpu_slice`]. The lazy op
-//! graph + `eval()` follow in subsequent commits per the runtime
-//! design doc (`docs/RUNTIME_DESIGN.md`).
+//! a node in the computation graph. A node is one of: a *placeholder*
+//! (metadata only — test scaffolding), a *leaf* (a materialized
+//! buffer), or an *op* (an [`OpKind`] plus its input tensors).
+//! Construction is always lazy: building an op tensor does no GPU
+//! work and allocates no output buffer. Both happen at `eval()` time
+//! — which has not yet landed; until then, op tensors are not
+//! materialized and [`Tensor::cpu_bytes`] returns `None` for them.
 //!
 //! [`Source::Placeholder`] is retained for tests and pure type-surface
 //! scaffolding that doesn't need a real device.
@@ -43,9 +40,10 @@ struct TensorInner {
 /// What produces a tensor's values.
 ///
 /// Grows as the runtime layer fills in. Today: metadata-only
-/// placeholders for scaffolding, and materialized leaves backed by a
-/// real [`Buffer`]. Op nodes and pending (in-flight) variants land in
-/// subsequent commits.
+/// placeholders for scaffolding, materialized leaves backed by a real
+/// [`Buffer`], and lazy op nodes referencing input tensors. A
+/// `Pending` variant (committed-but-not-completed) is planned for the
+/// scheduler work — see `docs/RUNTIME_DESIGN.md`.
 enum Source {
     /// Metadata-only tensor with no backing buffer. Useful as a
     /// stand-in for tests and for type-surface scaffolding that
@@ -60,6 +58,35 @@ enum Source {
     /// expressible without `Box<dyn ...>` while preserving the
     /// kernels-layer's typed-buffer dispatch contract.
     Leaf(Buffer<u8>),
+    /// Lazy op node: this tensor's values will be produced by running
+    /// [`OpKind`] against [`OpNode::inputs`] on the next `eval()`. No
+    /// GPU work has been scheduled.
+    Op(OpNode),
+}
+
+/// A lazy operation node: the op kind plus its input tensors.
+///
+/// `inputs` are `Tensor` clones (refcount bumps), which is what makes
+/// the graph a DAG rather than a tree — multiple consumers of the
+/// same producer share an [`Arc<TensorInner>`].
+struct OpNode {
+    kind: OpKind,
+    inputs: Vec<Tensor>,
+}
+
+/// Closed set of ops the runtime can dispatch.
+///
+/// Variant-per-op rather than `dyn Op`: we own every op in this crate
+/// and the extensibility tax of a trait isn't worth it until we have
+/// a reason to allow third-party ops. The dispatcher (next commit)
+/// `match`es on this enum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OpKind {
+    /// Element-wise identity copy. Output is a fresh dense tensor with
+    /// the same shape, dtype, and values as the input. Mirrors MLX's
+    /// `mx.copy` and dispatches to the vendored `v_copy` kernel.
+    Copy,
 }
 
 /// User-facing lazy tensor handle.
@@ -201,6 +228,42 @@ impl Tensor {
         }
     }
 
+    /// Schedule an identity copy of this tensor.
+    ///
+    /// Returns a new [`Tensor`] backed by an unevaluated
+    /// [`OpKind::Copy`] node referencing `self` as its sole input. No
+    /// GPU work runs and no output buffer is allocated; both happen
+    /// at `eval()` time (next commit).
+    ///
+    /// The result inherits this tensor's [`Shape`], [`DType`], and
+    /// [`Device`]; the output [`Layout`] is dense and contiguous,
+    /// regardless of the input's stride pattern (`copy` materializes a
+    /// dense version of the logical values, the same as MLX's
+    /// `mx.copy`).
+    pub fn copy(&self) -> Result<Self> {
+        let device = self.inner.device.as_ref().ok_or_else(|| {
+            Error::InvalidArgument("copy: cannot apply an op to a placeholder (no device)".into())
+        })?;
+        if !matches!(self.inner.layout, Layout::Dense { .. }) {
+            return Err(Error::InvalidArgument(
+                "copy: only dense tensors are supported".into(),
+            ));
+        }
+        let layout = dense_layout(&self.inner.shape);
+        Ok(Self {
+            inner: Arc::new(TensorInner {
+                shape: self.inner.shape.clone(),
+                dtype: self.inner.dtype,
+                layout,
+                device: Some(device.clone()),
+                source: Source::Op(OpNode {
+                    kind: OpKind::Copy,
+                    inputs: vec![self.clone()],
+                }),
+            }),
+        })
+    }
+
     /// Logical shape of this tensor.
     #[must_use]
     pub fn shape(&self) -> &Shape {
@@ -254,6 +317,43 @@ impl Tensor {
         matches!(self.inner.source, Source::Leaf(_))
     }
 
+    /// Whether this tensor is an unevaluated op node (a lazy graph
+    /// vertex with no buffer yet).
+    #[must_use]
+    pub fn is_op(&self) -> bool {
+        matches!(self.inner.source, Source::Op(_))
+    }
+
+    /// The [`OpKind`] of this tensor's lazy op node, or `None` if it
+    /// isn't an op node.
+    #[must_use]
+    pub fn op_kind(&self) -> Option<OpKind> {
+        match &self.inner.source {
+            Source::Op(node) => Some(node.kind),
+            Source::Placeholder | Source::Leaf(_) => None,
+        }
+    }
+
+    /// Inputs to this tensor's lazy op node, or `None` if it isn't an
+    /// op node. The slice elements are `Tensor` clones (refcount
+    /// bumps); identity of two referenced producers can be compared
+    /// with [`Tensor::ptr_eq`].
+    #[must_use]
+    pub fn op_inputs(&self) -> Option<&[Tensor]> {
+        match &self.inner.source {
+            Source::Op(node) => Some(&node.inputs),
+            Source::Placeholder | Source::Leaf(_) => None,
+        }
+    }
+
+    /// Whether two `Tensor` handles point at the same underlying graph
+    /// node. The op layer uses this for graph-node identity (CSE,
+    /// dedup); user code rarely needs it.
+    #[must_use]
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     /// Host-readable view of the tensor's raw bytes, or `None` if not
     /// materialized.
     ///
@@ -262,14 +362,15 @@ impl Tensor {
     /// buffer (today, trivially — leaves are only constructed from
     /// host-side data; once op dispatch lands, the eval boundary
     /// upholds the invariant by waiting on completion before
-    /// rewriting an op node into a leaf).
+    /// rewriting an op node into a leaf). Returns `None` for
+    /// placeholders and unevaluated op nodes.
     #[must_use]
     pub fn cpu_bytes(&self) -> Option<&[u8]> {
         match &self.inner.source {
             // SAFETY: see method docs — leaves uphold the no-concurrent-
             // GPU-write invariant.
             Source::Leaf(buffer) => Some(unsafe { buffer.as_slice() }),
-            Source::Placeholder => None,
+            Source::Placeholder | Source::Op(_) => None,
         }
     }
 
@@ -303,15 +404,16 @@ fn dense_layout(shape: &Shape) -> Layout {
 
 impl core::fmt::Debug for Tensor {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let source = match &self.inner.source {
-            Source::Placeholder => "Placeholder",
-            Source::Leaf(_) => "Leaf",
+        let source: &dyn core::fmt::Debug = match &self.inner.source {
+            Source::Placeholder => &"Placeholder",
+            Source::Leaf(_) => &"Leaf",
+            Source::Op(node) => &node.kind,
         };
         f.debug_struct("Tensor")
             .field("shape", &self.inner.shape)
             .field("dtype", &self.inner.dtype)
             .field("layout", &self.inner.layout)
-            .field("source", &source)
+            .field("source", source)
             .finish()
     }
 }
@@ -440,5 +542,88 @@ mod tests {
         let t = Tensor::zeros(&device, [4], DType::F32).expect("zeros");
         assert!(t.cpu_slice::<i32>().is_none());
         assert!(t.cpu_slice::<f32>().is_some());
+    }
+
+    #[test]
+    fn copy_builds_op_node_without_evaluating() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [4, 8], DType::F32).expect("zeros");
+
+        let op = leaf.copy().expect("copy");
+
+        assert!(op.is_op());
+        assert!(!op.is_materialized());
+        assert!(!op.is_placeholder());
+        assert_eq!(op.op_kind(), Some(OpKind::Copy));
+        assert!(op.cpu_bytes().is_none());
+    }
+
+    #[test]
+    fn copy_propagates_shape_dtype_and_device() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [2, 3, 5], DType::BF16).expect("zeros");
+
+        let op = leaf.copy().expect("copy");
+
+        assert_eq!(op.shape(), leaf.shape());
+        assert_eq!(op.dtype(), leaf.dtype());
+        assert_eq!(op.rank(), 3);
+        assert_eq!(op.elem_count(), 30);
+        assert!(op.layout().is_dense_contiguous(op.shape()));
+        assert!(op.device().is_some_and(|d| d.ptr_eq(&device)));
+    }
+
+    #[test]
+    fn copy_input_arc_identity_preserved() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [4], DType::F32).expect("zeros");
+
+        let op = leaf.copy().expect("copy");
+        let inputs = op.op_inputs().expect("op inputs");
+        assert_eq!(inputs.len(), 1);
+        assert!(inputs[0].ptr_eq(&leaf));
+    }
+
+    #[test]
+    fn copy_chain_builds_nested_graph() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [4], DType::F32).expect("zeros");
+
+        let once = leaf.copy().expect("copy 1");
+        let twice = once.copy().expect("copy 2");
+
+        // Outer op references the inner op, not the leaf directly.
+        let outer_inputs = twice.op_inputs().expect("op inputs");
+        assert_eq!(outer_inputs.len(), 1);
+        assert!(outer_inputs[0].ptr_eq(&once));
+
+        // Inner op references the leaf.
+        let inner_inputs = once.op_inputs().expect("op inputs");
+        assert!(inner_inputs[0].ptr_eq(&leaf));
+    }
+
+    #[test]
+    fn cloning_op_tensor_shares_node() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [4], DType::F32).expect("zeros");
+        let op = leaf.copy().expect("copy");
+        let cloned = op.clone();
+        assert!(op.ptr_eq(&cloned));
+    }
+
+    #[test]
+    fn copy_rejects_placeholder() {
+        let p = Tensor::placeholder::<f32>([4, 4]);
+        let err = p.copy().unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn leaf_accessors_return_none_for_op_methods() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [4], DType::F32).expect("zeros");
+        assert!(leaf.op_kind().is_none());
+        assert!(leaf.op_inputs().is_none());
+        assert!(!leaf.is_op());
     }
 }

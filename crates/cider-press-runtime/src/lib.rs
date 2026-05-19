@@ -6,13 +6,13 @@
 //! dispatch is delegated downward to `cider-press-kernels`; model
 //! architectures are layered upward in `cider-press-models`.
 //!
-//! Status: data primitives + storage. This step adds a [`Device`]
-//! handle and a materialized leaf variant to [`Tensor`], so a tensor
-//! can now be backed by a real Metal buffer (allocated via
-//! [`cider_press_kernels`]) and read back host-side via
-//! [`Tensor::cpu_bytes`] / [`Tensor::cpu_slice`]. Lazy op nodes and
-//! `eval()` follow in subsequent commits; see `docs/RUNTIME_DESIGN.md`
-//! for the staged plan.
+//! Status: data primitives + storage + lazy graph. A [`Tensor`] can
+//! be a metadata-only placeholder, a materialized leaf (real Metal
+//! buffer), or a lazy op node referencing input tensors. The first
+//! op constructor is [`Tensor::copy`]; op construction is purely
+//! metadata (no GPU work, no output buffer). `eval()` follows in the
+//! next commit and is what turns op nodes into leaves; see
+//! `docs/RUNTIME_DESIGN.md` for the staged plan.
 //!
 //! Quantized layouts are first-class from day one so the API design
 //! gets stress-tested by the awkward case before it accumulates
@@ -42,4 +42,4 @@ pub use layout::Layout;
 pub use quantization::Quantization;
 pub use shape::Shape;
 pub use strides::Strides;
-pub use tensor::Tensor;
+pub use tensor::{OpKind, Tensor};
