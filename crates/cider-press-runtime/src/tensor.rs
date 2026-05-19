@@ -337,6 +337,59 @@ impl Tensor {
         }
     }
 
+    /// Crate-private constructor for view tensors. Used by the public
+    /// view-building APIs (`reshape`, `permute`, `slice`,
+    /// `broadcast_to`). The new tensor inherits `source`'s dtype and
+    /// device; the caller chooses `shape` and `strides` and supplies a
+    /// `byte_offset` relative to `source`'s backing leaf (i.e. the
+    /// caller is expected to have already folded any
+    /// `source`-is-also-a-view indirection via
+    /// [`Tensor::flatten_view`]).
+    pub(crate) fn view(source: Tensor, byte_offset: usize, shape: Shape, strides: Strides) -> Self {
+        let device = source.inner.device.clone();
+        let dtype = source.inner.dtype;
+        let layout = Layout::Dense { strides };
+        Self {
+            inner: Arc::new(TensorInner {
+                shape,
+                dtype,
+                layout,
+                device,
+                op: None,
+                view: Some(ViewSource {
+                    source,
+                    byte_offset,
+                }),
+                cache: OnceLock::new(),
+            }),
+        }
+    }
+
+    /// Walk through any view-of-view chain to the storage-owning
+    /// tensor (a host leaf or op node) and return it plus the
+    /// accumulated byte offset. The returned tensor either has a
+    /// populated cache (host leaf, evaluated op) or will get one when
+    /// its op is evaluated.
+    ///
+    /// View-building APIs use this to keep new views one hop away
+    /// from the storage owner instead of layering chain after chain.
+    pub(crate) fn flatten_view(&self) -> (Tensor, usize) {
+        let mut inner = &self.inner;
+        let mut offset: usize = 0;
+        while let Some(v) = inner.view.as_ref() {
+            offset = offset
+                .checked_add(v.byte_offset)
+                .expect("byte offset overflowed usize during view-chain flatten");
+            inner = &v.source.inner;
+        }
+        (
+            Tensor {
+                inner: inner.clone(),
+            },
+            offset,
+        )
+    }
+
     /// Crate-private constructor for op tensors (used by op builders
     /// like [`Tensor::copy`] and [`QuantizedWeight::matvec`](crate::QuantizedWeight::matvec)).
     pub(crate) fn op_tensor(
@@ -390,6 +443,56 @@ impl Tensor {
             OpKind::Copy,
             vec![self.clone()],
         ))
+    }
+
+    /// Build a contiguous view of this tensor with a new shape.
+    ///
+    /// Zero-copy: the result shares the source's backing leaf. The
+    /// new shape must have the same element count as the input, and
+    /// the input must currently be contiguous. Non-contiguous inputs
+    /// (transposed, broadcast, sliced along an inner dim) need to be
+    /// materialized via [`Tensor::copy`] first; this restriction
+    /// keeps the op cheap and avoids surprising hidden copies.
+    ///
+    /// The result is dense and contiguous with fresh row-major
+    /// strides for the new shape, regardless of how the source's
+    /// view chain is structured.
+    pub fn reshape(&self, new_shape: impl Into<Shape>) -> Result<Self> {
+        if self.inner.device.is_none() {
+            return Err(Error::InvalidArgument(
+                "reshape: cannot apply a view to a placeholder (no device)".into(),
+            ));
+        }
+        let strides = match self.layout() {
+            Layout::Dense { strides } => strides,
+            Layout::Quantized(_) => {
+                return Err(Error::InvalidArgument(
+                    "reshape: quantized tensors are not supported".into(),
+                ));
+            }
+        };
+        if !strides.is_contiguous(self.shape()) {
+            return Err(Error::InvalidArgument(format!(
+                "reshape: input must be contiguous (got shape {:?} strides {:?})",
+                self.shape().dims(),
+                strides.as_slice(),
+            )));
+        }
+
+        let new_shape = new_shape.into();
+        if new_shape.elem_count() != self.elem_count() {
+            return Err(Error::InvalidArgument(format!(
+                "reshape: element count mismatch ({} -> {}); shapes {:?} -> {:?}",
+                self.elem_count(),
+                new_shape.elem_count(),
+                self.shape().dims(),
+                new_shape.dims(),
+            )));
+        }
+
+        let new_strides = Strides::contiguous(&new_shape);
+        let (source, byte_offset) = self.flatten_view();
+        Ok(Self::view(source, byte_offset, new_shape, new_strides))
     }
 
     /// Materialize this tensor and every unevaluated op node it
@@ -1301,6 +1404,128 @@ mod tests {
         let iter = leaf.cpu_iter::<f32>().expect("cpu_iter");
         assert_eq!(iter.len(), 30);
         assert_eq!(iter.size_hint(), (30, Some(30)));
+    }
+
+    #[test]
+    fn reshape_identity_preserves_values() {
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..24)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [2, 3, 4]).expect("from_slice");
+        let v = leaf.reshape([2, 3, 4]).expect("reshape");
+
+        assert!(v.is_view());
+        assert_eq!(v.shape().dims(), &[2, 3, 4]);
+        assert_eq!(v.cpu_to_vec::<f32>().unwrap(), data);
+    }
+
+    #[test]
+    fn reshape_flatten_then_unflatten_round_trip() {
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..24)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [2, 3, 4]).expect("from_slice");
+        let flat = leaf.reshape([24]).expect("flatten");
+        assert_eq!(flat.shape().dims(), &[24]);
+        assert_eq!(flat.cpu_to_vec::<f32>().unwrap(), data);
+
+        let cube = flat.reshape([4, 6]).expect("unflatten");
+        assert_eq!(cube.shape().dims(), &[4, 6]);
+        assert_eq!(cube.cpu_to_vec::<f32>().unwrap(), data);
+        assert!(cube.layout().is_dense_contiguous(cube.shape()));
+    }
+
+    #[test]
+    fn reshape_view_is_contiguous_via_cpu_bytes() {
+        // Contiguous views must satisfy the cpu_bytes contract: same
+        // logical bytes as cpu_iter would emit.
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..12)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [12]).expect("from_slice");
+
+        let v = leaf.reshape([3, 4]).expect("reshape");
+        let bytes = v
+            .cpu_bytes()
+            .expect("contiguous view should expose cpu_bytes");
+        assert_eq!(bytes.len(), 12 * 4);
+        let typed = v.cpu_slice::<f32>().expect("cpu_slice");
+        assert_eq!(typed, data.as_slice());
+    }
+
+    #[test]
+    fn reshape_folds_view_chain() {
+        // reshape-of-reshape should point directly at the leaf, not at
+        // the intermediate view (one-hop chain instead of two).
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..24)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [24]).expect("from_slice");
+
+        let mid = leaf.reshape([2, 12]).expect("reshape 1");
+        let outer = mid.reshape([4, 3, 2]).expect("reshape 2");
+
+        // Inspect the chain: outer's ViewSource should point at the
+        // leaf directly, not at `mid`.
+        let outer_view = outer.inner.view.as_ref().expect("view");
+        assert!(outer_view.source.ptr_eq(&leaf));
+        assert_eq!(outer_view.byte_offset, 0);
+    }
+
+    #[test]
+    fn reshape_rejects_elem_count_mismatch() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [2, 3], DType::F32).expect("zeros");
+        let err = leaf.reshape([2, 4]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn reshape_rejects_non_contiguous_input() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [2, 3], DType::F32).expect("zeros");
+        // Hand-construct a transposed view (non-contiguous) and try to
+        // reshape it — should error rather than silently producing
+        // wrong data.
+        let transposed = manual_view(&leaf, 0, Shape::from([3, 2]), Strides::from([1isize, 3]));
+        let err = transposed.reshape([6]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn reshape_rejects_quantized() {
+        let t = Tensor::quantized_placeholder([4096, 4096], Quantization::Q4_GS64);
+        let err = t.reshape([4096 * 4096]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn reshape_rejects_placeholder() {
+        let p = Tensor::placeholder::<f32>([2, 3]);
+        let err = p.reshape([6]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn reshape_of_evaluated_op_is_readable() {
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..16)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let src = Tensor::from_slice(&device, &data, [16]).expect("from_slice");
+        let op = src.copy().expect("copy");
+
+        // Reshape an unevaluated op output. The view is constructed
+        // immediately; reading it requires the op to be evaluated.
+        let v = op.reshape([4, 4]).expect("reshape");
+        assert!(!v.is_materialized());
+        op.eval().expect("eval");
+        assert!(v.is_materialized());
+        assert_eq!(v.cpu_to_vec::<f32>().unwrap(), data);
     }
 
     #[test]
