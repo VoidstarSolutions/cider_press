@@ -66,20 +66,31 @@ Subject to verification against `config.json` when we load it.
 Each row is roughly one PR. Lengths are estimates; reality is
 fuzzier and we'll inevitably collapse / split a few.
 
+The big shift from the first draft of this doc: **weight loading moves to
+branch 3, before any new ops land**. Loader needs nothing beyond the storage
+primitives branch 1 already shipped (`from_bytes`, `quantized_from_bytes`),
+and it costs nothing to validate (bytes-in-our-tensors == bytes-in-the-
+safetensors). The payoff is that every later op branch validates against
+real Qwen tensors — layer 0's actual `W_q`, layer 0's actual `gamma` — not
+synthetic fixtures. Catches dtype/layout/shape-convention bugs at the op
+that introduced them, instead of three branches later in some composition.
+
 | # | Branch | Adds | Validated by |
 |---|---|---|---|
-| 1 | (closing now) `feat/runtime-data-primitives` | Tensor, Device, Layout, DType, OpKind, eval, Copy (all dtypes), Qmv (bf16/int4 gs=64) | Stage-4 fixture parity (already passing) |
+| 1 | (done) `feat/runtime-data-primitives` | Tensor, Device, Layout, DType, OpKind, eval, Copy (all dtypes), Qmv (bf16/int4 gs=64) | Stage-4 fixture parity (already passing) |
 | 2 | `feat/runtime-views` | `ViewSource` field on TensorInner; `Tensor::reshape` / `::transpose` / `::slice` / `::broadcast_to`; non-contiguous `cpu_*` accessors | Round-trip tests on reshape/transpose; broadcasting test against MLX shape rules |
-| 3 | `feat/elementwise-add` | First binary op family: vendor MLX's `binary*.metal`, `OpKind::Add`, broadcasting support; while we're here, `OpKind::Mul` | MLX parity on `[B,T,D] + [D]` (broadcasting), `[X] * [X]` (elementwise) |
-| 4 | `feat/rmsnorm` | `OpKind::RmsNorm` (kernel, not composed — perf-critical); vendor `rms_norm.metal` (or compose unary+reduction first, optimize later) | MLX parity on `[B, T, D]` with `[D]` gamma |
-| 5 | `feat/silu-and-gelu` | `OpKind::SiLU` (Qwen uses SwiGLU = silu(gate) * up); maybe GELU for free since same `unary*.metal` | MLX parity per dtype |
-| 6 | `feat/gather` | `OpKind::Gather` for embedding lookup; vendor MLX's gather kernel | MLX parity on random indices |
-| 7 | `feat/kv-cache` | `KvCache` type (separate from Tensor); `update` (eager `Copy` to a slab); view accessors | Round-trip: write N rows, read back via view, compare |
-| 8 | `feat/rope` | `OpKind::Rope` (Qwen RoPE config — base θ, dim split); could be a fused kernel or composed | MLX parity on `[B, T, H, D_h]` Q/K |
-| 9 | `feat/softmax` | `OpKind::Softmax` (reduction along last axis); needed by SDPA and the router (later MoE) | MLX parity |
-| 10 | `feat/sdpa-split` | SDPA as **three ops**: `qk_matmul`, `softmax(scale + mask)`, `attn_matmul`. Composes the previous primitives. Defer fused SDPA. | MLX parity on a single attention block |
-| 11 | `feat/models-scaffold + qwen2` | Bring `cider-press-models` to life: layer modules (`Linear`, `RmsNormLayer`, `Attention`, `Mlp`, `TransformerBlock`, `Qwen2Model`); module pattern | Unit tests per module against MLX equivalents |
-| 12 | `feat/weight-loading` | safetensors integration; Qwen2.5 weight-key mapping; config.json parsing | Load a checkpoint, run one forward pass, match MLX logits |
+| 3 | `feat/weight-loading` | safetensors integration; Qwen2.5 weight-key mapping; `config.json` parsing; HF revision SHA pinned. Includes the per-op MLX activation-dump harness (one `uv run` script that takes op name + shapes + dtypes and writes a parity safetensors). | Loaded tensor bytes == safetensors bytes (memcmp). Shape/dtype assertions match `config.json` predictions. No forward pass yet. |
+| 4 | `feat/elementwise-add` | First binary op family: vendor MLX's `binary*.metal`, `OpKind::Add`, broadcasting support; while we're here, `OpKind::Mul` | MLX parity on `[B,T,D] + [D]` (broadcasting), `[X] * [X]` (elementwise), driven from real layer 0 residual tensors |
+| 5 | `feat/rmsnorm` | Composed: reduction (square → mean) + rsqrt + multiply against broadcast `gamma`. Lands the first reduction primitive, which softmax reuses. Defer a fused `rms_norm.metal` kernel until branch-15 measurements demand it. | MLX parity on `[B, T, D]` against layer 0's real `gamma` |
+| 6 | `feat/silu-and-gelu` | `OpKind::SiLU` (Qwen uses SwiGLU = silu(gate) * up); GELU is mostly free from the same `unary*.metal` | MLX parity per dtype |
+| 7 | `feat/gather` | `OpKind::Gather` for embedding lookup; vendor MLX's gather kernel. **Decision needed here:** tied embeddings are quantized, so either (a) implement quantized-row gather, or (b) gather → `dequantize_row` for the embedding path while qmv handles the LM head. Leaning (b) — embedding gather is once per token at decode and tiny. | MLX parity on random indices against real `W_embed` |
+| 8 | `feat/kv-cache` | `KvCache` type (separate from Tensor); `update` (eager `Copy` to a slab); view accessors | Round-trip: write N rows, read back via view, compare |
+| 9 | `feat/rope` | `OpKind::Rope` (Qwen RoPE config — base θ, dim split); could be a fused kernel or composed | MLX parity on `[B, T, H, D_h]` Q/K |
+| 10 | `feat/softmax` | `OpKind::Softmax` (reduction along last axis, reuses branch-5's reduction primitive); needed by SDPA and the router (later MoE) | MLX parity |
+| 11 | `feat/sdpa-split` | SDPA as **three ops**: `qk_matmul`, `softmax(scale + mask)`, `attn_matmul`. Composes the previous primitives. Defer fused SDPA. | MLX parity on a single attention block driven from real layer 0 weights |
+| 12a | `feat/models-linear-rmsnorm` | `cider-press-models` scaffold; `Linear` and `RmsNormLayer` (thin wrappers around qmv / composed rmsnorm). Module trait/pattern lands here. | Unit tests against MLX equivalents |
+| 12b | `feat/models-attention-mlp` | `Attention` (Q/K/V proj + RoPE + KV cache + SDPA + O proj) and `Mlp` (SwiGLU) | Per-module parity against MLX layer 0 |
+| 12c | `feat/models-qwen2` | `TransformerBlock` + `Qwen2Model`; tied embedding handling; final norm + LM head | Logits parity vs MLX-LM on prefill of a fixed prompt |
 | 13 | `feat/tokenizer` | BPE tokenizer (probably `tokenizers` crate from HF for Qwen's BPE vocab) | Round-trip encode/decode against HF tokenizer |
 | 14 | `feat/cli + greedy decode` | CLI: load model, take prompt, prefill, decode loop, greedy argmax sampling, streamed detokenize | Generate a coherent completion |
 | 15 | `feat/perf-measurement` | Tokens/sec bench against MLX-LM; memory profile; identify hot spots | Numbers documented in `docs/QWEN_PERF.md` |
@@ -121,3 +132,22 @@ Branch 2 (`feat/runtime-views`). Specifically:
 
 The branch is self-contained: no new ops, no model code, no
 weight loading. Just the view machinery.
+
+After that, branch 3 (`feat/weight-loading`) is the first session that
+isn't kernel/runtime muscle-building — it's plumbing. Worth flagging:
+expect a session or two of "no new compute landed" while keys,
+`config.json`, dtype mapping, and the activation-dump harness get nailed
+down. The payoff is sharper parity tests for every branch after.
+
+Specifically for branch 3:
+
+1. Pick a specific MLX-pre-quantized Qwen2.5-0.5B checkpoint on HF and
+   pin its revision SHA. Community quants drift; we want reproducibility.
+2. Build the key-mapping table from HF/MLX names to our `Qwen2Weights`
+   struct field names. Verify against `config.json`-derived expected
+   shapes.
+3. Land the MLX activation-dump harness alongside: a `uv run` script
+   that takes `(op_name, input_shapes, dtypes)` and writes a parity
+   safetensors. Every later op branch adds one case to it.
+4. No forward pass test yet — that's branch 12c's job. Branch 3's job
+   is "the bytes are in the right tensors with the right metadata."
