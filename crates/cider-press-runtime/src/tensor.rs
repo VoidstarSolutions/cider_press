@@ -495,6 +495,75 @@ impl Tensor {
         Ok(Self::view(source, byte_offset, new_shape, new_strides))
     }
 
+    /// Build a permuted view of this tensor.
+    ///
+    /// `axes` must be a permutation of `0..self.rank()`. The result's
+    /// `shape[i]` is `self.shape[axes[i]]` and the result's `strides[i]`
+    /// is `self.strides[axes[i]]` — the same data, viewed in a
+    /// different axis order. Zero-copy; shares the source's backing
+    /// leaf at the same byte offset.
+    ///
+    /// Unlike [`Tensor::reshape`], `permute` does not require the
+    /// input to be contiguous — it composes cleanly with prior view
+    /// ops. (Subsequent ops that *do* require contiguity, like
+    /// `reshape`, will need a materializing copy.)
+    ///
+    /// Matches MLX's `mx.transpose(x, axes)` semantics. Named
+    /// `permute` rather than `transpose` because the latter carries
+    /// linear-algebra "swap last two dims" baggage that doesn't fit
+    /// a general axis reordering.
+    pub fn permute(&self, axes: &[usize]) -> Result<Self> {
+        if self.inner.device.is_none() {
+            return Err(Error::InvalidArgument(
+                "permute: cannot apply a view to a placeholder (no device)".into(),
+            ));
+        }
+        let cur_strides = match self.layout() {
+            Layout::Dense { strides } => strides,
+            Layout::Quantized(_) => {
+                return Err(Error::InvalidArgument(
+                    "permute: quantized tensors are not supported".into(),
+                ));
+            }
+        };
+
+        let rank = self.rank();
+        if axes.len() != rank {
+            return Err(Error::InvalidArgument(format!(
+                "permute: axes length {} does not match tensor rank {}",
+                axes.len(),
+                rank,
+            )));
+        }
+        let mut seen = vec![false; rank];
+        for &axis in axes {
+            if axis >= rank {
+                return Err(Error::InvalidArgument(format!(
+                    "permute: axis {axis} is out of range for rank {rank}",
+                )));
+            }
+            if seen[axis] {
+                return Err(Error::InvalidArgument(format!(
+                    "permute: axis {axis} appears more than once in {axes:?}",
+                )));
+            }
+            seen[axis] = true;
+        }
+
+        let cur_dims = self.shape().dims();
+        let cur_strides_slice = cur_strides.as_slice();
+        let new_dims: Vec<usize> = axes.iter().map(|&a| cur_dims[a]).collect();
+        let new_strides_vec: Vec<isize> = axes.iter().map(|&a| cur_strides_slice[a]).collect();
+
+        let (source, byte_offset) = self.flatten_view();
+        Ok(Self::view(
+            source,
+            byte_offset,
+            Shape::from(new_dims),
+            Strides::from(new_strides_vec),
+        ))
+    }
+
     /// Materialize this tensor and every unevaluated op node it
     /// transitively depends on.
     ///
@@ -1526,6 +1595,148 @@ mod tests {
         op.eval().expect("eval");
         assert!(v.is_materialized());
         assert_eq!(v.cpu_to_vec::<f32>().unwrap(), data);
+    }
+
+    #[test]
+    fn permute_identity_yields_same_values() {
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..24)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [2, 3, 4]).expect("from_slice");
+
+        let same = leaf.permute(&[0, 1, 2]).expect("permute identity");
+        assert_eq!(same.shape().dims(), &[2, 3, 4]);
+        assert_eq!(same.cpu_to_vec::<f32>().unwrap(), data);
+    }
+
+    #[test]
+    fn permute_2d_transpose_matches_manual() {
+        let device = Device::shared().expect("system default device");
+        // [[0,1,2],[3,4,5]]
+        let data: Vec<f32> = (0..6)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [2, 3]).expect("from_slice");
+
+        let t = leaf.permute(&[1, 0]).expect("permute");
+        assert_eq!(t.shape().dims(), &[3, 2]);
+        // Transposed row-major: [[0,3],[1,4],[2,5]]
+        assert_eq!(
+            t.cpu_to_vec::<f32>().unwrap(),
+            vec![0.0, 3.0, 1.0, 4.0, 2.0, 5.0],
+        );
+    }
+
+    #[test]
+    fn permute_4d_attention_pattern() {
+        // [B=2, T=3, H=2, D_h=2] → [B, H, T, D_h] via axes [0, 2, 1, 3]
+        // is the Q/K/V reshape every attention block does.
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..24)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [2, 3, 2, 2]).expect("from_slice");
+
+        let permuted = leaf.permute(&[0, 2, 1, 3]).expect("permute");
+        assert_eq!(permuted.shape().dims(), &[2, 2, 3, 2]);
+
+        // Reference: walk the original (b, t, h, d) layout with the
+        // permuted index (b, h, t, d) and read the value.
+        let mut expected: Vec<f32> = Vec::with_capacity(24);
+        for b in 0..2 {
+            for h in 0..2 {
+                for t in 0..3 {
+                    for d in 0..2 {
+                        let src_idx = ((b * 3 + t) * 2 + h) * 2 + d;
+                        expected.push(data[src_idx]);
+                    }
+                }
+            }
+        }
+        assert_eq!(permuted.cpu_to_vec::<f32>().unwrap(), expected);
+    }
+
+    #[test]
+    fn permute_of_permute_composes() {
+        // Swapping back returns the original logical order.
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..12)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [3, 4]).expect("from_slice");
+
+        let once = leaf.permute(&[1, 0]).expect("permute 1");
+        let twice = once.permute(&[1, 0]).expect("permute 2");
+        assert_eq!(twice.shape().dims(), &[3, 4]);
+        assert_eq!(twice.cpu_to_vec::<f32>().unwrap(), data);
+    }
+
+    #[test]
+    fn permute_folds_through_reshape_chain() {
+        // reshape then permute should keep the view one hop from the
+        // backing leaf, not stack two view nodes.
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..12)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [12]).expect("from_slice");
+        let v = leaf
+            .reshape([3, 4])
+            .expect("reshape")
+            .permute(&[1, 0])
+            .expect("permute");
+        let view_node = v.inner.view.as_ref().expect("view");
+        assert!(view_node.source.ptr_eq(&leaf));
+    }
+
+    #[test]
+    fn permute_rejects_wrong_length() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [2, 3], DType::F32).expect("zeros");
+        let err = leaf.permute(&[0]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn permute_rejects_out_of_range_axis() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [2, 3], DType::F32).expect("zeros");
+        let err = leaf.permute(&[0, 5]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn permute_rejects_duplicate_axis() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [2, 3], DType::F32).expect("zeros");
+        let err = leaf.permute(&[0, 0]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn permute_rejects_quantized() {
+        let t = Tensor::quantized_placeholder([4096, 4096], Quantization::Q4_GS64);
+        let err = t.permute(&[1, 0]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn permute_rejects_placeholder() {
+        let p = Tensor::placeholder::<f32>([2, 3]);
+        let err = p.permute(&[1, 0]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn permuted_view_reports_non_contiguous_cpu_bytes() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [2, 3], DType::F32).expect("zeros");
+        let t = leaf.permute(&[1, 0]).expect("permute");
+        // Transposed strides aren't row-major-contiguous for [3,2].
+        assert!(t.cpu_bytes().is_none());
+        // But cpu_iter still works.
+        assert!(t.cpu_iter::<f32>().is_some());
     }
 
     #[test]
