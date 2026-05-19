@@ -1,0 +1,436 @@
+# Runtime design: lazy `Tensor` + graph + `eval()`
+
+Planning doc for the next slice of `cider-press-runtime`. Picks up
+where `CLAUDE.md`'s post-spike Findings left off. Scope is the layer
+that turns the data primitives (`DType`, `Shape`, `Strides`, `Layout`,
+`Quantization`, the `Tensor` skeleton) into something that can hold
+real buffers, build a graph of operations, and execute them on the
+GPU via `cider-press-kernels`.
+
+This is a *planning* doc, not a spec. Decisions are recorded with
+their reason so future-me can challenge them when something doesn't
+fit. Code lands in follow-up commits.
+
+---
+
+## Goals (this slice)
+
+1. **Storage.** A `Tensor` can be backed by a real Metal buffer, with
+   a typed constructor surface (`zeros`, `from_slice`, `from_bytes`)
+   that allocates via the kernels-layer `Device`.
+2. **Lazy graph.** A `Tensor` can also represent the *result* of an
+   op on other tensors — no GPU work runs at construction.
+3. **`eval()`.** Walking the graph from an unevaluated `Tensor`
+   allocates output buffers, encodes dispatches into a `Commands`,
+   commits, and waits. After `eval()`, every reachable node is a
+   materialized leaf.
+4. **First op coverage.** Enough ops to demonstrate the pattern
+   end-to-end. Concretely: `copy` (already validated in spike) and
+   one quantized matmul (`qmv`, validated bit-exact in Stage 4).
+   That's two ops with very different dispatch shapes — enough to
+   stress-test the abstraction without over-extending it.
+
+## Decided up-front: sync public API
+
+This one is called out separately because, unlike a deferred
+optimization, it shapes every op signature in the runtime. **The
+caller-visible API is synchronous. No `async fn`. Forever.**
+
+The reasoning, briefly:
+
+- Sequential token generation is the dominant workload and is
+  strictly data-dependent (token N+1 needs token N's logits). It
+  has zero pipelining headroom *above* the eval boundary. An async
+  API would buy nothing for this case and would force the entire
+  user codepath (tokenizer, sampler, CLI) to be async — contagion
+  for no benefit.
+- Batched serving is real, but it's a *scheduler* concern that sits
+  above the inference engine, not inside it. vLLM, llama.cpp, and
+  MLX-LM all structure things this way: sync per-request engine,
+  async scheduler on top. The runtime crate is the engine.
+- The 1.5× perf gap to MLX (Stage 5) lives in *internal* dispatch
+  pipelining, not in the public API shape — MLX's `mx.eval` is
+  itself sync. Closing the gap is an implementation concern; see
+  "What pipelining needs" below.
+
+Picking an async runtime (tokio / smol / executor-agnostic
+futures) would be a heavy API tax that doesn't pay for itself on
+this hardware and workload.
+
+## Non-goals (deferred)
+
+- **Buffer pool / allocator.** Use raw `Device::new_buffer` per
+  allocation. The MLX `allocator.cpp` design is the reference for
+  later, but pooling is an optimization, not a design constraint on
+  the public API.
+- **Cross-buffer command-buffer batching / internal pipelining.**
+  First cut: one `Commands` per `eval()`, synchronous commit +
+  wait. The 1.5× perf gap to MLX (Stage 5) lives here — but
+  closing it is a follow-up, not a prerequisite. The graph shape
+  we pick here is what *enables* batching later (see
+  `Source::Pending` below); we don't need to land the scheduling
+  logic now.
+- **Autograd.** Inference only. Ops don't carry backward closures.
+- **Multi-device, multi-stream.** Single shared device, single
+  command queue. Apple-Silicon-only scope makes this trivial.
+- **In-place ops, views, broadcasting tricks.** Get the eager case
+  right first; views and broadcasting are layered on top by
+  decorating `Layout` rather than threading new variants through
+  every op.
+
+## Mental model
+
+Same as MLX's `array` + lazy eval, in idiomatic Rust:
+
+- `Tensor` is a cheap-to-clone handle. Cloning bumps an `Arc`.
+- Behind the `Arc` is a `TensorInner` carrying `Shape`, `DType`,
+  `Layout`, and a `Source`.
+- `Source` is the discriminant for *how this tensor's values are
+  produced*. Three variants in this slice:
+  - `Placeholder` — metadata only (existing). Stays around for
+    test/debug scaffolding; not used by op nodes.
+  - `Leaf(Buffer)` — materialized. Backed by a real `MTLBuffer`
+    (via the kernels-crate `Buffer` wrapper). Either user-supplied
+    (from `zeros` / `from_slice`) or the result of a completed
+    `eval()`.
+  - `Op(OpNode)` — lazy. Carries the op kind and its input
+    tensors. After `eval()`, this variant gets *replaced* with
+    `Leaf` (see "Mutation under `Arc`" below).
+- Building a graph: `Tensor::copy(&a)` returns a new `Tensor` whose
+  `Source` is `Op { kind: Copy, inputs: [a.clone()] }`. No GPU
+  work yet.
+- `t.eval()` walks the DAG rooted at `t`, allocates output buffers
+  for every unevaluated `Op` node, encodes them into one `Commands`,
+  commits, waits, and rewrites each `Op` node into a `Leaf`. After
+  `eval()`, `t` and every dependency are materialized.
+
+### What pipelining needs (future `Source::Pending`)
+
+The sync-public / pipelined-internal split (see "Decided up-front"
+above) is what closes the 1.5× perf gap to MLX without changing op
+signatures. The data model has to admit it without rework. One
+future variant does the job:
+
+```rust
+enum Source {
+    Placeholder,
+    Leaf(Buffer),                // CPU-readable, GPU-done
+    Op(OpNode),                  // not yet encoded
+    Pending(InFlight),           // committed, not yet completed (future)
+}
+
+struct InFlight {
+    buffer: Buffer,                              // already allocated
+    command_buffer: Retained<MTLCommandBuffer>,  // status / waitUntilCompleted
+}
+```
+
+The `Mutex<Source>` rewrite mechanism (see "Mutation under `Arc`")
+already supports the three-step transition `Op → Pending → Leaf`
+just as easily as the two-step `Op → Leaf` we land first. Metal's
+`MTLCommandBuffer` exposes `status` and `waitUntilCompleted`
+natively — no futures executor required to express "in flight" or
+"wait." The user-visible methods stay the same: `t.eval()` blocks
+on completion of any `Pending` ancestor; `t.cpu_bytes()` implicitly
+evaluates if not `Leaf`; `t.is_materialized()` returns true only
+for `Leaf`.
+
+The first-slice `eval()` simply skips ever producing a `Pending`
+state — it transitions straight from `Op` to `Leaf` because it
+calls `waitUntilCompleted` before the rewrite. The variant lands
+when the scheduler does.
+
+## The graph: data-only, not a separate type
+
+There is *no* separate `Graph` type. The graph is the transitive
+closure of `Op::inputs` reachable from the `Tensor` you call
+`eval()` on. This mirrors MLX (`array` self-describes its lineage)
+and keeps the API surface narrow. It also means subgraphs are
+implicit — calling `eval()` on `b` after `eval()` on `a` only
+evaluates what's actually unmaterialized.
+
+The op enum is closed (we own it). No `dyn Op` trait until we have
+a reason — extension by enum variant is fine while the op set is
+small. When it grows past ~20 ops the enum-vs-trait tradeoff is
+worth revisiting; not before.
+
+```rust
+enum OpKind {
+    Copy,
+    Qmv { /* group_size, bits, etc. -- see Quantization */ },
+    // grows
+}
+
+struct OpNode {
+    kind: OpKind,
+    inputs: SmallVec<[Tensor; 4]>, // most ops have ≤4 inputs
+}
+```
+
+## Type-system leverage
+
+Once the sync-API decision is locked in (see "Decided up-front"),
+the type system isn't carrying any async / materialization-state
+load. That frees it for the places it earns its keep: turning
+op-level preconditions into compile-time guarantees, and keeping
+construction-time information available without forcing every
+helper to be generic.
+
+Things we *do* lean on the type system for:
+
+- **Newtypes at the op boundary.** Most ops are layout-agnostic; a
+  few aren't. `qmv` requires a quantized weight with scales and
+  biases; an attention kernel requires a contiguous KV-cache slab;
+  a softmax wants a logits tensor of a specific rank. Encode that
+  in the signature:
+  ```rust
+  fn qmv(w: &QuantizedWeight, x: &Tensor) -> Tensor
+  ```
+  not `fn qmv(a: &Tensor, b: &Tensor) -> Result<Tensor>`.
+  `QuantizedWeight` is a thin newtype around `Tensor` that only
+  `Tensor::quantized_from_bytes(...)` can construct; the
+  `Layout::Quantized(_)` check happens once, at construction.
+  Thereafter the op signatures are infallible at the type level.
+  Same pattern will apply to `KvCache`, `AttentionMask`,
+  `LogitsTensor`, etc. as they show up.
+- **Dtype-typed at construction, dtype-erased on the handle.**
+  Already what we do — `Tensor::placeholder::<f32>(...)` takes the
+  dtype as a type parameter for ergonomic typed construction;
+  `Tensor::dense_placeholder(shape, DType::BF16)` is the
+  runtime-typed escape hatch for model loading. The handle stores
+  `DType` dynamically so a `Vec<Tensor>` of mixed dtypes is
+  expressible without `Box<dyn Anything>`.
+- **Sealed `OpKind` enum.** Closed set, no `dyn Op` trait. We own
+  every op; the extensibility tax of a trait isn't worth paying
+  for a hypothetical third-party extension that isn't in scope.
+  Switch to a trait if/when the variant count gets unwieldy or
+  external extension becomes a real requirement.
+- **`Arc`-based identity for graph dedup.** `Arc::ptr_eq` is the
+  equivalence relation for "same node." Common subexpression
+  elimination is mechanical (walk the graph, collect by pointer
+  identity) rather than requiring us to invent a hash for ops.
+- **`Send + Sync` for `Tensor`.** Falls out of `Arc<TensorInner>` +
+  `Mutex<Source>`. That's what lets a future batched-serving
+  scheduler layer sit on top of the runtime without us having to
+  retrofit thread-safety into core types.
+
+Things we deliberately *don't* encode in the type system:
+
+- **Materialization state on the handle** (typestate `Tensor<Lazy>`
+  / `Tensor<Pending>` / `Tensor<Ready>`). Catches no real bug —
+  the right behavior for `t.cpu_bytes()` on a not-yet-eval'd tensor
+  is to implicitly evaluate, not to refuse to compile — and it
+  would force every helper that takes a `Tensor` to be generic
+  over state. Net negative.
+- **Const-generic rank** (`Tensor<F32, 3>`). LLM forward passes
+  reshape, broadcast, and slice constantly; the static rank ends
+  up dynamic at every interesting boundary. Not worth the tax.
+- **Compile-time dtype on the handle.** Same reason — model
+  loading produces dtype-at-runtime tensors and the generic
+  explosion downstream would be severe. We get the wins of typed
+  construction via the typed constructor surface, then erase.
+- **Compile-time device** (`Tensor<Gpu>` etc.). Single-platform
+  scope makes the abstraction empty.
+
+The newtype-at-the-op-boundary pattern is the high-leverage one to
+get right before the first op signatures cast: it's both the most
+load-bearing for safety and the hardest to retrofit later without
+breaking callers.
+
+## Storage: `Buffer` ownership
+
+The kernels crate already owns `Buffer` (an `MTLBuffer` wrapper).
+The runtime crate's `Source::Leaf` carries a `Buffer` directly.
+Lifetimes are managed by `Arc<TensorInner>` — when the last clone
+drops, the inner drops, the buffer drops, the `MTLBuffer` releases.
+
+`Device` handle: `Tensor`s capture an `Arc<Device>` on construction.
+- Single-device scope makes this implicit (created once at startup
+  or lazily on first allocation, lives forever in practice).
+- Carrying it on every tensor means `t.eval()` works without an
+  explicit device arg — ergonomic.
+- Op constructors assert inputs share the same `Arc<Device>` (cheap
+  `Arc::ptr_eq`). Trivially true today; the check is a guard for
+  later.
+
+Open: do we expose `Device` as a public type, or hide it behind a
+process-global `default_device()` like MLX? Lean toward **expose
+it** — explicit > magical for a library — but provide a
+`Device::shared()` convenience that returns the lazily-initialized
+global. Easy to use, easy to test, no global mutation pain because
+device handles are immutable.
+
+## Mutation under `Arc`: rewriting `Op` → `Leaf`
+
+`eval()` needs to replace the `Source::Op` variant on each
+unevaluated node with `Source::Leaf(buffer)`, so that subsequent
+ops downstream see materialized inputs and the graph is freed.
+
+Two viable shapes:
+
+1. **`Mutex<Source>` inside `TensorInner`.** Simple, well-typed,
+   small overhead (uncontended `Mutex` lock is ~ns on macOS).
+   `Arc<TensorInner>` stays the API.
+2. **`OnceCell<Buffer>` next to `Source`.** `Source` becomes
+   immutable; the leaf-after-eval is recorded separately. Slightly
+   weirder type (two fields encode the same state when materialized)
+   but avoids the lock.
+
+**Pick `Mutex<Source>`.** The simpler invariant is worth a ns
+under uncontended access; we don't have a concurrent-eval story
+yet, and when we do we'll want explicit synchronization anyway.
+The "two fields encoding one state" smell of option (2) is the
+kind of thing that bites later.
+
+## `eval()` algorithm (first cut)
+
+```
+fn eval(&self):
+    1. Collect topological order of unevaluated Op nodes reachable
+       from self. Reverse post-order DFS, dedup by Arc pointer
+       identity. Skip Leaf and Placeholder nodes (already terminal).
+    2. For each Op node in order:
+         a. Allocate output Buffer (via Device::new_buffer).
+         b. Look up the dispatcher for OpKind in a match.
+         c. Dispatcher encodes into the shared Commands, given:
+              - input Buffers (already materialized by prior iters)
+              - output Buffer
+              - shape/dtype/layout from TensorInner
+    3. Commands.commit_and_wait().
+    4. For each Op node in order, swap Source::Op → Source::Leaf
+       under the Mutex.
+```
+
+Simplicity choices:
+
+- One `Commands` per `eval()`. No mid-walk commit. Closes the door
+  on the perf-batching question, opens it back up when we need it.
+- Synchronous wait. No completion handlers, no async API yet. The
+  perf gap this leaves on the table is the same one MLX already
+  beats us by 1.5× on; we're not trying to close it here.
+- Output buffer size is computed from `Shape` + `DType` (dense) or
+  `Shape` + `Quantization` (quantized) — both already implemented
+  on the data primitives.
+
+## Quantized tensors as first-class
+
+Per memory `feedback_api_design`: quantized layouts ride along
+from day one. Concretely:
+
+- `Tensor::quantized_placeholder` already exists. Add
+  `Tensor::quantized_from_bytes(shape, quantization, w, scales,
+  biases)` — takes the three packed buffers MLX's `qmv` needs and
+  constructs a single `Tensor` whose `Layout::Quantized(_)` carries
+  the descriptor. Internally this is *one* `Tensor` of dtype
+  `U32` (the packing word) plus side-channel `Buffer`s for scales
+  and biases.
+- Open question: should scales/biases be separate `Tensor`s
+  (composite op input list), or fields on a `QuantizedLeaf` struct?
+  Lean toward **fields on the leaf** — they're an inseparable unit
+  in MLX's data model, and treating them as independent tensors
+  invites the user to mismatch them. The composite-input shape
+  is easy to switch to later if it turns out we want it (e.g.
+  shared scales across multiple weight tensors).
+
+This is the first place the abstraction will feel awkward, which is
+exactly why we want it in the first slice — surface the awkwardness
+before the API ossifies.
+
+## File layout in `cider-press-runtime`
+
+Current:
+
+```
+src/
+├── dtype.rs
+├── error.rs
+├── layout.rs
+├── lib.rs
+├── quantization.rs
+├── shape.rs
+├── strides.rs
+└── tensor.rs        # skeleton, Source::Placeholder only
+```
+
+After this slice (sketch — actual filenames decided as we go):
+
+```
+src/
+├── device.rs        # Arc<Device> handle, shared()
+├── dtype.rs
+├── error.rs
+├── eval.rs          # topo walk + dispatcher table
+├── layout.rs
+├── lib.rs
+├── ops/
+│   ├── mod.rs       # OpKind enum + Tensor op constructors
+│   ├── copy.rs      # Copy dispatcher
+│   └── qmv.rs       # Qmv dispatcher
+├── quantization.rs
+├── shape.rs
+├── source.rs        # Source enum + OpNode
+├── storage.rs       # Source::Leaf helpers, allocation
+├── strides.rs
+└── tensor.rs        # Tensor + TensorInner, slimmed
+```
+
+## Commit plan
+
+Stage-by-stage, one logical concern per commit (per memory
+`feedback_workflow`):
+
+1. **`Device` handle + `Source::Leaf`.** Add `device.rs`. Replace
+   `Tensor` constructors that today produce `Placeholder` with a
+   typed surface: `zeros`, `from_slice`, `from_bytes`. Each
+   allocates a real `Buffer`. `Placeholder` stays as the
+   metadata-only variant for tests.
+2. **`OpKind` + lazy graph.** Add `ops/mod.rs` and `source.rs`.
+   Add `Tensor::copy(&self)` as the first op — it returns a new
+   `Tensor` with `Source::Op { kind: Copy, inputs: [self.clone()] }`.
+   No `eval()` yet; new tests assert the graph shape (rank, dtype,
+   etc. propagate correctly through the op).
+3. **`eval()` for `Copy`.** Topo walk, single `Commands`, synchronous
+   commit + wait. New test: `Tensor::from_slice(&[1,2,3]).copy().eval()`
+   produces a leaf whose buffer reads back as `[1,2,3]`.
+4. **`Qmv` op + quantized leaf.** Add
+   `Tensor::quantized_from_bytes`, `Tensor::qmv(&w, &x)`, and the
+   dispatcher in `ops/qmv.rs`. Reuse the Stage-4 fixture as the
+   parity test, but now driven through the runtime API instead of
+   raw kernels-crate code.
+
+Each step ends with green tests, formatted code, and updated
+`lib.rs` rustdoc reflecting the new status. `CLAUDE.md` gets a
+status line update at the end of step 4 (the slice is "done" when
+both example ops are wired through the runtime).
+
+## Risks & things I expect to get wrong
+
+- **`Mutex<Source>` ergonomics.** Holding a lock across an
+  allocation in step 2 of `eval()` is fine (single-threaded eval),
+  but if we *ever* want concurrent eval the lock needs splitting.
+  Worth a comment in the code, not worth designing for now.
+- **Op enum vs trait.** I'll regret picking enum the moment we
+  want to extend ops outside the crate. Acceptable trade for the
+  inference-only single-crate scope; revisit if/when `cider-press-models`
+  starts wanting custom ops.
+- **Quantized leaf shape.** The "fields on the leaf" decision is
+  the place I most expect to revise once `qmm`, `dequantize`, and
+  attention's KV-cache quant land. Document the alternative
+  (composite-input form) in the code so the switch is mechanical.
+- **Buffer reuse.** Per-`eval()` allocation will look slow on a
+  real forward pass. The pool design is deliberately deferred but
+  is the next obvious follow-up; reserve the file slot for it
+  (`src/pool.rs`) once `eval()` lands.
+
+## After this slice
+
+Per `CLAUDE.md` post-spike Findings:
+
+- Second kernel: `scaled_dot_product_attention`. Different
+  dispatch pattern; will exercise the op trait/enum question and
+  the multi-output node question (sdpa returns one tensor but
+  often pairs with KV-cache updates).
+- Buffer pool / allocator.
+- Cross-`eval()` command-buffer batching — the lever that should
+  close the 1.5× perf gap to MLX.
+- `.metallib` precompilation strategy for shipping.

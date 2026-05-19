@@ -6,13 +6,17 @@
 //! dispatch is delegated downward to `cider-press-kernels`; model
 //! architectures are layered upward in `cider-press-models`.
 //!
-//! Status: data primitives only. This step lands the type surface —
-//! [`DType`], [`Shape`], [`Strides`], [`Quantization`], [`Layout`],
-//! and a placeholder [`Tensor`] — without yet wiring storage or ops.
+//! Status: data primitives + storage. This step adds a [`Device`]
+//! handle and a materialized leaf variant to [`Tensor`], so a tensor
+//! can now be backed by a real Metal buffer (allocated via
+//! [`cider_press_kernels`]) and read back host-side via
+//! [`Tensor::cpu_bytes`] / [`Tensor::cpu_slice`]. Lazy op nodes and
+//! `eval()` follow in subsequent commits; see `docs/RUNTIME_DESIGN.md`
+//! for the staged plan.
+//!
 //! Quantized layouts are first-class from day one so the API design
 //! gets stress-tested by the awkward case before it accumulates
-//! homogeneous-dense assumptions. The next step (per `CLAUDE.md`) is
-//! the storage + lazy-graph + `eval()` layer.
+//! homogeneous-dense assumptions.
 
 #![cfg_attr(not(target_os = "macos"), allow(unused))]
 
@@ -22,6 +26,7 @@ compile_error!(
      Build on an aarch64-apple-darwin host."
 );
 
+mod device;
 mod dtype;
 mod error;
 mod layout;
@@ -30,6 +35,7 @@ mod shape;
 mod strides;
 mod tensor;
 
+pub use device::Device;
 pub use dtype::{DType, Scalar};
 pub use error::{Error, Result};
 pub use layout::Layout;
