@@ -11,7 +11,8 @@
 //! quantized leaf, or an op node referencing input tensors. Two ops
 //! are wired through the runtime end-to-end:
 //!
-//! - [`Tensor::copy`] — element-wise identity (`f32`, `f16`).
+//! - [`Tensor::copy`] — element-wise identity (`f32`, `f16`, `bf16`,
+//!   `i32`, `u32` — every dtype the runtime currently models).
 //! - [`QuantizedWeight::matvec`] — affine-quantized matvec (bf16
 //!   inputs, bf16 output; bit-exact parity with MLX's
 //!   `mx.quantized_matmul` on the Stage-4 fixture).

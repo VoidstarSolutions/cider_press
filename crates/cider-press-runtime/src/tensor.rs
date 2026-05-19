@@ -821,13 +821,40 @@ mod tests {
     }
 
     #[test]
-    fn eval_rejects_unsupported_dtype() {
+    fn eval_materializes_copy_bf16() {
         let device = Device::shared().expect("system default device");
-        // The kernels crate currently exposes only f32 and f16 copy
-        // variants; eval on a copy with another dtype should error.
-        let src = Tensor::zeros(&device, [4], DType::I32).expect("zeros");
+        let data: Vec<bf16> = (0..32)
+            .map(|i| bf16::from_f32(f32::from(i16::try_from(i).unwrap())))
+            .collect();
+        let src = Tensor::from_slice(&device, &data, [32]).expect("from_slice");
         let dst = src.copy().expect("copy");
-        let err = dst.eval().unwrap_err();
-        assert!(matches!(err, Error::InvalidArgument(_)));
+
+        dst.eval().expect("eval");
+        let read_back = dst.cpu_slice::<bf16>().expect("cpu_slice");
+        assert_eq!(read_back, data.as_slice());
+    }
+
+    #[test]
+    fn eval_materializes_copy_i32() {
+        let device = Device::shared().expect("system default device");
+        let data: Vec<i32> = (0..32).map(|i| i * 7 - 100).collect();
+        let src = Tensor::from_slice(&device, &data, [32]).expect("from_slice");
+        let dst = src.copy().expect("copy");
+
+        dst.eval().expect("eval");
+        let read_back = dst.cpu_slice::<i32>().expect("cpu_slice");
+        assert_eq!(read_back, data.as_slice());
+    }
+
+    #[test]
+    fn eval_materializes_copy_u32() {
+        let device = Device::shared().expect("system default device");
+        let data: Vec<u32> = (0..32u32).map(|i| i.wrapping_mul(0x9E37_79B1)).collect();
+        let src = Tensor::from_slice(&device, &data, [32]).expect("from_slice");
+        let dst = src.copy().expect("copy");
+
+        dst.eval().expect("eval");
+        let read_back = dst.cpu_slice::<u32>().expect("cpu_slice");
+        assert_eq!(read_back, data.as_slice());
     }
 }

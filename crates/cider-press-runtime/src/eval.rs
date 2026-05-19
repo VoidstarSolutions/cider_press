@@ -212,28 +212,36 @@ fn dispatch_copy(
 
     let library = device.copy_library()?;
 
+    // SAFETY (every arm below): the runtime's dtype tag is the source
+    // of truth for the byte contents; reinterpreting `Buffer<u8>` as
+    // the typed view matches what the kernel expects. Byte length
+    // divides evenly because the buffers were sized as
+    // `elem_count * size_bytes` at allocation.
     match inner.dtype {
         DType::F32 => {
-            // SAFETY: the runtime's dtype tag is the source of truth
-            // for the byte contents; reinterpreting `Buffer<u8>` as
-            // `Buffer<f32>` matches what the kernel expects. Byte
-            // length divides evenly because the buffers were sized
-            // as `elem_count * size_bytes` at allocation.
             let src_typed = unsafe { src.reinterpret_as::<f32>() };
             let mut dst_typed = unsafe { dst.reinterpret_as::<f32>() };
             copy::copy_v_f32(commands, library, &src_typed, &mut dst_typed)?;
         }
         DType::F16 => {
-            // SAFETY: same justification as the F32 arm.
             let src_typed = unsafe { src.reinterpret_as::<half::f16>() };
             let mut dst_typed = unsafe { dst.reinterpret_as::<half::f16>() };
             copy::copy_v_f16(commands, library, &src_typed, &mut dst_typed)?;
         }
-        other => {
-            return Err(Error::InvalidArgument(format!(
-                "Copy: dtype {other} is not yet wired through the dispatcher \
-                 (kernels crate currently exposes only f32 and f16)"
-            )));
+        DType::BF16 => {
+            let src_typed = unsafe { src.reinterpret_as::<half::bf16>() };
+            let mut dst_typed = unsafe { dst.reinterpret_as::<half::bf16>() };
+            copy::copy_v_bf16(commands, library, &src_typed, &mut dst_typed)?;
+        }
+        DType::I32 => {
+            let src_typed = unsafe { src.reinterpret_as::<i32>() };
+            let mut dst_typed = unsafe { dst.reinterpret_as::<i32>() };
+            copy::copy_v_i32(commands, library, &src_typed, &mut dst_typed)?;
+        }
+        DType::U32 => {
+            let src_typed = unsafe { src.reinterpret_as::<u32>() };
+            let mut dst_typed = unsafe { dst.reinterpret_as::<u32>() };
+            copy::copy_v_u32(commands, library, &src_typed, &mut dst_typed)?;
         }
     }
 
