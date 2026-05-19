@@ -20,6 +20,7 @@ compile_error!(
 );
 
 mod error;
+pub mod qwen2;
 pub mod safetensors_io;
 
 pub use error::{Error, Result};
