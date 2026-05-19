@@ -658,6 +658,81 @@ impl Tensor {
         ))
     }
 
+    /// Build a broadcast view of this tensor with the target shape.
+    ///
+    /// Follows MLX (and `NumPy`) right-aligned broadcasting:
+    /// - the source shape is right-aligned against `target`;
+    /// - any source axis of size 1 expands to the target's size at
+    ///   that axis, with stride 0 (the underlying element is reread,
+    ///   not copied);
+    /// - any leading axes that `target` has but the source doesn't
+    ///   are prepended with stride 0;
+    /// - any non-1 source axis that doesn't match the target's size
+    ///   at the aligned position is an error.
+    ///
+    /// Zero-copy. The result is non-contiguous whenever any expansion
+    /// is involved, so reads go through [`Tensor::cpu_iter`].
+    pub fn broadcast_to(&self, target: impl Into<Shape>) -> Result<Self> {
+        if self.inner.device.is_none() {
+            return Err(Error::InvalidArgument(
+                "broadcast_to: cannot apply a view to a placeholder (no device)".into(),
+            ));
+        }
+        let cur_strides = match self.layout() {
+            Layout::Dense { strides } => strides,
+            Layout::Quantized(_) => {
+                return Err(Error::InvalidArgument(
+                    "broadcast_to: quantized tensors are not supported".into(),
+                ));
+            }
+        };
+
+        let target = target.into();
+        let src_dims = self.shape().dims();
+        let src_strides_slice = cur_strides.as_slice();
+        let target_dims = target.dims();
+
+        if src_dims.len() > target_dims.len() {
+            return Err(Error::InvalidArgument(format!(
+                "broadcast_to: source rank {} exceeds target rank {}; \
+                 broadcasting can add leading axes but not drop them",
+                src_dims.len(),
+                target_dims.len(),
+            )));
+        }
+
+        let pad = target_dims.len() - src_dims.len();
+        let mut new_strides_vec: Vec<isize> = Vec::with_capacity(target_dims.len());
+        for (axis, &target_dim) in target_dims.iter().enumerate() {
+            if axis < pad {
+                new_strides_vec.push(0);
+            } else {
+                let src_axis = axis - pad;
+                let src_dim = src_dims[src_axis];
+                let src_stride = src_strides_slice[src_axis];
+                if src_dim == target_dim {
+                    new_strides_vec.push(src_stride);
+                } else if src_dim == 1 {
+                    new_strides_vec.push(0);
+                } else {
+                    return Err(Error::InvalidArgument(format!(
+                        "broadcast_to: source axis {src_axis} of size {src_dim} cannot \
+                         broadcast to target axis {axis} of size {target_dim}; \
+                         only size-1 source axes can expand",
+                    )));
+                }
+            }
+        }
+
+        let (source, byte_offset) = self.flatten_view();
+        Ok(Self::view(
+            source,
+            byte_offset,
+            target,
+            Strides::from(new_strides_vec),
+        ))
+    }
+
     /// Materialize this tensor and every unevaluated op node it
     /// transitively depends on.
     ///
@@ -1963,6 +2038,99 @@ mod tests {
         let p = Tensor::placeholder::<f32>([2, 3]);
         let err = p.slice(&[0..2, 0..3]).unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn broadcast_to_pads_leading_axes() {
+        // [D] -> [B, T, D]: the rmsnorm-style gamma broadcast.
+        let device = Device::shared().expect("system default device");
+        let gamma: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let leaf = Tensor::from_slice(&device, &gamma, [4]).expect("from_slice");
+
+        let v = leaf.broadcast_to([2, 3, 4]).expect("broadcast");
+        assert_eq!(v.shape().dims(), &[2, 3, 4]);
+
+        // The full broadcast is gamma repeated B*T times.
+        let expected: Vec<f32> = (0..6).flat_map(|_| gamma.iter().copied()).collect();
+        assert_eq!(v.cpu_iter::<f32>().unwrap().collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn broadcast_to_expands_size_one_axis() {
+        // [1, 4] -> [3, 4]: same-rank broadcast.
+        let device = Device::shared().expect("system default device");
+        let row: Vec<f32> = vec![10.0, 20.0, 30.0, 40.0];
+        let leaf = Tensor::from_slice(&device, &row, [1, 4]).expect("from_slice");
+
+        let v = leaf.broadcast_to([3, 4]).expect("broadcast");
+        let expected: Vec<f32> = (0..3).flat_map(|_| row.iter().copied()).collect();
+        assert_eq!(v.cpu_iter::<f32>().unwrap().collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn broadcast_to_identity_keeps_strides() {
+        // Same shape broadcast is a no-op contents-wise but still
+        // builds a view (cheap and uniform with the other cases).
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..6)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [2, 3]).expect("from_slice");
+        let v = leaf.broadcast_to([2, 3]).expect("broadcast");
+        assert_eq!(v.shape().dims(), &[2, 3]);
+        assert_eq!(v.cpu_iter::<f32>().unwrap().collect::<Vec<_>>(), data);
+    }
+
+    #[test]
+    fn broadcast_to_supports_zero_strides_via_iter() {
+        // Scalar-ish source: [1] broadcast to [5] yields constant view.
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::from_slice(&device, &[42.0_f32], [1]).expect("from_slice");
+        let v = leaf.broadcast_to([5]).expect("broadcast");
+        assert_eq!(
+            v.cpu_iter::<f32>().unwrap().collect::<Vec<_>>(),
+            vec![42.0; 5]
+        );
+    }
+
+    #[test]
+    fn broadcast_to_rejects_non_one_mismatch() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [3, 4], DType::F32).expect("zeros");
+        let err = leaf.broadcast_to([3, 5]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn broadcast_to_rejects_target_with_lower_rank() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [2, 3], DType::F32).expect("zeros");
+        let err = leaf.broadcast_to([3]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn broadcast_to_rejects_quantized() {
+        let t = Tensor::quantized_placeholder([4096, 4096], Quantization::Q4_GS64);
+        let err = t.broadcast_to([4096, 4096]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn broadcast_to_rejects_placeholder() {
+        let p = Tensor::placeholder::<f32>([4]);
+        let err = p.broadcast_to([2, 4]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn broadcast_view_reports_non_contiguous_cpu_bytes() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [4], DType::F32).expect("zeros");
+        let v = leaf.broadcast_to([3, 4]).expect("broadcast");
+        // Stride pattern [0, 1] isn't row-major-contiguous for shape [3, 4].
+        assert!(v.cpu_bytes().is_none());
+        assert!(v.cpu_iter::<f32>().is_some());
     }
 
     #[test]
