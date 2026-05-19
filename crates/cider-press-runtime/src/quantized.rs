@@ -74,7 +74,7 @@ impl QuantizedWeight {
                  (N*K*bits/32 = {expected_w_words} u32 words for shape {:?} with {} bits)",
                 weights.len(),
                 shape,
-                quantization.bits,
+                quantization.bits(),
             )));
         }
         let groups = quantization.group_count(elem_count)?;
@@ -149,18 +149,7 @@ impl QuantizedWeight {
                 "QuantizedWeight::matvec: activation shape must be [{k}]; got {x_shape:?}"
             )));
         }
-        let q = match self.tensor.layout() {
-            Layout::Quantized(q) => *q,
-            Layout::Dense { .. } => {
-                // Unreachable by construction (from_bytes builds Quantized),
-                // but match exhaustively rather than `unreachable!()` —
-                // cheaper to surface than to crash if invariants slip.
-                return Err(Error::InvalidArgument(
-                    "QuantizedWeight: inner tensor lost its quantized layout".into(),
-                ));
-            }
-        };
-
+        let q = self.quantization();
         let out_shape = Shape::from([n]);
         let out_layout = Layout::Dense {
             strides: crate::Strides::contiguous(&out_shape),
@@ -171,8 +160,8 @@ impl QuantizedWeight {
             DType::BF16,
             out_layout,
             OpKind::Qmv {
-                group_size: q.group_size,
-                bits: q.bits,
+                group_size: q.group_size(),
+                bits: q.bits(),
             },
             vec![self.tensor.clone(), x.clone()],
         ))
