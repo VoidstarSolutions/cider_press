@@ -6,12 +6,15 @@
 //! dispatch is delegated downward to `cider-press-kernels`; model
 //! architectures are layered upward in `cider-press-models`.
 //!
-//! Status: data primitives + storage + lazy graph. A [`Tensor`] can
-//! be a metadata-only placeholder, a materialized leaf (real Metal
-//! buffer), or a lazy op node referencing input tensors. The first
-//! op constructor is [`Tensor::copy`]; op construction is purely
-//! metadata (no GPU work, no output buffer). `eval()` follows in the
-//! next commit and is what turns op nodes into leaves; see
+//! Status: data primitives + storage + lazy graph + eval. A
+//! [`Tensor`] can be a metadata-only placeholder, a host-constructed
+//! leaf, or an op node referencing input tensors. The first op is
+//! [`Tensor::copy`]; [`Tensor::eval`] is the synchronous boundary
+//! that walks the graph, dispatches MLX kernels via
+//! [`cider_press_kernels`], blocks on completion, and populates each
+//! op's result cache. After eval, op tensors are materialized and
+//! [`Tensor::cpu_bytes`] / [`Tensor::cpu_slice`] return their bytes.
+//! Currently wired dtypes for `Copy`: `f32`, `f16`. See
 //! `docs/RUNTIME_DESIGN.md` for the staged plan.
 //!
 //! Quantized layouts are first-class from day one so the API design
@@ -29,6 +32,7 @@ compile_error!(
 mod device;
 mod dtype;
 mod error;
+mod eval;
 mod layout;
 mod quantization;
 mod shape;

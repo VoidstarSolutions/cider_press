@@ -93,15 +93,17 @@ Same as MLX's `array` + lazy eval, in idiomatic Rust:
     (via the kernels-crate `Buffer` wrapper). Either user-supplied
     (from `zeros` / `from_slice`) or the result of a completed
     `eval()`.
-  - `Op(OpNode)` — lazy. Carries the op kind and its input
-    tensors. After `eval()`, this variant gets *replaced* with
-    `Leaf` (see "Mutation under `Arc`" below).
+  - `Op(OpNode)` — produced by an op. Carries the op kind and its
+    input tensors. The op metadata is immutable; what changes at
+    `eval()` time is a separate `OnceLock<Buffer>` cache (see
+    "Materialization state" below). An op tensor with a populated
+    cache is the post-eval state — the lineage is preserved.
 - Building a graph: `Tensor::copy(&a)` returns a new `Tensor` whose
   `Source` is `Op { kind: Copy, inputs: [a.clone()] }`. No GPU
   work yet.
 - `t.eval()` walks the DAG rooted at `t`, allocates output buffers
   for every unevaluated `Op` node, encodes them into one `Commands`,
-  commits, waits, and rewrites each `Op` node into a `Leaf`. After
+  commits, waits, and populates each op's result cache. After
   `eval()`, `t` and every dependency are materialized.
 
 ### What pipelining needs (future `Source::Pending`)
@@ -125,20 +127,27 @@ struct InFlight {
 }
 ```
 
-The `Mutex<Source>` rewrite mechanism (see "Mutation under `Arc`")
-already supports the three-step transition `Op → Pending → Leaf`
-just as easily as the two-step `Op → Leaf` we land first. Metal's
+In the implemented model (immutable op metadata + `OnceLock<Buffer>`
+cache; see "Materialization state" below), pipelining is just a
+third state for the cache slot: instead of two states (empty,
+populated) we'd have three (empty, in-flight, ready). Two viable
+shapes for that extension:
+
+- Add an `in_flight: OnceLock<InFlight>` parallel field, set when
+  eval encodes and commits but doesn't wait; `cache` is populated
+  from a completion handler.
+- Replace `OnceLock<Buffer>` with a small custom state machine
+  (`Empty | Pending(InFlight) | Ready(Buffer)`) behind a `Mutex`,
+  paying the read-path lock cost in exchange for atomic transitions.
+
+The first-slice `eval()` skips the in-flight state entirely — it
+calls `waitUntilCompleted` before populating the cache, so readers
+only ever see the empty → ready transition. Picking between the
+two extension shapes can wait until the scheduler design is
+concrete; the public API doesn't depend on the choice. Metal's
 `MTLCommandBuffer` exposes `status` and `waitUntilCompleted`
 natively — no futures executor required to express "in flight" or
-"wait." The user-visible methods stay the same: `t.eval()` blocks
-on completion of any `Pending` ancestor; `t.cpu_bytes()` implicitly
-evaluates if not `Leaf`; `t.is_materialized()` returns true only
-for `Leaf`.
-
-The first-slice `eval()` simply skips ever producing a `Pending`
-state — it transitions straight from `Op` to `Leaf` because it
-calls `waitUntilCompleted` before the rewrite. The variant lands
-when the scheduler does.
+"wait."
 
 ## The graph: data-only, not a separate type
 
@@ -210,9 +219,11 @@ Things we *do* lean on the type system for:
   elimination is mechanical (walk the graph, collect by pointer
   identity) rather than requiring us to invent a hash for ops.
 - **`Send + Sync` for `Tensor`.** Falls out of `Arc<TensorInner>` +
-  `Mutex<Source>`. That's what lets a future batched-serving
-  scheduler layer sit on top of the runtime without us having to
-  retrofit thread-safety into core types.
+  immutable op metadata + `OnceLock<Buffer<u8>>` (with
+  `Buffer<u8>: Send + Sync` added in the kernels crate). That's
+  what lets a future batched-serving scheduler layer sit on top of
+  the runtime without us having to retrofit thread-safety into
+  core types.
 
 Things we deliberately *don't* encode in the type system:
 
@@ -260,27 +271,45 @@ it** — explicit > magical for a library — but provide a
 global. Easy to use, easy to test, no global mutation pain because
 device handles are immutable.
 
-## Mutation under `Arc`: rewriting `Op` → `Leaf`
+## Materialization state: `Option<OpNode>` + `OnceLock<Buffer>`
 
-`eval()` needs to replace the `Source::Op` variant on each
-unevaluated node with `Source::Leaf(buffer)`, so that subsequent
-ops downstream see materialized inputs and the graph is freed.
+`eval()` needs each unevaluated node to acquire a materialized
+buffer so that downstream ops see real bytes.
 
-Two viable shapes:
+Two viable shapes were on the table:
 
-1. **`Mutex<Source>` inside `TensorInner`.** Simple, well-typed,
-   small overhead (uncontended `Mutex` lock is ~ns on macOS).
-   `Arc<TensorInner>` stays the API.
-2. **`OnceCell<Buffer>` next to `Source`.** `Source` becomes
-   immutable; the leaf-after-eval is recorded separately. Slightly
-   weirder type (two fields encode the same state when materialized)
-   but avoids the lock.
+1. **`Mutex<Source>` inside `TensorInner`.** One enum, locked
+   discriminant; eval rewrites `Source::Op` → `Source::Leaf(buffer)`.
+2. **Split fields: immutable op metadata + `OnceLock<Buffer>` cache.**
+   Op metadata is set at construction and never mutated; the buffer
+   slot transitions empty → populated exactly once, monotonically.
 
-**Pick `Mutex<Source>`.** The simpler invariant is worth a ns
-under uncontended access; we don't have a concurrent-eval story
-yet, and when we do we'll want explicit synchronization anyway.
-The "two fields encoding one state" smell of option (2) is the
-kind of thing that bites later.
+**Picked (2).** Originally this doc preferred (1), but implementation
+revealed option (2) is materially simpler:
+
+- **No lock on the read path.** `cpu_bytes()` can return `&[u8]`
+  borrowed directly from the `OnceLock` storage — no `MutexGuard`
+  lifetime leaking into the public API, no closure form needed.
+- **No race window between mutations.** There's exactly one
+  transition (cache empty → populated); the op-metadata field never
+  moves. Compare with a `Mutex<Source>` rewrite, which has to
+  atomically swap a whole variant.
+- **State enumeration is still clean.** `(op, cache)` deterministically
+  encodes four states: placeholder (None, None), host-constructed
+  leaf (None, Some), unevaluated op (Some, None), evaluated op
+  (Some, Some). The "two fields encoding one state" smell the
+  earlier draft worried about doesn't materialize — the fields
+  encode *complementary* facts (lineage vs. materialization), not
+  the same fact twice.
+- **`Send + Sync` falls out** the same way: `OnceLock<Buffer<u8>>`
+  is `Send + Sync` given `Buffer<u8>: Send + Sync` (added to the
+  kernels crate alongside this slice).
+
+The trade-off this gives up: an evaluated op tensor reports both
+`is_op() == true` and `is_materialized() == true`. That's accurate
+(it's an op-produced tensor whose result is cached) and not
+misleading — `is_op` queries lineage, `is_materialized` queries
+readiness.
 
 ## `eval()` algorithm (first cut)
 
@@ -405,10 +434,11 @@ both example ops are wired through the runtime).
 
 ## Risks & things I expect to get wrong
 
-- **`Mutex<Source>` ergonomics.** Holding a lock across an
-  allocation in step 2 of `eval()` is fine (single-threaded eval),
-  but if we *ever* want concurrent eval the lock needs splitting.
-  Worth a comment in the code, not worth designing for now.
+- **`OnceLock<Buffer>` race semantics.** Two threads concurrently
+  evaluating the same node both produce an output; one set wins,
+  the other's buffer is dropped. Wastes work but is correct (both
+  produce the same bytes). Fine for now; revisit when concurrent
+  eval becomes a thing.
 - **Op enum vs trait.** I'll regret picking enum the moment we
   want to extend ops outside the crate. Acceptable trade for the
   inference-only single-crate scope; revisit if/when `cider-press-models`

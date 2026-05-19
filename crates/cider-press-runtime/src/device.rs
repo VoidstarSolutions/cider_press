@@ -8,6 +8,11 @@
 //! equal via [`Arc::ptr_eq`], which the op layer uses to assert all
 //! inputs share a device.
 //!
+//! The handle also owns lazily-initialized JIT'd kernel libraries
+//! (e.g. the vendored MLX `copy.metal`) that the dispatcher needs at
+//! eval time. JIT cost is amortized across every `eval()` on this
+//! device, not paid per-dispatch.
+//!
 //! [`Device::shared`] returns a lazily-initialized process-global
 //! default device for the common single-device case. Construct an
 //! explicit handle via [`Device::system_default`] when you need
@@ -20,6 +25,13 @@ use cider_press_kernels as kernels;
 
 use crate::error::Result;
 
+struct DeviceInner {
+    kernels: kernels::Device,
+    /// JIT'd MLX `copy.metal` library. Populated on first `eval()`
+    /// that needs it; subsequent calls reuse the cached library.
+    copy_library: OnceLock<kernels::KernelLibrary>,
+}
+
 /// Refcounted handle to the system's default Metal device.
 ///
 /// Cheap to clone (bumps an [`Arc`]). Identity is by pointer: two
@@ -27,7 +39,7 @@ use crate::error::Result;
 /// same kernels-layer device.
 #[derive(Clone)]
 pub struct Device {
-    inner: Arc<kernels::Device>,
+    inner: Arc<DeviceInner>,
 }
 
 impl Device {
@@ -37,7 +49,10 @@ impl Device {
     /// the common case of a single process-wide device.
     pub fn system_default() -> Result<Self> {
         Ok(Self {
-            inner: Arc::new(kernels::Device::system_default()?),
+            inner: Arc::new(DeviceInner {
+                kernels: kernels::Device::system_default()?,
+                copy_library: OnceLock::new(),
+            }),
         })
     }
 
@@ -50,13 +65,16 @@ impl Device {
     /// expected to flap, but caching a `Result` would require `Error:
     /// Clone` which we don't want to commit to crate-wide.
     pub fn shared() -> Result<Self> {
-        static SHARED: OnceLock<Arc<kernels::Device>> = OnceLock::new();
+        static SHARED: OnceLock<Arc<DeviceInner>> = OnceLock::new();
         if let Some(inner) = SHARED.get() {
             return Ok(Self {
                 inner: inner.clone(),
             });
         }
-        let fresh = Arc::new(kernels::Device::system_default()?);
+        let fresh = Arc::new(DeviceInner {
+            kernels: kernels::Device::system_default()?,
+            copy_library: OnceLock::new(),
+        });
         let stored = SHARED.get_or_init(|| fresh);
         Ok(Self {
             inner: stored.clone(),
@@ -74,7 +92,22 @@ impl Device {
     /// runtime uses this to thread allocation and dispatch through;
     /// callers outside the crate should stay at the [`Device`] level.
     pub(crate) fn kernels(&self) -> &kernels::Device {
-        &self.inner
+        &self.inner.kernels
+    }
+
+    /// Lazily JIT-compile and cache MLX's `copy.metal` library.
+    ///
+    /// First call pays the JIT cost (sub-100 ms warm — Metal caches
+    /// the compiled library to disk across processes). Subsequent
+    /// calls return the cached library.
+    pub(crate) fn copy_library(&self) -> Result<&kernels::KernelLibrary> {
+        if let Some(lib) = self.inner.copy_library.get() {
+            return Ok(lib);
+        }
+        let lib = kernels::KernelLibrary::copy(&self.inner.kernels)?;
+        // Race-safe: if another thread already populated the slot, the
+        // value we just built is dropped and the stored one is returned.
+        Ok(self.inner.copy_library.get_or_init(|| lib))
     }
 }
 
@@ -109,5 +142,13 @@ mod tests {
         let a = Device::shared().expect("shared device");
         let b = a.clone();
         assert!(a.ptr_eq(&b));
+    }
+
+    #[test]
+    fn copy_library_is_cached() {
+        let d = Device::shared().expect("shared device");
+        let a = std::ptr::from_ref(d.copy_library().expect("copy library"));
+        let b = std::ptr::from_ref(d.copy_library().expect("copy library"));
+        assert_eq!(a, b);
     }
 }
