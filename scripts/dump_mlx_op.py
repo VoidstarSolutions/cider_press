@@ -46,6 +46,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import mlx.core as mx
+import mlx.nn as nn
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +228,50 @@ def run_erf(args: argparse.Namespace) -> dict[str, mx.array]:
 
 
 # ---------------------------------------------------------------------------
+# silu / gelu: composed activations against MLX's mlx.nn references
+# (consumed by branch 6 `feat/silu-and-gelu`). silu = x * sigmoid(x);
+# gelu is the exact erf-based variant (mlx.nn.gelu, not the tanh
+# approx). Writes `lhs`, `out`. The composed-path tolerance on the
+# Rust side is bf16-compose (each intermediate rounds to bf16); under
+# f32 we expect bit-exact since both sides reduce to the same
+# arithmetic in the same order.
+# ---------------------------------------------------------------------------
+
+
+def add_silu_parser(subparsers: argparse._SubParsersAction) -> None:
+    p = subparsers.add_parser("silu", help="x * sigmoid(x) via mlx.nn.silu")
+    p.add_argument("--lhs-shape", required=True, help="comma-separated, e.g. 1,8,896")
+    p.add_argument("--dtype", default="bf16", help="one of f32, f16, bf16")
+
+
+def run_silu(args: argparse.Namespace) -> dict[str, mx.array]:
+    shape = _parse_shape(args.lhs_shape)
+    dtype = _float_dtype(args.dtype)
+    lhs = (mx.random.uniform(shape=shape) - 0.5).astype(dtype)
+    out = nn.silu(lhs)
+    mx.eval(lhs, out)
+    return {"lhs": lhs, "out": out}
+
+
+def add_gelu_parser(subparsers: argparse._SubParsersAction) -> None:
+    p = subparsers.add_parser(
+        "gelu",
+        help="0.5 * x * (1 + erf(x / sqrt(2))) via mlx.nn.gelu (exact)",
+    )
+    p.add_argument("--lhs-shape", required=True, help="comma-separated, e.g. 1,8,896")
+    p.add_argument("--dtype", default="bf16", help="one of f32, f16, bf16")
+
+
+def run_gelu(args: argparse.Namespace) -> dict[str, mx.array]:
+    shape = _parse_shape(args.lhs_shape)
+    dtype = _float_dtype(args.dtype)
+    lhs = (mx.random.uniform(shape=shape) - 0.5).astype(dtype)
+    out = nn.gelu(lhs)
+    mx.eval(lhs, out)
+    return {"lhs": lhs, "out": out}
+
+
+# ---------------------------------------------------------------------------
 # mul: element-wise multiply with broadcasting. Writes `lhs`, `rhs`, `out`.
 # Shares the add-style argparser and seeding convention.
 # ---------------------------------------------------------------------------
@@ -268,6 +313,8 @@ OPS: dict[str, tuple[ParserBuilder, Runner]] = {
     "rms_norm": (add_rms_norm_parser, run_rms_norm),
     "sigmoid": (add_sigmoid_parser, run_sigmoid),
     "erf": (add_erf_parser, run_erf),
+    "silu": (add_silu_parser, run_silu),
+    "gelu": (add_gelu_parser, run_gelu),
 }
 
 
