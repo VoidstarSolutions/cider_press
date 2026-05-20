@@ -210,6 +210,42 @@ mod tests {
     }
 
     #[test]
+    fn head_dim_rejects_zero_attention_heads() {
+        let cfg = Qwen2Config {
+            hidden_size: 8,
+            num_hidden_layers: 1,
+            num_attention_heads: 0,
+            num_key_value_heads: 1,
+            intermediate_size: 1,
+            vocab_size: 1,
+            max_position_embeddings: 1,
+            rope_theta: 1.0,
+            rms_norm_eps: 1.0,
+            tie_word_embeddings: false,
+            quantization: None,
+        };
+        assert!(matches!(cfg.head_dim(), Err(Error::InvalidArgument(_))));
+    }
+
+    #[test]
+    fn gqa_ratio_rejects_zero_kv_heads() {
+        let cfg = Qwen2Config {
+            hidden_size: 8,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 0,
+            intermediate_size: 1,
+            vocab_size: 1,
+            max_position_embeddings: 1,
+            rope_theta: 1.0,
+            rms_norm_eps: 1.0,
+            tie_word_embeddings: false,
+            quantization: None,
+        };
+        assert!(matches!(cfg.gqa_ratio(), Err(Error::InvalidArgument(_))));
+    }
+
+    #[test]
     fn hf_revision_is_full_sha() {
         // Sanity: the pinned revision is a 40-hex-char commit SHA.
         // Catches accidental truncation when bumping.
