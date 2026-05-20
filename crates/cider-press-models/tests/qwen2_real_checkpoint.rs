@@ -27,9 +27,8 @@ use safetensors::SafeTensors;
 /// that's almost always operator error worth surfacing immediately.
 fn checkpoint_path() -> Option<PathBuf> {
     let raw = std::env::var("CIDER_QWEN_CHECKPOINT_PATH").ok()?;
-    let path = fs::canonicalize(&raw).unwrap_or_else(|err| {
-        panic!("CIDER_QWEN_CHECKPOINT_PATH={raw} does not resolve: {err}")
-    });
+    let path = fs::canonicalize(&raw)
+        .unwrap_or_else(|err| panic!("CIDER_QWEN_CHECKPOINT_PATH={raw} does not resolve: {err}"));
     assert!(
         path.is_dir(),
         "CIDER_QWEN_CHECKPOINT_PATH={} is not a directory",
