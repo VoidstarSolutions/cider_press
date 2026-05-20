@@ -141,22 +141,3 @@ Open question carried forward from branch 4: whether to introduce a
 the reduction, or to fuse them into the reduce. The MLX path
 exposes them as separate ops via `unary.metal`; leaning the same
 way for symmetry with branch 4.
-
-After that, branch 3 (`feat/weight-loading`) is the first session that
-isn't kernel/runtime muscle-building — it's plumbing. Worth flagging:
-expect a session or two of "no new compute landed" while keys,
-`config.json`, dtype mapping, and the activation-dump harness get nailed
-down. The payoff is sharper parity tests for every branch after.
-
-Specifically for branch 3:
-
-1. Pick a specific MLX-pre-quantized Qwen2.5-0.5B checkpoint on HF and
-   pin its revision SHA. Community quants drift; we want reproducibility.
-2. Build the key-mapping table from HF/MLX names to our `Qwen2Weights`
-   struct field names. Verify against `config.json`-derived expected
-   shapes.
-3. Land the MLX activation-dump harness alongside: a `uv run` script
-   that takes `(op_name, input_shapes, dtypes)` and writes a parity
-   safetensors. Every later op branch adds one case to it.
-4. No forward pass test yet — that's branch 12c's job. Branch 3's job
-   is "the bytes are in the right tensors with the right metadata."

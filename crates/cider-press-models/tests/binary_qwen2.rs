@@ -245,7 +245,9 @@ fn tempdir() -> PathBuf {
         .expect("SystemTime")
         .as_nanos();
     let pid = std::process::id();
-    let dir = std::env::temp_dir().join(format!("cider-press-models-binary-parity-{pid}-{nanos}"));
+    let dir = workspace_root()
+        .join("target")
+        .join(format!("cider-press-models-binary-parity-{pid}-{nanos}"));
     fs::create_dir_all(&dir).expect("mktemp");
     dir
 }
