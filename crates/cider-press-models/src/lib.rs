@@ -2,14 +2,15 @@
 //!
 //! Sits on top of [`cider_press_runtime`]: model code consumes the
 //! runtime's `Tensor` and ops, never reaches into kernel dispatch
-//! directly. Per-architecture modules will be gated behind submodules
-//! (e.g. `qwen2`, landing in subsequent commits); the safetensors
-//! plumbing in [`safetensors_io`] is shared across them.
+//! directly. Per-architecture modules live in submodules (currently
+//! [`qwen2`]); the safetensors plumbing in [`safetensors_io`] is
+//! shared across them.
 //!
-//! Status: weight-loader plumbing landing now. `safetensors_io` reads
+//! Status: weight-loader plumbing in place. `safetensors_io` reads
 //! dense and quantized tensors out of a parsed safetensors archive
-//! into the runtime's `Tensor` / `QuantizedWeight` types. The Qwen2
-//! config + weight-mapping layer is the next commit.
+//! into the runtime's `Tensor` / `QuantizedWeight` types, and
+//! [`qwen2`] provides the Qwen2 config schema plus
+//! `load_qwen2_weights` key mapping.
 
 #![cfg_attr(not(target_os = "macos"), allow(unused))]
 

@@ -58,32 +58,32 @@ def _parse_shape(text: str) -> tuple[int, ...]:
     return tuple(int(part) for part in text.split(",") if part)
 
 
-_DTYPES = {
+_FLOAT_DTYPES = {
     "f32": mx.float32,
     "f16": mx.float16,
     "bf16": mx.bfloat16,
-    "i32": mx.int32,
-    "u32": mx.uint32,
 }
 
 
-def _dtype(name: str) -> mx.Dtype:
-    if name not in _DTYPES:
-        raise SystemExit(f"unknown dtype {name!r}; expected one of {sorted(_DTYPES)}")
-    return _DTYPES[name]
+def _float_dtype(name: str) -> mx.Dtype:
+    if name not in _FLOAT_DTYPES:
+        raise SystemExit(
+            f"unknown dtype {name!r}; expected one of {sorted(_FLOAT_DTYPES)}"
+        )
+    return _FLOAT_DTYPES[name]
 
 
 def add_add_parser(subparsers: argparse._SubParsersAction) -> None:
     p = subparsers.add_parser("add", help="Element-wise add with NumPy broadcasting")
     p.add_argument("--lhs-shape", required=True, help="comma-separated, e.g. 2,3,4")
     p.add_argument("--rhs-shape", required=True, help="comma-separated, e.g. 4")
-    p.add_argument("--dtype", default="bf16", help="one of f32, f16, bf16, i32, u32")
+    p.add_argument("--dtype", default="bf16", help="one of f32, f16, bf16")
 
 
 def run_add(args: argparse.Namespace) -> dict[str, mx.array]:
     lhs_shape = _parse_shape(args.lhs_shape)
     rhs_shape = _parse_shape(args.rhs_shape)
-    dtype = _dtype(args.dtype)
+    dtype = _float_dtype(args.dtype)
     lhs = (mx.random.uniform(shape=lhs_shape) - 0.5).astype(dtype)
     rhs = (mx.random.uniform(shape=rhs_shape) - 0.5).astype(dtype)
     out = mx.add(lhs, rhs)
@@ -124,7 +124,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
-    if args.op not in OPS:  # argparse should already enforce, defence in depth.
+    if args.op not in OPS:  # argparse should already enforce, defense in depth.
         raise SystemExit(f"unknown op {args.op!r}")
     mx.random.seed(args.seed)
     _, runner = OPS[args.op]

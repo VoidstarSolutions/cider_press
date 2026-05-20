@@ -22,12 +22,14 @@ use cider_press_runtime::Device;
 use safetensors::SafeTensors;
 
 /// Skip-or-load helper. Returns `None` if the env var isn't set,
-/// otherwise returns the absolute path. Panics if the env var is set
-/// but the path doesn't resolve — that's almost always operator error
-/// worth surfacing immediately.
+/// otherwise returns the canonicalized absolute path. Panics if the
+/// env var is set but the path doesn't resolve to a directory —
+/// that's almost always operator error worth surfacing immediately.
 fn checkpoint_path() -> Option<PathBuf> {
     let raw = std::env::var("CIDER_QWEN_CHECKPOINT_PATH").ok()?;
-    let path = PathBuf::from(raw);
+    let path = fs::canonicalize(&raw).unwrap_or_else(|err| {
+        panic!("CIDER_QWEN_CHECKPOINT_PATH={raw} does not resolve: {err}")
+    });
     assert!(
         path.is_dir(),
         "CIDER_QWEN_CHECKPOINT_PATH={} is not a directory",

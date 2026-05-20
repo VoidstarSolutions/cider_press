@@ -1,9 +1,8 @@
 //! Read tensor entries out of a parsed safetensors archive into the
 //! runtime's [`Tensor`] / [`QuantizedWeight`] types.
 //!
-//! Architecture-agnostic plumbing — the per-model key-mapping layer
-//! lives in submodules like `crate::qwen2` (landing in subsequent
-//! commits) and uses these helpers.
+//! Architecture-agnostic plumbing — per-model key-mapping layers
+//! (e.g. [`crate::qwen2`]) use these helpers.
 //!
 //! Two flavours:
 //!
