@@ -81,7 +81,7 @@ that introduced them, instead of three branches later in some composition.
 | 2 | `feat/runtime-views` | `ViewSource` field on TensorInner; `Tensor::reshape` / `::transpose` / `::slice` / `::broadcast_to`; non-contiguous `cpu_*` accessors | Round-trip tests on reshape/transpose; broadcasting test against MLX shape rules |
 | 3 | `feat/weight-loading` | safetensors integration; Qwen2.5 weight-key mapping; `config.json` parsing; HF revision SHA pinned. Includes the per-op MLX activation-dump harness (one `uv run` script that takes op name + shapes + dtypes and writes a parity safetensors). | Loaded tensor bytes == safetensors bytes (memcmp). Shape/dtype assertions match `config.json` predictions. No forward pass yet. |
 | 4 | (done) `feat/elementwise-add` | First binary op family: vendored MLX's `binary.metal`, `OpKind::Binary { op: Add \| Mul }`, NumPy broadcasting via existing `broadcast_to`; `vv_*` fast path + `g{1,2,3}_*` rank-specialised strided paths for f32/f16/bf16 | MLX bit-exact parity at kernels, runtime, and models levels: synthetic `[1,8,896]` same-shape and broadcast `+[896]`; gated real-checkpoint test loads `layer0.input_layernorm` and broadcast-adds it bit-exactly vs a CPU bf16 reference |
-| 5 | `feat/rmsnorm` | Composed: reduction (square → mean) + rsqrt + multiply against broadcast `gamma`. Lands the first reduction primitive, which softmax reuses. Defer a fused `rms_norm.metal` kernel until branch-15 measurements demand it. | MLX parity on `[B, T, D]` against layer 0's real `gamma` |
+| 5 | (done) `feat/rmsnorm` | Vendored MLX's `unary.metal` + `reduce.metal`. Kernels: `v_{square,rsqrt}_*` (6 fns) + `row_reduce_{sum,prod,min,max}_*` (12 fns, with `init_reduce` + `row_reduce_looped` bundled per op). Runtime: `OpKind::Unary` + `OpKind::Reduce`, `Tensor::{square, rsqrt, sum, prod, min, max, mean}`. Models: `nn::rms_norm(x, gamma, eps)` composed (no fused kernel). | MLX parity on `[1, 8, 896]` bf16 vs `mx.fast.rms_norm` (composed-path tolerance) plus gated real-checkpoint test against `layer0.input_layernorm` + CPU f32 reference |
 | 6 | `feat/silu-and-gelu` | `OpKind::SiLU` (Qwen uses SwiGLU = silu(gate) * up); GELU is mostly free from the same `unary*.metal` | MLX parity per dtype |
 | 7 | `feat/gather` | `OpKind::Gather` for embedding lookup; vendor MLX's gather kernel. **Decision needed here:** tied embeddings are quantized, so either (a) implement quantized-row gather, or (b) gather → `dequantize_row` for the embedding path while qmv handles the LM head. Leaning (b) — embedding gather is once per token at decode and tiny. | MLX parity on random indices against real `W_embed` |
 | 8 | `feat/kv-cache` | `KvCache` type (separate from Tensor); `update` (eager `Copy` to a slab); view accessors | Round-trip: write N rows, read back via view, compare |
@@ -118,26 +118,27 @@ for "it's fast and clean" but can wait until branch 15+:
 
 ## What to do next time we sit down
 
-Branch 5 (`feat/rmsnorm`). Specifically:
+Branch 6 (`feat/silu-and-gelu`). Specifically:
 
-1. Decide reduction primitive shape. RMSNorm needs `mean(x²)` along
-   the last axis, then `rsqrt` of that, then a broadcast-multiply
-   against `gamma`. The multiply already exists (branch 4); the
-   reduction does not. Probably want `OpKind::Reduce` parametrised
-   by reduction kind + axis, dispatching MLX's `reduce*.metal`.
-2. Look at MLX's `reduce.cpp` for the dispatch pattern (this is the
-   first reduction, so it's the analogue of branch 4's first
-   look at `binary.cpp`).
-3. Compose: `square → reduce(mean, axis=-1) → rsqrt → broadcast_mul
-   → mul(gamma)`. Watch for the keep-dim semantics so the broadcast
-   back works without an extra reshape.
-4. Parity test against `layer0.input_layernorm`'s real `gamma`
-   loaded via `load_qwen2_weights`, comparing against MLX's
-   `mx.fast.rms_norm` (or `mx.linalg.norm`-based reference if
-   `fast.rms_norm` is in a different module).
+1. SiLU is the activation in Qwen's SwiGLU MLP: the gate-proj output
+   passes through SiLU then multiplies the up-proj output. GELU
+   isn't used by Qwen but is the next-most-common transformer
+   activation and comes essentially for free off the same
+   `unary.metal` we already vendored in branch 5 — both are single
+   instantiations of the existing dispatch pattern.
+2. Plumbing: add `UnaryOp::{Silu, Gelu}` to the runtime enum and
+   matching `Tensor::silu` / `Tensor::gelu` methods. The kernels
+   crate adds `v_{silu,gelu}_{f32,f16,bf16}` (6 fns) following the
+   exact shape `v_square_*` and `v_rsqrt_*` already use.
+3. Parity: extend `dump_mlx_op.py` with `silu` and `gelu` cases and
+   add bit-exact parity tests at the kernels + runtime layers. No
+   real-checkpoint test needed — these are pointwise primitives and
+   the loader doesn't change.
 
-Open question carried forward from branch 4: whether to introduce a
-`Tensor::square` / `Tensor::rsqrt` (Unary op family) before doing
-the reduction, or to fuse them into the reduce. The MLX path
-exposes them as separate ops via `unary.metal`; leaning the same
-way for symmetry with branch 4.
+Open question carried forward from branch 5 reduce-scope discussion:
+whether the deferred kernel variants (`row_reduce_simple` for high
+out-count cases, `all_reduce` for full-tensor collapse, `col_reduce`
+for non-last reductions) should be wired alongside their first
+consumer or in a dedicated reduction perf pass. Leaning the former
+for `row_reduce_simple` (softmax on branch 10 wants it for prefill
+perf) and the latter for the rest.

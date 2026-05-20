@@ -69,7 +69,7 @@ crate re-exports from runtime + models. Workspace-level
 version pins in one place; each member uses `lints.workspace = true`
 and `dep.workspace = true`.
 
-## Current state: elementwise Add/Mul landed
+## Current state: RMSNorm landed
 
 The development spike (Stages 0–5 below) passed every acceptance bar,
 including bit-exact `qmv` parity with MLX's own `quantized_matmul`.
@@ -117,6 +117,30 @@ branch-by-branch roadmap):
   CPU bf16 reference). CI now installs `uv` via
   `astral-sh/setup-uv@v6` so parity tests can shell out to
   `dump_mlx_op.py` at test time without checking in fixture bytes.
+- **Branch 5 (`feat/rmsnorm`).** First reduction + unary op
+  families, then `RMSNorm` composed from them. Vendored
+  `unary.metal` + `reduce.metal` (and transitive headers). Kernels
+  crate exposes `v_{square,rsqrt}_{f32,f16,bf16}` (6 fns) and
+  `row_reduce_{sum,prod,min,max}_{f32,f16,bf16}` (12 fns); the
+  reduce surface adopts a cleaner API than mirroring kernel host
+  names — one `pub fn` per (op, dtype) that internally issues
+  `init_reduce_*` + the right reducer variant. Variant scope is
+  `row_reduce_looped` only; simple/all/col land when consumers
+  appear. Axis scope is last-axis only; non-last reductions can
+  be expressed via `permute` first. Runtime adds `OpKind::Unary`
+  + `OpKind::Reduce` (`ReduceKind::Sum/Prod/Min/Max` — no `Mean`,
+  composed) and `Tensor::{square, rsqrt, sum, prod, min, max,
+  mean}`. The eps in RMSNorm flows through the graph as a
+  host-side `[1]`-tensor broadcast through the existing binary
+  path (deferred MLX scalar `sv_/vs_` kernels; perf delta vs `[1]`
+  broadcast is essentially zero at this scale). Models crate ships
+  `nn::rms_norm(x, gamma, eps)` composed as `x * rsqrt(mean(x²) +
+  eps) * gamma`. Validated against `mx.fast.rms_norm` at bf16
+  tolerance (composed path costs more bf16 round-trips than the
+  fused kernel; well under 1 bf16 ULP) plus a gated real-checkpoint
+  test that runs `nn::rms_norm` against the loaded layer-0
+  `input_layernorm` weight at `config.rms_norm_eps`, vs a CPU f32
+  reference.
 
 **Concrete target: Qwen2.5-0.5B-Instruct running interactively.**
 Smallest published dense Qwen; same architecture family as the
@@ -125,15 +149,13 @@ branch-by-branch roadmap; `docs/RUNTIME_DESIGN.md` has the
 framework-gap analysis for the two structural additions we know
 we'll need (Views landed in branch 2; `KvCache` type comes later).
 
-**Next concrete step: branch 5 of the roadmap — `feat/rmsnorm`.**
-First reduction primitive (`mean(x²)` along the last axis), composed
-with `rsqrt` and broadcast `mul` against `gamma` to form RMSNorm.
-Multiply + broadcast already work as of branch 4; the new surface is
-the reduction op (`OpKind::Reduce` over `reduce*.metal`) and probably
-a small unary-op family (`square`, `rsqrt`) factored from MLX's
-`unary.metal`. Validates via `dump_mlx_op.py` against MLX's
-`mx.fast.rms_norm` and against `layer0.input_layernorm`'s real
-`gamma` loaded by `load_qwen2_weights`.
+**Next concrete step: branch 6 of the roadmap — `feat/silu-and-gelu`.**
+SiLU (used in Qwen's SwiGLU as `silu(gate) * up`) plus GELU come
+mostly for free off the same `unary.metal` we already vendored in
+branch 5 — just two new entries in `kernels::unary` + matching
+`Tensor::silu` / `Tensor::gelu`. After branch 6, branch 7 is
+`feat/gather` (embedding lookup) and the deferred quantized-gather
+decision (see open question below).
 
 Open question deferred from branch 3, surfaced concretely by the
 loader: `model.embed_tokens` is *quantized*, and tied embeddings mean
