@@ -6,8 +6,9 @@
 //! library; pipeline-build cost is one-time per kernel name. Subsequent
 //! lookups for the same name hit the in-memory cache.
 //!
-//! The crate ships two pre-built libraries from vendored MLX sources:
-//! [`KernelLibrary::copy`] and [`KernelLibrary::quantized`]. Both wrap
+//! The crate ships three pre-built libraries from vendored MLX sources:
+//! [`KernelLibrary::copy`], [`KernelLibrary::binary`], and
+//! [`KernelLibrary::quantized`]. All three wrap
 //! [`KernelLibrary::from_source`], which is also public for callers
 //! that want to compile their own inline MSL (e.g. one-off kernels).
 //!
@@ -30,6 +31,9 @@ use crate::error::{Error, Result};
 
 /// Pre-flattened MLX `copy.metal`, produced by `build.rs`.
 const COPY_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/copy_inlined.metal"));
+
+/// Pre-flattened MLX `binary.metal`, produced by `build.rs`.
+const BINARY_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/binary_inlined.metal"));
 
 /// Pre-flattened MLX `quantized.metal`, produced by `build.rs`.
 const QUANTIZED_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/quantized_inlined.metal"));
@@ -81,6 +85,14 @@ impl KernelLibrary {
     /// JIT-compile MLX's `copy.metal` (vendored under `kernels-mlx/`).
     pub fn copy(device: &Device) -> Result<Self> {
         Self::from_source(device, COPY_SOURCE)
+    }
+
+    /// JIT-compile MLX's `binary.metal` (vendored under
+    /// `kernels-mlx/`). Hosts the element-wise binary op family
+    /// (`Add`, `Multiply`, etc.) in contiguous (`vv_/vs_/sv_/ss_`)
+    /// and strided (`g1_/g2_/g3_/gn2_`) variants.
+    pub fn binary(device: &Device) -> Result<Self> {
+        Self::from_source(device, BINARY_SOURCE)
     }
 
     /// JIT-compile MLX's `quantized.metal` (vendored under

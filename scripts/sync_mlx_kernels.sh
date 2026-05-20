@@ -25,6 +25,9 @@ fi
 FILES=(
     mlx/backend/metal/kernels/copy.metal
     mlx/backend/metal/kernels/copy.h
+    mlx/backend/metal/kernels/binary.metal
+    mlx/backend/metal/kernels/binary.h
+    mlx/backend/metal/kernels/binary_ops.h
     mlx/backend/metal/kernels/quantized.metal
     mlx/backend/metal/kernels/quantized.h
     mlx/backend/metal/kernels/quantized_utils.h

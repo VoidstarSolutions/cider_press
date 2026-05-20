@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 /// will be `<stem>_inlined.metal` in `OUT_DIR`.
 const ENTRY_POINTS: &[(&str, &str)] = &[
     ("mlx/backend/metal/kernels/copy.metal", "copy"),
+    ("mlx/backend/metal/kernels/binary.metal", "binary"),
     ("mlx/backend/metal/kernels/quantized.metal", "quantized"),
 ];
 
