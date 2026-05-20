@@ -793,10 +793,10 @@ fn layout_strides(t: &Tensor) -> Result<&[isize]> {
     }
 }
 
-/// Dispatch an element-wise unary op (Square / Rsqrt). Inputs must be
-/// dense and contiguous (the runtime's `Tensor::unary` enforces this
-/// at construction time); the kernels-crate `v_*` family is the only
-/// variant currently wired.
+/// Dispatch an element-wise unary op (Square / Rsqrt / Sigmoid /
+/// Erf). Inputs must be dense and contiguous (the runtime's
+/// `Tensor::unary` enforces this at construction time); the
+/// kernels-crate `v_*` family is the only variant currently wired.
 fn dispatch_unary(
     inner: &Arc<TensorInner>,
     op: &OpNode,
@@ -828,6 +828,8 @@ fn dispatch_unary(
             match unary_op {
                 UnaryOp::Square => unary::v_square_f32(commands, library, &s, &mut d)?,
                 UnaryOp::Rsqrt => unary::v_rsqrt_f32(commands, library, &s, &mut d)?,
+                UnaryOp::Sigmoid => unary::v_sigmoid_f32(commands, library, &s, &mut d)?,
+                UnaryOp::Erf => unary::v_erf_f32(commands, library, &s, &mut d)?,
             }
         }
         DType::F16 => {
@@ -836,6 +838,8 @@ fn dispatch_unary(
             match unary_op {
                 UnaryOp::Square => unary::v_square_f16(commands, library, &s, &mut d)?,
                 UnaryOp::Rsqrt => unary::v_rsqrt_f16(commands, library, &s, &mut d)?,
+                UnaryOp::Sigmoid => unary::v_sigmoid_f16(commands, library, &s, &mut d)?,
+                UnaryOp::Erf => unary::v_erf_f16(commands, library, &s, &mut d)?,
             }
         }
         DType::BF16 => {
@@ -844,11 +848,13 @@ fn dispatch_unary(
             match unary_op {
                 UnaryOp::Square => unary::v_square_bf16(commands, library, &s, &mut d)?,
                 UnaryOp::Rsqrt => unary::v_rsqrt_bf16(commands, library, &s, &mut d)?,
+                UnaryOp::Sigmoid => unary::v_sigmoid_bf16(commands, library, &s, &mut d)?,
+                UnaryOp::Erf => unary::v_erf_bf16(commands, library, &s, &mut d)?,
             }
         }
         dtype @ (DType::I32 | DType::U32) => {
             return Err(Error::InvalidArgument(format!(
-                "unary: dtype {dtype:?} not wired for Square/Rsqrt yet \
+                "unary: dtype {dtype:?} not wired for float unary ops yet \
                  (only float dtypes are instantiated at the kernels layer)",
             )));
         }

@@ -10,7 +10,7 @@
 //!
 //! `Square` + `Rsqrt` cover the `rms_norm` composition. `Sigmoid` and
 //! `Erf` are the primitives MLX itself uses to compose `silu` and
-//! `gelu` in `mlx.nn` — SiLU = `x * sigmoid(x)`, exact GELU =
+//! `gelu` in `mlx.nn` — `SiLU` = `x * sigmoid(x)`, exact `GELU` =
 //! `0.5 * x * (1 + erf(x / sqrt(2)))`. The rest of MLX's unary
 //! surface (Exp / Sin / Cos / Tanh / …) lands the same way when its
 //! first consumer arrives.

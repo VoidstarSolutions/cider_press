@@ -1,5 +1,6 @@
 //! Runtime-level parity tests for `Tensor::square` / `Tensor::rsqrt` /
-//! `Tensor::sum` / `Tensor::mean` against MLX.
+//! `Tensor::sigmoid` / `Tensor::erf` / `Tensor::sum` / `Tensor::mean`
+//! against MLX.
 //!
 //! The kernels-crate tests already validate each underlying dispatch
 //! bit-exactly; these tests validate that the runtime threads inputs +
@@ -46,6 +47,31 @@ fn rsqrt_through_runtime_matches_mlx() {
         out, out_ref,
         "Tensor::rsqrt must match mx.rsqrt bit-exactly"
     );
+}
+
+#[test]
+fn sigmoid_through_runtime_matches_mlx() {
+    let (lhs, out_ref) = fixture("sigmoid");
+    let device = Device::system_default().expect("device");
+    let t = Tensor::from_slice(&device, &lhs, [1, S, H]).expect("lhs");
+    let sig = t.sigmoid().expect("schedule sigmoid");
+    sig.eval().expect("eval");
+    let out: Vec<bf16> = sig.cpu_to_vec().expect("dense out");
+    assert_eq!(
+        out, out_ref,
+        "Tensor::sigmoid must match mx.sigmoid bit-exactly"
+    );
+}
+
+#[test]
+fn erf_through_runtime_matches_mlx() {
+    let (lhs, out_ref) = fixture("erf");
+    let device = Device::system_default().expect("device");
+    let t = Tensor::from_slice(&device, &lhs, [1, S, H]).expect("lhs");
+    let e = t.erf().expect("schedule erf");
+    e.eval().expect("eval");
+    let out: Vec<bf16> = e.cpu_to_vec().expect("dense out");
+    assert_eq!(out, out_ref, "Tensor::erf must match mx.erf bit-exactly");
 }
 
 #[test]
