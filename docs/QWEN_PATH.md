@@ -80,7 +80,7 @@ that introduced them, instead of three branches later in some composition.
 | 1 | (done) `feat/runtime-data-primitives` | Tensor, Device, Layout, DType, OpKind, eval, Copy (all dtypes), Qmv (bf16/int4 gs=64) | Stage-4 fixture parity (already passing) |
 | 2 | `feat/runtime-views` | `ViewSource` field on TensorInner; `Tensor::reshape` / `::transpose` / `::slice` / `::broadcast_to`; non-contiguous `cpu_*` accessors | Round-trip tests on reshape/transpose; broadcasting test against MLX shape rules |
 | 3 | `feat/weight-loading` | safetensors integration; Qwen2.5 weight-key mapping; `config.json` parsing; HF revision SHA pinned. Includes the per-op MLX activation-dump harness (one `uv run` script that takes op name + shapes + dtypes and writes a parity safetensors). | Loaded tensor bytes == safetensors bytes (memcmp). Shape/dtype assertions match `config.json` predictions. No forward pass yet. |
-| 4 | `feat/elementwise-add` | First binary op family: vendor MLX's `binary*.metal`, `OpKind::Add`, broadcasting support; while we're here, `OpKind::Mul` | MLX parity on `[B,T,D] + [D]` (broadcasting), `[X] * [X]` (elementwise), driven from real layer 0 residual tensors |
+| 4 | (done) `feat/elementwise-add` | First binary op family: vendored MLX's `binary.metal`, `OpKind::Binary { op: Add \| Mul }`, NumPy broadcasting via existing `broadcast_to`; `vv_*` fast path + `g{1,2,3}_*` rank-specialised strided paths for f32/f16/bf16 | MLX bit-exact parity at kernels, runtime, and models levels: synthetic `[1,8,896]` same-shape and broadcast `+[896]`; gated real-checkpoint test loads `layer0.input_layernorm` and broadcast-adds it bit-exactly vs a CPU bf16 reference |
 | 5 | `feat/rmsnorm` | Composed: reduction (square → mean) + rsqrt + multiply against broadcast `gamma`. Lands the first reduction primitive, which softmax reuses. Defer a fused `rms_norm.metal` kernel until branch-15 measurements demand it. | MLX parity on `[B, T, D]` against layer 0's real `gamma` |
 | 6 | `feat/silu-and-gelu` | `OpKind::SiLU` (Qwen uses SwiGLU = silu(gate) * up); GELU is mostly free from the same `unary*.metal` | MLX parity per dtype |
 | 7 | `feat/gather` | `OpKind::Gather` for embedding lookup; vendor MLX's gather kernel. **Decision needed here:** tied embeddings are quantized, so either (a) implement quantized-row gather, or (b) gather → `dequantize_row` for the embedding path while qmv handles the LM head. Leaning (b) — embedding gather is once per token at decode and tiny. | MLX parity on random indices against real `W_embed` |
@@ -118,20 +118,29 @@ for "it's fast and clean" but can wait until branch 15+:
 
 ## What to do next time we sit down
 
-Branch 2 (`feat/runtime-views`). Specifically:
+Branch 5 (`feat/rmsnorm`). Specifically:
 
-1. Read `cider_press_kernels::kernels::copy` and the MLX strided
-   `g*_copy` macros to understand what strided dispatch looks like.
-2. Decide on the `ViewSource` invariants (the design doc sketches
-   them; lock them in with code).
-3. Land `Tensor::reshape` (the trivial case — same byte layout,
-   just relabels shape), then `transpose` and `slice` and
-   `broadcast_to`.
-4. Tests against MLX's broadcasting rules and the obvious
-   reshape/transpose roundtrips.
+1. Decide reduction primitive shape. RMSNorm needs `mean(x²)` along
+   the last axis, then `rsqrt` of that, then a broadcast-multiply
+   against `gamma`. The multiply already exists (branch 4); the
+   reduction does not. Probably want `OpKind::Reduce` parametrised
+   by reduction kind + axis, dispatching MLX's `reduce*.metal`.
+2. Look at MLX's `reduce.cpp` for the dispatch pattern (this is the
+   first reduction, so it's the analogue of branch 4's first
+   look at `binary.cpp`).
+3. Compose: `square → reduce(mean, axis=-1) → rsqrt → broadcast_mul
+   → mul(gamma)`. Watch for the keep-dim semantics so the broadcast
+   back works without an extra reshape.
+4. Parity test against `layer0.input_layernorm`'s real `gamma`
+   loaded via `load_qwen2_weights`, comparing against MLX's
+   `mx.fast.rms_norm` (or `mx.linalg.norm`-based reference if
+   `fast.rms_norm` is in a different module).
 
-The branch is self-contained: no new ops, no model code, no
-weight loading. Just the view machinery.
+Open question carried forward from branch 4: whether to introduce a
+`Tensor::square` / `Tensor::rsqrt` (Unary op family) before doing
+the reduction, or to fuse them into the reduce. The MLX path
+exposes them as separate ops via `unary.metal`; leaning the same
+way for symmetry with branch 4.
 
 After that, branch 3 (`feat/weight-loading`) is the first session that
 isn't kernel/runtime muscle-building — it's plumbing. Worth flagging:
