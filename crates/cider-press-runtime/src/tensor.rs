@@ -84,8 +84,20 @@ pub(crate) struct TensorInner {
 pub(crate) struct ViewSource {
     /// The tensor whose backing leaf this view ultimately reads from.
     pub(crate) source: Tensor,
-    /// Byte offset into the backing leaf where this view's element
-    /// `[0, 0, …]` lives. Cumulative across a view-of-view chain.
+    /// Byte offset into `source`'s element `[0, 0, …]` where this
+    /// view's element `[0, 0, …]` lives. Defined *per hop* — i.e.
+    /// relative to the immediate `source`, not the ultimate backing
+    /// leaf. Chain walkers ([`Tensor::flatten_view`] and
+    /// [`Tensor::resolve_leaf`]) sum these offsets across hops, so
+    /// constructors must supply a hop-local offset; passing a leaf-
+    /// relative offset for a multi-hop source double-counts the
+    /// intermediate hops' offsets.
+    ///
+    /// Note: today most view-building APIs use
+    /// [`Tensor::flatten_view`] before constructing the new view, so
+    /// the chains they emit are one hop deep (source is always the
+    /// storage owner). Multi-hop chains arise only when an external
+    /// caller composes views manually without flattening.
     pub(crate) byte_offset: usize,
 }
 
@@ -857,9 +869,10 @@ impl Tensor {
     ///   `LeafStorage::Quantized` variant).
     ///
     /// For non-contiguous views (transpose, broadcast, sliced along
-    /// an inner dim) this returns `None`; the strided host iterator
-    /// landing in the next commit (`cpu_iter`) provides element-wise
-    /// access regardless of stride pattern.
+    /// an inner dim) this returns `None`; use [`Tensor::cpu_iter`] for
+    /// element-wise access regardless of stride pattern, or
+    /// [`Tensor::copy`] to materialise the logical layout into a fresh
+    /// contiguous tensor first.
     ///
     /// Safe to call: a populated `cache` on the backing leaf carries
     /// the invariant that no GPU dispatch is concurrently writing the
@@ -1532,10 +1545,11 @@ mod tests {
     }
 
     /// Test-only constructor for a view tensor pointing at `source`
-    /// with an explicit `byte_offset`, `shape`, and (dense) `strides`.
-    /// The public view-building API lands in subsequent commits;
-    /// this helper exists so commit 1 can verify the chain-walking
-    /// plumbing in isolation.
+    /// with an explicit `byte_offset`, `shape`, and (dense) `strides`,
+    /// bypassing [`Tensor::flatten_view`]. The public view-building
+    /// APIs (`reshape`, `permute`, `slice`, `broadcast_to`) flatten
+    /// view chains on the way in; this helper exists so the chain-
+    /// walking tests can build multi-hop chains directly.
     fn manual_view(source: &Tensor, byte_offset: usize, shape: Shape, strides: Strides) -> Tensor {
         let layout = Layout::Dense { strides };
         Tensor {
