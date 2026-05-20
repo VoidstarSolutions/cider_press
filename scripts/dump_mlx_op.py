@@ -92,6 +92,48 @@ def run_add(args: argparse.Namespace) -> dict[str, mx.array]:
 
 
 # ---------------------------------------------------------------------------
+# square / rsqrt: element-wise unary ops (consumed by branch 5
+# `feat/rmsnorm`). Writes `lhs`, `out`. Use uniform-in-[0.1, 1.1]
+# inputs for rsqrt to avoid the rsqrt(0) trap; square accepts any
+# real input.
+# ---------------------------------------------------------------------------
+
+
+def add_square_parser(subparsers: argparse._SubParsersAction) -> None:
+    p = subparsers.add_parser("square", help="Element-wise x*x")
+    p.add_argument("--lhs-shape", required=True, help="comma-separated, e.g. 1,8,896")
+    p.add_argument("--dtype", default="bf16", help="one of f32, f16, bf16")
+
+
+def run_square(args: argparse.Namespace) -> dict[str, mx.array]:
+    shape = _parse_shape(args.lhs_shape)
+    dtype = _float_dtype(args.dtype)
+    lhs = (mx.random.uniform(shape=shape) - 0.5).astype(dtype)
+    out = mx.square(lhs)
+    mx.eval(lhs, out)
+    return {"lhs": lhs, "out": out}
+
+
+def add_rsqrt_parser(subparsers: argparse._SubParsersAction) -> None:
+    p = subparsers.add_parser("rsqrt", help="Element-wise 1/sqrt(x); inputs are uniform in [0.1, 1.1]")
+    p.add_argument("--lhs-shape", required=True, help="comma-separated, e.g. 1,8,896")
+    p.add_argument("--dtype", default="bf16", help="one of f32, f16, bf16")
+
+
+def run_rsqrt(args: argparse.Namespace) -> dict[str, mx.array]:
+    shape = _parse_shape(args.lhs_shape)
+    dtype = _float_dtype(args.dtype)
+    # Shift the uniform distribution into [0.1, 1.1] so we never feed
+    # rsqrt() a zero/near-zero. The runtime test does not need to
+    # validate rsqrt's behaviour on degenerate inputs — that's a
+    # property of the hardware op, not our dispatch.
+    lhs = (mx.random.uniform(shape=shape) + 0.1).astype(dtype)
+    out = mx.rsqrt(lhs)
+    mx.eval(lhs, out)
+    return {"lhs": lhs, "out": out}
+
+
+# ---------------------------------------------------------------------------
 # mul: element-wise multiply with broadcasting. Writes `lhs`, `rhs`, `out`.
 # Shares the add-style argparser and seeding convention.
 # ---------------------------------------------------------------------------
@@ -127,6 +169,8 @@ ParserBuilder = Callable[[argparse._SubParsersAction], None]
 OPS: dict[str, tuple[ParserBuilder, Runner]] = {
     "add": (add_add_parser, run_add),
     "mul": (add_mul_parser, run_mul),
+    "square": (add_square_parser, run_square),
+    "rsqrt": (add_rsqrt_parser, run_rsqrt),
 }
 
 
