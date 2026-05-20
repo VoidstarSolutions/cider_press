@@ -1385,6 +1385,29 @@ mod tests {
     }
 
     #[test]
+    fn eval_through_view_materializes_source_op() {
+        // A view of an unevaluated op should, when eval()'d, dispatch
+        // the underlying op so the view becomes materialised.
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..12)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let src = Tensor::from_slice(&device, &data, [3, 4]).expect("from_slice");
+        let copied = src.copy().expect("copy"); // unevaluated op
+        assert!(!copied.is_materialized());
+        let view = copied.reshape([2, 6]).expect("reshape"); // view of op
+        assert!(!view.is_materialized());
+
+        view.eval().expect("eval view");
+
+        assert!(copied.is_materialized());
+        assert!(view.is_materialized());
+        // View shares the source's bytes; reshape is contiguous so
+        // cpu_slice works directly.
+        assert_eq!(view.cpu_slice::<f32>().unwrap(), data.as_slice());
+    }
+
+    #[test]
     fn eval_shared_subgraph_dispatched_once() {
         let device = Device::shared().expect("system default device");
         let data: Vec<f32> = vec![1.0; 8];

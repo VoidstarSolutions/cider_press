@@ -95,9 +95,15 @@ fn visit(
             visit(&input.inner, visited, order);
         }
         order.push(inner.clone());
+    } else if let Some(view) = inner.view.as_ref() {
+        // Views own no storage; eval needs to chase the source so the
+        // op that backs the view (if any) gets dispatched. The view
+        // itself never enters `order` — it has nothing to dispatch.
+        visit(&view.source.inner, visited, order);
     }
-    // Placeholders (no op, no cache) are silently skipped — eval()
-    // catches the broken case at step 2 if the root needs dispatching.
+    // Placeholders (no op, no view, no cache) are silently skipped —
+    // eval() catches the broken case at step 2 if the root needs
+    // dispatching.
 }
 
 /// Resolve a dense op input's backing buffer.
