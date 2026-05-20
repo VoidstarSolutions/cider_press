@@ -82,6 +82,11 @@ impl Qwen2Config {
     /// Returns [`Error::InvalidArgument`] if `hidden_size` doesn't
     /// divide evenly.
     pub fn head_dim(&self) -> Result<usize> {
+        if self.num_attention_heads == 0 {
+            return Err(Error::InvalidArgument(
+                "Qwen2Config: num_attention_heads must be > 0".into(),
+            ));
+        }
         if self.hidden_size % self.num_attention_heads != 0 {
             return Err(Error::InvalidArgument(format!(
                 "Qwen2Config: hidden_size {} not divisible by num_attention_heads {}",
@@ -94,7 +99,9 @@ impl Qwen2Config {
     /// Grouped-query attention ratio:
     /// `num_attention_heads / num_key_value_heads`.
     pub fn gqa_ratio(&self) -> Result<usize> {
-        if self.num_key_value_heads == 0 || self.num_attention_heads % self.num_key_value_heads != 0
+        if self.num_attention_heads == 0
+            || self.num_key_value_heads == 0
+            || self.num_attention_heads % self.num_key_value_heads != 0
         {
             return Err(Error::InvalidArgument(format!(
                 "Qwen2Config: num_attention_heads {} not a multiple of num_key_value_heads {}",

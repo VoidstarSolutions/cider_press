@@ -114,6 +114,14 @@ pub fn load_qwen2_weights(
     config: &Qwen2Config,
     device: &Device,
 ) -> Result<Qwen2Weights> {
+    if !config.tie_word_embeddings {
+        return Err(Error::InvalidArgument(
+            "Qwen2Config.tie_word_embeddings=false is not supported yet; \
+             lm_head loading is missing"
+                .into(),
+        ));
+    }
+
     let quant = derive_quantization(config)?;
     let hidden = config.hidden_size;
     let head_dim = config.head_dim()?;
