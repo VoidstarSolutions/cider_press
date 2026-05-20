@@ -13,12 +13,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use cider_press_kernels::{
-    Buffer, Commands,
+    Buffer, Commands, KernelLibrary,
     kernels::{copy, qmv},
 };
 
 use crate::dtype::DType;
 use crate::error::{Error, Result};
+use crate::layout::Layout;
 use crate::tensor::{LeafStorage, OpKind, OpNode, Tensor, TensorInner, checked_byte_count};
 
 pub(crate) fn eval(root: &Tensor) -> Result<()> {
@@ -95,9 +96,15 @@ fn visit(
             visit(&input.inner, visited, order);
         }
         order.push(inner.clone());
+    } else if let Some(view) = inner.view.as_ref() {
+        // Views own no storage; eval needs to chase the source so the
+        // op that backs the view (if any) gets dispatched. The view
+        // itself never enters `order` — it has nothing to dispatch.
+        visit(&view.source.inner, visited, order);
     }
-    // Placeholders (no op, no cache) are silently skipped — eval()
-    // catches the broken case at step 2 if the root needs dispatching.
+    // Placeholders (no op, no view, no cache) are silently skipped —
+    // eval() catches the broken case at step 2 if the root needs
+    // dispatching.
 }
 
 /// Resolve a dense op input's backing buffer.
@@ -208,9 +215,19 @@ fn dispatch_copy(
         .inputs
         .first()
         .expect("Copy has exactly one input by construction");
-    let src = dense_input_buffer(input, outputs, index_of)?;
-
     let library = device.copy_library()?;
+
+    // Views own no storage; resolving them yields the storage owner
+    // plus the cumulative byte offset to the view's element [0,..]. A
+    // view always takes the strided path because its element order
+    // (transpose, broadcast, sliced inner dim) is not generally
+    // byte-equivalent to its leaf, and a non-zero byte offset can't be
+    // expressed through the vector kernel anyway.
+    if input.inner.view.is_some() {
+        return dispatch_copy_strided(input, inner, commands, outputs, dst, index_of, library);
+    }
+
+    let src = dense_input_buffer(input, outputs, index_of)?;
 
     // SAFETY (every arm below): the runtime's dtype tag is the source
     // of truth for the byte contents; reinterpreting `Buffer<u8>` as
@@ -246,6 +263,197 @@ fn dispatch_copy(
     }
 
     Ok(())
+}
+
+/// Strided same-dtype copy: input is a view onto some storage owner;
+/// gather it element-wise into a fresh contiguous dst via MLX's
+/// `copy_gg*` family. Mirrors what MLX's `copy_gpu` does for
+/// `CopyType::General` reshapes of non-contiguous arrays.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_copy_strided(
+    input: &Tensor,
+    inner: &Arc<TensorInner>,
+    commands: &mut Commands<'_>,
+    outputs: &[Buffer<u8>],
+    dst: &mut Buffer<u8>,
+    index_of: &HashMap<*const TensorInner, usize>,
+    library: &KernelLibrary,
+) -> Result<()> {
+    let (src_bytes, src_byte_offset) = resolve_view_storage(input, outputs, index_of)?;
+    let src_strides = match input.layout() {
+        Layout::Dense { strides } => strides_to_i64(strides.as_slice())?,
+        Layout::Quantized(_) => {
+            return Err(Error::InvalidArgument(
+                "eval: strided copy from a quantized view is not supported".into(),
+            ));
+        }
+    };
+    let shape_i32 = shape_to_i32(input.shape().dims())?;
+    let dst_strides = contiguous_strides_i64(&shape_i32);
+
+    match inner.dtype {
+        DType::F32 => {
+            let src = unsafe { src_bytes.reinterpret_as::<f32>() };
+            let mut dst_typed = unsafe { dst.reinterpret_as::<f32>() };
+            copy::copy_g_f32(
+                commands,
+                library,
+                &src,
+                src_byte_offset,
+                &src_strides,
+                &mut dst_typed,
+                0,
+                &dst_strides,
+                &shape_i32,
+            )?;
+        }
+        DType::F16 => {
+            let src = unsafe { src_bytes.reinterpret_as::<half::f16>() };
+            let mut dst_typed = unsafe { dst.reinterpret_as::<half::f16>() };
+            copy::copy_g_f16(
+                commands,
+                library,
+                &src,
+                src_byte_offset,
+                &src_strides,
+                &mut dst_typed,
+                0,
+                &dst_strides,
+                &shape_i32,
+            )?;
+        }
+        DType::BF16 => {
+            let src = unsafe { src_bytes.reinterpret_as::<half::bf16>() };
+            let mut dst_typed = unsafe { dst.reinterpret_as::<half::bf16>() };
+            copy::copy_g_bf16(
+                commands,
+                library,
+                &src,
+                src_byte_offset,
+                &src_strides,
+                &mut dst_typed,
+                0,
+                &dst_strides,
+                &shape_i32,
+            )?;
+        }
+        DType::I32 => {
+            let src = unsafe { src_bytes.reinterpret_as::<i32>() };
+            let mut dst_typed = unsafe { dst.reinterpret_as::<i32>() };
+            copy::copy_g_i32(
+                commands,
+                library,
+                &src,
+                src_byte_offset,
+                &src_strides,
+                &mut dst_typed,
+                0,
+                &dst_strides,
+                &shape_i32,
+            )?;
+        }
+        DType::U32 => {
+            let src = unsafe { src_bytes.reinterpret_as::<u32>() };
+            let mut dst_typed = unsafe { dst.reinterpret_as::<u32>() };
+            copy::copy_g_u32(
+                commands,
+                library,
+                &src,
+                src_byte_offset,
+                &src_strides,
+                &mut dst_typed,
+                0,
+                &dst_strides,
+                &shape_i32,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Walk a view chain to the storage owner; return a refcount-bumped
+/// `Buffer<u8>` plus the cumulative byte offset to the view's
+/// element `[0, 0, …]`.
+///
+/// The storage owner is either (a) an op output that was just
+/// allocated earlier in this eval call — looked up via `index_of` —
+/// or (b) a previously-cached leaf / op (host upload or earlier
+/// `eval`). Hitting a placeholder mid-chain means eval was called on
+/// a graph that wasn't fully constructed; we surface that as an error.
+fn resolve_view_storage(
+    input: &Tensor,
+    outputs: &[Buffer<u8>],
+    index_of: &HashMap<*const TensorInner, usize>,
+) -> Result<(Buffer<u8>, usize)> {
+    let mut current = &input.inner;
+    let mut offset: usize = 0;
+    loop {
+        if let Some(view) = current.view.as_ref() {
+            offset = offset.checked_add(view.byte_offset).ok_or_else(|| {
+                Error::InvalidArgument("eval: view-chain byte offset overflowed usize".into())
+            })?;
+            current = &view.source.inner;
+            continue;
+        }
+        if let Some(&i) = index_of.get(&Arc::as_ptr(current)) {
+            let buf = outputs.get(i).ok_or_else(|| {
+                Error::InvalidArgument(
+                    "eval: strided-copy input's storage owner has no allocated output yet \
+                     (topo order bug?)"
+                        .into(),
+                )
+            })?;
+            // SAFETY: u8→u8 reinterpret is trivially valid; this is a
+            // refcount bump so the caller owns a handle independent of
+            // the borrow on `outputs`.
+            return Ok((unsafe { buf.reinterpret_as::<u8>() }, offset));
+        }
+        match current.cache.get() {
+            Some(LeafStorage::Dense(buf)) => {
+                // SAFETY: as above.
+                return Ok((unsafe { buf.reinterpret_as::<u8>() }, offset));
+            }
+            Some(LeafStorage::Quantized { .. }) => {
+                return Err(Error::InvalidArgument(
+                    "eval: strided copy from a quantized leaf is not supported".into(),
+                ));
+            }
+            None => {
+                return Err(Error::InvalidArgument(
+                    "eval: view chain terminates at a placeholder (no storage to copy from)".into(),
+                ));
+            }
+        }
+    }
+}
+
+fn strides_to_i64(strides: &[isize]) -> Result<Vec<i64>> {
+    strides
+        .iter()
+        .map(|&s| {
+            i64::try_from(s).map_err(|_| {
+                Error::InvalidArgument(format!("eval: stride {s} does not fit in i64"))
+            })
+        })
+        .collect()
+}
+
+fn shape_to_i32(dims: &[usize]) -> Result<Vec<i32>> {
+    dims.iter()
+        .map(|&d| {
+            i32::try_from(d).map_err(|_| {
+                Error::InvalidArgument(format!("eval: shape dim {d} does not fit in i32"))
+            })
+        })
+        .collect()
+}
+
+fn contiguous_strides_i64(shape: &[i32]) -> Vec<i64> {
+    let mut strides = vec![1i64; shape.len()];
+    for d in (0..shape.len().saturating_sub(1)).rev() {
+        strides[d] = strides[d + 1] * i64::from(shape[d + 1]);
+    }
+    strides
 }
 
 #[allow(clippy::too_many_arguments)]

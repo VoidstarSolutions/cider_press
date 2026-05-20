@@ -4,8 +4,10 @@
 //! [`Arc`]), carries [`Shape`] + [`DType`] + [`Layout`], and refers to
 //! a node in the computation graph. A node is one of: a *placeholder*
 //! (metadata only — test scaffolding), a *host-constructed leaf* (a
-//! materialized buffer with no op lineage), or an *op* (an [`OpKind`]
-//! plus its input tensors, possibly already evaluated).
+//! materialized buffer with no op lineage), an *op* (an [`OpKind`]
+//! plus its input tensors, possibly already evaluated), or a *view*
+//! (a different shape / stride / byte-offset window onto another
+//! tensor's storage; see [`ViewSource`]).
 //!
 //! Construction is always lazy: building an op tensor does no GPU
 //! work and allocates no output buffer. Both happen at [`Tensor::eval`]
@@ -20,7 +22,16 @@
 //! sketched in `docs/RUNTIME_DESIGN.md`: no lock on the read path,
 //! no race window between mutations, and [`Tensor::cpu_bytes`] can
 //! return `&[u8]` directly.
+//!
+//! **View invariants.** `view` and `op` are mutually exclusive: a
+//! tensor either describes its own op lineage or it points at another
+//! tensor's storage, never both. View tensors never populate their own
+//! `cache`; their bytes come from chasing [`ViewSource::source`] to
+//! the backing leaf. This means `cpu_bytes()` on a view follows the
+//! chain rather than reading the view's own (always-empty) cache.
 
+use std::marker::PhantomData;
+use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
 use cider_press_kernels::Buffer;
@@ -42,17 +53,52 @@ pub(crate) struct TensorInner {
     /// will ever exist. Every other tensor carries a real device.
     pub(crate) device: Option<Device>,
     /// Op lineage. `Some` for tensors produced by an op (whether
-    /// evaluated or not); `None` for placeholders and host-constructed
-    /// leaves. Set at construction and never mutated thereafter — the
-    /// `OnceLock` cache below is what records evaluation.
+    /// evaluated or not); `None` for placeholders, host-constructed
+    /// leaves, and views. Set at construction and never mutated
+    /// thereafter — the `OnceLock` cache below is what records
+    /// evaluation.
+    ///
+    /// Mutually exclusive with `view`: a tensor either has its own op
+    /// lineage or it's a view onto another tensor, never both.
     pub(crate) op: Option<OpNode>,
-    /// Materialized storage. Empty for placeholders and unevaluated
-    /// op nodes; populated either at construction (host-constructed
-    /// leaves) or by [`Tensor::eval`] (op outputs). Once populated,
-    /// the storage is immutable for the lifetime of the inner —
-    /// that's what makes [`Tensor::cpu_bytes`] safe to expose as
-    /// `&[u8]`.
+    /// View lineage. `Some` for tensors that share storage with
+    /// another tensor (`reshape`, `permute`, `slice`, `broadcast_to`). View
+    /// tensors never populate their own `cache` — they chase
+    /// [`ViewSource::source`] to find the backing leaf at read time.
+    pub(crate) view: Option<ViewSource>,
+    /// Materialized storage. Empty for placeholders, unevaluated op
+    /// nodes, and views; populated either at construction
+    /// (host-constructed leaves) or by [`Tensor::eval`] (op outputs).
+    /// Once populated, the storage is immutable for the lifetime of
+    /// the inner — that's what makes [`Tensor::cpu_bytes`] safe to
+    /// expose as `&[u8]`.
     pub(crate) cache: OnceLock<LeafStorage>,
+}
+
+/// A view onto another tensor's storage.
+///
+/// View tensors carry their own `shape` / `layout` (strides) /
+/// `byte_offset` while sharing the backing buffer with `source`.
+/// `source` may itself be a view (chains collapse at read time) or a
+/// leaf / op tensor.
+pub(crate) struct ViewSource {
+    /// The tensor whose backing leaf this view ultimately reads from.
+    pub(crate) source: Tensor,
+    /// Byte offset into `source`'s element `[0, 0, …]` where this
+    /// view's element `[0, 0, …]` lives. Defined *per hop* — i.e.
+    /// relative to the immediate `source`, not the ultimate backing
+    /// leaf. Chain walkers ([`Tensor::flatten_view`] and
+    /// [`Tensor::resolve_leaf`]) sum these offsets across hops, so
+    /// constructors must supply a hop-local offset; passing a leaf-
+    /// relative offset for a multi-hop source double-counts the
+    /// intermediate hops' offsets.
+    ///
+    /// Note: today most view-building APIs use
+    /// [`Tensor::flatten_view`] before constructing the new view, so
+    /// the chains they emit are one hop deep (source is always the
+    /// storage owner). Multi-hop chains arise only when an external
+    /// caller composes views manually without flattening.
+    pub(crate) byte_offset: usize,
 }
 
 /// Materialized backing storage for a [`Tensor`].
@@ -155,6 +201,7 @@ impl Tensor {
                 layout: Layout::Dense { strides },
                 device: None,
                 op: None,
+                view: None,
                 cache: OnceLock::new(),
             }),
         }
@@ -175,6 +222,7 @@ impl Tensor {
                 layout: Layout::Quantized(quantization),
                 device: None,
                 op: None,
+                view: None,
                 cache: OnceLock::new(),
             }),
         }
@@ -296,9 +344,63 @@ impl Tensor {
                 layout,
                 device: Some(device.clone()),
                 op: None,
+                view: None,
                 cache,
             }),
         }
+    }
+
+    /// Crate-private constructor for view tensors. Used by the public
+    /// view-building APIs (`reshape`, `permute`, `slice`,
+    /// `broadcast_to`). The new tensor inherits `source`'s dtype and
+    /// device; the caller chooses `shape` and `strides` and supplies a
+    /// `byte_offset` relative to `source`'s backing leaf (i.e. the
+    /// caller is expected to have already folded any
+    /// `source`-is-also-a-view indirection via
+    /// [`Tensor::flatten_view`]).
+    pub(crate) fn view(source: Tensor, byte_offset: usize, shape: Shape, strides: Strides) -> Self {
+        let device = source.inner.device.clone();
+        let dtype = source.inner.dtype;
+        let layout = Layout::Dense { strides };
+        Self {
+            inner: Arc::new(TensorInner {
+                shape,
+                dtype,
+                layout,
+                device,
+                op: None,
+                view: Some(ViewSource {
+                    source,
+                    byte_offset,
+                }),
+                cache: OnceLock::new(),
+            }),
+        }
+    }
+
+    /// Walk through any view-of-view chain to the storage-owning
+    /// tensor (a host leaf or op node) and return it plus the
+    /// accumulated byte offset. The returned tensor either has a
+    /// populated cache (host leaf, evaluated op) or will get one when
+    /// its op is evaluated.
+    ///
+    /// View-building APIs use this to keep new views one hop away
+    /// from the storage owner instead of layering chain after chain.
+    pub(crate) fn flatten_view(&self) -> (Tensor, usize) {
+        let mut inner = &self.inner;
+        let mut offset: usize = 0;
+        while let Some(v) = inner.view.as_ref() {
+            offset = offset
+                .checked_add(v.byte_offset)
+                .expect("byte offset overflowed usize during view-chain flatten");
+            inner = &v.source.inner;
+        }
+        (
+            Tensor {
+                inner: inner.clone(),
+            },
+            offset,
+        )
     }
 
     /// Crate-private constructor for op tensors (used by op builders
@@ -318,6 +420,7 @@ impl Tensor {
                 layout,
                 device: Some(device.clone()),
                 op: Some(OpNode { kind, inputs }),
+                view: None,
                 cache: OnceLock::new(),
             }),
         }
@@ -352,6 +455,293 @@ impl Tensor {
             layout,
             OpKind::Copy,
             vec![self.clone()],
+        ))
+    }
+
+    /// Build a contiguous view of this tensor with a new shape.
+    ///
+    /// Zero-copy: the result shares the source's backing leaf. The
+    /// new shape must have the same element count as the input, and
+    /// the input must currently be contiguous. Non-contiguous inputs
+    /// (transposed, broadcast, sliced along an inner dim) need to be
+    /// materialized via [`Tensor::copy`] first; this restriction
+    /// keeps the op cheap and avoids surprising hidden copies.
+    ///
+    /// The result is dense and contiguous with fresh row-major
+    /// strides for the new shape, regardless of how the source's
+    /// view chain is structured.
+    pub fn reshape(&self, new_shape: impl Into<Shape>) -> Result<Self> {
+        if self.inner.device.is_none() {
+            return Err(Error::InvalidArgument(
+                "reshape: cannot apply a view to a placeholder (no device)".into(),
+            ));
+        }
+        let strides = match self.layout() {
+            Layout::Dense { strides } => strides,
+            Layout::Quantized(_) => {
+                return Err(Error::InvalidArgument(
+                    "reshape: quantized tensors are not supported".into(),
+                ));
+            }
+        };
+        if !strides.is_contiguous(self.shape()) {
+            return Err(Error::InvalidArgument(format!(
+                "reshape: input must be contiguous (got shape {:?} strides {:?})",
+                self.shape().dims(),
+                strides.as_slice(),
+            )));
+        }
+
+        let new_shape = new_shape.into();
+        if new_shape.elem_count() != self.elem_count() {
+            return Err(Error::InvalidArgument(format!(
+                "reshape: element count mismatch ({} -> {}); shapes {:?} -> {:?}",
+                self.elem_count(),
+                new_shape.elem_count(),
+                self.shape().dims(),
+                new_shape.dims(),
+            )));
+        }
+
+        let new_strides = Strides::contiguous(&new_shape);
+        let (source, byte_offset) = self.flatten_view();
+        Ok(Self::view(source, byte_offset, new_shape, new_strides))
+    }
+
+    /// Build a permuted view of this tensor.
+    ///
+    /// `axes` must be a permutation of `0..self.rank()`. The result's
+    /// `shape[i]` is `self.shape[axes[i]]` and the result's `strides[i]`
+    /// is `self.strides[axes[i]]` — the same data, viewed in a
+    /// different axis order. Zero-copy; shares the source's backing
+    /// leaf at the same byte offset.
+    ///
+    /// Unlike [`Tensor::reshape`], `permute` does not require the
+    /// input to be contiguous — it composes cleanly with prior view
+    /// ops. (Subsequent ops that *do* require contiguity, like
+    /// `reshape`, will need a materializing copy.)
+    ///
+    /// Matches MLX's `mx.transpose(x, axes)` semantics. Named
+    /// `permute` rather than `transpose` because the latter carries
+    /// linear-algebra "swap last two dims" baggage that doesn't fit
+    /// a general axis reordering.
+    pub fn permute(&self, axes: &[usize]) -> Result<Self> {
+        if self.inner.device.is_none() {
+            return Err(Error::InvalidArgument(
+                "permute: cannot apply a view to a placeholder (no device)".into(),
+            ));
+        }
+        let cur_strides = match self.layout() {
+            Layout::Dense { strides } => strides,
+            Layout::Quantized(_) => {
+                return Err(Error::InvalidArgument(
+                    "permute: quantized tensors are not supported".into(),
+                ));
+            }
+        };
+
+        let rank = self.rank();
+        if axes.len() != rank {
+            return Err(Error::InvalidArgument(format!(
+                "permute: axes length {} does not match tensor rank {}",
+                axes.len(),
+                rank,
+            )));
+        }
+        let mut seen = vec![false; rank];
+        for &axis in axes {
+            if axis >= rank {
+                return Err(Error::InvalidArgument(format!(
+                    "permute: axis {axis} is out of range for rank {rank}",
+                )));
+            }
+            if seen[axis] {
+                return Err(Error::InvalidArgument(format!(
+                    "permute: axis {axis} appears more than once in {axes:?}",
+                )));
+            }
+            seen[axis] = true;
+        }
+
+        let cur_dims = self.shape().dims();
+        let cur_strides_slice = cur_strides.as_slice();
+        let new_dims: Vec<usize> = axes.iter().map(|&a| cur_dims[a]).collect();
+        let new_strides_vec: Vec<isize> = axes.iter().map(|&a| cur_strides_slice[a]).collect();
+
+        let (source, byte_offset) = self.flatten_view();
+        Ok(Self::view(
+            source,
+            byte_offset,
+            Shape::from(new_dims),
+            Strides::from(new_strides_vec),
+        ))
+    }
+
+    /// Build a sliced view of this tensor.
+    ///
+    /// `ranges` provides one half-open `start..end` per axis; the
+    /// result's shape is `[end - start, ...]` per axis and the strides
+    /// are unchanged from the source. The view's `byte_offset` shifts
+    /// by `Σ(start_i × stride_i × dtype_bytes)`.
+    ///
+    /// Zero-copy. Slicing along the leading axis preserves contiguity;
+    /// slicing along an inner axis produces a non-contiguous view
+    /// readable via [`Tensor::cpu_iter`].
+    pub fn slice(&self, ranges: &[Range<usize>]) -> Result<Self> {
+        if self.inner.device.is_none() {
+            return Err(Error::InvalidArgument(
+                "slice: cannot apply a view to a placeholder (no device)".into(),
+            ));
+        }
+        let cur_strides = match self.layout() {
+            Layout::Dense { strides } => strides,
+            Layout::Quantized(_) => {
+                return Err(Error::InvalidArgument(
+                    "slice: quantized tensors are not supported".into(),
+                ));
+            }
+        };
+
+        let rank = self.rank();
+        if ranges.len() != rank {
+            return Err(Error::InvalidArgument(format!(
+                "slice: expected {rank} ranges (one per axis), got {}",
+                ranges.len(),
+            )));
+        }
+
+        let cur_dims = self.shape().dims();
+        let cur_strides_slice = cur_strides.as_slice();
+        let dtype_bytes = self.inner.dtype.size_bytes();
+        let elem_size_signed = isize::try_from(dtype_bytes).expect("dtype size fits in isize");
+
+        let mut new_dims = Vec::with_capacity(rank);
+        let mut byte_delta: isize = 0;
+        for (axis, range) in ranges.iter().enumerate() {
+            let dim = cur_dims[axis];
+            if range.start > range.end {
+                return Err(Error::InvalidArgument(format!(
+                    "slice: axis {axis} range {}..{} has start > end",
+                    range.start, range.end,
+                )));
+            }
+            if range.end > dim {
+                return Err(Error::InvalidArgument(format!(
+                    "slice: axis {axis} range {}..{} exceeds dimension {dim}",
+                    range.start, range.end,
+                )));
+            }
+            new_dims.push(range.end - range.start);
+
+            let start_signed = isize::try_from(range.start).expect("slice start fits in isize");
+            let step = start_signed
+                .checked_mul(cur_strides_slice[axis])
+                .and_then(|s| s.checked_mul(elem_size_signed))
+                .ok_or_else(|| {
+                    Error::InvalidArgument(format!(
+                        "slice: byte-offset arithmetic overflowed isize for axis {axis}",
+                    ))
+                })?;
+            byte_delta = byte_delta.checked_add(step).ok_or_else(|| {
+                Error::InvalidArgument("slice: cumulative byte offset overflowed isize".into())
+            })?;
+        }
+
+        let (source, source_offset) = self.flatten_view();
+        let source_offset_signed = isize::try_from(source_offset)
+            .expect("source byte offset fits in isize (Metal allocations bounded)");
+        let combined = source_offset_signed
+            .checked_add(byte_delta)
+            .ok_or_else(|| {
+                Error::InvalidArgument("slice: combined byte offset overflowed isize".into())
+            })?;
+        let new_byte_offset = usize::try_from(combined).map_err(|_| {
+            Error::InvalidArgument(
+                "slice: resulting byte offset is negative (would underrun the backing leaf)".into(),
+            )
+        })?;
+
+        let new_strides = Strides::from(cur_strides_slice.to_vec());
+        Ok(Self::view(
+            source,
+            new_byte_offset,
+            Shape::from(new_dims),
+            new_strides,
+        ))
+    }
+
+    /// Build a broadcast view of this tensor with the target shape.
+    ///
+    /// Follows MLX (and `NumPy`) right-aligned broadcasting:
+    /// - the source shape is right-aligned against `target`;
+    /// - any source axis of size 1 expands to the target's size at
+    ///   that axis, with stride 0 (the underlying element is reread,
+    ///   not copied);
+    /// - any leading axes that `target` has but the source doesn't
+    ///   are prepended with stride 0;
+    /// - any non-1 source axis that doesn't match the target's size
+    ///   at the aligned position is an error.
+    ///
+    /// Zero-copy. The result is non-contiguous whenever any expansion
+    /// is involved, so reads go through [`Tensor::cpu_iter`].
+    pub fn broadcast_to(&self, target: impl Into<Shape>) -> Result<Self> {
+        if self.inner.device.is_none() {
+            return Err(Error::InvalidArgument(
+                "broadcast_to: cannot apply a view to a placeholder (no device)".into(),
+            ));
+        }
+        let cur_strides = match self.layout() {
+            Layout::Dense { strides } => strides,
+            Layout::Quantized(_) => {
+                return Err(Error::InvalidArgument(
+                    "broadcast_to: quantized tensors are not supported".into(),
+                ));
+            }
+        };
+
+        let target = target.into();
+        let src_dims = self.shape().dims();
+        let src_strides_slice = cur_strides.as_slice();
+        let target_dims = target.dims();
+
+        if src_dims.len() > target_dims.len() {
+            return Err(Error::InvalidArgument(format!(
+                "broadcast_to: source rank {} exceeds target rank {}; \
+                 broadcasting can add leading axes but not drop them",
+                src_dims.len(),
+                target_dims.len(),
+            )));
+        }
+
+        let pad = target_dims.len() - src_dims.len();
+        let mut new_strides_vec: Vec<isize> = Vec::with_capacity(target_dims.len());
+        for (axis, &target_dim) in target_dims.iter().enumerate() {
+            if axis < pad {
+                new_strides_vec.push(0);
+            } else {
+                let src_axis = axis - pad;
+                let src_dim = src_dims[src_axis];
+                let src_stride = src_strides_slice[src_axis];
+                if src_dim == target_dim {
+                    new_strides_vec.push(src_stride);
+                } else if src_dim == 1 {
+                    new_strides_vec.push(0);
+                } else {
+                    return Err(Error::InvalidArgument(format!(
+                        "broadcast_to: source axis {src_axis} of size {src_dim} cannot \
+                         broadcast to target axis {axis} of size {target_dim}; \
+                         only size-1 source axes can expand",
+                    )));
+                }
+            }
+        }
+
+        let (source, byte_offset) = self.flatten_view();
+        Ok(Self::view(
+            source,
+            byte_offset,
+            target,
+            Strides::from(new_strides_vec),
         ))
     }
 
@@ -426,10 +816,11 @@ impl Tensor {
 
     /// Whether this tensor's backing buffer has been materialized
     /// and can be read host-side. `true` for host-constructed leaves
-    /// (always) and for op tensors after [`Tensor::eval`].
+    /// (always), for op tensors after [`Tensor::eval`], and for views
+    /// whose source chain terminates at a materialized leaf.
     #[must_use]
     pub fn is_materialized(&self) -> bool {
-        self.inner.cache.get().is_some()
+        self.resolve_leaf().is_some()
     }
 
     /// Whether this tensor was produced by an op (regardless of
@@ -463,27 +854,125 @@ impl Tensor {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 
-    /// Host-readable view of the tensor's raw bytes, or `None` if the
-    /// backing buffer hasn't been materialized yet *or* if the tensor
-    /// is quantized (quantized tensors carry three byte-erased
-    /// buffers — packed weights, scales, biases — that don't
-    /// collapse into a single contiguous `&[u8]` view; the runtime
-    /// reads them by-component at dispatch time via the
-    /// `LeafStorage::Quantized` variant).
+    /// Host-readable view of the tensor's logical contiguous byte
+    /// window, or `None` if it isn't observable as a contiguous slice.
     ///
-    /// Safe to call: a populated `cache` carries the invariant that
-    /// no GPU dispatch is concurrently writing the buffer.
-    /// Host-constructed leaves uphold this trivially; op outputs
-    /// uphold it because [`Tensor::eval`] populates the cache only
-    /// after `waitUntilCompleted`.
+    /// Returns `Some` iff every condition below holds:
+    /// - the backing leaf is materialized (host-constructed leaf, or
+    ///   an op output after [`Tensor::eval`]);
+    /// - the layout is [`Layout::Dense`] with contiguous (row-major)
+    ///   strides for the tensor's current shape;
+    /// - the leaf storage is dense (quantized leaves carry three
+    ///   byte-erased buffers — packed weights, scales, biases — that
+    ///   don't collapse into a single contiguous `&[u8]` view; the
+    ///   runtime reads them by-component at dispatch time via the
+    ///   `LeafStorage::Quantized` variant).
+    ///
+    /// For non-contiguous views (transpose, broadcast, sliced along
+    /// an inner dim) this returns `None`; use [`Tensor::cpu_iter`] for
+    /// element-wise access regardless of stride pattern, or
+    /// [`Tensor::copy`] to materialise the logical layout into a fresh
+    /// contiguous tensor first.
+    ///
+    /// Safe to call: a populated `cache` on the backing leaf carries
+    /// the invariant that no GPU dispatch is concurrently writing the
+    /// buffer. Host-constructed leaves uphold this trivially; op
+    /// outputs uphold it because [`Tensor::eval`] populates the cache
+    /// only after `waitUntilCompleted`.
     #[must_use]
     pub fn cpu_bytes(&self) -> Option<&[u8]> {
-        match self.inner.cache.get()? {
-            // SAFETY: see method docs — the cache invariant rules out
-            // concurrent GPU writes.
-            LeafStorage::Dense(buffer) => Some(unsafe { buffer.as_slice() }),
-            LeafStorage::Quantized { .. } => None,
+        if !self.inner.layout.is_dense_contiguous(&self.inner.shape) {
+            return None;
         }
+        let (storage, byte_offset) = self.resolve_leaf()?;
+        let buffer = match storage {
+            LeafStorage::Dense(buffer) => buffer,
+            LeafStorage::Quantized { .. } => return None,
+        };
+        // SAFETY: the cache invariant on the backing leaf rules out
+        // concurrent GPU writes (see method docs).
+        let bytes = unsafe { buffer.as_slice() };
+        let elem_count = self.inner.shape.elem_count();
+        let byte_count = elem_count.checked_mul(self.inner.dtype.size_bytes())?;
+        let end = byte_offset.checked_add(byte_count)?;
+        bytes.get(byte_offset..end)
+    }
+
+    /// Whether this tensor is a view onto another tensor's storage.
+    /// Views share their backing leaf with their `source`; they never
+    /// allocate their own buffer.
+    #[must_use]
+    pub fn is_view(&self) -> bool {
+        self.inner.view.is_some()
+    }
+
+    /// Walk the view chain to the backing leaf, accumulating
+    /// byte-offset. Returns `(leaf_storage, total_byte_offset)`. None
+    /// if any link in the chain is unmaterialized (placeholder or an
+    /// op that hasn't been evaluated yet).
+    pub(crate) fn resolve_leaf(&self) -> Option<(&LeafStorage, usize)> {
+        let mut current = &self.inner;
+        let mut offset: usize = 0;
+        loop {
+            if let Some(storage) = current.cache.get() {
+                return Some((storage, offset));
+            }
+            let view = current.view.as_ref()?;
+            offset = offset.checked_add(view.byte_offset)?;
+            current = &view.source.inner;
+        }
+    }
+
+    /// Element-wise host iterator over the tensor's logical values.
+    ///
+    /// Works for *any* stride pattern (contiguous, transposed,
+    /// broadcast, sliced). The iterator walks the logical shape in
+    /// row-major order, computing each element's byte offset from
+    /// the view's strides and reading the typed scalar from the
+    /// backing leaf via `ptr::read_unaligned`.
+    ///
+    /// Returns `Some` iff the backing leaf is materialized, the
+    /// tensor is dense (not quantized), and the dtype matches `T`.
+    /// Test-grade performance only — production kernels do the same
+    /// indexing on the GPU.
+    #[must_use]
+    pub fn cpu_iter<T: Scalar>(&self) -> Option<CpuIter<'_, T>> {
+        if self.dtype() != T::DTYPE {
+            return None;
+        }
+        let strides = match self.layout() {
+            Layout::Dense { strides } => strides.as_slice(),
+            Layout::Quantized(_) => return None,
+        };
+        let (storage, byte_offset) = self.resolve_leaf()?;
+        let buffer = match storage {
+            LeafStorage::Dense(buffer) => buffer,
+            LeafStorage::Quantized { .. } => return None,
+        };
+        // SAFETY: the cache invariant on the backing leaf rules out
+        // concurrent GPU writes; same as cpu_bytes.
+        let bytes = unsafe { buffer.as_slice() };
+        let dims = self.inner.shape.dims();
+        let remaining = self.inner.shape.elem_count();
+        Some(CpuIter {
+            bytes,
+            base_offset: byte_offset,
+            shape: dims,
+            strides,
+            elem_size: T::DTYPE.size_bytes(),
+            indices: vec![0; dims.len()],
+            remaining,
+            _t: PhantomData,
+        })
+    }
+
+    /// Collect the tensor's logical values into a fresh `Vec<T>` in
+    /// row-major order. Thin wrapper over [`Tensor::cpu_iter`] for
+    /// tests where the vec is the assertion target. Returns `None`
+    /// under the same conditions as `cpu_iter`.
+    #[must_use]
+    pub fn cpu_to_vec<T: Scalar>(&self) -> Option<Vec<T>> {
+        Some(self.cpu_iter::<T>()?.collect())
     }
 
     /// Typed host-readable view of a dense materialized tensor.
@@ -528,6 +1017,87 @@ pub(crate) fn checked_byte_count(shape: &Shape, dtype: DType) -> Result<usize> {
 fn dense_layout(shape: &Shape) -> Layout {
     Layout::Dense {
         strides: Strides::contiguous(shape),
+    }
+}
+
+/// Element-wise host iterator returned by [`Tensor::cpu_iter`].
+///
+/// Walks the logical shape in row-major order, reading each typed
+/// scalar from the backing leaf via stride arithmetic. Yields `T` by
+/// value (every [`Scalar`] is `Copy`).
+///
+/// The iterator borrows the backing leaf bytes; the leaf stays alive
+/// for the iterator's lifetime via the source tensor's `Arc`.
+pub struct CpuIter<'a, T: Scalar> {
+    bytes: &'a [u8],
+    base_offset: usize,
+    shape: &'a [usize],
+    strides: &'a [isize],
+    elem_size: usize,
+    indices: Vec<usize>,
+    remaining: usize,
+    _t: PhantomData<T>,
+}
+
+impl<T: Scalar> Iterator for CpuIter<'_, T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        if self.remaining == 0 {
+            return None;
+        }
+
+        let mut signed_off: isize = isize::try_from(self.base_offset)
+            .expect("base_offset fits in isize (Metal allocations are well under isize::MAX)");
+        for (idx, stride) in self.indices.iter().zip(self.strides.iter()) {
+            let idx_signed = isize::try_from(*idx).expect("index fits in isize");
+            let elem_signed = isize::try_from(self.elem_size).expect("dtype size fits in isize");
+            let step = idx_signed
+                .checked_mul(*stride)
+                .and_then(|s| s.checked_mul(elem_signed))
+                .expect("stride arithmetic overflowed isize");
+            signed_off = signed_off
+                .checked_add(step)
+                .expect("byte offset overflowed isize");
+        }
+        let byte_off = usize::try_from(signed_off).expect("computed byte offset is non-negative");
+        debug_assert!(byte_off + self.elem_size <= self.bytes.len());
+
+        // SAFETY: byte_off + elem_size ≤ bytes.len() (asserted in debug;
+        // the public view-building APIs guarantee this in release by
+        // bounds-checking shape × strides at construction). Metal
+        // shared-storage allocations are page-aligned, but we still use
+        // read_unaligned so mid-buffer offsets are sound for any T.
+        let val = unsafe {
+            self.bytes
+                .as_ptr()
+                .add(byte_off)
+                .cast::<T>()
+                .read_unaligned()
+        };
+
+        // Advance odometer: increment last axis, carry up. Rank-0
+        // tensors have an empty `indices` and bail out via the
+        // `remaining` counter alone.
+        for axis in (0..self.indices.len()).rev() {
+            self.indices[axis] += 1;
+            if self.indices[axis] < self.shape[axis] {
+                break;
+            }
+            self.indices[axis] = 0;
+        }
+        self.remaining -= 1;
+        Some(val)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl<T: Scalar> ExactSizeIterator for CpuIter<'_, T> {
+    fn len(&self) -> usize {
+        self.remaining
     }
 }
 
@@ -828,6 +1398,104 @@ mod tests {
     }
 
     #[test]
+    fn eval_through_view_materializes_source_op() {
+        // A view of an unevaluated op should, when eval()'d, dispatch
+        // the underlying op so the view becomes materialised.
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..12)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let src = Tensor::from_slice(&device, &data, [3, 4]).expect("from_slice");
+        let copied = src.copy().expect("copy"); // unevaluated op
+        assert!(!copied.is_materialized());
+        let view = copied.reshape([2, 6]).expect("reshape"); // view of op
+        assert!(!view.is_materialized());
+
+        view.eval().expect("eval view");
+
+        assert!(copied.is_materialized());
+        assert!(view.is_materialized());
+        // View shares the source's bytes; reshape is contiguous so
+        // cpu_slice works directly.
+        assert_eq!(view.cpu_slice::<f32>().unwrap(), data.as_slice());
+    }
+
+    #[test]
+    fn copy_of_transposed_view_materializes_logical_layout() {
+        // A 2x3 row-major source, transposed to 3x2, then copied. The
+        // copy should produce a contiguous 3x2 tensor whose values
+        // match the transposed view element-for-element.
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; // 2x3
+        let src = Tensor::from_slice(&device, &data, [2, 3]).expect("from_slice");
+        let transposed = src.permute(&[1, 0]).expect("permute"); // 3x2 view
+
+        let copied = transposed.copy().expect("copy");
+        copied.eval().expect("eval");
+
+        // Logical transpose: rows become columns.
+        let expected: Vec<f32> = vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0];
+        assert_eq!(copied.shape().dims(), &[3, 2]);
+        assert_eq!(copied.cpu_slice::<f32>().unwrap(), expected.as_slice());
+    }
+
+    #[test]
+    fn copy_of_broadcast_view_materializes_repeated_rows() {
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = vec![10.0, 20.0, 30.0, 40.0]; // 1x4
+        let src = Tensor::from_slice(&device, &data, [1, 4]).expect("from_slice");
+        let broadcasted = src.broadcast_to([3, 4]).expect("broadcast_to");
+
+        let copied = broadcasted.copy().expect("copy");
+        copied.eval().expect("eval");
+
+        let expected: Vec<f32> = vec![
+            10.0, 20.0, 30.0, 40.0, 10.0, 20.0, 30.0, 40.0, 10.0, 20.0, 30.0, 40.0,
+        ];
+        assert_eq!(copied.cpu_slice::<f32>().unwrap(), expected.as_slice());
+    }
+
+    #[test]
+    fn copy_of_sliced_view_materializes_window() {
+        // Slice along axis 0 (preserves contiguity but introduces a
+        // byte offset) and along axis 1 (introduces non-unit stride).
+        let device = Device::shared().expect("system default device");
+        let data: Vec<i32> = (0..24).collect(); // 4x6
+        let src = Tensor::from_slice(&device, &data, [4, 6]).expect("from_slice");
+        let window = src.slice(&[1..3, 0..6]).expect("slice axis 0"); // rows 1..3
+        let inner = window.slice(&[0..2, 2..5]).expect("slice axis 1"); // cols 2..5
+
+        let copied = inner.copy().expect("copy");
+        copied.eval().expect("eval");
+
+        // Rows 1,2 of `data`, columns 2..5:
+        let expected: Vec<i32> = vec![8, 9, 10, 14, 15, 16];
+        assert_eq!(copied.shape().dims(), &[2, 3]);
+        assert_eq!(copied.cpu_slice::<i32>().unwrap(), expected.as_slice());
+    }
+
+    #[test]
+    fn copy_of_view_over_unevaluated_op_dispatches_both() {
+        // The view's source is another (unevaluated) Copy op. eval()
+        // on the strided copy should walk: strided-copy → view →
+        // source copy → leaf, dispatching the source copy in the same
+        // batch and then the strided copy.
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let src = Tensor::from_slice(&device, &data, [2, 3]).expect("from_slice");
+        let staged = src.copy().expect("first copy"); // unevaluated op
+        let transposed = staged.permute(&[1, 0]).expect("permute"); // view of op
+        let final_copy = transposed.copy().expect("strided copy");
+
+        final_copy.eval().expect("eval");
+
+        assert!(staged.is_materialized());
+        assert!(final_copy.is_materialized());
+        let expected: Vec<f32> = vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0];
+        assert_eq!(final_copy.cpu_slice::<f32>().unwrap(), expected.as_slice());
+    }
+
+    #[test]
     fn eval_shared_subgraph_dispatched_once() {
         let device = Device::shared().expect("system default device");
         let data: Vec<f32> = vec![1.0; 8];
@@ -874,6 +1542,730 @@ mod tests {
         dst.eval().expect("eval");
         let read_back = dst.cpu_slice::<i32>().expect("cpu_slice");
         assert_eq!(read_back, data.as_slice());
+    }
+
+    /// Test-only constructor for a view tensor pointing at `source`
+    /// with an explicit `byte_offset`, `shape`, and (dense) `strides`,
+    /// bypassing [`Tensor::flatten_view`]. The public view-building
+    /// APIs (`reshape`, `permute`, `slice`, `broadcast_to`) flatten
+    /// view chains on the way in; this helper exists so the chain-
+    /// walking tests can build multi-hop chains directly.
+    fn manual_view(source: &Tensor, byte_offset: usize, shape: Shape, strides: Strides) -> Tensor {
+        let layout = Layout::Dense { strides };
+        Tensor {
+            inner: Arc::new(TensorInner {
+                shape,
+                dtype: source.dtype(),
+                layout,
+                device: source.device().cloned(),
+                op: None,
+                view: Some(ViewSource {
+                    source: source.clone(),
+                    byte_offset,
+                }),
+                cache: OnceLock::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn view_chain_walks_to_materialized_leaf() {
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..16)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [16]).expect("from_slice");
+
+        // Full-window view: byte_offset = 0, same shape, contiguous strides.
+        let v = manual_view(
+            &leaf,
+            0,
+            Shape::from([16]),
+            Strides::contiguous(&Shape::from([16])),
+        );
+
+        assert!(v.is_view());
+        assert!(v.is_materialized());
+        let bytes = v.cpu_bytes().expect("view cpu_bytes");
+        assert_eq!(bytes.len(), 16 * 4);
+        let typed = v.cpu_slice::<f32>().expect("view cpu_slice");
+        assert_eq!(typed, data.as_slice());
+    }
+
+    #[test]
+    fn view_with_byte_offset_reads_logical_window() {
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..16)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [16]).expect("from_slice");
+
+        // View the second half: skip 8 f32 (32 bytes), shape [8].
+        let v = manual_view(
+            &leaf,
+            32,
+            Shape::from([8]),
+            Strides::contiguous(&Shape::from([8])),
+        );
+
+        let typed = v.cpu_slice::<f32>().expect("view cpu_slice");
+        assert_eq!(typed, &data[8..]);
+    }
+
+    #[test]
+    fn non_contiguous_view_returns_none_from_cpu_bytes() {
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..6)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [2, 3]).expect("from_slice");
+
+        // Transposed view: shape [3, 2], strides [1, 3] (non-contiguous).
+        let v = manual_view(&leaf, 0, Shape::from([3, 2]), Strides::from([1isize, 3]));
+
+        assert!(v.is_materialized());
+        assert!(v.cpu_bytes().is_none());
+        assert!(v.cpu_slice::<f32>().is_none());
+    }
+
+    #[test]
+    fn view_of_view_accumulates_byte_offset() {
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..16)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [16]).expect("from_slice");
+
+        let outer = manual_view(
+            &leaf,
+            16,
+            Shape::from([12]),
+            Strides::contiguous(&Shape::from([12])),
+        );
+        // Take a further [8] sub-window starting 8 bytes in.
+        let inner = manual_view(
+            &outer,
+            8,
+            Shape::from([6]),
+            Strides::contiguous(&Shape::from([6])),
+        );
+
+        // Total byte_offset = 16 + 8 = 24 → f32 index 6, length 6.
+        let typed = inner.cpu_slice::<f32>().expect("view cpu_slice");
+        assert_eq!(typed, &data[6..12]);
+    }
+
+    #[test]
+    fn cpu_iter_matches_cpu_slice_for_contiguous_leaf() {
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..24)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [2, 3, 4]).expect("from_slice");
+
+        let iter_vec: Vec<f32> = leaf.cpu_iter::<f32>().expect("cpu_iter").collect();
+        let slice = leaf.cpu_slice::<f32>().expect("cpu_slice");
+        assert_eq!(iter_vec, slice);
+        assert_eq!(iter_vec, data);
+    }
+
+    #[test]
+    fn cpu_to_vec_round_trips_contiguous() {
+        let device = Device::shared().expect("system default device");
+        let data: Vec<i32> = (-8..8).collect();
+        let leaf = Tensor::from_slice(&device, &data, [4, 4]).expect("from_slice");
+        let v = leaf.cpu_to_vec::<i32>().expect("cpu_to_vec");
+        assert_eq!(v, data);
+    }
+
+    #[test]
+    fn cpu_iter_walks_transposed_view_in_logical_order() {
+        // Build a [2, 3] f32 leaf and view it as [3, 2] with swapped
+        // strides — the manual "transpose." cpu_iter should yield the
+        // elements in row-major order of the transposed shape.
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..6)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [2, 3]).expect("from_slice");
+
+        // Original strides for [2,3] are [3, 1]; transpose swaps to [1, 3].
+        let v = manual_view(&leaf, 0, Shape::from([3, 2]), Strides::from([1isize, 3]));
+
+        let collected: Vec<f32> = v.cpu_iter::<f32>().expect("cpu_iter").collect();
+        // Original layout: [[0,1,2],[3,4,5]]; transposed: [[0,3],[1,4],[2,5]].
+        assert_eq!(collected, vec![0.0, 3.0, 1.0, 4.0, 2.0, 5.0]);
+    }
+
+    #[test]
+    fn cpu_iter_respects_byte_offset_window() {
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..12)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [12]).expect("from_slice");
+
+        // Skip the first 4 f32 (16 bytes), shape [8] contiguous.
+        let v = manual_view(
+            &leaf,
+            16,
+            Shape::from([8]),
+            Strides::contiguous(&Shape::from([8])),
+        );
+        let collected: Vec<f32> = v.cpu_iter::<f32>().expect("cpu_iter").collect();
+        assert_eq!(collected, data[4..].to_vec());
+    }
+
+    #[test]
+    fn cpu_iter_handles_broadcast_zero_strides() {
+        // Three-element vector broadcast to [2, 3] via stride [0, 1].
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = vec![10.0, 20.0, 30.0];
+        let leaf = Tensor::from_slice(&device, &data, [3]).expect("from_slice");
+
+        let v = manual_view(&leaf, 0, Shape::from([2, 3]), Strides::from([0isize, 1]));
+        let collected: Vec<f32> = v.cpu_iter::<f32>().expect("cpu_iter").collect();
+        assert_eq!(collected, vec![10.0, 20.0, 30.0, 10.0, 20.0, 30.0]);
+    }
+
+    #[test]
+    fn cpu_iter_returns_none_for_dtype_mismatch() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [4], DType::F32).expect("zeros");
+        assert!(leaf.cpu_iter::<i32>().is_none());
+        assert!(leaf.cpu_iter::<f32>().is_some());
+    }
+
+    #[test]
+    fn cpu_iter_returns_none_for_unmaterialized_op() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [4], DType::F32).expect("zeros");
+        let op = leaf.copy().expect("copy");
+        assert!(op.cpu_iter::<f32>().is_none());
+
+        op.eval().expect("eval");
+        assert!(op.cpu_iter::<f32>().is_some());
+    }
+
+    #[test]
+    fn cpu_iter_size_hint_and_len_match_elem_count() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [2, 3, 5], DType::F32).expect("zeros");
+        let iter = leaf.cpu_iter::<f32>().expect("cpu_iter");
+        assert_eq!(iter.len(), 30);
+        assert_eq!(iter.size_hint(), (30, Some(30)));
+    }
+
+    #[test]
+    fn reshape_identity_preserves_values() {
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..24)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [2, 3, 4]).expect("from_slice");
+        let v = leaf.reshape([2, 3, 4]).expect("reshape");
+
+        assert!(v.is_view());
+        assert_eq!(v.shape().dims(), &[2, 3, 4]);
+        assert_eq!(v.cpu_to_vec::<f32>().unwrap(), data);
+    }
+
+    #[test]
+    fn reshape_flatten_then_unflatten_round_trip() {
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..24)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [2, 3, 4]).expect("from_slice");
+        let flat = leaf.reshape([24]).expect("flatten");
+        assert_eq!(flat.shape().dims(), &[24]);
+        assert_eq!(flat.cpu_to_vec::<f32>().unwrap(), data);
+
+        let cube = flat.reshape([4, 6]).expect("unflatten");
+        assert_eq!(cube.shape().dims(), &[4, 6]);
+        assert_eq!(cube.cpu_to_vec::<f32>().unwrap(), data);
+        assert!(cube.layout().is_dense_contiguous(cube.shape()));
+    }
+
+    #[test]
+    fn reshape_view_is_contiguous_via_cpu_bytes() {
+        // Contiguous views must satisfy the cpu_bytes contract: same
+        // logical bytes as cpu_iter would emit.
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..12)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [12]).expect("from_slice");
+
+        let v = leaf.reshape([3, 4]).expect("reshape");
+        let bytes = v
+            .cpu_bytes()
+            .expect("contiguous view should expose cpu_bytes");
+        assert_eq!(bytes.len(), 12 * 4);
+        let typed = v.cpu_slice::<f32>().expect("cpu_slice");
+        assert_eq!(typed, data.as_slice());
+    }
+
+    #[test]
+    fn reshape_folds_view_chain() {
+        // reshape-of-reshape should point directly at the leaf, not at
+        // the intermediate view (one-hop chain instead of two).
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..24)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [24]).expect("from_slice");
+
+        let mid = leaf.reshape([2, 12]).expect("reshape 1");
+        let outer = mid.reshape([4, 3, 2]).expect("reshape 2");
+
+        // Inspect the chain: outer's ViewSource should point at the
+        // leaf directly, not at `mid`.
+        let outer_view = outer.inner.view.as_ref().expect("view");
+        assert!(outer_view.source.ptr_eq(&leaf));
+        assert_eq!(outer_view.byte_offset, 0);
+    }
+
+    #[test]
+    fn reshape_rejects_elem_count_mismatch() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [2, 3], DType::F32).expect("zeros");
+        let err = leaf.reshape([2, 4]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn reshape_rejects_non_contiguous_input() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [2, 3], DType::F32).expect("zeros");
+        // Hand-construct a transposed view (non-contiguous) and try to
+        // reshape it — should error rather than silently producing
+        // wrong data.
+        let transposed = manual_view(&leaf, 0, Shape::from([3, 2]), Strides::from([1isize, 3]));
+        let err = transposed.reshape([6]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn reshape_rejects_quantized() {
+        let t = Tensor::quantized_placeholder([4096, 4096], Quantization::Q4_GS64);
+        let err = t.reshape([4096 * 4096]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn reshape_rejects_placeholder() {
+        let p = Tensor::placeholder::<f32>([2, 3]);
+        let err = p.reshape([6]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn reshape_of_evaluated_op_is_readable() {
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..16)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let src = Tensor::from_slice(&device, &data, [16]).expect("from_slice");
+        let op = src.copy().expect("copy");
+
+        // Reshape an unevaluated op output. The view is constructed
+        // immediately; reading it requires the op to be evaluated.
+        let v = op.reshape([4, 4]).expect("reshape");
+        assert!(!v.is_materialized());
+        op.eval().expect("eval");
+        assert!(v.is_materialized());
+        assert_eq!(v.cpu_to_vec::<f32>().unwrap(), data);
+    }
+
+    #[test]
+    fn permute_identity_yields_same_values() {
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..24)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [2, 3, 4]).expect("from_slice");
+
+        let same = leaf.permute(&[0, 1, 2]).expect("permute identity");
+        assert_eq!(same.shape().dims(), &[2, 3, 4]);
+        assert_eq!(same.cpu_to_vec::<f32>().unwrap(), data);
+    }
+
+    #[test]
+    fn permute_2d_transpose_matches_manual() {
+        let device = Device::shared().expect("system default device");
+        // [[0,1,2],[3,4,5]]
+        let data: Vec<f32> = (0..6)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [2, 3]).expect("from_slice");
+
+        let t = leaf.permute(&[1, 0]).expect("permute");
+        assert_eq!(t.shape().dims(), &[3, 2]);
+        // Transposed row-major: [[0,3],[1,4],[2,5]]
+        assert_eq!(
+            t.cpu_to_vec::<f32>().unwrap(),
+            vec![0.0, 3.0, 1.0, 4.0, 2.0, 5.0],
+        );
+    }
+
+    #[test]
+    fn permute_4d_attention_pattern() {
+        // [B=2, T=3, H=2, D_h=2] → [B, H, T, D_h] via axes [0, 2, 1, 3]
+        // is the Q/K/V reshape every attention block does.
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..24)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [2, 3, 2, 2]).expect("from_slice");
+
+        let permuted = leaf.permute(&[0, 2, 1, 3]).expect("permute");
+        assert_eq!(permuted.shape().dims(), &[2, 2, 3, 2]);
+
+        // Reference: walk the original (b, t, h, d) layout with the
+        // permuted index (b, h, t, d) and read the value.
+        let mut expected: Vec<f32> = Vec::with_capacity(24);
+        for b in 0..2 {
+            for h in 0..2 {
+                for t in 0..3 {
+                    for d in 0..2 {
+                        let src_idx = ((b * 3 + t) * 2 + h) * 2 + d;
+                        expected.push(data[src_idx]);
+                    }
+                }
+            }
+        }
+        assert_eq!(permuted.cpu_to_vec::<f32>().unwrap(), expected);
+    }
+
+    #[test]
+    fn permute_of_permute_composes() {
+        // Swapping back returns the original logical order.
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..12)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [3, 4]).expect("from_slice");
+
+        let once = leaf.permute(&[1, 0]).expect("permute 1");
+        let twice = once.permute(&[1, 0]).expect("permute 2");
+        assert_eq!(twice.shape().dims(), &[3, 4]);
+        assert_eq!(twice.cpu_to_vec::<f32>().unwrap(), data);
+    }
+
+    #[test]
+    fn permute_folds_through_reshape_chain() {
+        // reshape then permute should keep the view one hop from the
+        // backing leaf, not stack two view nodes.
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..12)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [12]).expect("from_slice");
+        let v = leaf
+            .reshape([3, 4])
+            .expect("reshape")
+            .permute(&[1, 0])
+            .expect("permute");
+        let view_node = v.inner.view.as_ref().expect("view");
+        assert!(view_node.source.ptr_eq(&leaf));
+    }
+
+    #[test]
+    fn permute_rejects_wrong_length() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [2, 3], DType::F32).expect("zeros");
+        let err = leaf.permute(&[0]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn permute_rejects_out_of_range_axis() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [2, 3], DType::F32).expect("zeros");
+        let err = leaf.permute(&[0, 5]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn permute_rejects_duplicate_axis() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [2, 3], DType::F32).expect("zeros");
+        let err = leaf.permute(&[0, 0]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn permute_rejects_quantized() {
+        let t = Tensor::quantized_placeholder([4096, 4096], Quantization::Q4_GS64);
+        let err = t.permute(&[1, 0]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn permute_rejects_placeholder() {
+        let p = Tensor::placeholder::<f32>([2, 3]);
+        let err = p.permute(&[1, 0]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn permuted_view_reports_non_contiguous_cpu_bytes() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [2, 3], DType::F32).expect("zeros");
+        let t = leaf.permute(&[1, 0]).expect("permute");
+        // Transposed strides aren't row-major-contiguous for [3,2].
+        assert!(t.cpu_bytes().is_none());
+        // But cpu_iter still works.
+        assert!(t.cpu_iter::<f32>().is_some());
+    }
+
+    #[test]
+    fn slice_leading_axis_is_contiguous() {
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..12)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [4, 3]).expect("from_slice");
+
+        let v = leaf.slice(&[1..3, 0..3]).expect("slice leading");
+        assert_eq!(v.shape().dims(), &[2, 3]);
+        // Leading slice [1..3] is contiguous in row-major.
+        let bytes = v.cpu_bytes().expect("contiguous via leading slice");
+        assert_eq!(bytes.len(), 6 * 4);
+        assert_eq!(v.cpu_to_vec::<f32>().unwrap(), data[3..9].to_vec());
+    }
+
+    #[test]
+    fn slice_inner_axis_is_non_contiguous() {
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..12)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [4, 3]).expect("from_slice");
+
+        // Take columns 1..3 of every row.
+        let v = leaf.slice(&[0..4, 1..3]).expect("slice inner");
+        assert_eq!(v.shape().dims(), &[4, 2]);
+        // Inner-axis slice is non-contiguous: stride is still 3, but
+        // shape's row-major contiguous would require stride 2.
+        assert!(v.cpu_bytes().is_none());
+
+        let mut expected: Vec<f32> = Vec::with_capacity(8);
+        for row in 0..4 {
+            for col in 1..3 {
+                expected.push(data[row * 3 + col]);
+            }
+        }
+        assert_eq!(v.cpu_iter::<f32>().unwrap().collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn slice_chain_accumulates_byte_offset() {
+        // Slice twice; the second slice should fold into a single view
+        // pointing directly at the leaf with combined offset.
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..16)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [16]).expect("from_slice");
+
+        let a = leaf.slice(std::slice::from_ref(&(4..12))).expect("slice 1");
+        let b = a.slice(std::slice::from_ref(&(2..6))).expect("slice 2");
+        assert_eq!(b.shape().dims(), &[4]);
+        assert_eq!(b.cpu_to_vec::<f32>().unwrap(), data[6..10].to_vec());
+
+        let view_node = b.inner.view.as_ref().expect("view");
+        assert!(view_node.source.ptr_eq(&leaf));
+        // 4 + 2 = 6 f32s, × 4 bytes = 24.
+        assert_eq!(view_node.byte_offset, 24);
+    }
+
+    #[test]
+    fn slice_of_permute_reads_logical_values() {
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..12)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [3, 4]).expect("from_slice");
+
+        // Transpose to [4, 3], then take the middle two rows.
+        let t = leaf.permute(&[1, 0]).expect("permute");
+        let v = t.slice(&[1..3, 0..3]).expect("slice");
+        assert_eq!(v.shape().dims(), &[2, 3]);
+
+        // Permuted logical layout columns (col 1, col 2 of original):
+        // col 1: [1, 5, 9]; col 2: [2, 6, 10].
+        let expected = vec![1.0, 5.0, 9.0, 2.0, 6.0, 10.0];
+        assert_eq!(v.cpu_iter::<f32>().unwrap().collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn slice_empty_range_yields_zero_count() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [4, 3], DType::F32).expect("zeros");
+        let v = leaf.slice(&[2..2, 0..3]).expect("empty slice");
+        assert_eq!(v.shape().dims(), &[0, 3]);
+        assert_eq!(v.elem_count(), 0);
+        assert_eq!(v.cpu_to_vec::<f32>().unwrap(), Vec::<f32>::new());
+    }
+
+    #[test]
+    fn slice_rejects_wrong_range_count() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [2, 3], DType::F32).expect("zeros");
+        let err = leaf.slice(std::slice::from_ref(&(0..2))).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn slice_rejects_out_of_bounds() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [2, 3], DType::F32).expect("zeros");
+        let err = leaf.slice(&[0..2, 0..5]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn slice_rejects_inverted_range() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [2, 3], DType::F32).expect("zeros");
+        // Construct an inverted range via the struct literal so clippy
+        // doesn't reject `1..0` — the whole point of this test is to
+        // assert slice itself rejects start > end.
+        let inverted = Range { start: 1, end: 0 };
+        let err = leaf.slice(&[inverted, 0..3]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn slice_rejects_quantized() {
+        let t = Tensor::quantized_placeholder([4096, 4096], Quantization::Q4_GS64);
+        let err = t.slice(&[0..1024, 0..1024]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn slice_rejects_placeholder() {
+        let p = Tensor::placeholder::<f32>([2, 3]);
+        let err = p.slice(&[0..2, 0..3]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn broadcast_to_pads_leading_axes() {
+        // [D] -> [B, T, D]: the rmsnorm-style gamma broadcast.
+        let device = Device::shared().expect("system default device");
+        let gamma: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let leaf = Tensor::from_slice(&device, &gamma, [4]).expect("from_slice");
+
+        let v = leaf.broadcast_to([2, 3, 4]).expect("broadcast");
+        assert_eq!(v.shape().dims(), &[2, 3, 4]);
+
+        // The full broadcast is gamma repeated B*T times.
+        let expected: Vec<f32> = (0..6).flat_map(|_| gamma.iter().copied()).collect();
+        assert_eq!(v.cpu_iter::<f32>().unwrap().collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn broadcast_to_expands_size_one_axis() {
+        // [1, 4] -> [3, 4]: same-rank broadcast.
+        let device = Device::shared().expect("system default device");
+        let row: Vec<f32> = vec![10.0, 20.0, 30.0, 40.0];
+        let leaf = Tensor::from_slice(&device, &row, [1, 4]).expect("from_slice");
+
+        let v = leaf.broadcast_to([3, 4]).expect("broadcast");
+        let expected: Vec<f32> = (0..3).flat_map(|_| row.iter().copied()).collect();
+        assert_eq!(v.cpu_iter::<f32>().unwrap().collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn broadcast_to_identity_keeps_strides() {
+        // Same shape broadcast is a no-op contents-wise but still
+        // builds a view (cheap and uniform with the other cases).
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..6)
+            .map(|i| f32::from(i16::try_from(i).unwrap()))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [2, 3]).expect("from_slice");
+        let v = leaf.broadcast_to([2, 3]).expect("broadcast");
+        assert_eq!(v.shape().dims(), &[2, 3]);
+        assert_eq!(v.cpu_iter::<f32>().unwrap().collect::<Vec<_>>(), data);
+    }
+
+    #[test]
+    fn broadcast_to_supports_zero_strides_via_iter() {
+        // Scalar-ish source: [1] broadcast to [5] yields constant view.
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::from_slice(&device, &[42.0_f32], [1]).expect("from_slice");
+        let v = leaf.broadcast_to([5]).expect("broadcast");
+        assert_eq!(
+            v.cpu_iter::<f32>().unwrap().collect::<Vec<_>>(),
+            vec![42.0; 5]
+        );
+    }
+
+    #[test]
+    fn broadcast_to_rejects_non_one_mismatch() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [3, 4], DType::F32).expect("zeros");
+        let err = leaf.broadcast_to([3, 5]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn broadcast_to_rejects_target_with_lower_rank() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [2, 3], DType::F32).expect("zeros");
+        let err = leaf.broadcast_to([3]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn broadcast_to_rejects_quantized() {
+        let t = Tensor::quantized_placeholder([4096, 4096], Quantization::Q4_GS64);
+        let err = t.broadcast_to([4096, 4096]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn broadcast_to_rejects_placeholder() {
+        let p = Tensor::placeholder::<f32>([4]);
+        let err = p.broadcast_to([2, 4]).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn broadcast_view_reports_non_contiguous_cpu_bytes() {
+        let device = Device::shared().expect("system default device");
+        let leaf = Tensor::zeros(&device, [4], DType::F32).expect("zeros");
+        let v = leaf.broadcast_to([3, 4]).expect("broadcast");
+        // Stride pattern [0, 1] isn't row-major-contiguous for shape [3, 4].
+        assert!(v.cpu_bytes().is_none());
+        assert!(v.cpu_iter::<f32>().is_some());
+    }
+
+    #[test]
+    fn view_of_unevaluated_op_is_not_materialized() {
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = vec![0.0; 8];
+        let leaf = Tensor::from_slice(&device, &data, [8]).expect("from_slice");
+        let op = leaf.copy().expect("copy");
+
+        let v = manual_view(
+            &op,
+            0,
+            Shape::from([8]),
+            Strides::contiguous(&Shape::from([8])),
+        );
+        assert!(!v.is_materialized());
+        assert!(v.cpu_bytes().is_none());
+
+        // After evaluating the op, the view becomes readable.
+        op.eval().expect("eval");
+        assert!(v.is_materialized());
+        let typed = v.cpu_slice::<f32>().expect("view cpu_slice");
+        assert_eq!(typed, data.as_slice());
     }
 
     #[test]
