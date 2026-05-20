@@ -36,7 +36,10 @@ fn parity_v_square_bf16() {
 
     // SAFETY: commit_and_wait synchronised; GPU is done with `dst`.
     let out: Vec<bf16> = unsafe { dst.as_mut_slice() }.to_vec();
-    assert_eq!(out, out_ref, "v_Squarebfloat16bfloat16 must be bit-exact vs MLX");
+    assert_eq!(
+        out, out_ref,
+        "v_Squarebfloat16bfloat16 must be bit-exact vs MLX"
+    );
 }
 
 #[test]
@@ -53,7 +56,10 @@ fn parity_v_rsqrt_bf16() {
 
     // SAFETY: commit_and_wait synchronised; GPU is done with `dst`.
     let out: Vec<bf16> = unsafe { dst.as_mut_slice() }.to_vec();
-    assert_eq!(out, out_ref, "v_Rsqrtbfloat16bfloat16 must be bit-exact vs MLX");
+    assert_eq!(
+        out, out_ref,
+        "v_Rsqrtbfloat16bfloat16 must be bit-exact vs MLX"
+    );
 }
 
 fn fixture(op: &str) -> (Vec<bf16>, Vec<bf16>) {
