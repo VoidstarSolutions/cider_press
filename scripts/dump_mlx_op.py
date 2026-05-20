@@ -134,6 +134,28 @@ def run_rsqrt(args: argparse.Namespace) -> dict[str, mx.array]:
 
 
 # ---------------------------------------------------------------------------
+# row_sum: sum-reduce along the last axis (consumed by branch 5
+# `feat/rmsnorm`). Writes `lhs`, `out`. Output shape drops the last
+# axis (i.e. caller picks keep_dim semantics at the runtime layer).
+# ---------------------------------------------------------------------------
+
+
+def add_row_sum_parser(subparsers: argparse._SubParsersAction) -> None:
+    p = subparsers.add_parser("row_sum", help="Sum-reduce along the last axis")
+    p.add_argument("--lhs-shape", required=True, help="comma-separated, e.g. 1,8,896")
+    p.add_argument("--dtype", default="bf16", help="one of f32, f16, bf16")
+
+
+def run_row_sum(args: argparse.Namespace) -> dict[str, mx.array]:
+    shape = _parse_shape(args.lhs_shape)
+    dtype = _float_dtype(args.dtype)
+    lhs = (mx.random.uniform(shape=shape) - 0.5).astype(dtype)
+    out = mx.sum(lhs, axis=-1, keepdims=False)
+    mx.eval(lhs, out)
+    return {"lhs": lhs, "out": out}
+
+
+# ---------------------------------------------------------------------------
 # mul: element-wise multiply with broadcasting. Writes `lhs`, `rhs`, `out`.
 # Shares the add-style argparser and seeding convention.
 # ---------------------------------------------------------------------------
@@ -171,6 +193,7 @@ OPS: dict[str, tuple[ParserBuilder, Runner]] = {
     "mul": (add_mul_parser, run_mul),
     "square": (add_square_parser, run_square),
     "rsqrt": (add_rsqrt_parser, run_rsqrt),
+    "row_sum": (add_row_sum_parser, run_row_sum),
 }
 
 
