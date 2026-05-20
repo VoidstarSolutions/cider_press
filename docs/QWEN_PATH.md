@@ -82,7 +82,7 @@ that introduced them, instead of three branches later in some composition.
 | 3 | `feat/weight-loading` | safetensors integration; Qwen2.5 weight-key mapping; `config.json` parsing; HF revision SHA pinned. Includes the per-op MLX activation-dump harness (one `uv run` script that takes op name + shapes + dtypes and writes a parity safetensors). | Loaded tensor bytes == safetensors bytes (memcmp). Shape/dtype assertions match `config.json` predictions. No forward pass yet. |
 | 4 | (done) `feat/elementwise-add` | First binary op family: vendored MLX's `binary.metal`, `OpKind::Binary { op: Add \| Mul }`, NumPy broadcasting via existing `broadcast_to`; `vv_*` fast path + `g{1,2,3}_*` rank-specialised strided paths for f32/f16/bf16 | MLX bit-exact parity at kernels, runtime, and models levels: synthetic `[1,8,896]` same-shape and broadcast `+[896]`; gated real-checkpoint test loads `layer0.input_layernorm` and broadcast-adds it bit-exactly vs a CPU bf16 reference |
 | 5 | (done) `feat/rmsnorm` | Vendored MLX's `unary.metal` + `reduce.metal`. Kernels: `v_{square,rsqrt}_*` (6 fns) + `row_reduce_{sum,prod,min,max}_*` (12 fns, with `init_reduce` + `row_reduce_looped` bundled per op). Runtime: `OpKind::Unary` + `OpKind::Reduce`, `Tensor::{square, rsqrt, sum, prod, min, max, mean}`. Models: `nn::rms_norm(x, gamma, eps)` composed (no fused kernel). | MLX parity on `[1, 8, 896]` bf16 vs `mx.fast.rms_norm` (composed-path tolerance) plus gated real-checkpoint test against `layer0.input_layernorm` + CPU f32 reference |
-| 6 | `feat/silu-and-gelu` | `OpKind::SiLU` (Qwen uses SwiGLU = silu(gate) * up); GELU is mostly free from the same `unary*.metal` | MLX parity per dtype |
+| 6 | (done) `feat/silu-and-gelu` | Two activations composed from existing unary primitives. MLX's `unary.metal` doesn't ship `Silu`/`Gelu`; `mlx.nn` composes them on the Python side, so we mirror that factoring. Kernels: `v_{sigmoid,erf}_*` (6 fns; instantiations already present in the vendored `unary.metal`). Runtime: `UnaryOp::{Sigmoid, Erf}` + `Tensor::{sigmoid, erf}`. Models: `nn::silu(x) = x * sigmoid(x)`, exact `nn::gelu(x) = 0.5 * x * (1 + erf(x / sqrt(2)))`. | SiLU bit-exact vs `mlx.nn.silu`. GELU bf16-compose tolerance vs `mlx.nn.gelu` (we reciprocal-multiply where MLX divides — runtime has no divide op yet — so the bf16-rounded constants differ in the last few bits). |
 | 7 | `feat/gather` | `OpKind::Gather` for embedding lookup; vendor MLX's gather kernel. **Decision needed here:** tied embeddings are quantized, so either (a) implement quantized-row gather, or (b) gather → `dequantize_row` for the embedding path while qmv handles the LM head. Leaning (b) — embedding gather is once per token at decode and tiny. | MLX parity on random indices against real `W_embed` |
 | 8 | `feat/kv-cache` | `KvCache` type (separate from Tensor); `update` (eager `Copy` to a slab); view accessors | Round-trip: write N rows, read back via view, compare |
 | 9 | `feat/rope` | `OpKind::Rope` (Qwen RoPE config — base θ, dim split); could be a fused kernel or composed | MLX parity on `[B, T, H, D_h]` Q/K |
@@ -118,22 +118,29 @@ for "it's fast and clean" but can wait until branch 15+:
 
 ## What to do next time we sit down
 
-Branch 6 (`feat/silu-and-gelu`). Specifically:
+Branch 7 (`feat/gather`). Specifically:
 
-1. SiLU is the activation in Qwen's SwiGLU MLP: the gate-proj output
-   passes through SiLU then multiplies the up-proj output. GELU
-   isn't used by Qwen but is the next-most-common transformer
-   activation and comes essentially for free off the same
-   `unary.metal` we already vendored in branch 5 — both are single
-   instantiations of the existing dispatch pattern.
-2. Plumbing: add `UnaryOp::{Silu, Gelu}` to the runtime enum and
-   matching `Tensor::silu` / `Tensor::gelu` methods. The kernels
-   crate adds `v_{silu,gelu}_{f32,f16,bf16}` (6 fns) following the
-   exact shape `v_square_*` and `v_rsqrt_*` already use.
-3. Parity: extend `dump_mlx_op.py` with `silu` and `gelu` cases and
-   add bit-exact parity tests at the kernels + runtime layers. No
-   real-checkpoint test needed — these are pointwise primitives and
-   the loader doesn't change.
+1. Vendor MLX's gather kernel (`mlx/backend/metal/kernels/gather.metal`
+   plus any transitive headers) and add a `KernelLibrary::gather`
+   slot. Embedding gather is the only consumer for now — bf16 indexed
+   by `u32`.
+2. Decide quantized embedding strategy. `model.embed_tokens` is
+   quantized (4-bit, group 64), and tied embeddings mean the LM head
+   reads the same weight. Two paths:
+   - (a) Implement a quantized-row gather kernel (gather + dequantize
+     per row, fused).
+   - (b) `gather → dequantize_row` as separate ops, reusing the qmv
+     dequant path.
+   Leaning (b) — embedding gather is once per token at decode and
+   tiny; (a) is a perf-only win we can revisit if measurement asks.
+   Either way, the LM head keeps using qmv against the same packed
+   weight.
+3. Runtime: `OpKind::Gather` + `Tensor::gather(indices)`. Output
+   shape is `indices.shape() ++ source.shape()[1:]` for axis 0.
+4. Parity: gather + dequant on random `u32` indices against MLX's
+   reference, run against the real `embed_tokens` weight loaded by
+   `load_qwen2_weights`. The gated real-checkpoint test pattern from
+   branches 4+5 carries forward.
 
 Open question carried forward from branch 5 reduce-scope discussion:
 whether the deferred kernel variants (`row_reduce_simple` for high
