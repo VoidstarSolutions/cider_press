@@ -21,6 +21,7 @@ compile_error!(
 );
 
 mod error;
+pub mod nn;
 pub mod qwen2;
 pub mod safetensors_io;
 

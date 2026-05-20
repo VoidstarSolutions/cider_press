@@ -901,16 +901,16 @@ fn dispatch_reduce(
             let mut d = unsafe { dst.reinterpret_as::<f32>() };
             match kind {
                 ReduceKind::Sum => {
-                    reduce::row_reduce_sum_f32(commands, library, &s, &src_dims, &mut d)?
+                    reduce::row_reduce_sum_f32(commands, library, &s, &src_dims, &mut d)?;
                 }
                 ReduceKind::Prod => {
-                    reduce::row_reduce_prod_f32(commands, library, &s, &src_dims, &mut d)?
+                    reduce::row_reduce_prod_f32(commands, library, &s, &src_dims, &mut d)?;
                 }
                 ReduceKind::Min => {
-                    reduce::row_reduce_min_f32(commands, library, &s, &src_dims, &mut d)?
+                    reduce::row_reduce_min_f32(commands, library, &s, &src_dims, &mut d)?;
                 }
                 ReduceKind::Max => {
-                    reduce::row_reduce_max_f32(commands, library, &s, &src_dims, &mut d)?
+                    reduce::row_reduce_max_f32(commands, library, &s, &src_dims, &mut d)?;
                 }
             }
         }
@@ -919,16 +919,16 @@ fn dispatch_reduce(
             let mut d = unsafe { dst.reinterpret_as::<half::f16>() };
             match kind {
                 ReduceKind::Sum => {
-                    reduce::row_reduce_sum_f16(commands, library, &s, &src_dims, &mut d)?
+                    reduce::row_reduce_sum_f16(commands, library, &s, &src_dims, &mut d)?;
                 }
                 ReduceKind::Prod => {
-                    reduce::row_reduce_prod_f16(commands, library, &s, &src_dims, &mut d)?
+                    reduce::row_reduce_prod_f16(commands, library, &s, &src_dims, &mut d)?;
                 }
                 ReduceKind::Min => {
-                    reduce::row_reduce_min_f16(commands, library, &s, &src_dims, &mut d)?
+                    reduce::row_reduce_min_f16(commands, library, &s, &src_dims, &mut d)?;
                 }
                 ReduceKind::Max => {
-                    reduce::row_reduce_max_f16(commands, library, &s, &src_dims, &mut d)?
+                    reduce::row_reduce_max_f16(commands, library, &s, &src_dims, &mut d)?;
                 }
             }
         }
@@ -937,16 +937,16 @@ fn dispatch_reduce(
             let mut d = unsafe { dst.reinterpret_as::<half::bf16>() };
             match kind {
                 ReduceKind::Sum => {
-                    reduce::row_reduce_sum_bf16(commands, library, &s, &src_dims, &mut d)?
+                    reduce::row_reduce_sum_bf16(commands, library, &s, &src_dims, &mut d)?;
                 }
                 ReduceKind::Prod => {
-                    reduce::row_reduce_prod_bf16(commands, library, &s, &src_dims, &mut d)?
+                    reduce::row_reduce_prod_bf16(commands, library, &s, &src_dims, &mut d)?;
                 }
                 ReduceKind::Min => {
-                    reduce::row_reduce_min_bf16(commands, library, &s, &src_dims, &mut d)?
+                    reduce::row_reduce_min_bf16(commands, library, &s, &src_dims, &mut d)?;
                 }
                 ReduceKind::Max => {
-                    reduce::row_reduce_max_bf16(commands, library, &s, &src_dims, &mut d)?
+                    reduce::row_reduce_max_bf16(commands, library, &s, &src_dims, &mut d)?;
                 }
             }
         }
