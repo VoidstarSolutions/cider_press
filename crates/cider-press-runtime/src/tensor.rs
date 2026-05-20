@@ -1408,6 +1408,81 @@ mod tests {
     }
 
     #[test]
+    fn copy_of_transposed_view_materializes_logical_layout() {
+        // A 2x3 row-major source, transposed to 3x2, then copied. The
+        // copy should produce a contiguous 3x2 tensor whose values
+        // match the transposed view element-for-element.
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; // 2x3
+        let src = Tensor::from_slice(&device, &data, [2, 3]).expect("from_slice");
+        let transposed = src.permute(&[1, 0]).expect("permute"); // 3x2 view
+
+        let copied = transposed.copy().expect("copy");
+        copied.eval().expect("eval");
+
+        // Logical transpose: rows become columns.
+        let expected: Vec<f32> = vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0];
+        assert_eq!(copied.shape().dims(), &[3, 2]);
+        assert_eq!(copied.cpu_slice::<f32>().unwrap(), expected.as_slice());
+    }
+
+    #[test]
+    fn copy_of_broadcast_view_materializes_repeated_rows() {
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = vec![10.0, 20.0, 30.0, 40.0]; // 1x4
+        let src = Tensor::from_slice(&device, &data, [1, 4]).expect("from_slice");
+        let broadcasted = src.broadcast_to([3, 4]).expect("broadcast_to");
+
+        let copied = broadcasted.copy().expect("copy");
+        copied.eval().expect("eval");
+
+        let expected: Vec<f32> = vec![
+            10.0, 20.0, 30.0, 40.0, 10.0, 20.0, 30.0, 40.0, 10.0, 20.0, 30.0, 40.0,
+        ];
+        assert_eq!(copied.cpu_slice::<f32>().unwrap(), expected.as_slice());
+    }
+
+    #[test]
+    fn copy_of_sliced_view_materializes_window() {
+        // Slice along axis 0 (preserves contiguity but introduces a
+        // byte offset) and along axis 1 (introduces non-unit stride).
+        let device = Device::shared().expect("system default device");
+        let data: Vec<i32> = (0..24).collect(); // 4x6
+        let src = Tensor::from_slice(&device, &data, [4, 6]).expect("from_slice");
+        let window = src.slice(&[1..3, 0..6]).expect("slice axis 0"); // rows 1..3
+        let inner = window.slice(&[0..2, 2..5]).expect("slice axis 1"); // cols 2..5
+
+        let copied = inner.copy().expect("copy");
+        copied.eval().expect("eval");
+
+        // Rows 1,2 of `data`, columns 2..5:
+        let expected: Vec<i32> = vec![8, 9, 10, 14, 15, 16];
+        assert_eq!(copied.shape().dims(), &[2, 3]);
+        assert_eq!(copied.cpu_slice::<i32>().unwrap(), expected.as_slice());
+    }
+
+    #[test]
+    fn copy_of_view_over_unevaluated_op_dispatches_both() {
+        // The view's source is another (unevaluated) Copy op. eval()
+        // on the strided copy should walk: strided-copy → view →
+        // source copy → leaf, dispatching the source copy in the same
+        // batch and then the strided copy.
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let src = Tensor::from_slice(&device, &data, [2, 3]).expect("from_slice");
+        let staged = src.copy().expect("first copy"); // unevaluated op
+        let transposed = staged.permute(&[1, 0]).expect("permute"); // view of op
+        let final_copy = transposed.copy().expect("strided copy");
+
+        final_copy.eval().expect("eval");
+
+        assert!(staged.is_materialized());
+        assert!(final_copy.is_materialized());
+        let expected: Vec<f32> = vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0];
+        assert_eq!(final_copy.cpu_slice::<f32>().unwrap(), expected.as_slice());
+    }
+
+    #[test]
     fn eval_shared_subgraph_dispatched_once() {
         let device = Device::shared().expect("system default device");
         let data: Vec<f32> = vec![1.0; 8];
