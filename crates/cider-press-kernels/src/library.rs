@@ -35,6 +35,12 @@ const COPY_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/copy_inlined.m
 /// Pre-flattened MLX `binary.metal`, produced by `build.rs`.
 const BINARY_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/binary_inlined.metal"));
 
+/// Pre-flattened MLX `unary.metal`, produced by `build.rs`.
+const UNARY_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/unary_inlined.metal"));
+
+/// Pre-flattened MLX `reduce.metal`, produced by `build.rs`.
+const REDUCE_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/reduce_inlined.metal"));
+
 /// Pre-flattened MLX `quantized.metal`, produced by `build.rs`.
 const QUANTIZED_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/quantized_inlined.metal"));
 
@@ -93,6 +99,22 @@ impl KernelLibrary {
     /// and strided (`g1_/g2_/g3_/gn2_`) variants.
     pub fn binary(device: &Device) -> Result<Self> {
         Self::from_source(device, BINARY_SOURCE)
+    }
+
+    /// JIT-compile MLX's `unary.metal` (vendored under
+    /// `kernels-mlx/`). Hosts the element-wise unary op family
+    /// (`Square`, `Rsqrt`, `Exp`, etc.) in contiguous (`v_/v2_`) and
+    /// strided (`g{n}_`) variants.
+    pub fn unary(device: &Device) -> Result<Self> {
+        Self::from_source(device, UNARY_SOURCE)
+    }
+
+    /// JIT-compile MLX's `reduce.metal` (vendored under
+    /// `kernels-mlx/`). Hosts the reduction op family
+    /// (`Sum`, `Mean`, `Max`, `Min`, `Prod`) for `all`, `row`, and
+    /// `column` reductions.
+    pub fn reduce(device: &Device) -> Result<Self> {
+        Self::from_source(device, REDUCE_SOURCE)
     }
 
     /// JIT-compile MLX's `quantized.metal` (vendored under
