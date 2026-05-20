@@ -165,6 +165,26 @@ pub enum OpKind {
         /// match the input weight's [`Quantization::bits`].
         bits: u8,
     },
+    /// Element-wise binary op with `NumPy` broadcasting. Inputs (in
+    /// [`Tensor::op_inputs`] order) are `[lhs, rhs]`, both dense
+    /// tensors of the same [`DType`] on the same [`Device`]. The
+    /// dispatcher picks between MLX's `vv_<Op>` (same-shape contiguous
+    /// fast path) and `g{1,2,3}_<Op>` (rank-specialised strided path)
+    /// based on whether either input is a view or has a shape
+    /// shorter than the output.
+    Binary {
+        /// Which arithmetic operation to perform.
+        op: BinaryOp,
+    },
+}
+
+/// Element-wise binary operations supported by [`OpKind::Binary`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BinaryOp {
+    /// `c = a + b`.
+    Add,
+    /// `c = a * b`.
+    Mul,
 }
 
 /// User-facing lazy tensor handle.
@@ -455,6 +475,96 @@ impl Tensor {
             layout,
             OpKind::Copy,
             vec![self.clone()],
+        ))
+    }
+
+    /// Schedule `self + other` (element-wise, NumPy-broadcasting).
+    /// See [`Tensor::binary`] for the broadcasting rules and shared
+    /// preconditions.
+    pub fn add(&self, other: &Tensor) -> Result<Self> {
+        self.binary(other, BinaryOp::Add)
+    }
+
+    /// Schedule `self * other` (element-wise, NumPy-broadcasting).
+    /// See [`Tensor::binary`] for the broadcasting rules and shared
+    /// preconditions.
+    pub fn mul(&self, other: &Tensor) -> Result<Self> {
+        self.binary(other, BinaryOp::Mul)
+    }
+
+    /// Schedule an element-wise binary op between `self` and `other`
+    /// with `NumPy` broadcasting.
+    ///
+    /// Both inputs must be dense (no quantized operand support yet),
+    /// share a [`Device`], and share a [`DType`]. The output shape is
+    /// the right-aligned broadcast of the two input shapes: shorter
+    /// rank is padded on the left with size-1 axes, then each axis must
+    /// be either equal between the two inputs or have one side equal
+    /// to 1 (which the dispatcher will broadcast via zero strides).
+    ///
+    /// The returned tensor is dense and contiguous over the broadcast
+    /// output shape; no GPU work runs until [`Tensor::eval`].
+    ///
+    /// Public so external code can pick the op without re-doing the
+    /// shape/device/dtype validation in [`Tensor::add`] / [`Tensor::mul`].
+    pub fn binary(&self, other: &Tensor, op: BinaryOp) -> Result<Self> {
+        let lhs_device = self.inner.device.as_ref().ok_or_else(|| {
+            Error::InvalidArgument(
+                "binary: cannot apply an op to a placeholder (no device) on lhs".into(),
+            )
+        })?;
+        let rhs_device = other.inner.device.as_ref().ok_or_else(|| {
+            Error::InvalidArgument(
+                "binary: cannot apply an op to a placeholder (no device) on rhs".into(),
+            )
+        })?;
+        if !lhs_device.ptr_eq(rhs_device) {
+            return Err(Error::InvalidArgument(
+                "binary: lhs and rhs are on different devices".into(),
+            ));
+        }
+        if self.inner.dtype != other.inner.dtype {
+            return Err(Error::InvalidArgument(format!(
+                "binary: dtype mismatch (lhs={:?}, rhs={:?}); \
+                 mixed-dtype binary ops are not supported yet",
+                self.inner.dtype, other.inner.dtype,
+            )));
+        }
+        match (&self.inner.layout, &other.inner.layout) {
+            (Layout::Dense { .. }, Layout::Dense { .. }) => {}
+            _ => {
+                return Err(Error::InvalidArgument(
+                    "binary: only dense tensors are supported (quantized binary ops are not in scope)".into(),
+                ));
+            }
+        }
+
+        let out_shape = broadcast_shape(self.shape(), other.shape())?;
+
+        // Align each operand to the output shape via `broadcast_to` if
+        // its shape differs. `broadcast_to` is a zero-copy view that
+        // pads leading axes with stride-0 and expands size-1 axes; if
+        // the operand already matches, we keep the original (avoids an
+        // unnecessary view node on the vv-fast path).
+        let lhs = if self.shape().dims() == out_shape.dims() {
+            self.clone()
+        } else {
+            self.broadcast_to(out_shape.clone())?
+        };
+        let rhs = if other.shape().dims() == out_shape.dims() {
+            other.clone()
+        } else {
+            other.broadcast_to(out_shape.clone())?
+        };
+
+        let layout = dense_layout(&out_shape);
+        Ok(Self::op_tensor(
+            lhs_device,
+            out_shape,
+            self.inner.dtype,
+            layout,
+            OpKind::Binary { op },
+            vec![lhs, rhs],
         ))
     }
 
@@ -1018,6 +1128,38 @@ fn dense_layout(shape: &Shape) -> Layout {
     Layout::Dense {
         strides: Strides::contiguous(shape),
     }
+}
+
+/// NumPy-style right-aligned broadcast of two shapes.
+///
+/// Each output axis is the max of the corresponding (right-aligned)
+/// input axes, with the constraint that mismatched axes are only legal
+/// when one of them is 1. Inputs of different rank are aligned on the
+/// right; the shorter shape is implicitly padded with size-1 leading
+/// axes.
+fn broadcast_shape(a: &Shape, b: &Shape) -> Result<Shape> {
+    let a_dims = a.dims();
+    let b_dims = b.dims();
+    let out_rank = a_dims.len().max(b_dims.len());
+    let mut out = vec![0usize; out_rank];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let ai = a_dims.len().checked_sub(out_rank - i);
+        let bi = b_dims.len().checked_sub(out_rank - i);
+        let av = ai.map_or(1, |idx| a_dims[idx]);
+        let bv = bi.map_or(1, |idx| b_dims[idx]);
+        *slot = match (av, bv) {
+            (x, y) if x == y => x,
+            (1, y) => y,
+            (x, 1) => x,
+            (x, y) => {
+                return Err(Error::InvalidArgument(format!(
+                    "binary broadcast: incompatible axis sizes {x} and {y} at output axis {i} \
+                     (shapes {a_dims:?} vs {b_dims:?})",
+                )));
+            }
+        };
+    }
+    Ok(Shape::from(out))
 }
 
 /// Element-wise host iterator returned by [`Tensor::cpu_iter`].
@@ -2266,6 +2408,88 @@ mod tests {
         assert!(v.is_materialized());
         let typed = v.cpu_slice::<f32>().expect("view cpu_slice");
         assert_eq!(typed, data.as_slice());
+    }
+
+    #[test]
+    fn broadcast_shape_pads_leading_axes() {
+        let a = Shape::from([1, 8, 896]);
+        let b = Shape::from([896]);
+        let out = broadcast_shape(&a, &b).expect("broadcast");
+        assert_eq!(out.dims(), &[1, 8, 896]);
+    }
+
+    #[test]
+    fn broadcast_shape_expands_size_one() {
+        let a = Shape::from([3, 1, 5]);
+        let b = Shape::from([4, 5]);
+        let out = broadcast_shape(&a, &b).expect("broadcast");
+        assert_eq!(out.dims(), &[3, 4, 5]);
+    }
+
+    #[test]
+    fn broadcast_shape_rejects_incompatible_axes() {
+        let a = Shape::from([3, 4]);
+        let b = Shape::from([5, 4]);
+        let err = broadcast_shape(&a, &b).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(_)),
+            "expected InvalidArgument, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn add_picks_vv_path_for_same_shape() {
+        let device = Device::shared().expect("device");
+        let lhs = Tensor::from_slice(&device, &[1.0f32; 16], [4, 4]).expect("lhs");
+        let rhs = Tensor::from_slice(&device, &[2.0f32; 16], [4, 4]).expect("rhs");
+        let sum = lhs.add(&rhs).expect("add");
+        // Neither input was broadcast, so neither op input should be a
+        // view — the dispatcher will pick `vv_Addfloat32`.
+        let inputs = sum.op_inputs().expect("op inputs");
+        assert_eq!(inputs.len(), 2);
+        assert!(inputs[0].inner.view.is_none());
+        assert!(inputs[1].inner.view.is_none());
+        sum.eval().expect("eval");
+        let out = sum.cpu_to_vec::<f32>().expect("out");
+        assert_eq!(out, [3.0f32; 16]);
+    }
+
+    #[test]
+    fn add_inserts_broadcast_view_when_shapes_differ() {
+        let device = Device::shared().expect("device");
+        let lhs = Tensor::from_slice(&device, &[1.0f32; 8], [2, 4]).expect("lhs");
+        let rhs = Tensor::from_slice(&device, &[10.0f32; 4], [4]).expect("rhs");
+        let sum = lhs.add(&rhs).expect("add");
+        let inputs = sum.op_inputs().expect("op inputs");
+        // lhs already matches output shape, so it stays a non-view leaf;
+        // rhs gets a broadcast_to view to rank 2.
+        assert!(inputs[0].inner.view.is_none());
+        assert!(inputs[1].inner.view.is_some());
+        sum.eval().expect("eval");
+        let out = sum.cpu_to_vec::<f32>().expect("out");
+        assert_eq!(out, vec![11.0; 8]);
+    }
+
+    #[test]
+    fn add_rejects_dtype_mismatch() {
+        let device = Device::shared().expect("device");
+        let lhs = Tensor::from_slice(&device, &[1.0f32], [1]).expect("lhs");
+        let rhs = Tensor::from_slice(&device, &[bf16::from_f32(1.0)], [1]).expect("rhs");
+        let err = lhs.add(&rhs).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn mul_works_through_vv_path() {
+        let device = Device::shared().expect("device");
+        let lhs = Tensor::from_slice(&device, &[2.0f32, 3.0, 4.0, 5.0], [4]).expect("lhs");
+        let rhs = Tensor::from_slice(&device, &[10.0f32, 10.0, 10.0, 10.0], [4]).expect("rhs");
+        let prod = lhs.mul(&rhs).expect("mul");
+        prod.eval().expect("eval");
+        assert_eq!(
+            prod.cpu_to_vec::<f32>().unwrap(),
+            vec![20.0, 30.0, 40.0, 50.0]
+        );
     }
 
     #[test]

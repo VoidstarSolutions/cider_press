@@ -54,4 +54,4 @@ pub use quantization::Quantization;
 pub use quantized::QuantizedWeight;
 pub use shape::Shape;
 pub use strides::Strides;
-pub use tensor::{CpuIter, OpKind, Tensor};
+pub use tensor::{BinaryOp, CpuIter, OpKind, Tensor};

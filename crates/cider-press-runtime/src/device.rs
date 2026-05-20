@@ -34,6 +34,10 @@ struct DeviceInner {
     /// ~100 ms thanks to Metal's cross-process compiled-library
     /// cache). Populated on first qmv/qmm dispatch.
     quantized_library: OnceLock<kernels::KernelLibrary>,
+    /// JIT'd MLX `binary.metal` library. Populated on first binary
+    /// op dispatch (Add / Mul today; the rest of the family lands as
+    /// the runtime asks for it).
+    binary_library: OnceLock<kernels::KernelLibrary>,
 }
 
 /// Refcounted handle to the system's default Metal device.
@@ -57,6 +61,7 @@ impl Device {
                 kernels: kernels::Device::system_default()?,
                 copy_library: OnceLock::new(),
                 quantized_library: OnceLock::new(),
+                binary_library: OnceLock::new(),
             }),
         })
     }
@@ -80,6 +85,7 @@ impl Device {
             kernels: kernels::Device::system_default()?,
             copy_library: OnceLock::new(),
             quantized_library: OnceLock::new(),
+            binary_library: OnceLock::new(),
         });
         let stored = SHARED.get_or_init(|| fresh);
         Ok(Self {
@@ -129,6 +135,17 @@ impl Device {
         }
         let lib = kernels::KernelLibrary::quantized(&self.inner.kernels)?;
         Ok(self.inner.quantized_library.get_or_init(|| lib))
+    }
+
+    /// Lazily JIT-compile and cache MLX's `binary.metal` library.
+    /// First call pays the JIT cost; subsequent calls return the cached
+    /// library. See [`Device::copy_library`] for the cache semantics.
+    pub(crate) fn binary_library(&self) -> Result<&kernels::KernelLibrary> {
+        if let Some(lib) = self.inner.binary_library.get() {
+            return Ok(lib);
+        }
+        let lib = kernels::KernelLibrary::binary(&self.inner.kernels)?;
+        Ok(self.inner.binary_library.get_or_init(|| lib))
     }
 }
 
