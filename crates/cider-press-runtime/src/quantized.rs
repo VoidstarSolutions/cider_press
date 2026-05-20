@@ -23,7 +23,7 @@ use crate::Shape;
 use crate::Tensor;
 use crate::dtype::DType;
 use crate::error::{Error, Result};
-use crate::tensor::OpKind;
+use crate::tensor::{LeafStorage, OpKind};
 
 /// A quantized weight matrix, ready for [`QuantizedWeight::matvec`].
 ///
@@ -178,6 +178,41 @@ impl QuantizedWeight {
     #[must_use]
     pub fn shape(&self) -> &Shape {
         self.tensor.shape()
+    }
+
+    /// Host-readable byte views of the three component buffers
+    /// (packed weights, scales, biases). Safe to call: the leaf is
+    /// always materialized for [`QuantizedWeight::from_bytes`]
+    /// constructions, and the cache invariant rules out concurrent
+    /// GPU writes (same guarantee as [`Tensor::cpu_bytes`]).
+    ///
+    /// Primarily intended for round-trip / parity tests in higher
+    /// layers — the runtime itself reads these buffers via typed
+    /// reinterpret at dispatch time, not by hand.
+    #[must_use]
+    pub fn component_bytes(&self) -> (&[u8], &[u8], &[u8]) {
+        let storage = self
+            .tensor
+            .inner
+            .cache
+            .get()
+            .expect("QuantizedWeight always carries a materialized leaf by construction");
+        match storage {
+            LeafStorage::Quantized {
+                weights,
+                scales,
+                biases,
+            } => {
+                // SAFETY: see method docs.
+                let w = unsafe { weights.as_slice() };
+                let s = unsafe { scales.as_slice() };
+                let b = unsafe { biases.as_slice() };
+                (w, s, b)
+            }
+            LeafStorage::Dense(_) => {
+                unreachable!("QuantizedWeight always wraps LeafStorage::Quantized")
+            }
+        }
     }
 
     /// The quantization descriptor (bits + group size).

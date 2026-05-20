@@ -69,42 +69,64 @@ crate re-exports from runtime + models. Workspace-level
 version pins in one place; each member uses `lints.workspace = true`
 and `dep.workspace = true`.
 
-## Current state: runtime slice landed end-to-end
+## Current state: views + Qwen2 weight loading landed
 
 The development spike (Stages 0–5 below) passed every acceptance bar,
 including bit-exact `qmv` parity with MLX's own `quantized_matmul`.
-The workspace restructure followed immediately after, then the
-runtime slice planned in `docs/RUNTIME_DESIGN.md`:
+Branches landed since then (see `docs/QWEN_PATH.md` for the
+branch-by-branch roadmap):
 
-- `Device` handle with cached kernel libraries (`copy`, `quantized`).
-- Lazy `Tensor` with materialization-state-via-`OnceLock` (no Mutex
-  on the read path; see the design doc's "Materialization state"
-  section for the why).
-- Two ops wired through the runtime: `Tensor::copy` for all
-  five dtypes the runtime models and `QuantizedWeight::matvec`
-  for bf16. The latter has a runtime-level parity test against
-  the same Stage-4 fixture the spike used.
-- `Tensor::eval`: sync public API, single `Commands` per call,
-  synchronous commit + wait. Internal pipelining is deferred (see
-  the design doc's "What pipelining needs" section).
+- **Branch 1 (`feat/runtime-data-primitives`).** `Device` handle with
+  cached kernel libraries (`copy`, `quantized`); lazy `Tensor` with
+  materialization-state-via-`OnceLock`; `Tensor::copy` for all five
+  dtypes; `QuantizedWeight::matvec` for bf16 (runtime-level parity
+  test against the Stage-4 fixture). `Tensor::eval` is the sync
+  public boundary — single `Commands` per call, synchronous commit
+  + wait. Internal pipelining stays deferred.
+- **Branch 2 (`feat/runtime-views`).** `ViewSource` on `TensorInner`
+  plus `Tensor::{reshape, permute, slice, broadcast_to}` + a strided
+  `CpuIter` host accessor. Zero-copy views chase the backing leaf
+  through a chain-flattening helper. `cpu_bytes` is now contract-
+  bounded to "logical contiguous window or None"; non-contiguous
+  views are read via `cpu_iter` / `cpu_to_vec`.
+- **Branch 3 (`feat/weight-loading`).** `cider-press-models` scaffold
+  with: a generic `safetensors_io` adapter (dense + MLX three-key
+  quantized triples), a `Qwen2Config` serde-derived from
+  `config.json` (HF revision pinned), and `Qwen2Weights` +
+  `load_qwen2_weights` walking every key in HF's safetensors layout
+  into typed runtime tensors. Loaded bytes round-trip the archive
+  byte-for-byte (synthetic CI test + gated real-checkpoint test on
+  `CIDER_QWEN_CHECKPOINT_PATH`). Includes the per-op MLX activation-
+  dump harness `scripts/dump_mlx_op.py` that every later op branch
+  adds cases to.
 
 **Concrete target: Qwen2.5-0.5B-Instruct running interactively.**
 Smallest published dense Qwen; same architecture family as the
 eventual MoE target minus the router. `docs/QWEN_PATH.md` is the
 branch-by-branch roadmap; `docs/RUNTIME_DESIGN.md` has the
 framework-gap analysis for the two structural additions we know
-we'll need (Views, `KvCache` type) before the op flood.
+we'll need (Views landed in branch 2; `KvCache` type comes later).
 
-**Next concrete step: branch 2 of the roadmap — `feat/runtime-views`.**
-Adds a `ViewSource` field on `TensorInner` plus `Tensor::reshape`
-/ `::transpose` / `::slice` / `::broadcast_to`. Self-contained
-(no new ops, no model code) and unblocks every subsequent branch
-that needs attention, RMSNorm broadcasting, or KV-cache reads.
+**Next concrete step: branch 4 of the roadmap —
+`feat/elementwise-add`.**
+First binary op family: vendor MLX's `binary*.metal`, wire `OpKind::Add`
+(and `Mul` while we're there) through the runtime with broadcasting
+support. Validates via the activation-dump harness from branch 3
+against real layer-0 residual tensors loaded by `load_qwen2_weights`.
 
-Do **not** start on `cider-press-models` until at least one
-architecture's needs inform the runtime's op coverage — even with
-qmv landing, that bar isn't met yet (need attention + a few
-element-wise/normalization ops).
+Open question deferred from branch 3, surfaced concretely by the
+loader: `model.embed_tokens` is *quantized*, and tied embeddings mean
+the LM head reads the same data. Branch 7 (gather) has to decide
+between a quantized-row gather or `gather → dequantize_row` for the
+embedding path. Leaning the latter — gather is once per token at
+decode and tiny.
+
+Loader-naming footgun worth remembering: `q_proj.bias` (singular,
+dense bf16, additive Linear bias) is **distinct** from
+`q_proj.biases` (plural, per-group quantization bias on the qmv ABI).
+Only Q/K/V have the singular `.bias`; O has only `.biases`.
+`Qwen2AttentionWeights` separates the two via `q_bias` (Tensor) and
+the `QuantizedWeight` field's internal scales/biases.
 
 ### Spike goal
 

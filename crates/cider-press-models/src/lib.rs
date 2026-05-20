@@ -2,13 +2,15 @@
 //!
 //! Sits on top of [`cider_press_runtime`]: model code consumes the
 //! runtime's `Tensor` and ops, never reaches into kernel dispatch
-//! directly. Per-architecture modules will be feature-gated once the
-//! first architecture lands (see `CLAUDE.md`); the model-layout
-//! decision is intentionally deferred until there's a second
-//! architecture to compare against the first.
+//! directly. Per-architecture modules live in submodules (currently
+//! [`qwen2`]); the safetensors plumbing in [`safetensors_io`] is
+//! shared across them.
 //!
-//! Status: scaffolded only. The first architecture is TBD; SDPA is the
-//! next required kernel in `cider-press-kernels`.
+//! Status: weight-loader plumbing in place. `safetensors_io` reads
+//! dense and quantized tensors out of a parsed safetensors archive
+//! into the runtime's `Tensor` / `QuantizedWeight` types, and
+//! [`qwen2`] provides the Qwen2 config schema plus
+//! `load_qwen2_weights` key mapping.
 
 #![cfg_attr(not(target_os = "macos"), allow(unused))]
 
@@ -17,3 +19,9 @@ compile_error!(
     "cider-press currently targets macOS / Apple Silicon only. \
      Build on an aarch64-apple-darwin host."
 );
+
+mod error;
+pub mod qwen2;
+pub mod safetensors_io;
+
+pub use error::{Error, Result};
