@@ -1,10 +1,11 @@
-//! Parity test for `unary.metal` Square / Rsqrt dispatch (branch 5).
+//! Parity test for `unary.metal` Square / Rsqrt / Sigmoid / Erf
+//! dispatch (branches 5 + 6).
 //!
 //! Generates fixtures at test time via `uv run scripts/dump_mlx_op.py
-//! {square,rsqrt}` and asserts bit-exact equality with MLX for bf16
-//! at a Qwen2-residual-shaped tensor (`[1, 8, 896]`). Both ops are a
-//! single rounded primitive (`x * x` and `metal::rsqrt`), so any
-//! drift here is a dispatch-transcription bug.
+//! {square,rsqrt,sigmoid,erf}` and asserts bit-exact equality with MLX
+//! for bf16 at a Qwen2-residual-shaped tensor (`[1, 8, 896]`). Each op
+//! is a single rounded primitive in MSL, so any drift here is a
+//! dispatch-transcription bug.
 //!
 //! Like the binary parity test, fixtures are kept out of the repo —
 //! `dump_mlx_op.py` is the single source of truth for the reference
@@ -59,6 +60,46 @@ fn parity_v_rsqrt_bf16() {
     assert_eq!(
         out, out_ref,
         "v_Rsqrtbfloat16bfloat16 must be bit-exact vs MLX"
+    );
+}
+
+#[test]
+fn parity_v_sigmoid_bf16() {
+    let (lhs, out_ref) = fixture("sigmoid");
+    let device = Device::system_default().expect("Metal device");
+    let library = KernelLibrary::unary(&device).expect("compile unary.metal");
+
+    let src: Buffer<bf16> = device.upload(&lhs).expect("upload lhs");
+    let mut dst: Buffer<bf16> = device.alloc_buffer(S * H).expect("alloc out");
+    let mut cmds = device.commands().expect("commands");
+    kernels::unary::v_sigmoid_bf16(&mut cmds, &library, &src, &mut dst).expect("dispatch");
+    cmds.commit_and_wait().expect("commit");
+
+    // SAFETY: commit_and_wait synchronised; GPU is done with `dst`.
+    let out: Vec<bf16> = unsafe { dst.as_mut_slice() }.to_vec();
+    assert_eq!(
+        out, out_ref,
+        "v_Sigmoidbfloat16bfloat16 must be bit-exact vs MLX"
+    );
+}
+
+#[test]
+fn parity_v_erf_bf16() {
+    let (lhs, out_ref) = fixture("erf");
+    let device = Device::system_default().expect("Metal device");
+    let library = KernelLibrary::unary(&device).expect("compile unary.metal");
+
+    let src: Buffer<bf16> = device.upload(&lhs).expect("upload lhs");
+    let mut dst: Buffer<bf16> = device.alloc_buffer(S * H).expect("alloc out");
+    let mut cmds = device.commands().expect("commands");
+    kernels::unary::v_erf_bf16(&mut cmds, &library, &src, &mut dst).expect("dispatch");
+    cmds.commit_and_wait().expect("commit");
+
+    // SAFETY: commit_and_wait synchronised; GPU is done with `dst`.
+    let out: Vec<bf16> = unsafe { dst.as_mut_slice() }.to_vec();
+    assert_eq!(
+        out, out_ref,
+        "v_Erfbfloat16bfloat16 must be bit-exact vs MLX"
     );
 }
 

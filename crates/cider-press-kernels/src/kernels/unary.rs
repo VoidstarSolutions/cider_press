@@ -5,11 +5,14 @@
 //! Element-wise unary dispatch over MLX's `unary.metal`.
 //!
 //! Exposes the dense same-dtype `v_<Op><in_tname><out_tname>` family
-//! (the `N = 1` instantiation of `unary_v`) for `Square` and `Rsqrt`
-//! across `f32`, `f16`, and `bf16`. These two ops are what the
-//! `rms_norm` composition needs (`x.square()` then
-//! `rsqrt(mean(x²) + eps)`); the rest of MLX's unary surface
-//! (Exp / Sigmoid / Erf / Sin / Cos / …) lands the same way when its
+//! (the `N = 1` instantiation of `unary_v`) for `Square`, `Rsqrt`,
+//! `Sigmoid`, and `Erf` across `f32`, `f16`, and `bf16`.
+//!
+//! `Square` + `Rsqrt` cover the `rms_norm` composition. `Sigmoid` and
+//! `Erf` are the primitives MLX itself uses to compose `silu` and
+//! `gelu` in `mlx.nn` — SiLU = `x * sigmoid(x)`, exact GELU =
+//! `0.5 * x * (1 + erf(x / sqrt(2)))`. The rest of MLX's unary
+//! surface (Exp / Sin / Cos / Tanh / …) lands the same way when its
 //! first consumer arrives.
 //!
 //! Higher-rank strided (`gn{1,4}large_`), 2D-large contiguous
@@ -95,6 +98,72 @@ pub fn v_rsqrt_bf16(
     dst: &mut Buffer<bf16>,
 ) -> Result<()> {
     encode_v(commands, library, "v_Rsqrtbfloat16bfloat16", src, dst)
+}
+
+/// Element-wise `out = 1 / (1 + exp(-x))` for dense `f32` input. Maps
+/// to MLX's `Sigmoid` op (`backend/metal/kernels/unary_ops.h`), which
+/// uses a sign-aware formulation to avoid overflow on large negative
+/// `x`.
+pub fn v_sigmoid_f32(
+    commands: &mut Commands<'_>,
+    library: &KernelLibrary,
+    src: &Buffer<f32>,
+    dst: &mut Buffer<f32>,
+) -> Result<()> {
+    encode_v(commands, library, "v_Sigmoidfloat32float32", src, dst)
+}
+
+/// `f16` analogue of [`v_sigmoid_f32`].
+pub fn v_sigmoid_f16(
+    commands: &mut Commands<'_>,
+    library: &KernelLibrary,
+    src: &Buffer<f16>,
+    dst: &mut Buffer<f16>,
+) -> Result<()> {
+    encode_v(commands, library, "v_Sigmoidfloat16float16", src, dst)
+}
+
+/// `bf16` analogue of [`v_sigmoid_f32`].
+pub fn v_sigmoid_bf16(
+    commands: &mut Commands<'_>,
+    library: &KernelLibrary,
+    src: &Buffer<bf16>,
+    dst: &mut Buffer<bf16>,
+) -> Result<()> {
+    encode_v(commands, library, "v_Sigmoidbfloat16bfloat16", src, dst)
+}
+
+/// Element-wise Gauss error function for dense `f32` input. MLX's
+/// `Erf` op routes through a vendored polynomial approximation in
+/// `erf.h`; the dispatch slot binding is identical to every other
+/// `v_*` kernel here.
+pub fn v_erf_f32(
+    commands: &mut Commands<'_>,
+    library: &KernelLibrary,
+    src: &Buffer<f32>,
+    dst: &mut Buffer<f32>,
+) -> Result<()> {
+    encode_v(commands, library, "v_Erffloat32float32", src, dst)
+}
+
+/// `f16` analogue of [`v_erf_f32`].
+pub fn v_erf_f16(
+    commands: &mut Commands<'_>,
+    library: &KernelLibrary,
+    src: &Buffer<f16>,
+    dst: &mut Buffer<f16>,
+) -> Result<()> {
+    encode_v(commands, library, "v_Erffloat16float16", src, dst)
+}
+
+/// `bf16` analogue of [`v_erf_f32`].
+pub fn v_erf_bf16(
+    commands: &mut Commands<'_>,
+    library: &KernelLibrary,
+    src: &Buffer<bf16>,
+    dst: &mut Buffer<bf16>,
+) -> Result<()> {
+    encode_v(commands, library, "v_Erfbfloat16bfloat16", src, dst)
 }
 
 fn encode_v<T>(
