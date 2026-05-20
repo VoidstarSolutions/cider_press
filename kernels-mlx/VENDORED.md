@@ -23,12 +23,13 @@ when the flattener treats `kernels-mlx/` as its include root.
 Entry points (compiled to JITed `MTLLibrary`s by cider-press-kernels):
 
 - `mlx/backend/metal/kernels/copy.metal`
+- `mlx/backend/metal/kernels/binary.metal`
 - `mlx/backend/metal/kernels/quantized.metal`
 
 Transitive headers reached from those entry points (kept in sync by the
 sync workflow below):
 
-- `mlx/backend/metal/kernels/{copy,quantized,quantized_utils,utils,bf16,bf16_math,complex,defines,logging}.h`
+- `mlx/backend/metal/kernels/{copy,binary,binary_ops,quantized,quantized_utils,utils,bf16,bf16_math,complex,defines,logging}.h`
 - `mlx/backend/metal/kernels/steel/{defines,utils}.h`
 - `mlx/backend/metal/kernels/steel/gemm/{gemm,loader,mma,params,transforms}.h`
 - `mlx/backend/metal/kernels/steel/utils/{integral_constant,type_traits}.h`

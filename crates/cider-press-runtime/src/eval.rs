@@ -14,13 +14,15 @@ use std::sync::Arc;
 
 use cider_press_kernels::{
     Buffer, Commands, KernelLibrary,
-    kernels::{copy, qmv},
+    kernels::{binary, copy, qmv},
 };
 
 use crate::dtype::DType;
 use crate::error::{Error, Result};
 use crate::layout::Layout;
-use crate::tensor::{LeafStorage, OpKind, OpNode, Tensor, TensorInner, checked_byte_count};
+use crate::tensor::{
+    BinaryOp, LeafStorage, OpKind, OpNode, Tensor, TensorInner, checked_byte_count,
+};
 
 pub(crate) fn eval(root: &Tensor) -> Result<()> {
     // Step 1: topological order of unevaluated op nodes reachable from
@@ -196,6 +198,9 @@ fn dispatch(
         OpKind::Qmv { group_size, bits } => dispatch_qmv(
             inner, op, commands, outputs, dst, index_of, group_size, bits,
         ),
+        OpKind::Binary { op: binary_op } => {
+            dispatch_binary(inner, op, commands, outputs, dst, index_of, binary_op)
+        }
     }
 }
 
@@ -507,4 +512,276 @@ fn dispatch_qmv(
     )?;
 
     Ok(())
+}
+
+/// Dispatch an element-wise binary op (Add / Mul).
+///
+/// Picks one of MLX's two `binary.metal` families:
+///
+/// - `vv_<Op><dtype>` when both inputs are non-view dense tensors with
+///   the same shape as the output (typical residual add / Hadamard
+///   product). One contiguous dispatch, no stride bookkeeping.
+/// - `g{1,2,3}_<Op><dtype>` when at least one input is a view, which
+///   is exactly the broadcast case after `Tensor::binary` runs
+///   `broadcast_to` to align operand ranks. Strides come from each
+///   input's [`Layout::Dense`] entries (zero-stride axes encode the
+///   broadcast); the output is dense row-major.
+///
+/// Rank > 3 in the strided case is rejected for now (`gn2_` /
+/// `gn4large_` not wired). The runtime hasn't needed a binary op with
+/// rank-4 broadcast yet — Qwen2 attention/MLP operate at rank 3.
+fn dispatch_binary(
+    inner: &Arc<TensorInner>,
+    op: &OpNode,
+    commands: &mut Commands<'_>,
+    outputs: &[Buffer<u8>],
+    dst: &mut Buffer<u8>,
+    index_of: &HashMap<*const TensorInner, usize>,
+    binary_op: BinaryOp,
+) -> Result<()> {
+    let device = inner
+        .device
+        .as_ref()
+        .expect("op nodes are always constructed with a device");
+    let lhs = op
+        .inputs
+        .first()
+        .ok_or_else(|| Error::InvalidArgument("Binary: missing lhs input (inputs[0])".into()))?;
+    let rhs = op
+        .inputs
+        .get(1)
+        .ok_or_else(|| Error::InvalidArgument("Binary: missing rhs input (inputs[1])".into()))?;
+    let library = device.binary_library()?;
+
+    let is_strided = lhs.inner.view.is_some() || rhs.inner.view.is_some();
+
+    if !is_strided {
+        return dispatch_binary_vv(
+            inner, lhs, rhs, commands, outputs, dst, index_of, library, binary_op,
+        );
+    }
+    dispatch_binary_strided(
+        inner, lhs, rhs, commands, outputs, dst, index_of, library, binary_op,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_binary_vv(
+    inner: &Arc<TensorInner>,
+    lhs: &Tensor,
+    rhs: &Tensor,
+    commands: &mut Commands<'_>,
+    outputs: &[Buffer<u8>],
+    dst: &mut Buffer<u8>,
+    index_of: &HashMap<*const TensorInner, usize>,
+    library: &KernelLibrary,
+    binary_op: BinaryOp,
+) -> Result<()> {
+    let a = dense_input_buffer(lhs, outputs, index_of)?;
+    let b = dense_input_buffer(rhs, outputs, index_of)?;
+
+    // SAFETY: dtype tag drives the reinterpret. Allocation sized the
+    // buffers as `elem_count * size_bytes`, so byte lengths divide
+    // evenly into the typed element count.
+    match inner.dtype {
+        DType::F32 => {
+            let a_t = unsafe { a.reinterpret_as::<f32>() };
+            let b_t = unsafe { b.reinterpret_as::<f32>() };
+            let mut c_t = unsafe { dst.reinterpret_as::<f32>() };
+            match binary_op {
+                BinaryOp::Add => binary::vv_add_f32(commands, library, &a_t, &b_t, &mut c_t)?,
+                BinaryOp::Mul => binary::vv_mul_f32(commands, library, &a_t, &b_t, &mut c_t)?,
+            }
+        }
+        DType::F16 => {
+            let a_t = unsafe { a.reinterpret_as::<half::f16>() };
+            let b_t = unsafe { b.reinterpret_as::<half::f16>() };
+            let mut c_t = unsafe { dst.reinterpret_as::<half::f16>() };
+            match binary_op {
+                BinaryOp::Add => binary::vv_add_f16(commands, library, &a_t, &b_t, &mut c_t)?,
+                BinaryOp::Mul => binary::vv_mul_f16(commands, library, &a_t, &b_t, &mut c_t)?,
+            }
+        }
+        DType::BF16 => {
+            let a_t = unsafe { a.reinterpret_as::<half::bf16>() };
+            let b_t = unsafe { b.reinterpret_as::<half::bf16>() };
+            let mut c_t = unsafe { dst.reinterpret_as::<half::bf16>() };
+            match binary_op {
+                BinaryOp::Add => binary::vv_add_bf16(commands, library, &a_t, &b_t, &mut c_t)?,
+                BinaryOp::Mul => binary::vv_mul_bf16(commands, library, &a_t, &b_t, &mut c_t)?,
+            }
+        }
+        dtype @ (DType::I32 | DType::U32) => {
+            return Err(Error::InvalidArgument(format!(
+                "binary: dtype {dtype:?} not wired for Add/Mul yet (only float dtypes are \
+                 instantiated; integer instantiations exist in binary.metal but the typed \
+                 dispatch fns aren't exposed)",
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn dispatch_binary_strided(
+    inner: &Arc<TensorInner>,
+    lhs: &Tensor,
+    rhs: &Tensor,
+    commands: &mut Commands<'_>,
+    outputs: &[Buffer<u8>],
+    dst: &mut Buffer<u8>,
+    index_of: &HashMap<*const TensorInner, usize>,
+    library: &KernelLibrary,
+    binary_op: BinaryOp,
+) -> Result<()> {
+    let rank = inner.shape.dims().len();
+    if rank == 0 || rank > 3 {
+        return Err(Error::InvalidArgument(format!(
+            "binary: strided dispatch for rank {rank} is not wired (only g1/g2/g3 instantiated; \
+             gn2_/gn4large_ are deferred)",
+        )));
+    }
+
+    let (a_bytes, a_byte_offset) = resolve_view_storage(lhs, outputs, index_of)?;
+    let (b_bytes, b_byte_offset) = resolve_view_storage(rhs, outputs, index_of)?;
+    if a_byte_offset != 0 || b_byte_offset != 0 {
+        // MLX's g_nd1/2/3 take no byte offset — they assume each input
+        // buffer is bound at the broadcast view's element [0,..]. We'd
+        // need to bind with `setBuffer:offset:` to support this, but
+        // none of branch 4's targets (residual + bias adds) produce
+        // non-zero offsets, so surface the gap explicitly.
+        return Err(Error::InvalidArgument(format!(
+            "binary: non-zero view byte offset not yet supported in strided dispatch \
+             (lhs={a_byte_offset}, rhs={b_byte_offset}); add a setBuffer:offset bind when \
+             the first slice-broadcast case appears",
+        )));
+    }
+
+    let a_strides = strides_to_i64(layout_strides(lhs)?)?;
+    let b_strides = strides_to_i64(layout_strides(rhs)?)?;
+    let shape_i32 = shape_to_i32(inner.shape.dims())?;
+
+    if a_strides.len() != rank || b_strides.len() != rank {
+        return Err(Error::InvalidArgument(format!(
+            "binary: input strides rank mismatch (out rank {rank}, lhs strides {}, rhs strides {})",
+            a_strides.len(),
+            b_strides.len(),
+        )));
+    }
+
+    macro_rules! dispatch_typed {
+        ($ty:ty, $add1:path, $mul1:path, $add2:path, $mul2:path, $add3:path, $mul3:path) => {{
+            let a_t = unsafe { a_bytes.reinterpret_as::<$ty>() };
+            let b_t = unsafe { b_bytes.reinterpret_as::<$ty>() };
+            let mut c_t = unsafe { dst.reinterpret_as::<$ty>() };
+            match (rank, binary_op) {
+                (1, BinaryOp::Add) => $add1(
+                    commands,
+                    library,
+                    &a_t,
+                    &b_t,
+                    &mut c_t,
+                    a_strides[0],
+                    b_strides[0],
+                    shape_i32[0],
+                )?,
+                (1, BinaryOp::Mul) => $mul1(
+                    commands,
+                    library,
+                    &a_t,
+                    &b_t,
+                    &mut c_t,
+                    a_strides[0],
+                    b_strides[0],
+                    shape_i32[0],
+                )?,
+                (2, BinaryOp::Add) => $add2(
+                    commands,
+                    library,
+                    &a_t,
+                    &b_t,
+                    &mut c_t,
+                    [a_strides[0], a_strides[1]],
+                    [b_strides[0], b_strides[1]],
+                    [shape_i32[0], shape_i32[1]],
+                )?,
+                (2, BinaryOp::Mul) => $mul2(
+                    commands,
+                    library,
+                    &a_t,
+                    &b_t,
+                    &mut c_t,
+                    [a_strides[0], a_strides[1]],
+                    [b_strides[0], b_strides[1]],
+                    [shape_i32[0], shape_i32[1]],
+                )?,
+                (3, BinaryOp::Add) => $add3(
+                    commands,
+                    library,
+                    &a_t,
+                    &b_t,
+                    &mut c_t,
+                    [a_strides[0], a_strides[1], a_strides[2]],
+                    [b_strides[0], b_strides[1], b_strides[2]],
+                    [shape_i32[0], shape_i32[1], shape_i32[2]],
+                )?,
+                (3, BinaryOp::Mul) => $mul3(
+                    commands,
+                    library,
+                    &a_t,
+                    &b_t,
+                    &mut c_t,
+                    [a_strides[0], a_strides[1], a_strides[2]],
+                    [b_strides[0], b_strides[1], b_strides[2]],
+                    [shape_i32[0], shape_i32[1], shape_i32[2]],
+                )?,
+                _ => unreachable!("rank bounded above"),
+            }
+        }};
+    }
+
+    match inner.dtype {
+        DType::F32 => dispatch_typed!(
+            f32,
+            binary::g1_add_f32,
+            binary::g1_mul_f32,
+            binary::g2_add_f32,
+            binary::g2_mul_f32,
+            binary::g3_add_f32,
+            binary::g3_mul_f32
+        ),
+        DType::F16 => dispatch_typed!(
+            half::f16,
+            binary::g1_add_f16,
+            binary::g1_mul_f16,
+            binary::g2_add_f16,
+            binary::g2_mul_f16,
+            binary::g3_add_f16,
+            binary::g3_mul_f16
+        ),
+        DType::BF16 => dispatch_typed!(
+            half::bf16,
+            binary::g1_add_bf16,
+            binary::g1_mul_bf16,
+            binary::g2_add_bf16,
+            binary::g2_mul_bf16,
+            binary::g3_add_bf16,
+            binary::g3_mul_bf16
+        ),
+        dtype @ (DType::I32 | DType::U32) => {
+            return Err(Error::InvalidArgument(format!(
+                "binary: dtype {dtype:?} not wired for Add/Mul yet",
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn layout_strides(t: &Tensor) -> Result<&[isize]> {
+    match t.layout() {
+        Layout::Dense { strides } => Ok(strides.as_slice()),
+        Layout::Quantized(_) => Err(Error::InvalidArgument(
+            "binary: quantized input is not supported".into(),
+        )),
+    }
 }

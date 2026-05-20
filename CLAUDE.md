@@ -69,7 +69,7 @@ crate re-exports from runtime + models. Workspace-level
 version pins in one place; each member uses `lints.workspace = true`
 and `dep.workspace = true`.
 
-## Current state: views + Qwen2 weight loading landed
+## Current state: elementwise Add/Mul landed
 
 The development spike (Stages 0–5 below) passed every acceptance bar,
 including bit-exact `qmv` parity with MLX's own `quantized_matmul`.
@@ -99,6 +99,24 @@ branch-by-branch roadmap):
   `CIDER_QWEN_CHECKPOINT_PATH`). Includes the per-op MLX activation-
   dump harness `scripts/dump_mlx_op.py` that every later op branch
   adds cases to.
+- **Branch 4 (`feat/elementwise-add`).** First binary op family
+  end-to-end. Vendored MLX's `binary.metal` (+ `binary.h`,
+  `binary_ops.h`); kernels-crate exposes 18 typed dispatch fns
+  (`{vv,g1,g2,g3}_{add,mul}_{f32,f16,bf16}`). Runtime adds
+  `BinaryOp { Add, Mul }`, `OpKind::Binary { op }`, and
+  `Tensor::add` / `Tensor::mul` with NumPy broadcasting via the
+  existing `broadcast_to` view. `dispatch_binary` picks `vv_*` when
+  both inputs are non-view dense tensors with the same shape as the
+  output and `g{1,2,3}_*` when broadcasting injected a view; rank
+  > 3 in the strided case is deferred (`gn2_/gn4large_` not wired).
+  `Device::binary_library()` caches the JIT'd `binary.metal`. Adds
+  the `mul` case to `dump_mlx_op.py`. Validated bit-exactly vs MLX
+  at three layers — kernels, runtime, and models (synthetic
+  Qwen2-shape add+mul plus gated real-checkpoint test that loads
+  `layer0.input_layernorm` and broadcast-adds it bit-exactly vs a
+  CPU bf16 reference). CI now installs `uv` via
+  `astral-sh/setup-uv@v6` so parity tests can shell out to
+  `dump_mlx_op.py` at test time without checking in fixture bytes.
 
 **Concrete target: Qwen2.5-0.5B-Instruct running interactively.**
 Smallest published dense Qwen; same architecture family as the
@@ -107,12 +125,15 @@ branch-by-branch roadmap; `docs/RUNTIME_DESIGN.md` has the
 framework-gap analysis for the two structural additions we know
 we'll need (Views landed in branch 2; `KvCache` type comes later).
 
-**Next concrete step: branch 4 of the roadmap —
-`feat/elementwise-add`.**
-First binary op family: vendor MLX's `binary*.metal`, wire `OpKind::Add`
-(and `Mul` while we're there) through the runtime with broadcasting
-support. Validates via the activation-dump harness from branch 3
-against real layer-0 residual tensors loaded by `load_qwen2_weights`.
+**Next concrete step: branch 5 of the roadmap — `feat/rmsnorm`.**
+First reduction primitive (`mean(x²)` along the last axis), composed
+with `rsqrt` and broadcast `mul` against `gamma` to form RMSNorm.
+Multiply + broadcast already work as of branch 4; the new surface is
+the reduction op (`OpKind::Reduce` over `reduce*.metal`) and probably
+a small unary-op family (`square`, `rsqrt`) factored from MLX's
+`unary.metal`. Validates via `dump_mlx_op.py` against MLX's
+`mx.fast.rms_norm` and against `layer0.input_layernorm`'s real
+`gamma` loaded by `load_qwen2_weights`.
 
 Open question deferred from branch 3, surfaced concretely by the
 loader: `model.embed_tokens` is *quantized*, and tied embeddings mean

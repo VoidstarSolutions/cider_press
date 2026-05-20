@@ -9,5 +9,6 @@
 //! validated the dispatch transcription pattern (see Stage 4 findings
 //! in `CLAUDE.md`) so the per-kernel work is mostly mechanical.
 
+pub mod binary;
 pub mod copy;
 pub mod qmv;

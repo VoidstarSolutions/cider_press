@@ -590,6 +590,21 @@ mod tests {
     }
 
     #[test]
+    fn untied_word_embeddings_rejected() {
+        let device = Device::shared().expect("device");
+        let mut cfg = synthetic_config();
+        cfg.tie_word_embeddings = false;
+        let archive_bytes = synthesize_archive_bytes(&cfg);
+        let archive = SafeTensors::deserialize(&archive_bytes).expect("deserialize");
+
+        let err = load_qwen2_weights(&archive, &cfg, &device).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(_)),
+            "expected InvalidArgument, got {err:?}"
+        );
+    }
+
+    #[test]
     fn missing_quantization_config_errors() {
         let device = Device::shared().expect("device");
         let mut cfg = synthetic_config();

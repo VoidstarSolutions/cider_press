@@ -38,6 +38,15 @@ jobs:
           # depends on every file in kernels-mlx/.
           shared-key: ${{ hashFiles('kernels-mlx/**', 'Cargo.lock') }}
 
+      # The binary-op parity test shells out to
+      # `uv run scripts/dump_mlx_op.py` to generate MLX reference
+      # fixtures at test time (see crates/cider-press-kernels/tests/
+      # binary_parity.rs). Only the `test` job needs it, but installing
+      # it unconditionally keeps the matrix steps symmetric and is
+      # cheap (the action's own cache handles repeat runs).
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
       - name: cargo fmt --check
         if: matrix.task == 'fmt'
         run: cargo fmt --all -- --check
