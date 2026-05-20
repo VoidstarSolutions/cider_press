@@ -92,6 +92,30 @@ def run_add(args: argparse.Namespace) -> dict[str, mx.array]:
 
 
 # ---------------------------------------------------------------------------
+# mul: element-wise multiply with broadcasting. Writes `lhs`, `rhs`, `out`.
+# Shares the add-style argparser and seeding convention.
+# ---------------------------------------------------------------------------
+
+
+def add_mul_parser(subparsers: argparse._SubParsersAction) -> None:
+    p = subparsers.add_parser("mul", help="Element-wise multiply with NumPy broadcasting")
+    p.add_argument("--lhs-shape", required=True, help="comma-separated, e.g. 2,3,4")
+    p.add_argument("--rhs-shape", required=True, help="comma-separated, e.g. 4")
+    p.add_argument("--dtype", default="bf16", help="one of f32, f16, bf16")
+
+
+def run_mul(args: argparse.Namespace) -> dict[str, mx.array]:
+    lhs_shape = _parse_shape(args.lhs_shape)
+    rhs_shape = _parse_shape(args.rhs_shape)
+    dtype = _float_dtype(args.dtype)
+    lhs = (mx.random.uniform(shape=lhs_shape) - 0.5).astype(dtype)
+    rhs = (mx.random.uniform(shape=rhs_shape) - 0.5).astype(dtype)
+    out = mx.multiply(lhs, rhs)
+    mx.eval(lhs, rhs, out)
+    return {"lhs": lhs, "rhs": rhs, "out": out}
+
+
+# ---------------------------------------------------------------------------
 # CLI plumbing
 # ---------------------------------------------------------------------------
 
@@ -102,6 +126,7 @@ ParserBuilder = Callable[[argparse._SubParsersAction], None]
 
 OPS: dict[str, tuple[ParserBuilder, Runner]] = {
     "add": (add_add_parser, run_add),
+    "mul": (add_mul_parser, run_mul),
 }
 
 
