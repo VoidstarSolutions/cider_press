@@ -50,16 +50,34 @@ fn rsqrt_through_runtime_matches_mlx() {
 }
 
 #[test]
-fn sigmoid_through_runtime_matches_mlx() {
+fn sigmoid_through_runtime_matches_mlx_within_ulp_tolerance() {
     let (lhs, out_ref) = fixture("sigmoid");
     let device = Device::system_default().expect("device");
     let t = Tensor::from_slice(&device, &lhs, [1, S, H]).expect("lhs");
     let sig = t.sigmoid().expect("schedule sigmoid");
     sig.eval().expect("eval");
     let out: Vec<bf16> = sig.cpu_to_vec().expect("dense out");
-    assert_eq!(
-        out, out_ref,
-        "Tensor::sigmoid must match mx.sigmoid bit-exactly"
+    // Sigmoid composes `metal::exp(metal::abs(x))`, which drifts 1–2
+    // bf16 ULPs across Apple Silicon generations — see the kernel-layer
+    // parity test for the analysis. The runtime layer adds no new math
+    // on top, so the same tolerance applies here.
+    let mut max_abs = 0.0f32;
+    let mut max_rel = 0.0f32;
+    for (a, b) in out.iter().zip(out_ref.iter()) {
+        let af = a.to_f32();
+        let bf = b.to_f32();
+        let abs = (af - bf).abs();
+        let rel = if bf.abs() > 1e-6 { abs / bf.abs() } else { 0.0 };
+        max_abs = max_abs.max(abs);
+        max_rel = max_rel.max(rel);
+    }
+    assert!(
+        max_abs <= 0.005,
+        "Tensor::sigmoid max_abs {max_abs} exceeded bf16-ULP tolerance 0.005"
+    );
+    assert!(
+        max_rel <= 0.01,
+        "Tensor::sigmoid max_rel {max_rel} exceeded bf16-ULP tolerance 0.01"
     );
 }
 

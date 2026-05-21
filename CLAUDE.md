@@ -151,12 +151,18 @@ branch-by-branch roadmap):
   `unary.metal`, no new sources), runtime adds `UnaryOp::{Sigmoid,
   Erf}` + `Tensor::{sigmoid, erf}`, and models crate composes
   `nn::silu(x) = x * sigmoid(x)` and exact `nn::gelu(x) = 0.5 * x *
-  (1 + erf(x / sqrt(2)))`. SiLU is bit-exact vs `mlx.nn.silu`. GELU
-  uses bf16-compose tolerance (0.02 abs/rel) because MLX writes
-  `x / sqrt(2)` (division by bf16-rounded `sqrt(2)`) where we
-  reciprocal-multiply (no divide op yet); the bf16 constants differ
-  in the last few bits. Adds `sigmoid`, `erf`, `silu`, `gelu` cases
-  to `dump_mlx_op.py` (the silu/gelu cases drive against `mlx.nn`).
+  (1 + erf(x / sqrt(2)))`. Sigmoid (and therefore SiLU) uses a tight
+  bf16-ULP tolerance (0.005 abs / 0.01 rel, ~2 ULPs) rather than
+  bit-exact equality: `metal::exp` inside MLX's vendored Sigmoid kernel
+  drifts 1–2 bf16 ULPs across Apple Silicon generations (M-series local
+  vs macos-15 CI runners), even though the kernel source matches MLX
+  byte-for-byte. The other unary kernels (square / rsqrt / erf) happen
+  to stay bit-exact at the shapes we test. GELU uses bf16-compose
+  tolerance (0.02 abs/rel) because MLX writes `x / sqrt(2)` (division
+  by bf16-rounded `sqrt(2)`) where we reciprocal-multiply (no divide op
+  yet); the bf16 constants differ in the last few bits. Adds `sigmoid`,
+  `erf`, `silu`, `gelu` cases to `dump_mlx_op.py` (the silu/gelu cases
+  drive against `mlx.nn`).
 
 **Concrete target: Qwen2.5-0.5B-Instruct running interactively.**
 Smallest published dense Qwen; same architecture family as the
