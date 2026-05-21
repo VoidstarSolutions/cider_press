@@ -234,8 +234,9 @@ impl KernelLibrary {
             FunctionConstant::Bool { index, .. } => *index,
         });
 
-        let mut cache_key = String::with_capacity(kernel_name.len() + 8 * sorted.len());
+        let mut cache_key = String::with_capacity(kernel_name.len() + 1 + 8 * sorted.len());
         cache_key.push_str(kernel_name);
+        cache_key.push('!');
         for c in &sorted {
             cache_key.push('#');
             c.write_cache_token(&mut cache_key);
