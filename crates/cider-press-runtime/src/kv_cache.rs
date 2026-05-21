@@ -31,13 +31,25 @@
 //!
 //! [`KvCache::keys_view`] / [`KvCache::values_view`] return [`Tensor`]
 //! handles that share the slab's underlying `MTLBuffer`. A subsequent
-//! [`KvCache::update`] mutates the slab, which would invalidate any
-//! still-live view. Callers must drop view tensors before calling
-//! `update` again — in practice the decode loop consumes views
-//! through `eval()` within the same iteration that produced them, so
-//! the lifetime falls out naturally.
+//! [`KvCache::update`] mutates the slab via `as_mut_slice()`, so any
+//! still-live view (which can hand out `&[u8]` into the same bytes via
+//! `cpu_bytes()`) would create overlapping `&[u8]` + `&mut [u8]`
+//! references — undefined behavior under Rust's aliasing rules.
+//!
+//! `update` enforces this at runtime: it rejects with an
+//! [`Error::InvalidArgument`] when any view (or any tensor derived
+//! from one) is still live. The check piggybacks on the slab tensor's
+//! [`Arc`] strong count — `Tensor::slice` clones the slab Tensor into
+//! the view's `ViewSource::source`, so every outstanding view (and
+//! every op tensor whose input chain reaches a view) keeps the count
+//! `≥ 2`. `update` requires `&mut self`, so no new view can be created
+//! between the check and the mutation. In practice the decode loop
+//! consumes views through `eval()` within the same iteration that
+//! produced them, so the contract falls out naturally and the runtime
+//! check is silent.
 
 use std::fmt;
+use std::sync::Arc;
 
 use cider_press_kernels::Buffer;
 
@@ -138,6 +150,12 @@ impl KvCache {
             slab_layout,
             values.clone_handle(),
         );
+        // Soundness invariant: nothing inside KvCache may clone these
+        // slab Tensors. The update-time guard reads Arc::strong_count
+        // and treats `> 1` as "outstanding view"; an internal clone
+        // would silently break the check.
+        debug_assert_eq!(Arc::strong_count(&keys_slab.inner), 1);
+        debug_assert_eq!(Arc::strong_count(&values_slab.inner), 1);
         Ok(Self {
             device: device.clone(),
             keys,
@@ -163,6 +181,20 @@ impl KvCache {
     /// SDPA reads the cache anyway), then their bytes are `memcpy`'d
     /// into the slabs via the unified-memory host pointer.
     pub fn update(&mut self, k: &Tensor, v: &Tensor) -> Result<()> {
+        // See the module-level "Aliasing contract" doc for why this
+        // check exists. `&mut self` rules out concurrent `keys_view` /
+        // `values_view` calls, so the count can only stay or decrease
+        // between this check and the host writes below.
+        if Arc::strong_count(&self.keys_slab.inner) > 1
+            || Arc::strong_count(&self.values_slab.inner) > 1
+        {
+            return Err(Error::InvalidArgument(
+                "KvCache::update: a previously returned keys_view/values_view tensor \
+                 (or a tensor derived from one) is still live; drop it before calling \
+                 update to avoid aliasing the slab"
+                    .into(),
+            ));
+        }
         let step_t = self.validate_update_input(k, "k")?;
         let step_t_v = self.validate_update_input(v, "v")?;
         if step_t != step_t_v {

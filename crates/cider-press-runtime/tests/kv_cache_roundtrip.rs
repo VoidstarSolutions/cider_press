@@ -164,6 +164,48 @@ fn dtype_mismatch_is_rejected() {
 }
 
 #[test]
+fn update_rejects_outstanding_view() {
+    let device = Device::system_default().expect("device");
+    let mut cache =
+        KvCache::new(&device, MAX_TOKENS, N_KV_HEADS, HEAD_DIM, DType::BF16).expect("alloc");
+    let first = make_chunk_tensor(&device, 1, |_, _, _| 1.0);
+    cache.update(&first, &first).expect("first update");
+
+    let view = cache.keys_view();
+    let err = cache.update(&first, &first).expect_err("must reject");
+    let msg = format!("{err}");
+    assert!(msg.contains("still live"), "unexpected error: {msg}");
+    assert_eq!(cache.position(), 1, "rejected update must not advance");
+
+    drop(view);
+    cache
+        .update(&first, &first)
+        .expect("update succeeds after view dropped");
+    assert_eq!(cache.position(), 2);
+}
+
+#[test]
+fn update_rejects_op_tensor_derived_from_view() {
+    let device = Device::system_default().expect("device");
+    let mut cache =
+        KvCache::new(&device, MAX_TOKENS, N_KV_HEADS, HEAD_DIM, DType::BF16).expect("alloc");
+    let first = make_chunk_tensor(&device, 1, |_, _, _| 1.0);
+    cache.update(&first, &first).expect("first update");
+
+    // Op tensor descended from a view keeps the slab Arc bumped even
+    // after the original view is dropped, because the op holds its
+    // inputs in its OpNode.
+    let other = make_chunk_tensor(&device, 1, |_, _, _| 2.0);
+    let derived = cache.keys_view().add(&other).expect("add");
+    let err = cache.update(&first, &first).expect_err("must reject");
+    assert!(format!("{err}").contains("still live"));
+    drop(derived);
+    cache
+        .update(&first, &first)
+        .expect("update succeeds after derived dropped");
+}
+
+#[test]
 fn new_rejects_integer_dtype() {
     let device = Device::system_default().expect("device");
     let err = KvCache::new(&device, MAX_TOKENS, N_KV_HEADS, HEAD_DIM, DType::U32)
