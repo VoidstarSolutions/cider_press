@@ -59,6 +59,13 @@ pub struct KvCache {
     device: Device,
     keys: Buffer<u8>,
     values: Buffer<u8>,
+    // Full-shape `[max_tokens, n_kv_heads, head_dim]` host_leaf
+    // tensors aliasing `keys` / `values` via refcount-bumped buffer
+    // handles. Views handed out by `keys_view` / `values_view` are
+    // slices of these, so the view's logical length matches its shape
+    // even when only a prefix is populated.
+    keys_slab: Tensor,
+    values_slab: Tensor,
     dtype: DType,
     max_tokens: usize,
     n_kv_heads: usize,
@@ -113,10 +120,30 @@ impl KvCache {
         })?;
         let keys = device.kernels().alloc_buffer::<u8>(byte_count)?;
         let values = device.kernels().alloc_buffer::<u8>(byte_count)?;
+        let slab_shape = Shape::new([max_tokens, n_kv_heads, head_dim]);
+        let slab_layout = Layout::Dense {
+            strides: Strides::contiguous(&slab_shape),
+        };
+        let keys_slab = Tensor::host_leaf(
+            device,
+            slab_shape.clone(),
+            dtype,
+            slab_layout.clone(),
+            keys.clone_handle(),
+        );
+        let values_slab = Tensor::host_leaf(
+            device,
+            slab_shape,
+            dtype,
+            slab_layout,
+            values.clone_handle(),
+        );
         Ok(Self {
             device: device.clone(),
             keys,
             values,
+            keys_slab,
+            values_slab,
             dtype,
             max_tokens,
             n_kv_heads,
@@ -191,13 +218,13 @@ impl KvCache {
     /// the prefill-start case).
     #[must_use]
     pub fn keys_view(&self) -> Tensor {
-        self.prefix_view(&self.keys)
+        self.prefix_view(&self.keys_slab)
     }
 
     /// View of the populated V prefix; see [`KvCache::keys_view`].
     #[must_use]
     pub fn values_view(&self) -> Tensor {
-        self.prefix_view(&self.values)
+        self.prefix_view(&self.values_slab)
     }
 
     /// Number of rows currently populated (`0..=max_tokens`).
@@ -274,16 +301,16 @@ impl KvCache {
         Ok(dims[0])
     }
 
-    fn prefix_view(&self, slab: &Buffer<u8>) -> Tensor {
-        let shape = Shape::new([self.position, self.n_kv_heads, self.head_dim]);
-        let layout = Layout::Dense {
-            strides: Strides::contiguous(&shape),
-        };
-        // Refcount-bump clone: the view aliases the slab's MTLBuffer.
+    fn prefix_view(&self, slab: &Tensor) -> Tensor {
+        // Slice the full-shape slab tensor along axis 0 down to the
+        // populated prefix. The resulting view aliases the slab's
+        // MTLBuffer (zero-copy) and its logical length matches its
+        // shape, so vector-kernel dispatch sees a consistent
+        // `buffer.len() == shape.elem_count() * dtype.size_bytes()`.
         // The aliasing contract (see module docs) makes this view live
         // only until the caller drops it before the next update().
-        let buf = slab.clone_handle();
-        Tensor::host_leaf(&self.device, shape, self.dtype, layout, buf)
+        slab.slice(&[0..self.position, 0..self.n_kv_heads, 0..self.head_dim])
+            .expect("prefix slice is in-bounds by construction")
     }
 }
 
