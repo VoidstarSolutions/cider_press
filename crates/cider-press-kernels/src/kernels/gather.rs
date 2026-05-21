@@ -11,7 +11,7 @@
 //! MLX's own `backend/metal/indexing.cpp`. We mirror that factoring:
 //! a flattened header bundle (`GATHER_HEADERS` — `utils.h` + the two
 //! `indexing/*.h`) is prepended to a per-instantiation wrapper string
-//! produced from [`GATHER_WRAPPER_TEMPLATE`], compiled, and dispatched.
+//! produced from `GATHER_WRAPPER_TEMPLATE`, compiled, and dispatched.
 //!
 //! Scope for branch 7: one instantiation suitable for Qwen2's
 //! embedding lookup — `T = bfloat16_t`, `IdxT = uint`, `NIDX = 1`,
@@ -217,7 +217,7 @@ impl Instantiation {
 
 /// Assemble a complete, compilable MSL source string for the given
 /// instantiation. Concatenates [`GATHER_HEADERS`] with a wrapper
-/// expanded from [`GATHER_WRAPPER_TEMPLATE`].
+/// expanded from `GATHER_WRAPPER_TEMPLATE`.
 ///
 /// The corresponding kernel name (the `newFunctionWithName:` argument)
 /// is [`Instantiation::kernel_name`].
