@@ -448,6 +448,11 @@ def run_rope(args: argparse.Namespace) -> dict[str, mx.array]:
         raise SystemExit(
             f"rope: lhs-shape must have 4 dims [B, H, T, D], got {shape!r}"
         )
+    head_dim = shape[-1]
+    if args.dims < 1 or args.dims > head_dim:
+        raise SystemExit(
+            f"rope: --dims must be in [1, D] where D={head_dim}, got {args.dims}"
+        )
     dtype = _float_dtype(args.dtype)
     lhs = (mx.random.uniform(shape=shape) - 0.5).astype(dtype)
     out = mx.fast.rope(
