@@ -296,6 +296,35 @@ def run_mul(args: argparse.Namespace) -> dict[str, mx.array]:
 
 
 # ---------------------------------------------------------------------------
+# gather: axis-0 embedding-style lookup (consumed by branch 7
+# `feat/gather`). Writes `src`, `indices`, `out`. Indices are u32
+# uniformly drawn over `[0, vocab)`; src is bf16 uniform in [-0.5, 0.5).
+# The kernel is a pure data-mover so bit-exact equality holds for any
+# dtype.
+# ---------------------------------------------------------------------------
+
+
+def add_gather_parser(subparsers: argparse._SubParsersAction) -> None:
+    p = subparsers.add_parser(
+        "gather",
+        help="axis-0 gather (embedding lookup): out[t, h] = src[indices[t], h]",
+    )
+    p.add_argument("--vocab", type=int, required=True, help="source first-axis size, e.g. 128")
+    p.add_argument("--hidden", type=int, required=True, help="source second-axis size, e.g. 64")
+    p.add_argument("--n-indices", type=int, required=True, help="length of the rank-1 index tensor")
+    p.add_argument("--dtype", default="bf16", help="src/out dtype: one of f32, f16, bf16")
+
+
+def run_gather(args: argparse.Namespace) -> dict[str, mx.array]:
+    dtype = _float_dtype(args.dtype)
+    src = (mx.random.uniform(shape=(args.vocab, args.hidden)) - 0.5).astype(dtype)
+    indices = mx.random.randint(0, args.vocab, shape=(args.n_indices,)).astype(mx.uint32)
+    out = mx.take(src, indices, axis=0)
+    mx.eval(src, indices, out)
+    return {"src": src, "indices": indices, "out": out}
+
+
+# ---------------------------------------------------------------------------
 # CLI plumbing
 # ---------------------------------------------------------------------------
 
@@ -315,6 +344,7 @@ OPS: dict[str, tuple[ParserBuilder, Runner]] = {
     "erf": (add_erf_parser, run_erf),
     "silu": (add_silu_parser, run_silu),
     "gelu": (add_gelu_parser, run_gelu),
+    "gather": (add_gather_parser, run_gather),
 }
 
 

@@ -9,6 +9,11 @@
 //! `<metal_simdgroup>`, etc.) for the Metal compiler. Each output lands
 //! at `$OUT_DIR/<name>_inlined.metal`.
 //!
+//! `HEADER_BUNDLES` is the same flattener pointed at a *header-only*
+//! entry — useful for JIT-only kernels like gather where MLX has no
+//! precompiled `.metal` to vendor and the dispatch-time source string
+//! is assembled from a header prefix plus a per-instantiation wrapper.
+//!
 //! Sources live in `kernels-mlx/` at the workspace root; see
 //! `kernels-mlx/VENDORED.md` for the file list and sync procedure.
 
@@ -27,6 +32,25 @@ const ENTRY_POINTS: &[(&str, &str)] = &[
     ("mlx/backend/metal/kernels/reduce.metal", "reduce"),
     ("mlx/backend/metal/kernels/quantized.metal", "quantized"),
 ];
+
+/// Header-only bundles for JIT-assembled kernels.
+///
+/// Each entry flattens `(headers...)` into one `$OUT_DIR/<stem>_inlined.metal`
+/// string. The result is *not* directly compileable — it has no kernel
+/// entry points — but is meant to be prepended to a per-instantiation
+/// wrapper source at dispatch time and then compiled together. The
+/// transitive include set for each listed header is followed by the
+/// same flattener used for full `.metal` entry points.
+const HEADER_BUNDLES: &[(&[&str], &str)] = &[(
+    &[
+        // `utils.h` mirrors what MLX prepends via `metal::utils()`.
+        "mlx/backend/metal/kernels/utils.h",
+        // `gather.h` transitively pulls `indexing.h` and uses
+        // `elem_to_loc` + `Indices` + `offset_neg_idx` from utils.
+        "mlx/backend/metal/kernels/indexing/gather.h",
+    ],
+    "gather_headers",
+)];
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -50,6 +74,22 @@ fn main() {
         let mut seen: HashSet<PathBuf> = HashSet::new();
         let mut flat = String::new();
         flatten(&entry, &mlx_dir, &mut seen, &mut flat);
+        write_output(&format!("{stem}_inlined.metal"), &flat);
+    }
+
+    for (rels, stem) in HEADER_BUNDLES {
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        let mut flat = String::new();
+        for rel in *rels {
+            let entry = mlx_dir.join(rel);
+            assert!(
+                entry.exists(),
+                "vendored MLX header missing: {}\n\
+                 Did you run `scripts/sync_mlx_kernels.sh`? See kernels-mlx/VENDORED.md.",
+                entry.display()
+            );
+            flatten(&entry, &mlx_dir, &mut seen, &mut flat);
+        }
         write_output(&format!("{stem}_inlined.metal"), &flat);
     }
 }
