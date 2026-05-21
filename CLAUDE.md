@@ -57,6 +57,7 @@ cider-press/
 │   │   └── tests/{stage*,fixtures}     # spike parity + perf tests
 │   ├── cider-press-runtime/            # scaffold: lazy Tensor + graph + eval
 │   ├── cider-press-models/             # scaffold: transformer architectures
+│   ├── cider-press-test-utils/         # dev-only: shared MLX-parity test helpers
 │   └── cider-press/                    # scaffold: facade + CLI
 ├── scripts/                            # one-shot uv scripts (fixtures, MLX sync, perf)
 └── .github/workflows/{ci,mlx-sync}.yml

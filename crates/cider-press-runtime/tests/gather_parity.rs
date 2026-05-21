@@ -11,10 +11,8 @@
 #![cfg(target_os = "macos")]
 #![allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
 use cider_press_runtime::{Device, Tensor};
+use cider_press_test_utils::{dump_mlx_op, read_bf16, read_u32, tempdir};
 use half::bf16;
 use safetensors::SafeTensors;
 
@@ -45,9 +43,25 @@ fn gather_through_runtime_matches_mlx_bit_exact() {
 // ---------------------------------------------------------------------
 
 fn fixture() -> (Vec<bf16>, Vec<u32>, Vec<bf16>) {
-    let tmp = tempdir();
+    let tmp = tempdir("runtime-gather-parity");
     let path = tmp.join("gather.safetensors");
-    dump_mlx(&path);
+    let vocab_s = VOCAB.to_string();
+    let hidden_s = HIDDEN.to_string();
+    let n_s = N_INDICES.to_string();
+    dump_mlx_op(
+        &path,
+        &[
+            "gather",
+            "--vocab",
+            &vocab_s,
+            "--hidden",
+            &hidden_s,
+            "--n-indices",
+            &n_s,
+            "--dtype",
+            "bf16",
+        ],
+    );
     let bytes = std::fs::read(&path).expect("read fixture");
     let st = SafeTensors::deserialize(&bytes).expect("parse safetensors");
     (
@@ -55,80 +69,4 @@ fn fixture() -> (Vec<bf16>, Vec<u32>, Vec<bf16>) {
         read_u32(&st, "indices"),
         read_bf16(&st, "out"),
     )
-}
-
-fn dump_mlx(out: &Path) {
-    let script = workspace_root().join("scripts").join("dump_mlx_op.py");
-    let status = Command::new("uv")
-        .arg("run")
-        .arg(&script)
-        .arg("--output")
-        .arg(out)
-        .arg("--seed")
-        .arg("0")
-        .arg("gather")
-        .arg("--vocab")
-        .arg(VOCAB.to_string())
-        .arg("--hidden")
-        .arg(HIDDEN.to_string())
-        .arg("--n-indices")
-        .arg(N_INDICES.to_string())
-        .arg("--dtype")
-        .arg("bf16")
-        .status();
-    let status = match status {
-        Ok(s) => s,
-        Err(err) => panic!(
-            "failed to invoke `uv run {}`: {err}. This test requires `uv` on PATH; \
-             CI installs it via astral-sh/setup-uv.",
-            script.display()
-        ),
-    };
-    assert!(status.success(), "dump_mlx_op.py gather exited {status}");
-}
-
-fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("workspace root")
-        .to_path_buf()
-}
-
-fn read_bf16(st: &SafeTensors, name: &str) -> Vec<bf16> {
-    let view = st
-        .tensor(name)
-        .unwrap_or_else(|e| panic!("tensor {name}: {e}"));
-    assert_eq!(view.dtype(), safetensors::Dtype::BF16);
-    let bytes = view.data();
-    assert!(bytes.len() % 2 == 0);
-    bytes
-        .chunks_exact(2)
-        .map(|c| bf16::from_le_bytes([c[0], c[1]]))
-        .collect()
-}
-
-fn read_u32(st: &SafeTensors, name: &str) -> Vec<u32> {
-    let view = st
-        .tensor(name)
-        .unwrap_or_else(|e| panic!("tensor {name}: {e}"));
-    assert_eq!(view.dtype(), safetensors::Dtype::U32);
-    let bytes = view.data();
-    assert!(bytes.len() % 4 == 0);
-    bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
-}
-
-fn tempdir() -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("SystemTime")
-        .as_nanos();
-    let pid = std::process::id();
-    let dir =
-        std::env::temp_dir().join(format!("cider-press-runtime-gather-parity-{pid}-{nanos}"));
-    std::fs::create_dir_all(&dir).expect("mktemp");
-    dir
 }

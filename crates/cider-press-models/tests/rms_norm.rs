@@ -16,12 +16,12 @@
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 
 use cider_press_models::nn::rms_norm;
 use cider_press_models::qwen2::{Qwen2Config, load_qwen2_weights};
 use cider_press_runtime::{Device, Tensor};
+use cider_press_test_utils::{dump_mlx_op, read_bf16, tempdir};
 use half::bf16;
 use safetensors::SafeTensors;
 
@@ -31,9 +31,22 @@ const EPS: f32 = 1e-6;
 
 #[test]
 fn rms_norm_matches_mlx_fast_rms_norm() {
-    let tmp = tempdir();
+    let tmp = tempdir("rms-norm");
     let fixture = tmp.join("rms_norm.safetensors");
-    dump_mlx_rms_norm(&fixture, &format!("1,{S},{H}"), EPS);
+    let shape = format!("1,{S},{H}");
+    let eps_str = format!("{EPS}");
+    dump_mlx_op(
+        &fixture,
+        &[
+            "rms_norm",
+            "--x-shape",
+            &shape,
+            "--eps",
+            &eps_str,
+            "--dtype",
+            "bf16",
+        ],
+    );
 
     let bytes = fs::read(&fixture).expect("read fixture");
     let st = SafeTensors::deserialize(&bytes).expect("parse safetensors");
@@ -167,64 +180,4 @@ fn checkpoint_path() -> Option<PathBuf> {
         path.display(),
     );
     Some(path)
-}
-
-fn dump_mlx_rms_norm(out: &Path, x_shape: &str, eps: f32) {
-    let script = workspace_root().join("scripts").join("dump_mlx_op.py");
-    let status = Command::new("uv")
-        .arg("run")
-        .arg(&script)
-        .arg("--output")
-        .arg(out)
-        .arg("--seed")
-        .arg("0")
-        .arg("rms_norm")
-        .arg("--x-shape")
-        .arg(x_shape)
-        .arg("--eps")
-        .arg(format!("{eps}"))
-        .arg("--dtype")
-        .arg("bf16")
-        .status();
-    let status = match status {
-        Ok(s) => s,
-        Err(err) => panic!(
-            "failed to invoke `uv run {}`: {err}. This test requires `uv` on PATH; \
-             CI installs it via astral-sh/setup-uv.",
-            script.display()
-        ),
-    };
-    assert!(status.success(), "dump_mlx_op.py rms_norm exited {status}");
-}
-
-fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("workspace root")
-        .to_path_buf()
-}
-
-fn read_bf16(st: &SafeTensors, name: &str) -> Vec<bf16> {
-    let view = st
-        .tensor(name)
-        .unwrap_or_else(|e| panic!("tensor {name}: {e}"));
-    assert_eq!(view.dtype(), safetensors::Dtype::BF16);
-    let bytes = view.data();
-    assert!(bytes.len() % 2 == 0);
-    bytes
-        .chunks_exact(2)
-        .map(|c| bf16::from_le_bytes([c[0], c[1]]))
-        .collect()
-}
-
-fn tempdir() -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("SystemTime")
-        .as_nanos();
-    let pid = std::process::id();
-    let dir = std::env::temp_dir().join(format!("cider-press-rms-norm-{pid}-{nanos}"));
-    fs::create_dir_all(&dir).expect("mktemp");
-    dir
 }

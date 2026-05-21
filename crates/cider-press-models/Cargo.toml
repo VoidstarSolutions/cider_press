@@ -20,5 +20,8 @@ serde_json = { workspace = true }
 half = { workspace = true }
 thiserror = { workspace = true }
 
+[dev-dependencies]
+cider-press-test-utils = { path = "../cider-press-test-utils" }
+
 [lints]
 workspace = true

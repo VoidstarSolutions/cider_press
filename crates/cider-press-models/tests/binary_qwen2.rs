@@ -24,11 +24,11 @@
 #![allow(clippy::cast_precision_loss)]
 
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 
 use cider_press_models::qwen2::{Qwen2Config, load_qwen2_weights};
 use cider_press_runtime::{Device, Tensor};
+use cider_press_test_utils::{dump_mlx_op, read_bf16, tempdir};
 use half::bf16;
 use safetensors::SafeTensors;
 
@@ -87,9 +87,20 @@ fn mul_with_bias_broadcast_matches_mlx() {
 /// is the same rank as lhs or a rank-1 vector (which forces the
 /// strided dispatch path).
 fn parity_case(op: &str, lhs_shape: &str, rhs_shape: &str, broadcast: bool) {
-    let tmp = tempdir();
+    let tmp = tempdir("models-binary-parity");
     let fixture = tmp.join(format!("{op}_qwen2.safetensors"));
-    dump_mlx_op(op, &fixture, lhs_shape, rhs_shape);
+    dump_mlx_op(
+        &fixture,
+        &[
+            op,
+            "--lhs-shape",
+            lhs_shape,
+            "--rhs-shape",
+            rhs_shape,
+            "--dtype",
+            "bf16",
+        ],
+    );
 
     let bytes = fs::read(&fixture).expect("read fixture");
     let st = SafeTensors::deserialize(&bytes).expect("parse safetensors");
@@ -186,68 +197,4 @@ fn checkpoint_path() -> Option<PathBuf> {
         path.display(),
     );
     Some(path)
-}
-
-fn dump_mlx_op(op: &str, out: &Path, lhs_shape: &str, rhs_shape: &str) {
-    let script = workspace_root().join("scripts").join("dump_mlx_op.py");
-    let status = Command::new("uv")
-        .arg("run")
-        .arg(&script)
-        .arg("--output")
-        .arg(out)
-        .arg("--seed")
-        .arg("0")
-        .arg(op)
-        .arg("--lhs-shape")
-        .arg(lhs_shape)
-        .arg("--rhs-shape")
-        .arg(rhs_shape)
-        .arg("--dtype")
-        .arg("bf16")
-        .status();
-    let status = match status {
-        Ok(s) => s,
-        Err(err) => panic!(
-            "failed to invoke `uv run {}`: {err}. \
-             This test requires `uv` (https://docs.astral.sh/uv) on PATH \
-             so MLX can generate the parity fixture; CI installs it via \
-             astral-sh/setup-uv.",
-            script.display()
-        ),
-    };
-    assert!(status.success(), "dump_mlx_op.py {op} exited {status}");
-}
-
-fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("workspace root")
-        .to_path_buf()
-}
-
-fn read_bf16(st: &SafeTensors, name: &str) -> Vec<bf16> {
-    let view = st
-        .tensor(name)
-        .unwrap_or_else(|e| panic!("tensor {name}: {e}"));
-    assert_eq!(view.dtype(), safetensors::Dtype::BF16);
-    let bytes = view.data();
-    assert!(bytes.len() % 2 == 0);
-    bytes
-        .chunks_exact(2)
-        .map(|c| bf16::from_le_bytes([c[0], c[1]]))
-        .collect()
-}
-
-fn tempdir() -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("SystemTime")
-        .as_nanos();
-    let pid = std::process::id();
-    let dir = workspace_root()
-        .join("target")
-        .join(format!("cider-press-models-binary-parity-{pid}-{nanos}"));
-    fs::create_dir_all(&dir).expect("mktemp");
-    dir
 }

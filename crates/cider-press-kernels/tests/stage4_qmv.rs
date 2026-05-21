@@ -17,6 +17,7 @@ use std::path::PathBuf;
 
 use approx::assert_relative_eq;
 use cider_press_kernels::{Buffer, Device, KernelLibrary, kernels};
+use cider_press_test_utils::{read_bf16, read_u32};
 use half::bf16;
 use safetensors::SafeTensors;
 
@@ -89,30 +90,4 @@ fn parity_affine_qmv_fast_bf16_gs64_b4() {
         let ef = e.to_f32();
         assert_relative_eq!(af, ef, max_relative = 1e-2, epsilon = 5e-2);
     }
-}
-
-fn read_u32(st: &SafeTensors, name: &str) -> Vec<u32> {
-    let view = st
-        .tensor(name)
-        .unwrap_or_else(|e| panic!("tensor {name}: {e}"));
-    assert_eq!(view.dtype(), safetensors::Dtype::U32);
-    let bytes = view.data();
-    assert!(bytes.len() % 4 == 0);
-    bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
-}
-
-fn read_bf16(st: &SafeTensors, name: &str) -> Vec<bf16> {
-    let view = st
-        .tensor(name)
-        .unwrap_or_else(|e| panic!("tensor {name}: {e}"));
-    assert_eq!(view.dtype(), safetensors::Dtype::BF16);
-    let bytes = view.data();
-    assert!(bytes.len() % 2 == 0);
-    bytes
-        .chunks_exact(2)
-        .map(|c| bf16::from_le_bytes([c[0], c[1]]))
-        .collect()
 }

@@ -22,71 +22,32 @@
 
 #![cfg(target_os = "macos")]
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
 use cider_press_kernels::{Buffer, Device, KernelLibrary, kernels};
+use cider_press_test_utils::{dump_mlx_op, read_bf16, tempdir};
 use half::bf16;
 use safetensors::SafeTensors;
 
 const S: usize = 8;
 const H: usize = 896;
 
-fn dump_mlx_add(out: &Path, lhs_shape: &str, rhs_shape: &str) {
-    let script = workspace_root().join("scripts").join("dump_mlx_op.py");
-    let status = Command::new("uv")
-        .arg("run")
-        .arg(&script)
-        .arg("--output")
-        .arg(out)
-        .arg("--seed")
-        .arg("0")
-        .arg("add")
-        .arg("--lhs-shape")
-        .arg(lhs_shape)
-        .arg("--rhs-shape")
-        .arg(rhs_shape)
-        .arg("--dtype")
-        .arg("bf16")
-        .status();
-    let status = match status {
-        Ok(s) => s,
-        Err(err) => panic!(
-            "failed to invoke `uv run {}`: {err}. \
-             This test requires `uv` (https://docs.astral.sh/uv) on PATH \
-             so MLX can generate the parity fixture; CI installs it via \
-             astral-sh/setup-uv.",
-            script.display()
-        ),
-    };
-    assert!(status.success(), "dump_mlx_op.py add exited {status}");
-}
-
-fn workspace_root() -> PathBuf {
-    // CARGO_MANIFEST_DIR = crates/cider-press-kernels; go up two.
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("workspace root")
-        .to_path_buf()
-}
-
-fn read_bf16(st: &SafeTensors, name: &str) -> Vec<bf16> {
-    let view = st
-        .tensor(name)
-        .unwrap_or_else(|e| panic!("tensor {name}: {e}"));
-    assert_eq!(view.dtype(), safetensors::Dtype::BF16);
-    let bytes = view.data();
-    assert!(bytes.len() % 2 == 0);
-    bytes
-        .chunks_exact(2)
-        .map(|c| bf16::from_le_bytes([c[0], c[1]]))
-        .collect()
+fn dump_mlx_add(out: &std::path::Path, lhs_shape: &str, rhs_shape: &str) {
+    dump_mlx_op(
+        out,
+        &[
+            "add",
+            "--lhs-shape",
+            lhs_shape,
+            "--rhs-shape",
+            rhs_shape,
+            "--dtype",
+            "bf16",
+        ],
+    );
 }
 
 #[test]
 fn parity_vv_add_bf16() {
-    let tmp = tempdir();
+    let tmp = tempdir("kernels-binary-parity");
     let fixture = tmp.join("add_vv_bf16.safetensors");
     dump_mlx_add(&fixture, &format!("1,{S},{H}"), &format!("1,{S},{H}"));
 
@@ -118,7 +79,7 @@ fn parity_vv_add_bf16() {
 
 #[test]
 fn parity_g3_add_bf16_broadcast() {
-    let tmp = tempdir();
+    let tmp = tempdir("kernels-binary-parity");
     let fixture = tmp.join("add_bcast_bf16.safetensors");
     dump_mlx_add(&fixture, &format!("1,{S},{H}"), &format!("{H}"));
 
@@ -161,20 +122,4 @@ fn parity_g3_add_bf16_broadcast() {
         out, out_ref,
         "g3_Addbfloat16 broadcast must be bit-exact vs MLX"
     );
-}
-
-/// Cargo-test-local tempdir without pulling in the `tempfile` crate.
-/// Lives under `target/` so `cargo clean` collects it; randomised per
-/// test invocation to keep parallel test threads from colliding.
-fn tempdir() -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("SystemTime")
-        .as_nanos();
-    let pid = std::process::id();
-    let dir = workspace_root()
-        .join("target")
-        .join(format!("cider-press-binary-parity-{pid}-{nanos}"));
-    std::fs::create_dir_all(&dir).expect("mktemp");
-    dir
 }

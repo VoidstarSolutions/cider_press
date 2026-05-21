@@ -16,16 +16,16 @@
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
-    clippy::cast_precision_loss,
+    clippy::cast_precision_loss
 )]
 
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 
 use cider_press_models::nn::embed_tokens;
 use cider_press_models::qwen2::{Qwen2Config, load_qwen2_weights};
 use cider_press_runtime::{Device, Quantization, QuantizedWeight, Tensor};
+use cider_press_test_utils::{dump_mlx_op, read_bf16, read_u32, tempdir};
 use half::bf16;
 use safetensors::SafeTensors;
 
@@ -158,9 +158,31 @@ struct Synthetic {
 }
 
 fn synthetic_fixture() -> Synthetic {
-    let tmp = tempdir();
+    let tmp = tempdir("embed-tokens");
     let path = tmp.join("embed_tokens.safetensors");
-    dump_mlx_embed_tokens(&path);
+    let vocab_s = VOCAB.to_string();
+    let hidden_s = HIDDEN.to_string();
+    let n_s = N_INDICES.to_string();
+    let gs_s = GROUP_SIZE.to_string();
+    let bits_s = BITS.to_string();
+    dump_mlx_op(
+        &path,
+        &[
+            "embed_tokens",
+            "--vocab",
+            &vocab_s,
+            "--hidden",
+            &hidden_s,
+            "--n-indices",
+            &n_s,
+            "--group-size",
+            &gs_s,
+            "--bits",
+            &bits_s,
+            "--dtype",
+            "bf16",
+        ],
+    );
     let bytes = fs::read(&path).expect("read fixture");
     let st = SafeTensors::deserialize(&bytes).expect("parse safetensors");
     Synthetic {
@@ -170,39 +192,6 @@ fn synthetic_fixture() -> Synthetic {
         indices: read_u32(&st, "indices"),
         out: read_bf16(&st, "out"),
     }
-}
-
-fn dump_mlx_embed_tokens(out: &Path) {
-    let script = workspace_root().join("scripts").join("dump_mlx_op.py");
-    let status = Command::new("uv")
-        .arg("run")
-        .arg(&script)
-        .arg("--output")
-        .arg(out)
-        .arg("--seed")
-        .arg("0")
-        .arg("embed_tokens")
-        .arg("--vocab")
-        .arg(VOCAB.to_string())
-        .arg("--hidden")
-        .arg(HIDDEN.to_string())
-        .arg("--n-indices")
-        .arg(N_INDICES.to_string())
-        .arg("--group-size")
-        .arg(GROUP_SIZE.to_string())
-        .arg("--bits")
-        .arg(BITS.to_string())
-        .arg("--dtype")
-        .arg("bf16")
-        .status();
-    let status = match status {
-        Ok(s) => s,
-        Err(err) => panic!(
-            "failed to invoke `uv run {}`: {err}. This test requires `uv` on PATH.",
-            script.display()
-        ),
-    };
-    assert!(status.success(), "dump_mlx_op.py embed_tokens exited {status}");
 }
 
 // ---------------------------------------------------------------------
@@ -221,40 +210,6 @@ fn checkpoint_path() -> Option<PathBuf> {
     Some(path)
 }
 
-fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("workspace root")
-        .to_path_buf()
-}
-
-fn read_bf16(st: &SafeTensors, name: &str) -> Vec<bf16> {
-    let view = st
-        .tensor(name)
-        .unwrap_or_else(|e| panic!("tensor {name}: {e}"));
-    assert_eq!(view.dtype(), safetensors::Dtype::BF16);
-    let bytes = view.data();
-    assert!(bytes.len() % 2 == 0);
-    bytes
-        .chunks_exact(2)
-        .map(|c| bf16::from_le_bytes([c[0], c[1]]))
-        .collect()
-}
-
-fn read_u32(st: &SafeTensors, name: &str) -> Vec<u32> {
-    let view = st
-        .tensor(name)
-        .unwrap_or_else(|e| panic!("tensor {name}: {e}"));
-    assert_eq!(view.dtype(), safetensors::Dtype::U32);
-    let bytes = view.data();
-    assert!(bytes.len() % 4 == 0);
-    bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
-}
-
 fn u32_to_bytes(v: &[u32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() * 4);
     for &x in v {
@@ -269,15 +224,4 @@ fn bf16_to_bytes(v: &[bf16]) -> Vec<u8> {
         out.extend_from_slice(&x.to_le_bytes());
     }
     out
-}
-
-fn tempdir() -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("SystemTime")
-        .as_nanos();
-    let pid = std::process::id();
-    let dir = std::env::temp_dir().join(format!("cider-press-embed-tokens-{pid}-{nanos}"));
-    fs::create_dir_all(&dir).expect("mktemp");
-    dir
 }

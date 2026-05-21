@@ -11,13 +11,11 @@
 #![cfg(target_os = "macos")]
 #![allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
-use cider_press_kernels::kernels::gather::{
-    self, GatherDispatch, Instantiation, make_source,
-};
+use cider_press_kernels::kernels::gather::{self, GatherDispatch, Instantiation, make_source};
 use cider_press_kernels::{Buffer, Device, KernelLibrary};
+use cider_press_test_utils::{dump_mlx_op, read_bf16, read_u32, tempdir};
 use half::bf16;
 use safetensors::SafeTensors;
 
@@ -51,9 +49,7 @@ fn gather_axis0_bf16_u32_rank1_matches_mlx_bit_exact() {
     let src_shape: Buffer<i32> = device
         .upload(&[VOCAB as i32, HIDDEN as i32])
         .expect("src_shape");
-    let src_strides: Buffer<i64> = device
-        .upload(&[HIDDEN as i64, 1])
-        .expect("src_strides");
+    let src_strides: Buffer<i64> = device.upload(&[HIDDEN as i64, 1]).expect("src_strides");
     // axis 0 is gathered (slice size 1); axis 1 is preserved.
     let slice_sizes: Buffer<i32> = device.upload(&[1, HIDDEN as i32]).expect("slice_sizes");
     let axes: Buffer<i32> = device.upload(&[0]).expect("axes");
@@ -118,9 +114,7 @@ fn gather_axis0_u32_u32_rank1_matches_mlx_bit_exact() {
     let src_shape: Buffer<i32> = device
         .upload(&[U32_VOCAB as i32, U32_HIDDEN as i32])
         .expect("src_shape");
-    let src_strides: Buffer<i64> = device
-        .upload(&[U32_HIDDEN as i64, 1])
-        .expect("src_strides");
+    let src_strides: Buffer<i64> = device.upload(&[U32_HIDDEN as i64, 1]).expect("src_strides");
     let slice_sizes: Buffer<i32> = device.upload(&[1, U32_HIDDEN as i32]).expect("slice_sizes");
     let axes: Buffer<i32> = device.upload(&[0]).expect("axes");
     let idx_shapes: Buffer<i32> = device.upload(&[U32_N as i32]).expect("idx_shapes");
@@ -167,102 +161,47 @@ fn gather_axis0_u32_u32_rank1_matches_mlx_bit_exact() {
 // ---------------------------------------------------------------------
 
 fn fixture() -> (Vec<bf16>, Vec<u32>, Vec<bf16>) {
-    let tmp = tempdir();
+    let tmp = tempdir("kernels-gather-parity");
     let path = tmp.join("gather.safetensors");
-    dump_mlx_bf16(&path);
+    dump_mlx_gather(&path, VOCAB, HIDDEN, N_INDICES, "bf16");
     let bytes = std::fs::read(&path).expect("read fixture");
     let st = SafeTensors::deserialize(&bytes).expect("parse safetensors");
-    (read_bf16(&st, "src"), read_u32(&st, "indices"), read_bf16(&st, "out"))
+    (
+        read_bf16(&st, "src"),
+        read_u32(&st, "indices"),
+        read_bf16(&st, "out"),
+    )
 }
 
 fn u32_fixture() -> (Vec<u32>, Vec<u32>, Vec<u32>) {
-    let tmp = tempdir();
+    let tmp = tempdir("kernels-gather-parity");
     let path = tmp.join("gather_u32.safetensors");
-    dump_mlx_u32(&path);
+    dump_mlx_gather(&path, U32_VOCAB, U32_HIDDEN, U32_N, "u32");
     let bytes = std::fs::read(&path).expect("read u32 fixture");
     let st = SafeTensors::deserialize(&bytes).expect("parse safetensors");
-    (read_u32(&st, "src"), read_u32(&st, "indices"), read_u32(&st, "out"))
-}
-
-fn dump_mlx_bf16(out: &Path) {
-    dump_mlx_gather(out, VOCAB, HIDDEN, N_INDICES, "bf16");
-}
-
-fn dump_mlx_u32(out: &Path) {
-    dump_mlx_gather(out, U32_VOCAB, U32_HIDDEN, U32_N, "u32");
+    (
+        read_u32(&st, "src"),
+        read_u32(&st, "indices"),
+        read_u32(&st, "out"),
+    )
 }
 
 fn dump_mlx_gather(out: &Path, vocab: usize, hidden: usize, n: usize, dtype: &str) {
-    let script = workspace_root().join("scripts").join("dump_mlx_op.py");
-    let status = Command::new("uv")
-        .arg("run")
-        .arg(&script)
-        .arg("--output")
-        .arg(out)
-        .arg("--seed")
-        .arg("0")
-        .arg("gather")
-        .arg("--vocab")
-        .arg(vocab.to_string())
-        .arg("--hidden")
-        .arg(hidden.to_string())
-        .arg("--n-indices")
-        .arg(n.to_string())
-        .arg("--dtype")
-        .arg(dtype)
-        .status();
-    let status = match status {
-        Ok(s) => s,
-        Err(err) => panic!(
-            "failed to invoke `uv run {}`: {err}. This test requires `uv` on PATH; \
-             CI installs it via astral-sh/setup-uv.",
-            script.display()
-        ),
-    };
-    assert!(status.success(), "dump_mlx_op.py gather exited {status}");
-}
-
-fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("workspace root")
-        .to_path_buf()
-}
-
-fn read_bf16(st: &SafeTensors, name: &str) -> Vec<bf16> {
-    let view = st
-        .tensor(name)
-        .unwrap_or_else(|e| panic!("tensor {name}: {e}"));
-    assert_eq!(view.dtype(), safetensors::Dtype::BF16);
-    let bytes = view.data();
-    assert!(bytes.len() % 2 == 0);
-    bytes
-        .chunks_exact(2)
-        .map(|c| bf16::from_le_bytes([c[0], c[1]]))
-        .collect()
-}
-
-fn read_u32(st: &SafeTensors, name: &str) -> Vec<u32> {
-    let view = st
-        .tensor(name)
-        .unwrap_or_else(|e| panic!("tensor {name}: {e}"));
-    assert_eq!(view.dtype(), safetensors::Dtype::U32);
-    let bytes = view.data();
-    assert!(bytes.len() % 4 == 0);
-    bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
-}
-
-fn tempdir() -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("SystemTime")
-        .as_nanos();
-    let pid = std::process::id();
-    let dir = std::env::temp_dir().join(format!("cider-press-gather-parity-{pid}-{nanos}"));
-    std::fs::create_dir_all(&dir).expect("mktemp");
-    dir
+    let vocab_s = vocab.to_string();
+    let hidden_s = hidden.to_string();
+    let n_s = n.to_string();
+    dump_mlx_op(
+        out,
+        &[
+            "gather",
+            "--vocab",
+            &vocab_s,
+            "--hidden",
+            &hidden_s,
+            "--n-indices",
+            &n_s,
+            "--dtype",
+            dtype,
+        ],
+    );
 }
