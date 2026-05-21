@@ -37,6 +37,12 @@ sync workflow below):
 - `mlx/backend/metal/kernels/steel/gemm/{gemm,loader,mma,params,transforms}.h`
 - `mlx/backend/metal/kernels/steel/utils/{integral_constant,type_traits}.h`
 
+JIT-only kernel headers (no precompiled `.metal` upstream; the source
+string is assembled at dispatch time per instantiation, mirroring
+MLX's own `indexing.cpp` / `softmax.cpp` / etc.):
+
+- `mlx/backend/metal/kernels/indexing/{indexing,gather}.h`
+
 System includes (`<metal_stdlib>`, `<metal_simdgroup>`, etc.) are *not*
 vendored — they're resolved by Apple's Metal compiler at JIT time.
 
