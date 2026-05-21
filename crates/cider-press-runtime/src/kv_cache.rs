@@ -246,12 +246,11 @@ impl KvCache {
     }
 
     fn validate_update_input(&self, t: &Tensor, name: &str) -> Result<usize> {
-        if t.is_placeholder() {
-            return Err(Error::InvalidArgument(format!(
+        let t_device = t.device().ok_or_else(|| {
+            Error::InvalidArgument(format!(
                 "KvCache::update: {name} is a placeholder (no device)"
-            )));
-        }
-        let t_device = t.device().expect("checked above");
+            ))
+        })?;
         if !self.device.ptr_eq(t_device) {
             return Err(Error::InvalidArgument(format!(
                 "KvCache::update: {name} is on a different device than the cache"
