@@ -468,6 +468,39 @@ def run_rope(args: argparse.Namespace) -> dict[str, mx.array]:
 
 
 # ---------------------------------------------------------------------------
+# softmax: numerically-stable last-axis softmax (consumed by branch 10
+# `feat/softmax`). Writes `lhs`, `out`. Drives `mx.softmax(x, axis=-1,
+# precise=...)`. Inputs are uniform in [-3, 3] so the max-subtraction
+# produces a non-trivial exp range without overflowing bf16.
+# ---------------------------------------------------------------------------
+
+
+def add_softmax_parser(subparsers: argparse._SubParsersAction) -> None:
+    p = subparsers.add_parser(
+        "softmax",
+        help="last-axis softmax via mx.softmax(x, axis=-1, precise=...)",
+    )
+    p.add_argument("--lhs-shape", required=True, help="comma-separated, e.g. 1,14,4,4")
+    p.add_argument(
+        "--precise",
+        action="store_true",
+        help="use float accumulator (mx.softmax precise=True)",
+    )
+    p.add_argument("--dtype", default="bf16", help="one of f32, f16, bf16")
+
+
+def run_softmax(args: argparse.Namespace) -> dict[str, mx.array]:
+    shape = _parse_shape(args.lhs_shape)
+    dtype = _float_dtype(args.dtype)
+    # Inputs in [-3, 3] cover a useful exp range while staying well
+    # within bf16's representable region after max-subtraction.
+    lhs = (mx.random.uniform(shape=shape) * 6.0 - 3.0).astype(dtype)
+    out = mx.softmax(lhs, axis=-1, precise=args.precise)
+    mx.eval(lhs, out)
+    return {"lhs": lhs, "out": out}
+
+
+# ---------------------------------------------------------------------------
 # CLI plumbing
 # ---------------------------------------------------------------------------
 
@@ -491,6 +524,7 @@ OPS: dict[str, tuple[ParserBuilder, Runner]] = {
     "dequantize": (add_dequantize_parser, run_dequantize),
     "embed_tokens": (add_embed_tokens_parser, run_embed_tokens),
     "rope": (add_rope_parser, run_rope),
+    "softmax": (add_softmax_parser, run_softmax),
 }
 
 

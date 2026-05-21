@@ -16,4 +16,5 @@ pub mod gather;
 pub mod qmv;
 pub mod reduce;
 pub mod rope;
+pub mod softmax;
 pub mod unary;

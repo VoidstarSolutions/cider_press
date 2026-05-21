@@ -49,6 +49,9 @@ const REDUCE_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/reduce_inlin
 /// Pre-flattened MLX `rope.metal`, produced by `build.rs`.
 const ROPE_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/rope_inlined.metal"));
 
+/// Pre-flattened MLX `softmax.metal`, produced by `build.rs`.
+const SOFTMAX_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/softmax_inlined.metal"));
+
 /// Pre-flattened MLX `quantized.metal`, produced by `build.rs`.
 const QUANTIZED_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/quantized_inlined.metal"));
 
@@ -172,6 +175,18 @@ impl KernelLibrary {
     /// rather than [`KernelLibrary::pipeline`] for these.
     pub fn rope(device: &Device) -> Result<Self> {
         Self::from_source(device, ROPE_SOURCE)
+    }
+
+    /// JIT-compile MLX's `softmax.metal` (vendored under
+    /// `kernels-mlx/`). Hosts numerically-stable last-axis softmax in
+    /// `block_softmax_*` (single-threadgroup, axis ≤ 4096) and
+    /// `looped_softmax_*` (multi-pass, axis > 4096) variants, with
+    /// `_precise_` mirrors that swap the half-precision accumulator
+    /// for `float`. Variant selection is by kernel name (no
+    /// `[[function_constant]]` slots), so plain [`Self::pipeline`]
+    /// suffices.
+    pub fn softmax(device: &Device) -> Result<Self> {
+        Self::from_source(device, SOFTMAX_SOURCE)
     }
 
     /// JIT-compile MLX's `quantized.metal` (vendored under
