@@ -30,6 +30,7 @@ const ENTRY_POINTS: &[(&str, &str)] = &[
     ("mlx/backend/metal/kernels/binary.metal", "binary"),
     ("mlx/backend/metal/kernels/unary.metal", "unary"),
     ("mlx/backend/metal/kernels/reduce.metal", "reduce"),
+    ("mlx/backend/metal/kernels/rope.metal", "rope"),
     ("mlx/backend/metal/kernels/quantized.metal", "quantized"),
 ];
 
