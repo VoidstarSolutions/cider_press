@@ -206,6 +206,21 @@ pub enum OpKind {
     /// machinery accepts other dtypes / index ranks / axes but the
     /// runtime entry point hasn't grown them yet.
     Gather,
+    /// Affine-dequantize: `out = w * scale + bias` per group. Inputs
+    /// (in [`Tensor::op_inputs`] order) are `[w_q, scales, biases]`
+    /// where `w_q` is dense `U32` (packed `bits`-wide values, `32 /
+    /// bits` per element), `scales` and `biases` are dense `BF16`.
+    /// Output is dense `BF16` of `w_q.shape()` with the last axis
+    /// scaled to logical width (e.g. `w_q [[N, K * bits / 32]] ⇒
+    /// out [N, K]`). The runtime composes `embed_tokens` as
+    /// `gather(w_q, idx) + gather(scales, idx) + gather(biases, idx)
+    /// → Dequantize`.
+    Dequantize {
+        /// Quantization group size (elements per scale/bias).
+        group_size: u32,
+        /// Quantization bit-width (e.g. 4 for int4).
+        bits: u8,
+    },
 }
 
 /// Element-wise binary operations supported by [`OpKind::Binary`].
@@ -377,7 +392,7 @@ impl Tensor {
         Ok(Self::host_leaf(device, shape, dtype, layout, buffer))
     }
 
-    fn host_leaf(
+    pub(crate) fn host_leaf(
         device: &Device,
         shape: Shape,
         dtype: DType,
@@ -842,7 +857,9 @@ impl Tensor {
     /// - `self` (the source) is dense, contiguous, and rank ≥ 1.
     /// - `indices` is a dense, contiguous, rank-1 [`DType::U32`]
     ///   tensor on the same [`Device`] as `self`.
-    /// - Source dtype is `bf16` (the embedding case).
+    /// - Source dtype is [`DType::BF16`] (the dense embedding case) or
+    ///   [`DType::U32`] (the packed-quantized-weight case used by
+    ///   `nn::embed_tokens`).
     ///
     /// Output shape is `indices.shape() ++ self.shape()[1..]` with
     /// the same dtype as `self`.
@@ -883,9 +900,14 @@ impl Tensor {
                 "gather: src must have rank ≥ 1".into(),
             ));
         }
-        if self.inner.dtype != DType::BF16 {
+        // gather is dtype-agnostic at the Metal level (it's a pure
+        // data-mover); the runtime wires the two source dtypes the
+        // embedding-table integration needs: BF16 for the scales /
+        // biases / fully-dense source, U32 for packed quantized
+        // weights. Other dtypes land alongside their first consumer.
+        if !matches!(self.inner.dtype, DType::BF16 | DType::U32) {
             return Err(Error::InvalidArgument(format!(
-                "gather: only BF16 source is wired (got {:?})",
+                "gather: source dtype {:?} is not wired (only BF16 and U32 today)",
                 self.inner.dtype,
             )));
         }
@@ -931,6 +953,112 @@ impl Tensor {
             layout,
             OpKind::Gather,
             vec![self.clone(), indices.clone()],
+        ))
+    }
+
+    /// Schedule an affine dequantize: `out = w_q * scale + bias` per
+    /// group, producing a dense `BF16` tensor from a quantized triple.
+    ///
+    /// `w_q`, `scales`, and `biases` are the same three tensors a
+    /// [`QuantizedWeight`](crate::QuantizedWeight) carries internally;
+    /// expose them via
+    /// [`QuantizedWeight::components`](crate::QuantizedWeight::components)
+    /// and pipe through `gather` first if you want only a per-row
+    /// dequantize.
+    ///
+    /// Preconditions:
+    ///
+    /// - All three inputs share a [`Device`].
+    /// - `w_q` is dense, contiguous, [`DType::U32`].
+    /// - `scales` and `biases` are dense, contiguous, [`DType::BF16`].
+    /// - `w_q.shape() == scales.shape() == biases.shape()` in all
+    ///   leading axes; the trailing axis differs (packed
+    ///   `[..., K * bits / 32]` for `w_q`, `[..., K / group_size]`
+    ///   for `scales`/`biases`).
+    /// - `group_size` and `bits` match the (`group_size=64`,
+    ///   `bits=4`) wired by `kernels::dequantize::affine_dequantize_bf16_gs64_b4`.
+    ///
+    /// Output shape is `w_q.shape()` with the last axis expanded to
+    /// `(packed_cols) * (32 / bits)` — i.e. the logical (pre-quant)
+    /// width.
+    pub fn dequantize_affine(
+        w_q: &Self,
+        scales: &Self,
+        biases: &Self,
+        group_size: u32,
+        bits: u8,
+    ) -> Result<Self> {
+        let device = w_q.inner.device.as_ref().ok_or_else(|| {
+            Error::InvalidArgument(
+                "dequantize_affine: w_q cannot be a placeholder (no device)".into(),
+            )
+        })?;
+        for (name, t) in [("scales", scales), ("biases", biases)] {
+            let other_device = t.inner.device.as_ref().ok_or_else(|| {
+                Error::InvalidArgument(format!(
+                    "dequantize_affine: {name} cannot be a placeholder (no device)",
+                ))
+            })?;
+            if !device.ptr_eq(other_device) {
+                return Err(Error::InvalidArgument(format!(
+                    "dequantize_affine: {name} is on a different device than w_q",
+                )));
+            }
+        }
+        // Only the (group_size=64, bits=4) instantiation is wired in
+        // the kernels crate. Surface this here so callers fail fast
+        // rather than at dispatch time.
+        if !(group_size == 64 && bits == 4) {
+            return Err(Error::InvalidArgument(format!(
+                "dequantize_affine: only group_size=64 bits=4 is wired \
+                 (got group_size={group_size}, bits={bits})",
+            )));
+        }
+        if w_q.inner.dtype != DType::U32 {
+            return Err(Error::InvalidArgument(format!(
+                "dequantize_affine: w_q must be U32 (got {:?})",
+                w_q.inner.dtype,
+            )));
+        }
+        if scales.inner.dtype != DType::BF16 || biases.inner.dtype != DType::BF16 {
+            return Err(Error::InvalidArgument(format!(
+                "dequantize_affine: scales/biases must be BF16 (got {:?}/{:?})",
+                scales.inner.dtype, biases.inner.dtype,
+            )));
+        }
+        for (name, t) in [("w_q", w_q), ("scales", scales), ("biases", biases)] {
+            let strides = match t.layout() {
+                Layout::Dense { strides } => strides,
+                Layout::Quantized(_) => {
+                    return Err(Error::InvalidArgument(format!(
+                        "dequantize_affine: {name} must be a dense tensor",
+                    )));
+                }
+            };
+            if !strides.is_contiguous(t.shape()) {
+                return Err(Error::InvalidArgument(format!(
+                    "dequantize_affine: {name} must be contiguous (got shape {:?} strides {:?})",
+                    t.shape().dims(),
+                    strides.as_slice(),
+                )));
+            }
+        }
+        // Logical width: each u32 in w_q holds 32/bits dequantized
+        // values along the last axis.
+        let w_dims = w_q.shape().dims();
+        let last_packed = *w_dims.last().expect("w_q rank ≥ 1");
+        let logical_last = last_packed * (32 / bits as usize);
+        let mut out_dims: Vec<usize> = w_dims.to_vec();
+        *out_dims.last_mut().expect("rank ≥ 1") = logical_last;
+        let out_shape = Shape::from(out_dims);
+        let layout = dense_layout(&out_shape);
+        Ok(Self::op_tensor(
+            device,
+            out_shape,
+            DType::BF16,
+            layout,
+            OpKind::Dequantize { group_size, bits },
+            vec![w_q.clone(), scales.clone(), biases.clone()],
         ))
     }
 

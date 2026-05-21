@@ -215,6 +215,73 @@ impl QuantizedWeight {
         }
     }
 
+    /// Expose the three packed buffers as standalone dense `Tensor`s
+    /// with their natural dtypes and packed shapes:
+    ///
+    /// - `w_q`: `[N, K * bits / 32]` `U32`
+    /// - `scales`, `biases`: `[N, K / group_size]` `BF16`
+    ///
+    /// Each returned tensor shares the same underlying `MTLBuffer`
+    /// as this `QuantizedWeight` (refcount-bumped — no copy). Use
+    /// these as inputs to [`Tensor::gather`] or
+    /// [`Tensor::dequantize_affine`] when composing
+    /// embedding-style lookups.
+    #[must_use]
+    pub fn components(&self) -> (Tensor, Tensor, Tensor) {
+        let device = self
+            .tensor
+            .device()
+            .expect("QuantizedWeight always carries a device");
+        let storage = self
+            .tensor
+            .inner
+            .cache
+            .get()
+            .expect("QuantizedWeight always carries a materialized leaf by construction");
+        let (weights, scales, biases) = match storage {
+            LeafStorage::Quantized {
+                weights,
+                scales,
+                biases,
+            } => (weights, scales, biases),
+            LeafStorage::Dense(_) => {
+                unreachable!("QuantizedWeight always wraps LeafStorage::Quantized")
+            }
+        };
+
+        let logical = self.tensor.shape().dims();
+        let n = logical[0];
+        let k = logical[1];
+        let q = self.quantization();
+        let group_size = q.group_size() as usize;
+        let bits = q.bits() as usize;
+
+        let packed_cols = k * bits / 32;
+        let groups_per_row = k / group_size;
+
+        // SAFETY: reinterpret_as bumps the underlying MTLBuffer's
+        // refcount but doesn't change the bytes. The Rust element
+        // counts implied by Buffer<T>::len() come out right because
+        // `from_bytes` validated the byte counts: weights = N*K*bits/8
+        // bytes = packed_cols*N*4 bytes (U32 stride), scales/biases =
+        // groups_per_row*N*2 bytes (BF16 stride).
+        let w_buf = unsafe { weights.reinterpret_as::<u8>() };
+        let s_buf = unsafe { scales.reinterpret_as::<u8>() };
+        let b_buf = unsafe { biases.reinterpret_as::<u8>() };
+
+        let w_shape = Shape::from([n, packed_cols]);
+        let aux_shape = Shape::from([n, groups_per_row]);
+
+        let dense = |shape: &Shape| Layout::Dense {
+            strides: crate::Strides::contiguous(shape),
+        };
+
+        let w_tensor = Tensor::host_leaf(device, w_shape.clone(), DType::U32, dense(&w_shape), w_buf);
+        let s_tensor = Tensor::host_leaf(device, aux_shape.clone(), DType::BF16, dense(&aux_shape), s_buf);
+        let b_tensor = Tensor::host_leaf(device, aux_shape.clone(), DType::BF16, dense(&aux_shape), b_buf);
+        (w_tensor, s_tensor, b_tensor)
+    }
+
     /// The quantization descriptor (bits + group size).
     #[must_use]
     pub fn quantization(&self) -> Quantization {
