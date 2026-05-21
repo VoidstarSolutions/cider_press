@@ -197,6 +197,15 @@ pub enum OpKind {
         /// reduced axis.
         keep_dim: bool,
     },
+    /// Axis-0 gather (embedding-style lookup). Inputs (in
+    /// [`Tensor::op_inputs`] order) are `[src, indices]` where `src`
+    /// is a dense rank-2 tensor (`[vocab, slice]`) and `indices` is a
+    /// dense rank-1 `U32` tensor (`[n]`). Output is dense
+    /// `[n, slice]` with the same dtype as `src`. Scope mirrors the
+    /// kernels-crate `Instantiation::bf16_u32_rank1` — the JIT
+    /// machinery accepts other dtypes / index ranks / axes but the
+    /// runtime entry point hasn't grown them yet.
+    Gather,
 }
 
 /// Element-wise binary operations supported by [`OpKind::Binary`].
@@ -821,6 +830,107 @@ impl Tensor {
             layout,
             OpKind::Reduce { kind, keep_dim },
             vec![self.clone()],
+        ))
+    }
+
+    /// Schedule an axis-0 gather (embedding-style lookup):
+    /// `out[t, ..] = self[indices[t], ..]`.
+    ///
+    /// Preconditions (mirroring the kernels-crate scope; broader
+    /// instantiations land alongside their first consumer):
+    ///
+    /// - `self` (the source) is dense, contiguous, and rank ≥ 1.
+    /// - `indices` is a dense, contiguous, rank-1 [`DType::U32`]
+    ///   tensor on the same [`Device`] as `self`.
+    /// - Source dtype is `bf16` (the embedding case).
+    ///
+    /// Output shape is `indices.shape() ++ self.shape()[1..]` with
+    /// the same dtype as `self`.
+    pub fn gather(&self, indices: &Self) -> Result<Self> {
+        let device = self.inner.device.as_ref().ok_or_else(|| {
+            Error::InvalidArgument(
+                "gather: cannot apply an op to a placeholder (no device)".into(),
+            )
+        })?;
+        let idx_device = indices.inner.device.as_ref().ok_or_else(|| {
+            Error::InvalidArgument(
+                "gather: cannot use a placeholder as the indices input".into(),
+            )
+        })?;
+        if !device.ptr_eq(idx_device) {
+            return Err(Error::InvalidArgument(
+                "gather: src and indices are on different devices".into(),
+            ));
+        }
+        let src_strides = match self.layout() {
+            Layout::Dense { strides } => strides,
+            Layout::Quantized(_) => {
+                return Err(Error::InvalidArgument(
+                    "gather: quantized source tensors are not supported yet".into(),
+                ));
+            }
+        };
+        if !src_strides.is_contiguous(self.shape()) {
+            return Err(Error::InvalidArgument(format!(
+                "gather: src must be contiguous (got shape {:?} strides {:?}); \
+                 copy() first to materialise a dense version",
+                self.shape().dims(),
+                src_strides.as_slice(),
+            )));
+        }
+        if self.rank() == 0 {
+            return Err(Error::InvalidArgument(
+                "gather: src must have rank ≥ 1".into(),
+            ));
+        }
+        if self.inner.dtype != DType::BF16 {
+            return Err(Error::InvalidArgument(format!(
+                "gather: only BF16 source is wired (got {:?})",
+                self.inner.dtype,
+            )));
+        }
+
+        let idx_strides = match indices.layout() {
+            Layout::Dense { strides } => strides,
+            Layout::Quantized(_) => {
+                return Err(Error::InvalidArgument(
+                    "gather: quantized indices are not supported".into(),
+                ));
+            }
+        };
+        if !idx_strides.is_contiguous(indices.shape()) {
+            return Err(Error::InvalidArgument(format!(
+                "gather: indices must be contiguous (got shape {:?} strides {:?})",
+                indices.shape().dims(),
+                idx_strides.as_slice(),
+            )));
+        }
+        if indices.rank() != 1 {
+            return Err(Error::InvalidArgument(format!(
+                "gather: only rank-1 indices are wired (got rank {})",
+                indices.rank(),
+            )));
+        }
+        if indices.inner.dtype != DType::U32 {
+            return Err(Error::InvalidArgument(format!(
+                "gather: indices must be U32 (got {:?})",
+                indices.inner.dtype,
+            )));
+        }
+
+        // out shape: [n_indices] ++ src.shape()[1..]
+        let mut out_dims: Vec<usize> = Vec::with_capacity(self.rank());
+        out_dims.extend_from_slice(indices.shape().dims());
+        out_dims.extend_from_slice(&self.shape().dims()[1..]);
+        let out_shape = Shape::from(out_dims);
+        let layout = dense_layout(&out_shape);
+        Ok(Self::op_tensor(
+            device,
+            out_shape,
+            self.inner.dtype,
+            layout,
+            OpKind::Gather,
+            vec![self.clone(), indices.clone()],
         ))
     }
 

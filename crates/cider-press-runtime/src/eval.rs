@@ -208,6 +208,7 @@ fn dispatch(
         OpKind::Reduce { kind, keep_dim } => {
             dispatch_reduce(inner, op, commands, outputs, dst, index_of, kind, keep_dim)
         }
+        OpKind::Gather => dispatch_gather(inner, op, commands, outputs, dst, index_of),
     }
 }
 
@@ -964,4 +965,98 @@ fn dispatch_reduce(
         }
     }
     Ok(())
+}
+
+/// Dispatch an axis-0 gather. Inputs (per `Tensor::gather`): a dense
+/// contiguous bf16 src + a dense contiguous rank-1 U32 indices tensor.
+/// The runtime layer enforces these preconditions at construction time;
+/// here we just transcribe MLX's `Gather::eval_gpu` binding.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn dispatch_gather(
+    inner: &Arc<TensorInner>,
+    op: &OpNode,
+    commands: &mut Commands<'_>,
+    outputs: &[Buffer<u8>],
+    dst: &mut Buffer<u8>,
+    index_of: &HashMap<*const TensorInner, usize>,
+) -> Result<()> {
+    let device = inner
+        .device
+        .as_ref()
+        .expect("op nodes are always constructed with a device");
+    let src_tensor = op
+        .inputs
+        .first()
+        .ok_or_else(|| Error::InvalidArgument("Gather: missing src (inputs[0])".into()))?;
+    let idx_tensor = op
+        .inputs
+        .get(1)
+        .ok_or_else(|| Error::InvalidArgument("Gather: missing indices (inputs[1])".into()))?;
+
+    let inst = cider_press_kernels::kernels::gather::Instantiation::bf16_u32_rank1();
+    let library = device.gather_library(&inst)?;
+
+    let src_bytes = dense_input_buffer(src_tensor, outputs, index_of)?;
+    let idx_bytes = dense_input_buffer(idx_tensor, outputs, index_of)?;
+
+    // SAFETY: dtype tags enforced by Tensor::gather; src is bf16, idx is u32.
+    let src_typed = unsafe { src_bytes.reinterpret_as::<half::bf16>() };
+    let idx_typed = unsafe { idx_bytes.reinterpret_as::<u32>() };
+    let mut dst_typed = unsafe { dst.reinterpret_as::<half::bf16>() };
+
+    let src_shape_dims = src_tensor.shape().dims();
+    let n_indices = idx_tensor.shape().dims()[0];
+    // src is rank-1+ — slice axes are everything past axis 0.
+    let slice_size: usize = src_shape_dims.iter().skip(1).product();
+
+    // Element strides (MLX convention): row-major across src.
+    let src_strides_elem: Vec<i64> = element_strides(src_shape_dims);
+
+    let kernels_dev = device.kernels();
+    let src_shape_i32: Vec<i32> = src_shape_dims.iter().map(|&d| d as i32).collect();
+    let src_shape_buf = kernels_dev.upload(&src_shape_i32)?;
+    let src_strides_buf = kernels_dev.upload(&src_strides_elem)?;
+    // axes[0] = 0 (gathered axis), slice_sizes mirrors src.shape() with
+    // gathered axes set to 1.
+    let mut slice_sizes_i32: Vec<i32> = src_shape_i32.clone();
+    slice_sizes_i32[0] = 1;
+    let slice_sizes_buf = kernels_dev.upload(&slice_sizes_i32)?;
+    let axes_buf = kernels_dev.upload(&[0i32])?;
+    let idx_shapes_buf = kernels_dev.upload(&[n_indices as i32])?;
+    let idx_strides_buf = kernels_dev.upload(&[1i64])?;
+    let idx_contigs_buf = kernels_dev.upload(&[1u8])?;
+
+    let indices_refs = [&idx_typed];
+    cider_press_kernels::kernels::gather::dispatch(
+        commands,
+        &library,
+        &inst,
+        cider_press_kernels::kernels::gather::GatherDispatch {
+            src: &src_typed,
+            out: &mut dst_typed,
+            indices: &indices_refs,
+            src_shape: &src_shape_buf,
+            src_strides: &src_strides_buf,
+            src_ndim: src_shape_dims.len() as u64,
+            slice_sizes: &slice_sizes_buf,
+            axes: &axes_buf,
+            idx_shapes: &idx_shapes_buf,
+            idx_strides: &idx_strides_buf,
+            idx_contigs: &idx_contigs_buf,
+            idx_ndim: 1,
+            grid: (n_indices, 1, slice_size),
+        },
+    )?;
+    Ok(())
+}
+
+/// Row-major element strides for a shape: for `[d0, d1, d2]`,
+/// `[d1*d2, d2, 1]`.
+#[allow(clippy::cast_possible_wrap)]
+fn element_strides(shape: &[usize]) -> Vec<i64> {
+    let mut strides = vec![1i64; shape.len()];
+    for i in (0..shape.len().saturating_sub(1)).rev() {
+        strides[i] = strides[i + 1] * shape[i + 1] as i64;
+    }
+    strides
 }
