@@ -57,6 +57,7 @@ cider-press/
 │   │   └── tests/{stage*,fixtures}     # spike parity + perf tests
 │   ├── cider-press-runtime/            # scaffold: lazy Tensor + graph + eval
 │   ├── cider-press-models/             # scaffold: transformer architectures
+│   ├── cider-press-test-utils/         # dev-only: shared MLX-parity test helpers
 │   └── cider-press/                    # scaffold: facade + CLI
 ├── scripts/                            # one-shot uv scripts (fixtures, MLX sync, perf)
 └── .github/workflows/{ci,mlx-sync}.yml
@@ -163,6 +164,36 @@ branch-by-branch roadmap):
   yet); the bf16 constants differ in the last few bits. Adds `sigmoid`,
   `erf`, `silu`, `gelu` cases to `dump_mlx_op.py` (the silu/gelu cases
   drive against `mlx.nn`).
+- **Branch 7 (`feat/gather`).** Embedding lookup end-to-end, against
+  Qwen2's *quantized* embed_tokens. First branch that needed
+  JIT-assembled kernels — MLX has no precompiled `gather.metal`;
+  `indexing.cpp` assembles source per `(T, IdxT, NIDX, IDX_NDIM,
+  LocT)` instantiation. Vendored `indexing/{indexing,gather}.h`.
+  build.rs grows a `HEADER_BUNDLES` pass alongside `ENTRY_POINTS`
+  that flattens header-only sources into prefix strings.
+  Kernels crate: `kernels::gather::{Instantiation, make_source,
+  dispatch}` with `bf16_u32_rank1` / `u32_u32_rank1` instantiations
+  + the wrapper template copied verbatim from MLX's
+  `backend/metal/jit/indexing.h`; reusable for softmax/RoPE/SDPA
+  later (same JIT pattern). Also adds
+  `affine_dequantize_bf16_gs64_b4` reusing the existing
+  `quantized.metal` library — Qwen2 production config. Runtime:
+  per-`(T, IdxT, NIDX, IDX_NDIM, LocT)` `Mutex<HashMap>` library
+  cache on `Device` (the multi-instantiation case where `OnceLock`
+  doesn't fit), `Tensor::gather` accepting BF16 + U32 src,
+  `OpKind::Dequantize { group_size, bits }` + `Tensor::dequantize_affine`,
+  `QuantizedWeight::components()` exposing the packed triple as
+  three dense `Tensor`s sharing the underlying `MTLBuffer`s
+  (refcount-bumped, zero copy). Models crate ships
+  `nn::embed_tokens(input_ids, weight)` composing the lazy 4-op
+  graph (gather × 3 + dequantize). All five parity tests are
+  bit-exact (gather is a pure data-mover; per-row dequantize is
+  per-row identical between MLX and us). Real-checkpoint test
+  exercises the full path on Qwen2.5-0.5B's loaded `embed_tokens`,
+  comparing against a CPU per-row dequantize from the loaded raw
+  bytes. JIT cold-start is per-instantiation (one cache miss per
+  unique tuple); cross-process Metal cache amortizes subsequent
+  process invocations the same way it does for `.metal` libraries.
 
 **Concrete target: Qwen2.5-0.5B-Instruct running interactively.**
 Smallest published dense Qwen; same architecture family as the
@@ -171,12 +202,13 @@ branch-by-branch roadmap; `docs/RUNTIME_DESIGN.md` has the
 framework-gap analysis for the two structural additions we know
 we'll need (Views landed in branch 2; `KvCache` type comes later).
 
-**Next concrete step: branch 7 of the roadmap — `feat/gather`.**
-Embedding lookup for the input embedding and (since Qwen2.5 has tied
-embeddings) the LM head. Vendor MLX's gather kernel and decide the
-quantized-gather question below — leaning toward `gather →
-dequantize_row` rather than a quantized-row gather, since gather at
-decode is once per token and tiny.
+**Next concrete step: branch 8 of the roadmap — `feat/kv-cache`.**
+A `KvCache` type (separate from `Tensor`) backing the per-layer K
+and V slabs that decode appends to and SDPA reads from. Eager `Copy`
+into the slab on update; view accessors expose the populated prefix
+as `Tensor`s. First runtime-side abstraction that's not just a
+lazy-graph op — see `docs/RUNTIME_DESIGN.md` for the framework-gap
+analysis that motivated treating KV cache as a first-class type.
 
 Open question deferred from branch 3, surfaced concretely by the
 loader: `model.embed_tokens` is *quantized*, and tied embeddings mean

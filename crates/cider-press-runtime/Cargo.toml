@@ -20,6 +20,7 @@ thiserror = { workspace = true }
 [dev-dependencies]
 approx = { workspace = true }
 safetensors = { workspace = true }
+cider-press-test-utils = { path = "../cider-press-test-utils" }
 
 [lints]
 workspace = true

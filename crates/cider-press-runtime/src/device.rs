@@ -19,7 +19,8 @@
 //! control over initialization (e.g. surfacing the [`Result`] in a
 //! test, or to fail fast at startup).
 
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use cider_press_kernels as kernels;
 
@@ -46,6 +47,15 @@ struct DeviceInner {
     /// so callers see a one-time pause on first reduce dispatch.
     /// Subsequent calls return the cached library.
     reduce_library: OnceLock<kernels::KernelLibrary>,
+    /// JIT-assembled gather libraries, one entry per
+    /// [`kernels::kernels::gather::Instantiation`]. Keyed by the
+    /// instantiation's kernel name (which uniquely identifies the
+    /// `(T, IdxT, NIDX, IDX_NDIM, LocT)` tuple). Unlike the other
+    /// libraries this is per-instantiation because MLX has no
+    /// precompiled gather.metal — every `(T, IdxT, ...)` combination
+    /// is a separate compiled library, matching MLX's own
+    /// `d.get_library(lib_name, builder)` pattern.
+    gather_libraries: Mutex<HashMap<String, Arc<kernels::KernelLibrary>>>,
 }
 
 /// Refcounted handle to the system's default Metal device.
@@ -72,6 +82,7 @@ impl Device {
                 binary_library: OnceLock::new(),
                 unary_library: OnceLock::new(),
                 reduce_library: OnceLock::new(),
+                gather_libraries: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -98,6 +109,7 @@ impl Device {
             binary_library: OnceLock::new(),
             unary_library: OnceLock::new(),
             reduce_library: OnceLock::new(),
+            gather_libraries: Mutex::new(HashMap::new()),
         });
         let stored = SHARED.get_or_init(|| fresh);
         Ok(Self {
@@ -179,6 +191,34 @@ impl Device {
         }
         let lib = kernels::KernelLibrary::reduce(&self.inner.kernels)?;
         Ok(self.inner.reduce_library.get_or_init(|| lib))
+    }
+
+    /// Lazily JIT-compile and cache a gather library for one
+    /// instantiation tuple. The kernel name is the cache key, so each
+    /// unique `(T, IdxT, NIDX, IDX_NDIM, LocT)` combination is a
+    /// separate compiled library — mirroring MLX's
+    /// `d.get_library(lib_name, builder)` pattern in
+    /// `backend/metal/indexing.cpp`.
+    pub(crate) fn gather_library(
+        &self,
+        inst: &kernels::kernels::gather::Instantiation,
+    ) -> Result<Arc<kernels::KernelLibrary>> {
+        let kernel_name = inst.kernel_name();
+        let mut libs = self
+            .inner
+            .gather_libraries
+            .lock()
+            .expect("gather_libraries mutex poisoned");
+        if let Some(lib) = libs.get(&kernel_name) {
+            return Ok(lib.clone());
+        }
+        let source = kernels::kernels::gather::make_source(inst);
+        let lib = Arc::new(kernels::KernelLibrary::from_source(
+            &self.inner.kernels,
+            &source,
+        )?);
+        libs.insert(kernel_name, lib.clone());
+        Ok(lib)
     }
 }
 

@@ -6,11 +6,13 @@
 //! and returns it unevaluated; the caller chooses when to `eval()`.
 //!
 //! Status: branch 5 shipped [`rms_norm`]; branch 6 adds [`silu`] and
-//! [`gelu`] (exact, `erf`-based — matches `mlx.nn.gelu`). `SwiGLU`,
-//! `RoPE`, `SDPA`, and the rest of the Qwen2 layer building blocks
-//! land as their underlying ops do.
+//! [`gelu`] (exact, `erf`-based — matches `mlx.nn.gelu`); branch 7
+//! adds [`embed_tokens`] (gather + dequantize composition over a
+//! [`QuantizedWeight`] embedding table). `SwiGLU`, `RoPE`, `SDPA`,
+//! and the rest of the Qwen2 layer building blocks land as their
+//! underlying ops do.
 
-use cider_press_runtime::{DType, Device, Tensor};
+use cider_press_runtime::{DType, Device, QuantizedWeight, Tensor};
 use half::{bf16, f16};
 
 use crate::error::{Error, Result};
@@ -106,7 +108,7 @@ pub fn rms_norm(x: &Tensor, gamma: &Tensor, eps: f32) -> Result<Tensor> {
 /// Precondition: `x` is on a device (not a placeholder) and has a
 /// float dtype (`f32`, `f16`, or `bf16`).
 pub fn silu(x: &Tensor) -> Result<Tensor> {
-    require_float_activation_input(x, "silu")?;
+    let _ = float_activation_device(x, "silu")?;
     let sig = x.sigmoid()?;
     Ok(x.mul(&sig)?)
 }
@@ -121,8 +123,7 @@ pub fn silu(x: &Tensor) -> Result<Tensor> {
 /// Precondition: `x` is on a device (not a placeholder) and has a
 /// float dtype.
 pub fn gelu(x: &Tensor) -> Result<Tensor> {
-    require_float_activation_input(x, "gelu")?;
-    let device = x.device().expect("checked above");
+    let device = float_activation_device(x, "gelu")?;
     let dtype = x.dtype();
 
     // 1/sqrt(2) and 0.5 flow as host-side [1] tensors broadcast against
@@ -143,18 +144,50 @@ pub fn gelu(x: &Tensor) -> Result<Tensor> {
     Ok(half_x.mul(&inner)?)
 }
 
-fn require_float_activation_input(x: &Tensor, op: &str) -> Result<()> {
-    if x.is_placeholder() {
-        return Err(Error::InvalidArgument(format!(
-            "{op}: cannot apply to a placeholder (no device)",
-        )));
-    }
+fn float_activation_device<'a>(x: &'a Tensor, op: &str) -> Result<&'a Device> {
+    let device = x.device().ok_or_else(|| {
+        Error::InvalidArgument(format!("{op}: cannot apply to a placeholder (no device)"))
+    })?;
     match x.dtype() {
-        DType::F32 | DType::F16 | DType::BF16 => Ok(()),
+        DType::F32 | DType::F16 | DType::BF16 => Ok(device),
         dtype @ (DType::I32 | DType::U32) => Err(Error::InvalidArgument(format!(
             "{op}: dtype {dtype:?} is not supported (float dtypes only)",
         ))),
     }
+}
+
+/// Embedding lookup against a quantized embedding table:
+/// `out[t, ..] = dequantize(weight[input_ids[t], ..])`.
+///
+/// Composed entirely from existing runtime ops — no new kernel. The
+/// composition mirrors MLX-LM's quantized embedding path: gather the
+/// rows of each component of the quantized triple (packed `w_q` as
+/// `U32`, `scales`/`biases` as `BF16`), then run a single
+/// `affine_dequantize` over the gathered triple. Lazy throughout —
+/// the four constituent ops land in a single `eval()`.
+///
+/// Preconditions:
+///
+/// - `input_ids` is a dense, contiguous, rank-1 [`DType::U32`] tensor
+///   on the same device as `weight`.
+/// - `weight` is shaped `[vocab, hidden]` with quantization config
+///   `(group_size=64, bits=4)` (the only instantiation wired so far,
+///   matching Qwen2's production config).
+///
+/// Output is a dense `[input_ids.shape()[0], hidden]` `BF16` tensor.
+pub fn embed_tokens(input_ids: &Tensor, weight: &QuantizedWeight) -> Result<Tensor> {
+    let q = weight.quantization();
+    let (w_q, scales, biases) = weight.components();
+    let gathered_w = w_q.gather(input_ids)?;
+    let gathered_s = scales.gather(input_ids)?;
+    let gathered_b = biases.gather(input_ids)?;
+    Ok(Tensor::dequantize_affine(
+        &gathered_w,
+        &gathered_s,
+        &gathered_b,
+        q.group_size(),
+        q.bits(),
+    )?)
 }
 
 /// Build a `[1]` host-side tensor on `device` with the given value

@@ -296,6 +296,116 @@ def run_mul(args: argparse.Namespace) -> dict[str, mx.array]:
 
 
 # ---------------------------------------------------------------------------
+# gather: axis-0 embedding-style lookup (consumed by branch 7
+# `feat/gather`). Writes `src`, `indices`, `out`. Indices are u32
+# uniformly drawn over `[0, vocab)`; src is bf16 uniform in [-0.5, 0.5).
+# The kernel is a pure data-mover so bit-exact equality holds for any
+# dtype.
+# ---------------------------------------------------------------------------
+
+
+_GATHER_SRC_DTYPES = dict(_FLOAT_DTYPES, u32=mx.uint32)
+
+
+def add_gather_parser(subparsers: argparse._SubParsersAction) -> None:
+    p = subparsers.add_parser(
+        "gather",
+        help="axis-0 gather (embedding lookup): out[t, h] = src[indices[t], h]",
+    )
+    p.add_argument("--vocab", type=int, required=True, help="source first-axis size, e.g. 128")
+    p.add_argument("--hidden", type=int, required=True, help="source second-axis size, e.g. 64")
+    p.add_argument("--n-indices", type=int, required=True, help="length of the rank-1 index tensor")
+    p.add_argument(
+        "--dtype",
+        default="bf16",
+        help=f"src/out dtype: one of {sorted(_GATHER_SRC_DTYPES)}",
+    )
+
+
+def run_gather(args: argparse.Namespace) -> dict[str, mx.array]:
+    if args.dtype not in _GATHER_SRC_DTYPES:
+        raise SystemExit(
+            f"gather: unknown dtype {args.dtype!r}; expected one of {sorted(_GATHER_SRC_DTYPES)}"
+        )
+    dtype = _GATHER_SRC_DTYPES[args.dtype]
+    if dtype == mx.uint32:
+        # u32 is the packed-quantized-weight gather case (uint32 carries
+        # packed int4 values). Generate uniformly-random bits to avoid
+        # the kernel accidentally working on a degenerate `src = 0`.
+        src = mx.random.randint(0, 2**31 - 1, shape=(args.vocab, args.hidden)).astype(dtype)
+    else:
+        src = (mx.random.uniform(shape=(args.vocab, args.hidden)) - 0.5).astype(dtype)
+    indices = mx.random.randint(0, args.vocab, shape=(args.n_indices,)).astype(mx.uint32)
+    out = mx.take(src, indices, axis=0)
+    mx.eval(src, indices, out)
+    return {"src": src, "indices": indices, "out": out}
+
+
+# ---------------------------------------------------------------------------
+# dequantize: affine-dequantize a packed (w_q, scales, biases) triple
+# back to a dense bf16 tensor. Consumed by branch 7 (feat/gather) for
+# the embedding-table integration. Writes `w_q`, `scales`, `biases`,
+# `out`. Generates a random bf16 source, runs mx.quantize, then
+# mx.dequantize — the round-trip lets the Rust side compare against
+# the exact bytes MLX would produce given the same quantized triple.
+# ---------------------------------------------------------------------------
+
+
+def add_dequantize_parser(subparsers: argparse._SubParsersAction) -> None:
+    p = subparsers.add_parser(
+        "dequantize",
+        help="mx.dequantize on a quantized (w_q, scales, biases) triple",
+    )
+    p.add_argument("--rows", type=int, required=True, help="rows of the original (dense) weight, e.g. 128")
+    p.add_argument("--cols", type=int, required=True, help="cols of the original weight (multiple of group_size)")
+    p.add_argument("--group-size", type=int, default=64)
+    p.add_argument("--bits", type=int, default=4)
+    p.add_argument("--dtype", default="bf16", help="value dtype: one of f32, f16, bf16")
+
+
+def run_dequantize(args: argparse.Namespace) -> dict[str, mx.array]:
+    dtype = _float_dtype(args.dtype)
+    dense = (mx.random.uniform(shape=(args.rows, args.cols)) - 0.5).astype(dtype)
+    w_q, scales, biases = mx.quantize(dense, group_size=args.group_size, bits=args.bits)
+    out = mx.dequantize(w_q, scales, biases, group_size=args.group_size, bits=args.bits)
+    mx.eval(w_q, scales, biases, out)
+    return {"w_q": w_q, "scales": scales, "biases": biases, "out": out}
+
+
+# ---------------------------------------------------------------------------
+# embed_tokens: gather rows of a quantized embedding table by token IDs
+# and dequantize the gathered rows. The exact composition nn::embed_tokens
+# wires at the models layer. Writes (w_q, scales, biases, indices, out)
+# where out = mx.take(mx.dequantize(...), indices, axis=0). Bit-exact bar
+# because each row's dequantize is independent of every other row.
+# ---------------------------------------------------------------------------
+
+
+def add_embed_tokens_parser(subparsers: argparse._SubParsersAction) -> None:
+    p = subparsers.add_parser(
+        "embed_tokens",
+        help="gather + dequantize the rows of a quantized embedding table",
+    )
+    p.add_argument("--vocab", type=int, required=True, help="rows of embedding table")
+    p.add_argument("--hidden", type=int, required=True, help="cols of embedding table (multiple of group_size)")
+    p.add_argument("--n-indices", type=int, required=True, help="length of the rank-1 index tensor")
+    p.add_argument("--group-size", type=int, default=64)
+    p.add_argument("--bits", type=int, default=4)
+    p.add_argument("--dtype", default="bf16", help="value dtype: one of f32, f16, bf16")
+
+
+def run_embed_tokens(args: argparse.Namespace) -> dict[str, mx.array]:
+    dtype = _float_dtype(args.dtype)
+    dense = (mx.random.uniform(shape=(args.vocab, args.hidden)) - 0.5).astype(dtype)
+    w_q, scales, biases = mx.quantize(dense, group_size=args.group_size, bits=args.bits)
+    indices = mx.random.randint(0, args.vocab, shape=(args.n_indices,)).astype(mx.uint32)
+    dq = mx.dequantize(w_q, scales, biases, group_size=args.group_size, bits=args.bits)
+    out = mx.take(dq, indices, axis=0)
+    mx.eval(w_q, scales, biases, indices, out)
+    return {"w_q": w_q, "scales": scales, "biases": biases, "indices": indices, "out": out}
+
+
+# ---------------------------------------------------------------------------
 # CLI plumbing
 # ---------------------------------------------------------------------------
 
@@ -315,6 +425,9 @@ OPS: dict[str, tuple[ParserBuilder, Runner]] = {
     "erf": (add_erf_parser, run_erf),
     "silu": (add_silu_parser, run_silu),
     "gelu": (add_gelu_parser, run_gelu),
+    "gather": (add_gather_parser, run_gather),
+    "dequantize": (add_dequantize_parser, run_dequantize),
+    "embed_tokens": (add_embed_tokens_parser, run_embed_tokens),
 }
 
 

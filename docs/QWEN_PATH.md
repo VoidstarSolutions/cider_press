@@ -83,7 +83,7 @@ that introduced them, instead of three branches later in some composition.
 | 4 | (done) `feat/elementwise-add` | First binary op family: vendored MLX's `binary.metal`, `OpKind::Binary { op: Add \| Mul }`, NumPy broadcasting via existing `broadcast_to`; `vv_*` fast path + `g{1,2,3}_*` rank-specialised strided paths for f32/f16/bf16 | MLX bit-exact parity at kernels, runtime, and models levels: synthetic `[1,8,896]` same-shape and broadcast `+[896]`; gated real-checkpoint test loads `layer0.input_layernorm` and broadcast-adds it bit-exactly vs a CPU bf16 reference |
 | 5 | (done) `feat/rmsnorm` | Vendored MLX's `unary.metal` + `reduce.metal`. Kernels: `v_{square,rsqrt}_*` (6 fns) + `row_reduce_{sum,prod,min,max}_*` (12 fns, with `init_reduce` + `row_reduce_looped` bundled per op). Runtime: `OpKind::Unary` + `OpKind::Reduce`, `Tensor::{square, rsqrt, sum, prod, min, max, mean}`. Models: `nn::rms_norm(x, gamma, eps)` composed (no fused kernel). | MLX parity on `[1, 8, 896]` bf16 vs `mx.fast.rms_norm` (composed-path tolerance) plus gated real-checkpoint test against `layer0.input_layernorm` + CPU f32 reference |
 | 6 | (done) `feat/silu-and-gelu` | Two activations composed from existing unary primitives. MLX's `unary.metal` doesn't ship `Silu`/`Gelu`; `mlx.nn` composes them on the Python side, so we mirror that factoring. Kernels: `v_{sigmoid,erf}_*` (6 fns; instantiations already present in the vendored `unary.metal`). Runtime: `UnaryOp::{Sigmoid, Erf}` + `Tensor::{sigmoid, erf}`. Models: `nn::silu(x) = x * sigmoid(x)`, exact `nn::gelu(x) = 0.5 * x * (1 + erf(x / sqrt(2)))`. | SiLU bit-exact vs `mlx.nn.silu`. GELU bf16-compose tolerance vs `mlx.nn.gelu` (we reciprocal-multiply where MLX divides — runtime has no divide op yet — so the bf16-rounded constants differ in the last few bits). |
-| 7 | `feat/gather` | `OpKind::Gather` for embedding lookup; vendor MLX's gather kernel. **Decision needed here:** tied embeddings are quantized, so either (a) implement quantized-row gather, or (b) gather → `dequantize_row` for the embedding path while qmv handles the LM head. Leaning (b) — embedding gather is once per token at decode and tiny. | MLX parity on random indices against real `W_embed` |
+| 7 | (done) `feat/gather` | Embedding lookup end-to-end against Qwen2's quantized embed_tokens. First JIT-assembled kernel family — MLX has no precompiled `gather.metal`; source is generated per `(T, IdxT, NIDX, IDX_NDIM, LocT)` instantiation. Vendored `indexing/{indexing,gather}.h`; build.rs grows a `HEADER_BUNDLES` pass for header-only sources. Kernels: `gather::{Instantiation, make_source, dispatch}` (bf16+u32 instantiations) + `affine_dequantize_bf16_gs64_b4` (reuses existing `quantized.metal` library). Runtime: per-instantiation `Mutex<HashMap>` library cache on `Device`, `Tensor::gather` (BF16+U32 src), `OpKind::Dequantize` + `Tensor::dequantize_affine`, `QuantizedWeight::components()` exposing the packed triple as three dense Tensors sharing the underlying buffers. Models: `nn::embed_tokens` composes `gather × 3 → dequantize_affine`. The "decision" called out in the original entry resolved to "neither" — gather works on the components directly; dequantize is a single fused kernel over the gathered triple. | Bit-exact at every layer: gather is a pure data-mover, per-row dequantize is per-row identical between MLX and us. Real-checkpoint test exercises the full path on Qwen2.5-0.5B's loaded `embed_tokens` (6 token IDs across the vocab) vs CPU per-row dequantize from raw loaded bytes. |
 | 8 | `feat/kv-cache` | `KvCache` type (separate from Tensor); `update` (eager `Copy` to a slab); view accessors | Round-trip: write N rows, read back via view, compare |
 | 9 | `feat/rope` | `OpKind::Rope` (Qwen RoPE config — base θ, dim split); could be a fused kernel or composed | MLX parity on `[B, T, H, D_h]` Q/K |
 | 10 | `feat/softmax` | `OpKind::Softmax` (reduction along last axis, reuses branch-5's reduction primitive); needed by SDPA and the router (later MoE) | MLX parity |
@@ -118,29 +118,34 @@ for "it's fast and clean" but can wait until branch 15+:
 
 ## What to do next time we sit down
 
-Branch 7 (`feat/gather`). Specifically:
+Branch 8 (`feat/kv-cache`). Specifically:
 
-1. Vendor MLX's gather kernel (`mlx/backend/metal/kernels/gather.metal`
-   plus any transitive headers) and add a `KernelLibrary::gather`
-   slot. Embedding gather is the only consumer for now — bf16 indexed
-   by `u32`.
-2. Decide quantized embedding strategy. `model.embed_tokens` is
-   quantized (4-bit, group 64), and tied embeddings mean the LM head
-   reads the same weight. Two paths:
-   - (a) Implement a quantized-row gather kernel (gather + dequantize
-     per row, fused).
-   - (b) `gather → dequantize_row` as separate ops, reusing the qmv
-     dequant path.
-   Leaning (b) — embedding gather is once per token at decode and
-   tiny; (a) is a perf-only win we can revisit if measurement asks.
-   Either way, the LM head keeps using qmv against the same packed
-   weight.
-3. Runtime: `OpKind::Gather` + `Tensor::gather(indices)`. Output
-   shape is `indices.shape() ++ source.shape()[1:]` for axis 0.
-4. Parity: gather + dequant on random `u32` indices against MLX's
-   reference, run against the real `embed_tokens` weight loaded by
-   `load_qwen2_weights`. The gated real-checkpoint test pattern from
-   branches 4+5 carries forward.
+1. Design a `KvCache` type separate from `Tensor`. Each decoder layer
+   owns one (K, V) pair sized `[B, H_kv, T_max, D_h]` bf16. Decode
+   appends one row per step; prefill writes a full block. See
+   `docs/RUNTIME_DESIGN.md` for the framework-gap analysis — KV
+   cache doesn't fit the lazy-graph model (it's mutable, persistent
+   across `eval()` calls, and grows over time).
+2. `update(k, v)` does an eager `Copy` into the slab at the current
+   offset (no lazy graph node — the side-effect on the slab is the
+   point). View accessors `keys()` / `values()` return `Tensor`s
+   pointing at the populated `[..., :T_cur, ...]` prefix as
+   slice/view-of-leaf, reusing branch-2's view machinery.
+3. Roundtrip test: write N rows of synthetic data, read back via
+   view, compare. Eager copy means no MLX parity needed at the
+   KvCache layer itself — the underlying `Copy` kernel already has
+   parity from stage 2/3.
+4. No models-layer changes yet — `nn::attention` is branch 12b and
+   will integrate KvCache then. Branch 9 (`feat/rope`) and branch
+   10 (`feat/softmax`) come between.
+
+Open question carried forward from branch 7: the per-instantiation
+JIT cache on `Device` now holds one library per unique kernel name.
+For softmax / RoPE / SDPA the instantiation space is larger (more
+template parameters), but the same `Mutex<HashMap>` pattern carries
+forward. Worth noting that the cross-process Metal cache also
+amortizes per-instantiation, so the wall-clock cost only matters on
+first-ever invocation per instantiation per system.
 
 Open question carried forward from branch 5 reduce-scope discussion:
 whether the deferred kernel variants (`row_reduce_simple` for high

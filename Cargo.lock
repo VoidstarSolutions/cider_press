@@ -57,6 +57,7 @@ name = "cider-press-kernels"
 version = "0.1.0"
 dependencies = [
  "approx",
+ "cider-press-test-utils",
  "half",
  "objc2",
  "objc2-foundation",
@@ -70,6 +71,7 @@ name = "cider-press-models"
 version = "0.1.0"
 dependencies = [
  "cider-press-runtime",
+ "cider-press-test-utils",
  "half",
  "safetensors",
  "serde",
@@ -83,9 +85,18 @@ version = "0.1.0"
 dependencies = [
  "approx",
  "cider-press-kernels",
+ "cider-press-test-utils",
  "half",
  "safetensors",
  "thiserror",
+]
+
+[[package]]
+name = "cider-press-test-utils"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "safetensors",
 ]
 
 [[package]]

@@ -62,6 +62,8 @@ FILES=(
     mlx/backend/metal/kernels/steel/gemm/transforms.h
     mlx/backend/metal/kernels/steel/utils/integral_constant.h
     mlx/backend/metal/kernels/steel/utils/type_traits.h
+    mlx/backend/metal/kernels/indexing/indexing.h
+    mlx/backend/metal/kernels/indexing/gather.h
 )
 
 for f in "${FILES[@]}"; do

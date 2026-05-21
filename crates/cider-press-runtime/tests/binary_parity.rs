@@ -20,10 +20,10 @@
 
 #![cfg(target_os = "macos")]
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
 use cider_press_runtime::{Device, Tensor};
+use cider_press_test_utils::{dump_mlx_op, read_bf16, tempdir};
 use half::bf16;
 use safetensors::SafeTensors;
 
@@ -32,7 +32,7 @@ const H: usize = 896;
 
 #[test]
 fn add_vv_through_runtime_matches_mlx() {
-    let tmp = tempdir();
+    let tmp = tempdir("runtime-binary-parity");
     let fixture = tmp.join("add_vv_bf16.safetensors");
     dump_mlx_add(&fixture, &format!("1,{S},{H}"), &format!("1,{S},{H}"));
 
@@ -54,7 +54,7 @@ fn add_vv_through_runtime_matches_mlx() {
 
 #[test]
 fn add_broadcast_through_runtime_matches_mlx() {
-    let tmp = tempdir();
+    let tmp = tempdir("runtime-binary-parity");
     let fixture = tmp.join("add_bcast_bf16.safetensors");
     dump_mlx_add(&fixture, &format!("1,{S},{H}"), &format!("{H}"));
 
@@ -79,7 +79,7 @@ fn add_broadcast_through_runtime_matches_mlx() {
 
 #[test]
 fn mul_vv_through_runtime_matches_mlx() {
-    let tmp = tempdir();
+    let tmp = tempdir("runtime-binary-parity");
     let fixture = tmp.join("mul_vv_bf16.safetensors");
     dump_mlx_mul(&fixture, &format!("1,{S},{H}"), &format!("1,{S},{H}"));
 
@@ -101,7 +101,7 @@ fn mul_vv_through_runtime_matches_mlx() {
 
 #[test]
 fn mul_broadcast_through_runtime_matches_mlx() {
-    let tmp = tempdir();
+    let tmp = tempdir("runtime-binary-parity");
     let fixture = tmp.join("mul_bcast_bf16.safetensors");
     dump_mlx_mul(&fixture, &format!("1,{S},{H}"), &format!("{H}"));
 
@@ -125,73 +125,31 @@ fn mul_broadcast_through_runtime_matches_mlx() {
 }
 
 fn dump_mlx_add(out: &Path, lhs_shape: &str, rhs_shape: &str) {
-    dump_mlx_op("add", out, lhs_shape, rhs_shape);
+    dump_mlx_op(
+        out,
+        &[
+            "add",
+            "--lhs-shape",
+            lhs_shape,
+            "--rhs-shape",
+            rhs_shape,
+            "--dtype",
+            "bf16",
+        ],
+    );
 }
 
 fn dump_mlx_mul(out: &Path, lhs_shape: &str, rhs_shape: &str) {
-    dump_mlx_op("mul", out, lhs_shape, rhs_shape);
-}
-
-fn dump_mlx_op(op: &str, out: &Path, lhs_shape: &str, rhs_shape: &str) {
-    let script = workspace_root().join("scripts").join("dump_mlx_op.py");
-    let status = Command::new("uv")
-        .arg("run")
-        .arg(&script)
-        .arg("--output")
-        .arg(out)
-        .arg("--seed")
-        .arg("0")
-        .arg(op)
-        .arg("--lhs-shape")
-        .arg(lhs_shape)
-        .arg("--rhs-shape")
-        .arg(rhs_shape)
-        .arg("--dtype")
-        .arg("bf16")
-        .status();
-    let status = match status {
-        Ok(s) => s,
-        Err(err) => panic!(
-            "failed to invoke `uv run {}`: {err}. \
-             This test requires `uv` (https://docs.astral.sh/uv) on PATH \
-             so MLX can generate the parity fixture; CI installs it via \
-             astral-sh/setup-uv.",
-            script.display()
-        ),
-    };
-    assert!(status.success(), "dump_mlx_op.py {op} exited {status}");
-}
-
-fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("workspace root")
-        .to_path_buf()
-}
-
-fn read_bf16(st: &SafeTensors, name: &str) -> Vec<bf16> {
-    let view = st
-        .tensor(name)
-        .unwrap_or_else(|e| panic!("tensor {name}: {e}"));
-    assert_eq!(view.dtype(), safetensors::Dtype::BF16);
-    let bytes = view.data();
-    assert!(bytes.len() % 2 == 0);
-    bytes
-        .chunks_exact(2)
-        .map(|c| bf16::from_le_bytes([c[0], c[1]]))
-        .collect()
-}
-
-fn tempdir() -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("SystemTime")
-        .as_nanos();
-    let pid = std::process::id();
-    let dir = workspace_root()
-        .join("target")
-        .join(format!("cider-press-runtime-binary-parity-{pid}-{nanos}"));
-    std::fs::create_dir_all(&dir).expect("mktemp");
-    dir
+    dump_mlx_op(
+        out,
+        &[
+            "mul",
+            "--lhs-shape",
+            lhs_shape,
+            "--rhs-shape",
+            rhs_shape,
+            "--dtype",
+            "bf16",
+        ],
+    );
 }
