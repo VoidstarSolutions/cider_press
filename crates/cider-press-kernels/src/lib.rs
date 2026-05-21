@@ -35,4 +35,4 @@ pub use buffer::Buffer;
 pub use commands::Commands;
 pub use device::Device;
 pub use error::{Error, Result};
-pub use library::{KernelLibrary, Pipeline};
+pub use library::{FunctionConstant, KernelLibrary, Pipeline};
