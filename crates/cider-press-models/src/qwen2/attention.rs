@@ -36,13 +36,12 @@ use super::Qwen2Config;
 /// same device.
 pub fn rope(x: &Tensor, offset: &Tensor, config: &Qwen2Config) -> Result<Tensor> {
     let head_dim = config.head_dim()?;
-    let trailing =
-        *x.shape().dims().last().ok_or_else(|| {
-            Error::InvalidArgument("qwen2::rope: input must have rank ≥ 1".into())
-        })?;
+    let trailing = *x.shape().dims().last().ok_or_else(|| {
+        Error::InvalidArgument("qwen2::attention::rope: input must have rank ≥ 1".into())
+    })?;
     if trailing != head_dim {
         return Err(Error::InvalidArgument(format!(
-            "qwen2::rope: input's trailing dim ({trailing}) does not match \
+            "qwen2::attention::rope: input's trailing dim ({trailing}) does not match \
              config.head_dim() ({head_dim})",
         )));
     }
