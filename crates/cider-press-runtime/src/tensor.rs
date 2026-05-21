@@ -1294,9 +1294,9 @@ impl Tensor {
             )));
         }
         let dims = self.shape().dims();
-        let axis_size = *dims.last().ok_or_else(|| {
-            Error::InvalidArgument("softmax: input must have rank ≥ 1".into())
-        })?;
+        let axis_size = *dims
+            .last()
+            .ok_or_else(|| Error::InvalidArgument("softmax: input must have rank ≥ 1".into()))?;
         if axis_size == 0 {
             return Err(Error::InvalidArgument(
                 "softmax: trailing axis must be non-zero".into(),
