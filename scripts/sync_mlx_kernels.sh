@@ -33,6 +33,8 @@ FILES=(
     mlx/backend/metal/kernels/unary_ops.h
     mlx/backend/metal/kernels/reduce.metal
     mlx/backend/metal/kernels/rope.metal
+    mlx/backend/metal/kernels/softmax.metal
+    mlx/backend/metal/kernels/softmax.h
     mlx/backend/metal/kernels/reduce.h
     mlx/backend/metal/kernels/reduce_utils.h
     mlx/backend/metal/kernels/reduction/ops.h
