@@ -100,9 +100,7 @@ pub fn affine_dequantize_bf16_gs64_b4(
         )));
     }
 
-    let kernel_name = format!(
-        "affine_dequantize_bfloat16_t_gs_{GROUP_SIZE}_b_{BITS}",
-    );
+    let kernel_name = format!("affine_dequantize_bfloat16_t_gs_{GROUP_SIZE}_b_{BITS}");
     let pipeline = library.pipeline(&kernel_name)?;
     let encoder = commands.encoder()?;
     encoder.setComputePipelineState(pipeline.metal_pipeline_state());

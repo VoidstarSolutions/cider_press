@@ -276,9 +276,22 @@ impl QuantizedWeight {
             strides: crate::Strides::contiguous(shape),
         };
 
-        let w_tensor = Tensor::host_leaf(device, w_shape.clone(), DType::U32, dense(&w_shape), w_buf);
-        let s_tensor = Tensor::host_leaf(device, aux_shape.clone(), DType::BF16, dense(&aux_shape), s_buf);
-        let b_tensor = Tensor::host_leaf(device, aux_shape.clone(), DType::BF16, dense(&aux_shape), b_buf);
+        let w_tensor =
+            Tensor::host_leaf(device, w_shape.clone(), DType::U32, dense(&w_shape), w_buf);
+        let s_tensor = Tensor::host_leaf(
+            device,
+            aux_shape.clone(),
+            DType::BF16,
+            dense(&aux_shape),
+            s_buf,
+        );
+        let b_tensor = Tensor::host_leaf(
+            device,
+            aux_shape.clone(),
+            DType::BF16,
+            dense(&aux_shape),
+            b_buf,
+        );
         (w_tensor, s_tensor, b_tensor)
     }
 

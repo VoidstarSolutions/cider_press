@@ -865,14 +865,10 @@ impl Tensor {
     /// the same dtype as `self`.
     pub fn gather(&self, indices: &Self) -> Result<Self> {
         let device = self.inner.device.as_ref().ok_or_else(|| {
-            Error::InvalidArgument(
-                "gather: cannot apply an op to a placeholder (no device)".into(),
-            )
+            Error::InvalidArgument("gather: cannot apply an op to a placeholder (no device)".into())
         })?;
         let idx_device = indices.inner.device.as_ref().ok_or_else(|| {
-            Error::InvalidArgument(
-                "gather: cannot use a placeholder as the indices input".into(),
-            )
+            Error::InvalidArgument("gather: cannot use a placeholder as the indices input".into())
         })?;
         if !device.ptr_eq(idx_device) {
             return Err(Error::InvalidArgument(
