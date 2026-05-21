@@ -53,10 +53,12 @@ fn reduce_bf16_pipelines_resolve() {
             .unwrap_or_else(|err| panic!("{name} pipeline: {err}"));
     }
 
-    // `row_reduce_simple_*` is the variant the rmsnorm composition
-    // will dispatch when reducing along the last axis on rows that
-    // fit a single threadgroup (Qwen2.5-0.5B's `hidden_size = 896`
-    // does). The looped variants land for larger hidden dims.
+    // `row_reduce_simple_*` compiles in MLX's reduce.metal but isn't
+    // wired by the current Rust dispatcher — `encode_row_reduce`
+    // always uses `row_reduce_looped_*` regardless of row size. The
+    // pipeline-resolution check here just guarantees the simple
+    // variants stay buildable for when a future dispatcher selects
+    // them on rows that fit a single threadgroup.
     for op in ["sum", "prod", "min", "max"] {
         let name = format!("row_reduce_simple_{op}bfloat16");
         library

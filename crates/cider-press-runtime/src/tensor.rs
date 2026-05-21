@@ -642,6 +642,13 @@ impl Tensor {
         let device = self.inner.device.as_ref().ok_or_else(|| {
             Error::InvalidArgument("unary: cannot apply an op to a placeholder (no device)".into())
         })?;
+        if !self.inner.dtype.is_float() {
+            return Err(Error::InvalidArgument(format!(
+                "unary: dtype {:?} is not supported (only F32/F16/BF16 are wired \
+                 at the kernels layer)",
+                self.inner.dtype,
+            )));
+        }
         let strides = match self.layout() {
             Layout::Dense { strides } => strides,
             Layout::Quantized(_) => {
@@ -650,6 +657,14 @@ impl Tensor {
                 ));
             }
         };
+        if self.inner.view.is_some() {
+            return Err(Error::InvalidArgument(
+                "unary: view inputs are not supported; copy() first to materialise \
+                 a dense version (eval-side dispatch reads inputs as dense leaves \
+                 and does not resolve view chains)"
+                    .into(),
+            ));
+        }
         if !strides.is_contiguous(self.shape()) {
             return Err(Error::InvalidArgument(format!(
                 "unary: input must be contiguous (got shape {:?} strides {:?}); \
@@ -732,6 +747,13 @@ impl Tensor {
         let device = self.inner.device.as_ref().ok_or_else(|| {
             Error::InvalidArgument("reduce: cannot apply an op to a placeholder (no device)".into())
         })?;
+        if !self.inner.dtype.is_float() {
+            return Err(Error::InvalidArgument(format!(
+                "reduce: dtype {:?} is not supported (only F32/F16/BF16 are wired \
+                 at the kernels layer)",
+                self.inner.dtype,
+            )));
+        }
         let strides = match self.layout() {
             Layout::Dense { strides } => strides,
             Layout::Quantized(_) => {
@@ -740,6 +762,14 @@ impl Tensor {
                 ));
             }
         };
+        if self.inner.view.is_some() {
+            return Err(Error::InvalidArgument(
+                "reduce: view inputs are not supported; copy() first to materialise \
+                 a dense version (eval-side dispatch reads inputs as dense leaves \
+                 and does not resolve view chains)"
+                    .into(),
+            ));
+        }
         if !strides.is_contiguous(self.shape()) {
             return Err(Error::InvalidArgument(format!(
                 "reduce: input must be contiguous (got shape {:?} strides {:?}); \

@@ -111,6 +111,9 @@ fn encode_v<T>(
             src.len(),
         )));
     }
+    if n == 0 {
+        return Ok(());
+    }
     let size = u32::try_from(n).map_err(|_| {
         Error::InvalidArgument(format!(
             "unary v: element count {n} does not fit in u32; use the (deferred) v2_ variant",

@@ -211,9 +211,6 @@ fn encode_row_reduce<T>(
     }
     let row_size = *src_shape.last().expect("rank ≥ 1");
     let out_size: usize = src_shape[..src_shape.len() - 1].iter().product();
-    if row_size == 0 || out_size == 0 {
-        return Ok(()); // empty reduction; nothing to do.
-    }
     let total_elems: usize = src_shape.iter().product();
     if src.len() != total_elems {
         return Err(Error::InvalidArgument(format!(
@@ -233,9 +230,17 @@ fn encode_row_reduce<T>(
              the 'large' kernel variant is not yet wired",
         )));
     }
+    if out_size == 0 {
+        return Ok(()); // no rows to write; dst is zero-length too.
+    }
 
-    // 1) Init pass: seed dst with the op's identity element.
+    // 1) Init pass: seed dst with the op's identity element. Runs even
+    //    when `row_size == 0` (e.g. shape `[B, 0]`) so empty rows still
+    //    get a well-defined identity value rather than stale memory.
     encode_init_reduce(commands, library, op_name, tname, dst, out_size)?;
+    if row_size == 0 {
+        return Ok(());
+    }
 
     // 2) Reduce pass: row_reduce_looped, reduce_ndim = 0 → host_name
     //    template parameter `dim` is 1 (per MLX's
