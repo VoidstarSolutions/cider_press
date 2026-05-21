@@ -88,7 +88,13 @@ fn parity_v_sigmoid_bf16_within_ulp_tolerance() {
     assert_within_tolerance("v_Sigmoidbfloat16bfloat16", &out, &out_ref, 0.005, 0.01);
 }
 
-fn assert_within_tolerance(label: &str, got: &[bf16], expected: &[bf16], abs_tol: f32, rel_tol: f32) {
+fn assert_within_tolerance(
+    label: &str,
+    got: &[bf16],
+    expected: &[bf16],
+    abs_tol: f32,
+    rel_tol: f32,
+) {
     assert_eq!(got.len(), expected.len(), "{label}: length mismatch");
     let mut max_abs = 0.0f32;
     let mut max_rel = 0.0f32;
