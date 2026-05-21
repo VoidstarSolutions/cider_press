@@ -212,6 +212,21 @@ fn dispatch(
         OpKind::Dequantize { group_size, bits } => dispatch_dequantize(
             inner, op, commands, outputs, dst, index_of, group_size, bits,
         ),
+        OpKind::Rope {
+            base_log2,
+            scale,
+            rotary_dims,
+        } => dispatch_rope(
+            inner,
+            op,
+            commands,
+            outputs,
+            dst,
+            index_of,
+            base_log2,
+            scale,
+            rotary_dims,
+        ),
     }
 }
 
@@ -1131,6 +1146,80 @@ fn dispatch_dequantize(
         &s_typed,
         &b_typed,
         &mut dst_typed,
+    )?;
+    Ok(())
+}
+
+/// Dispatch a rotary positional embedding. Preconditions enforced by
+/// [`Tensor::rope`]: input is rank-4 dense contiguous BF16, offset is
+/// length-1 contiguous I32, both on the same device. We pass the strides
+/// directly from the input's row-major layout — `Tensor::rope` rejects
+/// non-contiguous inputs precisely so this is sound.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+fn dispatch_rope(
+    inner: &Arc<TensorInner>,
+    op: &OpNode,
+    commands: &mut Commands<'_>,
+    outputs: &[Buffer<u8>],
+    dst: &mut Buffer<u8>,
+    index_of: &HashMap<*const TensorInner, usize>,
+    base_log2: f32,
+    scale: f32,
+    rotary_dims: u32,
+) -> Result<()> {
+    let device = inner
+        .device
+        .as_ref()
+        .expect("op nodes are always constructed with a device");
+
+    let input = op
+        .inputs
+        .first()
+        .ok_or_else(|| Error::InvalidArgument("Rope: missing input (inputs[0])".into()))?;
+    let offset = op
+        .inputs
+        .get(1)
+        .ok_or_else(|| Error::InvalidArgument("Rope: missing offset (inputs[1])".into()))?;
+
+    let in_bytes = dense_input_buffer(input, outputs, index_of)?;
+    let off_bytes = dense_input_buffer(offset, outputs, index_of)?;
+
+    let in_typed = unsafe { in_bytes.reinterpret_as::<half::bf16>() };
+    let off_typed = unsafe { off_bytes.reinterpret_as::<i32>() };
+    let mut dst_typed = unsafe { dst.reinterpret_as::<half::bf16>() };
+
+    let dims = input.shape().dims();
+    let batch = dims[0] as i32;
+    let n_head = dims[1] as i32;
+    let seq_len = dims[2] as i32;
+    let head_dim = dims[3] as i32;
+    let mat = i64::from(seq_len) * i64::from(head_dim);
+
+    let args = cider_press_kernels::kernels::rope::RopeArgs {
+        batch,
+        n_head,
+        seq_len,
+        head_dim,
+        rotary_dims: rotary_dims as i32,
+        scale,
+        base_log2,
+        // Element strides for row-contiguous [B, H, T, D] over the
+        // (head, sequence, feature) axes; offset_stride=0 because we
+        // only accept a 1-element scalar offset today.
+        strides: [mat, i64::from(head_dim), 1],
+        out_strides: [mat, i64::from(head_dim), 1],
+        offset_stride: 0,
+    };
+
+    let library = device.rope_library()?;
+    cider_press_kernels::kernels::rope::dispatch_rope_bf16(
+        commands,
+        library,
+        &in_typed,
+        &mut dst_typed,
+        &off_typed,
+        args,
     )?;
     Ok(())
 }

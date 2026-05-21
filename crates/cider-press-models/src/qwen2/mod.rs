@@ -13,6 +13,7 @@
 //! gated integration test verifies against the real checkpoint at the
 //! revision pinned in [`HF_REVISION`].
 
+pub mod attention;
 mod config;
 mod weights;
 

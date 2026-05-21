@@ -219,17 +219,52 @@ we'd need — both now landed (Views in branch 2; `KvCache` in branch 8).
   the cache write into the SDPA command buffer) lands opportunistically
   in branch 11 if perf demands; true lazy KvCache stays deferred
   until branch-15 measurement justifies the mutable-leaf rework.
+- **Branch 9 (`feat/rope`).** First op that uses Metal
+  `[[function_constant]]` specialization. MLX ships
+  `rope.metal` precompiled (229 LOC) with all instantiations baked
+  in, so this is the `OnceLock<KernelLibrary>` pattern (same camp
+  as binary/unary/reduce); the per-specialization pipelines live in
+  the library's own pipeline-state cache. New
+  `FunctionConstant::Bool { index, value }` enum +
+  `KernelLibrary::pipeline_specialized(name, &[FunctionConstant])`
+  in the kernels crate; the cache key derives from the index-sorted
+  constants tuple so the same `(name, constants)` combination
+  always hits the same entry and unspecialized `pipeline()` calls
+  don't collide with any specialization. `Bool`-only surface;
+  extend with `U32` / `F32` when softmax / SDPA need them. One
+  dispatch wired (`kernels::rope::dispatch_rope_bf16`): Qwen2
+  inference forward, `traditional=false, hs_transpose=false`,
+  `with_freqs=false`, int32 indexing. The seven other
+  instantiations (`_single`, `_freqs`, `_large` × dtype) stay
+  dormant. `Tensor::rope(&self, offset, base, scale, rotary_dims)`
+  carries `offset` as a graph-input edge (length-1 I32 tensor)
+  rather than a host scalar — matches MLX's
+  `set_input_array(offset, 2)`. The `Eq` derive on `OpKind` drops
+  because `base_log2` / `scale` are `f32`; `PartialEq` still gives
+  test ergonomics. Models-crate adds
+  `qwen2::attention::rope(x, offset, &Qwen2Config)` — a thin
+  config-binding wrapper that pulls `rope_theta` and `head_dim`,
+  living in a new `qwen2::attention` submodule that future
+  attention bits (Q/K/V projections, SDPA wiring) accumulate into.
+  All three layers bit-exact vs `mx.fast.rope` at `offset=0`
+  (identity rotation, cos=1/sin=0). At `offset=37` (decode), tight
+  bf16-ULP tolerance (0.005 abs / 0.01 rel — same bar as sigmoid in
+  branch 6) instead of bit-exact: `metal::cos` / `metal::sin` drift
+  1–2 bf16 ULPs across Apple Silicon generations (M-series local
+  vs macos-15 CI runners). Tested at `[1, 14, 4, 64]` (Q) and
+  `[1, 2, 4, 64]` (K). No real-checkpoint test because rope
+  applies to projection *outputs* and qmv-as-`Tensor`-op lands in
+  branch 11b; the full layer-0 Q-projection → rope → cache → SDPA
+  integration test is a branch-11 task.
 
-**Next concrete step: branch 9 of the roadmap — `feat/rope`.**
-Qwen2 rotary positional embedding on Q/K. Decide compose-vs-fused
-at the kernel layer (check whether MLX ships a precompiled
-`rope.metal` entry point or whether it's JIT-only like gather), then
-follow either the precompiled-library pattern (`OnceLock<KernelLibrary>`
-slot on `Device`) or the per-instantiation `Mutex<HashMap>` cache
-pattern from branch 7. The "compose at models layer when `mlx.nn`
-does" rule applies if the fused kernel doesn't exist upstream.
-Three-layer parity (kernels / runtime / models) with a real-checkpoint
-case against layer-0 Q/K projections of Qwen2.5-0.5B.
+**Next concrete step: branch 10 of the roadmap — `feat/softmax`.**
+Stable softmax for attention scores. Check upstream: MLX has
+`softmax.metal` (precompiled, `OnceLock` pattern). Same scope shape
+as rope — kernels / runtime / models parity, Qwen2 attention-score
+shape `[B, H_q, T, T]` at bf16. Three function-constant slots on
+the kernel (`AXIS_SIZE_KNOWN_BOUND`, `block_size_KNOWN_BOUND`,
+`PRECISE`) suggest minor `FunctionConstant` extension (`U32` /
+`Bool` mix) — already foreseen in branch 9's enum doc.
 
 Quantized-embedding decision resolved in branch 7: neither
 quantized-row gather nor `gather → dequantize_row`. Instead,

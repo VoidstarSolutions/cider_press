@@ -406,6 +406,68 @@ def run_embed_tokens(args: argparse.Namespace) -> dict[str, mx.array]:
 
 
 # ---------------------------------------------------------------------------
+# rope: rotary positional embedding (consumed by branch 9 `feat/rope`).
+# Writes `lhs`, `out`. Input shape is `[B, H, T, D]`; the rotated leading
+# `dims` slots are computed with Qwen2-style non-traditional layout
+# (`(x[:d/2], x[d/2:])`) by default. `offset` is the starting position
+# along the sequence axis (the MLX binding accepts a Python int and
+# materializes the device-side scalar internally).
+# ---------------------------------------------------------------------------
+
+
+def add_rope_parser(subparsers: argparse._SubParsersAction) -> None:
+    p = subparsers.add_parser(
+        "rope",
+        help="rotary positional embedding via mx.fast.rope",
+    )
+    p.add_argument(
+        "--lhs-shape",
+        required=True,
+        help="comma-separated [B, H, T, D], e.g. 1,14,4,64",
+    )
+    p.add_argument(
+        "--dims",
+        type=int,
+        required=True,
+        help="number of leading head-dim slots to rotate (== D for Qwen2)",
+    )
+    p.add_argument("--base", type=float, default=10000.0, help="theta base (default 10000)")
+    p.add_argument("--scale", type=float, default=1.0, help="position scale (default 1.0)")
+    p.add_argument("--offset", type=int, default=0, help="starting sequence position")
+    p.add_argument(
+        "--traditional",
+        action="store_true",
+        help="use traditional (GPT-NeoX interleaved) rotation",
+    )
+    p.add_argument("--dtype", default="bf16", help="one of f32, f16, bf16")
+
+
+def run_rope(args: argparse.Namespace) -> dict[str, mx.array]:
+    shape = _parse_shape(args.lhs_shape)
+    if len(shape) != 4:
+        raise SystemExit(
+            f"rope: lhs-shape must have 4 dims [B, H, T, D], got {shape!r}"
+        )
+    head_dim = shape[-1]
+    if args.dims < 1 or args.dims > head_dim:
+        raise SystemExit(
+            f"rope: --dims must be in [1, D] where D={head_dim}, got {args.dims}"
+        )
+    dtype = _float_dtype(args.dtype)
+    lhs = (mx.random.uniform(shape=shape) - 0.5).astype(dtype)
+    out = mx.fast.rope(
+        lhs,
+        args.dims,
+        traditional=args.traditional,
+        base=args.base,
+        scale=args.scale,
+        offset=args.offset,
+    )
+    mx.eval(lhs, out)
+    return {"lhs": lhs, "out": out}
+
+
+# ---------------------------------------------------------------------------
 # CLI plumbing
 # ---------------------------------------------------------------------------
 
@@ -428,6 +490,7 @@ OPS: dict[str, tuple[ParserBuilder, Runner]] = {
     "gather": (add_gather_parser, run_gather),
     "dequantize": (add_dequantize_parser, run_dequantize),
     "embed_tokens": (add_embed_tokens_parser, run_embed_tokens),
+    "rope": (add_rope_parser, run_rope),
 }
 
 

@@ -144,7 +144,11 @@ pub(crate) struct OpNode {
 /// and the extensibility tax of a trait isn't worth it until we have
 /// a reason to allow third-party ops. The dispatcher in `eval`
 /// `match`es on this enum.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// Only `PartialEq` (not `Eq`) is derived because [`OpKind::Rope`]
+/// carries `f32` parameters (`base_log2`, `scale`) — the bit-exact
+/// comparison `PartialEq` provides is what tests want anyway.
+#[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum OpKind {
     /// Element-wise identity copy. Output is a fresh dense tensor with
@@ -222,6 +226,28 @@ pub enum OpKind {
         group_size: u32,
         /// Quantization bit-width (e.g. 4 for int4).
         bits: u8,
+    },
+    /// Rotary positional embedding on a dense bf16 tensor. Inputs (in
+    /// [`Tensor::op_inputs`] order) are `[input, offset]` where
+    /// `input` is a dense, contiguous, BF16 tensor of rank 4
+    /// (`[B, H, T, D]`) and `offset` is a dense, contiguous,
+    /// length-1 [`DType::I32`] tensor giving the starting sequence
+    /// position. Output has the same shape, dtype, and layout as
+    /// `input`. Only `traditional=false, forward=true,
+    /// hs_transpose=false, with_freqs=false` is wired today; see
+    /// `kernels::rope` for the rationale.
+    Rope {
+        /// `log2(theta)` — the host pre-computes this so the MSL
+        /// kernel can use `exp2(-d * base_log2)` directly. Mirrors
+        /// `float base = std::log2(base_)` in MLX's `rope.cpp`.
+        base_log2: f32,
+        /// MLX's `scale_` — multiplies the position before computing
+        /// the rotation angle. `1.0` for the standard formula.
+        scale: f32,
+        /// Number of leading per-head slots that get rotated (`dims_`
+        /// in MLX). Must be even and ≤ the trailing axis of `input`.
+        /// Equals `head_dim` for full-rotation models like Qwen2.
+        rotary_dims: u32,
     },
 }
 
@@ -1057,6 +1083,151 @@ impl Tensor {
             layout,
             OpKind::Dequantize { group_size, bits },
             vec![w_q.clone(), scales.clone(), biases.clone()],
+        ))
+    }
+
+    /// Schedule a rotary positional embedding on this tensor against
+    /// the given starting `offset`.
+    ///
+    /// Preconditions (mirroring the kernels-crate scope; broader
+    /// instantiations land alongside their first consumer):
+    ///
+    /// - `self` is dense, contiguous, [`DType::BF16`], rank 4
+    ///   (`[B, H, T, D]`).
+    /// - `offset` is dense, contiguous, [`DType::I32`], length 1.
+    /// - Both tensors are on the same [`Device`].
+    /// - `rotary_dims` is even and ≤ `D`. Equals `D` for full-rotation
+    ///   models like Qwen2.
+    /// - `D` (the last axis) is even.
+    ///
+    /// The host pre-computes `log2(base)` so the kernel can use a
+    /// single `exp2` per thread; pass the unscaled `base` (i.e. `θ`
+    /// = `10000` for the original `RoPE` paper, `1_000_000` for Qwen2.5).
+    ///
+    /// Output has the same shape, dtype, and (dense, contiguous)
+    /// layout as `self`. The Qwen2 inference specialization
+    /// (`forward=true, traditional=false, hs_transpose=false`,
+    /// `with_freqs=false`) is the only one wired.
+    #[allow(clippy::too_many_lines)]
+    pub fn rope(&self, offset: &Self, base: f32, scale: f32, rotary_dims: usize) -> Result<Self> {
+        let device = self.inner.device.as_ref().ok_or_else(|| {
+            Error::InvalidArgument("rope: cannot apply an op to a placeholder (no device)".into())
+        })?;
+        let off_device = offset.inner.device.as_ref().ok_or_else(|| {
+            Error::InvalidArgument("rope: cannot use a placeholder as the offset input".into())
+        })?;
+        if !device.ptr_eq(off_device) {
+            return Err(Error::InvalidArgument(
+                "rope: input and offset are on different devices".into(),
+            ));
+        }
+        if self.inner.view.is_some() {
+            return Err(Error::InvalidArgument(
+                "rope: view inputs are not supported; copy() first to materialise \
+                 a dense version (eval-side dispatch reads inputs as dense leaves \
+                 and does not resolve view chains)"
+                    .into(),
+            ));
+        }
+        if offset.inner.view.is_some() {
+            return Err(Error::InvalidArgument(
+                "rope: view offset is not supported; copy() first to materialise \
+                 a dense version"
+                    .into(),
+            ));
+        }
+        if !scale.is_finite() {
+            return Err(Error::InvalidArgument(format!(
+                "rope: scale must be finite (got {scale})"
+            )));
+        }
+        if !base.is_finite() || base <= 0.0 {
+            return Err(Error::InvalidArgument(format!(
+                "rope: base must be finite and > 0 (got {base})"
+            )));
+        }
+        if self.inner.dtype != DType::BF16 {
+            return Err(Error::InvalidArgument(format!(
+                "rope: only BF16 input is wired (got {:?})",
+                self.inner.dtype,
+            )));
+        }
+        if offset.inner.dtype != DType::I32 {
+            return Err(Error::InvalidArgument(format!(
+                "rope: offset must be I32 (got {:?})",
+                offset.inner.dtype,
+            )));
+        }
+        let strides = match self.layout() {
+            Layout::Dense { strides } => strides,
+            Layout::Quantized(_) => {
+                return Err(Error::InvalidArgument(
+                    "rope: quantized input is not supported".into(),
+                ));
+            }
+        };
+        if !strides.is_contiguous(self.shape()) {
+            return Err(Error::InvalidArgument(format!(
+                "rope: input must be contiguous (got shape {:?} strides {:?}); \
+                 copy() first to materialise a dense version",
+                self.shape().dims(),
+                strides.as_slice(),
+            )));
+        }
+        let dims = self.shape().dims();
+        if dims.len() != 4 {
+            return Err(Error::InvalidArgument(format!(
+                "rope: input must be rank 4 [B, H, T, D] (got rank {})",
+                dims.len(),
+            )));
+        }
+        let head_dim = dims[3];
+        if head_dim == 0 || head_dim % 2 != 0 {
+            return Err(Error::InvalidArgument(format!(
+                "rope: head_dim (last axis) must be a positive even number (got {head_dim})"
+            )));
+        }
+        if rotary_dims == 0 || rotary_dims > head_dim || rotary_dims % 2 != 0 {
+            return Err(Error::InvalidArgument(format!(
+                "rope: rotary_dims must be even and in (0, head_dim={head_dim}] \
+                 (got {rotary_dims})"
+            )));
+        }
+        let off_strides = match offset.layout() {
+            Layout::Dense { strides } => strides,
+            Layout::Quantized(_) => {
+                return Err(Error::InvalidArgument(
+                    "rope: quantized offset is not supported".into(),
+                ));
+            }
+        };
+        if !off_strides.is_contiguous(offset.shape()) {
+            return Err(Error::InvalidArgument(
+                "rope: offset must be contiguous".into(),
+            ));
+        }
+        if offset.shape().elem_count() != 1 {
+            return Err(Error::InvalidArgument(format!(
+                "rope: only a single scalar offset is wired (got shape {:?})",
+                offset.shape().dims(),
+            )));
+        }
+
+        let out_shape = self.shape().clone();
+        let layout = dense_layout(&out_shape);
+        let rotary_dims_u32 = u32::try_from(rotary_dims)
+            .map_err(|_| Error::InvalidArgument("rope: rotary_dims overflows u32".into()))?;
+        Ok(Self::op_tensor(
+            device,
+            out_shape,
+            DType::BF16,
+            layout,
+            OpKind::Rope {
+                base_log2: base.log2(),
+                scale,
+                rotary_dims: rotary_dims_u32,
+            },
+            vec![self.clone(), offset.clone()],
         ))
     }
 
