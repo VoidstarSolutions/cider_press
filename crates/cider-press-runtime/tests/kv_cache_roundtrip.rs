@@ -163,8 +163,11 @@ fn dtype_mismatch_is_rejected() {
 fn new_rejects_integer_dtype() {
     let device = Device::system_default().expect("device");
     let err = KvCache::new(&device, MAX_TOKENS, N_KV_HEADS, HEAD_DIM, DType::U32)
-        .expect_err("must reject");
+        .expect_err("must reject u32");
     assert!(format!("{err}").contains("U32"));
+    let err = KvCache::new(&device, MAX_TOKENS, N_KV_HEADS, HEAD_DIM, DType::I32)
+        .expect_err("must reject i32");
+    assert!(format!("{err}").contains("I32"));
 }
 
 // ---------------------------------------------------------------------

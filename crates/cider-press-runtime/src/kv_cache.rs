@@ -279,11 +279,10 @@ impl KvCache {
         let layout = Layout::Dense {
             strides: Strides::contiguous(&shape),
         };
-        // SAFETY: u8 -> u8 reinterpret is a refcount bump; the new
-        // handle aliases the same MTLBuffer as the slab. The aliasing
-        // contract (see module docs) makes this view live only until
-        // the caller drops it before the next update().
-        let buf = unsafe { slab.reinterpret_as::<u8>() };
+        // Refcount-bump clone: the view aliases the slab's MTLBuffer.
+        // The aliasing contract (see module docs) makes this view live
+        // only until the caller drops it before the next update().
+        let buf = slab.clone_handle();
         Tensor::host_leaf(&self.device, shape, self.dtype, layout, buf)
     }
 }
