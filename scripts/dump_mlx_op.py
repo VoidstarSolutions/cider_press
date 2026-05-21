@@ -342,6 +342,37 @@ def run_gather(args: argparse.Namespace) -> dict[str, mx.array]:
 
 
 # ---------------------------------------------------------------------------
+# dequantize: affine-dequantize a packed (w_q, scales, biases) triple
+# back to a dense bf16 tensor. Consumed by branch 7 (feat/gather) for
+# the embedding-table integration. Writes `w_q`, `scales`, `biases`,
+# `out`. Generates a random bf16 source, runs mx.quantize, then
+# mx.dequantize — the round-trip lets the Rust side compare against
+# the exact bytes MLX would produce given the same quantized triple.
+# ---------------------------------------------------------------------------
+
+
+def add_dequantize_parser(subparsers: argparse._SubParsersAction) -> None:
+    p = subparsers.add_parser(
+        "dequantize",
+        help="mx.dequantize on a quantized (w_q, scales, biases) triple",
+    )
+    p.add_argument("--rows", type=int, required=True, help="rows of the original (dense) weight, e.g. 128")
+    p.add_argument("--cols", type=int, required=True, help="cols of the original weight (multiple of group_size)")
+    p.add_argument("--group-size", type=int, default=64)
+    p.add_argument("--bits", type=int, default=4)
+    p.add_argument("--dtype", default="bf16", help="value dtype: one of f32, f16, bf16")
+
+
+def run_dequantize(args: argparse.Namespace) -> dict[str, mx.array]:
+    dtype = _float_dtype(args.dtype)
+    dense = (mx.random.uniform(shape=(args.rows, args.cols)) - 0.5).astype(dtype)
+    w_q, scales, biases = mx.quantize(dense, group_size=args.group_size, bits=args.bits)
+    out = mx.dequantize(w_q, scales, biases, group_size=args.group_size, bits=args.bits)
+    mx.eval(w_q, scales, biases, out)
+    return {"w_q": w_q, "scales": scales, "biases": biases, "out": out}
+
+
+# ---------------------------------------------------------------------------
 # CLI plumbing
 # ---------------------------------------------------------------------------
 
@@ -362,6 +393,7 @@ OPS: dict[str, tuple[ParserBuilder, Runner]] = {
     "silu": (add_silu_parser, run_silu),
     "gelu": (add_gelu_parser, run_gelu),
     "gather": (add_gather_parser, run_gather),
+    "dequantize": (add_dequantize_parser, run_dequantize),
 }
 
 
