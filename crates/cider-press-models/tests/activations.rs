@@ -38,7 +38,7 @@ fn silu_matches_mlx_nn_silu() {
 }
 
 #[test]
-fn gelu_matches_mlx_nn_gelu_exact() {
+fn gelu_matches_mlx_nn_gelu_within_bf16_compose_tolerance() {
     let (lhs, out_ref) = fixture("gelu");
     let device = Device::system_default().expect("device");
     let x = Tensor::from_slice(&device, &lhs, [1, S, H]).expect("x");

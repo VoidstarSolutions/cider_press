@@ -127,8 +127,11 @@ pub fn gelu(x: &Tensor) -> Result<Tensor> {
 
     // 1/sqrt(2) and 0.5 flow as host-side [1] tensors broadcast against
     // the activation, same pattern rms_norm uses for eps. Composed in
-    // input dtype throughout to match mlx.nn.gelu exactly (mlx does not
-    // promote to f32 internally).
+    // input dtype throughout to follow mlx.nn.gelu's algorithmic steps
+    // (mlx does not promote to f32 internally). f32/f16 match bit-exactly;
+    // bf16 exhibits small drift because mlx writes `x / sqrt(2)` while we
+    // reciprocal-multiply by a bf16-rounded `1/sqrt(2)` (no divide op yet),
+    // so the bf16 constants differ in the last few bits.
     let inv_sqrt2 = scalar_tensor(device, dtype, std::f32::consts::FRAC_1_SQRT_2)?;
     let half = scalar_tensor(device, dtype, 0.5)?;
     let one = scalar_tensor(device, dtype, 1.0)?;
