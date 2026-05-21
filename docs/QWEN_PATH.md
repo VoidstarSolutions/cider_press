@@ -84,10 +84,11 @@ that introduced them, instead of three branches later in some composition.
 | 5 | (done) `feat/rmsnorm` | Vendored MLX's `unary.metal` + `reduce.metal`. Kernels: `v_{square,rsqrt}_*` (6 fns) + `row_reduce_{sum,prod,min,max}_*` (12 fns, with `init_reduce` + `row_reduce_looped` bundled per op). Runtime: `OpKind::Unary` + `OpKind::Reduce`, `Tensor::{square, rsqrt, sum, prod, min, max, mean}`. Models: `nn::rms_norm(x, gamma, eps)` composed (no fused kernel). | MLX parity on `[1, 8, 896]` bf16 vs `mx.fast.rms_norm` (composed-path tolerance) plus gated real-checkpoint test against `layer0.input_layernorm` + CPU f32 reference |
 | 6 | (done) `feat/silu-and-gelu` | Two activations composed from existing unary primitives. MLX's `unary.metal` doesn't ship `Silu`/`Gelu`; `mlx.nn` composes them on the Python side, so we mirror that factoring. Kernels: `v_{sigmoid,erf}_*` (6 fns; instantiations already present in the vendored `unary.metal`). Runtime: `UnaryOp::{Sigmoid, Erf}` + `Tensor::{sigmoid, erf}`. Models: `nn::silu(x) = x * sigmoid(x)`, exact `nn::gelu(x) = 0.5 * x * (1 + erf(x / sqrt(2)))`. | SiLU bit-exact vs `mlx.nn.silu`. GELU bf16-compose tolerance vs `mlx.nn.gelu` (we reciprocal-multiply where MLX divides — runtime has no divide op yet — so the bf16-rounded constants differ in the last few bits). |
 | 7 | (done) `feat/gather` | Embedding lookup end-to-end against Qwen2's quantized embed_tokens. First JIT-assembled kernel family — MLX has no precompiled `gather.metal`; source is generated per `(T, IdxT, NIDX, IDX_NDIM, LocT)` instantiation. Vendored `indexing/{indexing,gather}.h`; build.rs grows a `HEADER_BUNDLES` pass for header-only sources. Kernels: `gather::{Instantiation, make_source, dispatch}` (bf16+u32 instantiations) + `affine_dequantize_bf16_gs64_b4` (reuses existing `quantized.metal` library). Runtime: per-instantiation `Mutex<HashMap>` library cache on `Device`, `Tensor::gather` (BF16+U32 src), `OpKind::Dequantize` + `Tensor::dequantize_affine`, `QuantizedWeight::components()` exposing the packed triple as three dense Tensors sharing the underlying buffers. Models: `nn::embed_tokens` composes `gather × 3 → dequantize_affine`. The "decision" called out in the original entry resolved to "neither" — gather works on the components directly; dequantize is a single fused kernel over the gathered triple. | Bit-exact at every layer: gather is a pure data-mover, per-row dequantize is per-row identical between MLX and us. Real-checkpoint test exercises the full path on Qwen2.5-0.5B's loaded `embed_tokens` (6 token IDs across the vocab) vs CPU per-row dequantize from raw loaded bytes. |
-| 8 | `feat/kv-cache` | `KvCache` type (separate from Tensor); `update` (eager `Copy` to a slab); view accessors | Round-trip: write N rows, read back via view, compare |
+| 8 | (done) `feat/kv-cache` | `KvCache` type (separate from `Tensor`) — first runtime-side abstraction that isn't a lazy-graph op. Pre-allocated `[max_tokens, n_kv_heads, head_dim]` slabs per K/V; `update(k, v)` is eager — materializes the source tensors then `memcpy`s their bytes into the slab via the unified-memory host pointer (Apple Silicon's shared storage makes this a host-side write, no Metal dispatch). `keys_view()`/`values_view()` return zero-copy `Tensor`s over the populated prefix via `Tensor::host_leaf` + a refcount-bumped `Buffer<u8>` clone. Aliasing contract documented: callers drop view tensors before the next `update`. Same-eval batching (folding the cache write into the SDPA command buffer) deferred to branch 11 if perf demands. | Roundtrip across multi-chunk `update`s reads back bit-exactly via `cpu_to_vec`; `reset()` rewinds; overflow / dtype / shape / device validation each rejected. No MLX parity needed (KvCache is a pure data-mover). |
 | 9 | `feat/rope` | `OpKind::Rope` (Qwen RoPE config — base θ, dim split); could be a fused kernel or composed | MLX parity on `[B, T, H, D_h]` Q/K |
 | 10 | `feat/softmax` | `OpKind::Softmax` (reduction along last axis, reuses branch-5's reduction primitive); needed by SDPA and the router (later MoE) | MLX parity |
 | 11 | `feat/sdpa-split` | SDPA as **three ops**: `qk_matmul`, `softmax(scale + mask)`, `attn_matmul`. Composes the previous primitives. Defer fused SDPA. | MLX parity on a single attention block driven from real layer 0 weights |
+| 11b | `feat/quantized-matmul` | `qmv` (decode, batch=1) + `qmm` (prefill) wired through the runtime as `Tensor::quantized_matmul` (the Stage-4 spike already validated `qmv` bit-exactly at the kernels layer). Needed before the tied LM head in branch 12c — the LM head reads the same quantized weight as `embed_tokens` but in the transpose direction, so dequantizing the full vocab table per step is the wrong move. | MLX parity on Qwen2's Q/K/V/O projection shapes + lm_head shape at bf16 tolerance |
 | 12a | `feat/models-linear-rmsnorm` | `cider-press-models` scaffold; `Linear` and `RmsNormLayer` (thin wrappers around qmv / composed rmsnorm). Module trait/pattern lands here. | Unit tests against MLX equivalents |
 | 12b | `feat/models-attention-mlp` | `Attention` (Q/K/V proj + RoPE + KV cache + SDPA + O proj) and `Mlp` (SwiGLU) | Per-module parity against MLX layer 0 |
 | 12c | `feat/models-qwen2` | `TransformerBlock` + `Qwen2Model`; tied embedding handling; final norm + LM head | Logits parity vs MLX-LM on prefill of a fixed prompt |
@@ -118,26 +119,29 @@ for "it's fast and clean" but can wait until branch 15+:
 
 ## What to do next time we sit down
 
-Branch 8 (`feat/kv-cache`). Specifically:
+Branch 9 (`feat/rope`). Specifically:
 
-1. Design a `KvCache` type separate from `Tensor`. Each decoder layer
-   owns one (K, V) pair sized `[B, H_kv, T_max, D_h]` bf16. Decode
-   appends one row per step; prefill writes a full block. See
-   `docs/RUNTIME_DESIGN.md` for the framework-gap analysis — KV
-   cache doesn't fit the lazy-graph model (it's mutable, persistent
-   across `eval()` calls, and grows over time).
-2. `update(k, v)` does an eager `Copy` into the slab at the current
-   offset (no lazy graph node — the side-effect on the slab is the
-   point). View accessors `keys()` / `values()` return `Tensor`s
-   pointing at the populated `[..., :T_cur, ...]` prefix as
-   slice/view-of-leaf, reusing branch-2's view machinery.
-3. Roundtrip test: write N rows of synthetic data, read back via
-   view, compare. Eager copy means no MLX parity needed at the
-   KvCache layer itself — the underlying `Copy` kernel already has
-   parity from stage 2/3.
-4. No models-layer changes yet — `nn::attention` is branch 12b and
-   will integrate KvCache then. Branch 9 (`feat/rope`) and branch
-   10 (`feat/softmax`) come between.
+1. Vendor MLX's RoPE source. If `rope.metal` exists as a precompiled
+   entry point use the same pattern as `binary.metal` / `unary.metal`
+   (one `OnceLock<KernelLibrary>` slot on `Device`); if RoPE is
+   JIT-only (like gather) use the per-instantiation `Mutex<HashMap>`
+   cache pattern established in branch 7.
+2. Decide compose-vs-fuse. RoPE is two reads + two writes (split,
+   rotate, recombine). If the fused MLX kernel exists, prefer it for
+   bit-exact parity. If it's composed in `mlx.nn.RoPE`, follow the
+   "compose at the models layer when `mlx.nn` does" rule.
+3. Wire `Tensor::rope(&self, position_ids: &Tensor, base_theta: f32)`
+   or its composed equivalent. Three-layer parity (kernels / runtime
+   / models) per the branch-4-onwards pattern. Real-checkpoint case:
+   apply RoPE to Q and K projected from layer 0 of Qwen2.5-0.5B
+   at fixed positions, compare bit-exactly (or bf16-compose
+   tolerance if composed) vs `mlx.fast.rope` / `mlx.nn.RoPE`.
+4. No models-layer integration yet — `nn::attention` is branch 12b.
+
+Branches still ahead of first end-to-end inference (br14): 9 (RoPE),
+10 (softmax), 11 (SDPA-split), 11b (quantized matmul), 12a/b/c
+(models layers + Qwen2 assembly), 13 (tokenizer), 14 (CLI + greedy
+decode). 8 branches between us and the first runnable Qwen2.5-0.5B.
 
 Open question carried forward from branch 7: the per-instantiation
 JIT cache on `Device` now holds one library per unique kernel name.

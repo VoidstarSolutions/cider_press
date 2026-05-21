@@ -199,23 +199,45 @@ branch-by-branch roadmap):
 Smallest published dense Qwen; same architecture family as the
 eventual MoE target minus the router. `docs/QWEN_PATH.md` is the
 branch-by-branch roadmap; `docs/RUNTIME_DESIGN.md` has the
-framework-gap analysis for the two structural additions we know
-we'll need (Views landed in branch 2; `KvCache` type comes later).
+framework-gap analysis for the two structural additions we knew
+we'd need — both now landed (Views in branch 2; `KvCache` in branch 8).
 
-**Next concrete step: branch 8 of the roadmap — `feat/kv-cache`.**
-A `KvCache` type (separate from `Tensor`) backing the per-layer K
-and V slabs that decode appends to and SDPA reads from. Eager `Copy`
-into the slab on update; view accessors expose the populated prefix
-as `Tensor`s. First runtime-side abstraction that's not just a
-lazy-graph op — see `docs/RUNTIME_DESIGN.md` for the framework-gap
-analysis that motivated treating KV cache as a first-class type.
+- **Branch 8 (`feat/kv-cache`).** First runtime-side abstraction
+  that isn't a lazy-graph op. `KvCache` is a separate type with
+  pre-allocated `[max_tokens, n_kv_heads, head_dim]` slabs per K/V
+  and a `position` counter; `update(k, v)` is eager — `Tensor::eval`s
+  the inputs, then `memcpy`s their bytes into the slab via the
+  unified-memory host pointer (Apple Silicon's shared storage makes
+  this a host write, no Metal dispatch). `keys_view()`/`values_view()`
+  return zero-copy `Tensor`s over the populated prefix via
+  `Tensor::host_leaf` + a refcount-bumped `Buffer<u8>` clone; the
+  aliasing contract (drop views before the next `update`) is
+  documented on the type. Reset path for restarting a decode loop.
+  Roundtrip test: multi-chunk `update`s into the cache and read back
+  bit-exactly via `cpu_to_vec`; overflow / dtype / shape / device
+  validation each rejected. Plan deferred: same-eval batching (folding
+  the cache write into the SDPA command buffer) lands opportunistically
+  in branch 11 if perf demands; true lazy KvCache stays deferred
+  until branch-15 measurement justifies the mutable-leaf rework.
 
-Open question deferred from branch 3, surfaced concretely by the
-loader: `model.embed_tokens` is *quantized*, and tied embeddings mean
-the LM head reads the same data. Branch 7 (gather) has to decide
-between a quantized-row gather or `gather → dequantize_row` for the
-embedding path. Leaning the latter — gather is once per token at
-decode and tiny.
+**Next concrete step: branch 9 of the roadmap — `feat/rope`.**
+Qwen2 rotary positional embedding on Q/K. Decide compose-vs-fused
+at the kernel layer (check whether MLX ships a precompiled
+`rope.metal` entry point or whether it's JIT-only like gather), then
+follow either the precompiled-library pattern (`OnceLock<KernelLibrary>`
+slot on `Device`) or the per-instantiation `Mutex<HashMap>` cache
+pattern from branch 7. The "compose at models layer when `mlx.nn`
+does" rule applies if the fused kernel doesn't exist upstream.
+Three-layer parity (kernels / runtime / models) with a real-checkpoint
+case against layer-0 Q/K projections of Qwen2.5-0.5B.
+
+Quantized-embedding decision resolved in branch 7: neither
+quantized-row gather nor `gather → dequantize_row`. Instead,
+`QuantizedWeight::components()` exposes the packed triple as three
+dense tensors so plain `gather` runs on each, then one fused
+`affine_dequantize` consumes the gathered triple. Tied LM head
+(same weight, transpose direction) lands in branch 11b via
+`qmv`/`qmm` rather than dequantizing the full vocab table.
 
 Loader-naming footgun worth remembering: `q_proj.bias` (singular,
 dense bf16, additive Linear bias) is **distinct** from

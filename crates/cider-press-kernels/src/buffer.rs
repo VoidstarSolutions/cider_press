@@ -90,6 +90,24 @@ impl<T> Buffer<T> {
         &self.raw
     }
 
+    /// Refcount-bump clone of this handle: a second `Buffer<T>` that
+    /// co-owns the same underlying `MTLBuffer`. No data copy — both
+    /// handles see the same bytes; mutation through one is visible
+    /// through the other.
+    ///
+    /// Not `impl Clone` deliberately: `Clone` on a buffer-shaped type
+    /// usually implies a fresh allocation, and silently aliasing
+    /// shared-storage memory would surprise readers. Callers that
+    /// want the aliasing semantics opt in explicitly.
+    #[must_use]
+    pub fn clone_handle(&self) -> Buffer<T> {
+        Buffer {
+            raw: self.raw.clone(),
+            len: self.len,
+            _marker: PhantomData,
+        }
+    }
+
     /// Reinterpret this buffer as one with element type `U`, sharing
     /// the same underlying `MTLBuffer` storage (Retained clone — a
     /// refcount bump, no copy).
