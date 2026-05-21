@@ -373,6 +373,39 @@ def run_dequantize(args: argparse.Namespace) -> dict[str, mx.array]:
 
 
 # ---------------------------------------------------------------------------
+# embed_tokens: gather rows of a quantized embedding table by token IDs
+# and dequantize the gathered rows. The exact composition nn::embed_tokens
+# wires at the models layer. Writes (w_q, scales, biases, indices, out)
+# where out = mx.take(mx.dequantize(...), indices, axis=0). Bit-exact bar
+# because each row's dequantize is independent of every other row.
+# ---------------------------------------------------------------------------
+
+
+def add_embed_tokens_parser(subparsers: argparse._SubParsersAction) -> None:
+    p = subparsers.add_parser(
+        "embed_tokens",
+        help="gather + dequantize the rows of a quantized embedding table",
+    )
+    p.add_argument("--vocab", type=int, required=True, help="rows of embedding table")
+    p.add_argument("--hidden", type=int, required=True, help="cols of embedding table (multiple of group_size)")
+    p.add_argument("--n-indices", type=int, required=True, help="length of the rank-1 index tensor")
+    p.add_argument("--group-size", type=int, default=64)
+    p.add_argument("--bits", type=int, default=4)
+    p.add_argument("--dtype", default="bf16", help="value dtype: one of f32, f16, bf16")
+
+
+def run_embed_tokens(args: argparse.Namespace) -> dict[str, mx.array]:
+    dtype = _float_dtype(args.dtype)
+    dense = (mx.random.uniform(shape=(args.vocab, args.hidden)) - 0.5).astype(dtype)
+    w_q, scales, biases = mx.quantize(dense, group_size=args.group_size, bits=args.bits)
+    indices = mx.random.randint(0, args.vocab, shape=(args.n_indices,)).astype(mx.uint32)
+    dq = mx.dequantize(w_q, scales, biases, group_size=args.group_size, bits=args.bits)
+    out = mx.take(dq, indices, axis=0)
+    mx.eval(w_q, scales, biases, indices, out)
+    return {"w_q": w_q, "scales": scales, "biases": biases, "indices": indices, "out": out}
+
+
+# ---------------------------------------------------------------------------
 # CLI plumbing
 # ---------------------------------------------------------------------------
 
@@ -394,6 +427,7 @@ OPS: dict[str, tuple[ParserBuilder, Runner]] = {
     "gelu": (add_gelu_parser, run_gelu),
     "gather": (add_gather_parser, run_gather),
     "dequantize": (add_dequantize_parser, run_dequantize),
+    "embed_tokens": (add_embed_tokens_parser, run_embed_tokens),
 }
 
 

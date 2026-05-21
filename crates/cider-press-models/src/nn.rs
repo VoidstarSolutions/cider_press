@@ -6,11 +6,13 @@
 //! and returns it unevaluated; the caller chooses when to `eval()`.
 //!
 //! Status: branch 5 shipped [`rms_norm`]; branch 6 adds [`silu`] and
-//! [`gelu`] (exact, `erf`-based — matches `mlx.nn.gelu`). `SwiGLU`,
-//! `RoPE`, `SDPA`, and the rest of the Qwen2 layer building blocks
-//! land as their underlying ops do.
+//! [`gelu`] (exact, `erf`-based — matches `mlx.nn.gelu`); branch 7
+//! adds [`embed_tokens`] (gather + dequantize composition over a
+//! [`QuantizedWeight`] embedding table). `SwiGLU`, `RoPE`, `SDPA`,
+//! and the rest of the Qwen2 layer building blocks land as their
+//! underlying ops do.
 
-use cider_press_runtime::{DType, Device, Tensor};
+use cider_press_runtime::{DType, Device, QuantizedWeight, Tensor};
 use half::{bf16, f16};
 
 use crate::error::{Error, Result};
@@ -155,6 +157,40 @@ fn require_float_activation_input(x: &Tensor, op: &str) -> Result<()> {
             "{op}: dtype {dtype:?} is not supported (float dtypes only)",
         ))),
     }
+}
+
+/// Embedding lookup against a quantized embedding table:
+/// `out[t, ..] = dequantize(weight[input_ids[t], ..])`.
+///
+/// Composed entirely from existing runtime ops — no new kernel. The
+/// composition mirrors MLX-LM's quantized embedding path: gather the
+/// rows of each component of the quantized triple (packed `w_q` as
+/// `U32`, `scales`/`biases` as `BF16`), then run a single
+/// `affine_dequantize` over the gathered triple. Lazy throughout —
+/// the four constituent ops land in a single `eval()`.
+///
+/// Preconditions:
+///
+/// - `input_ids` is a dense, contiguous, rank-1 [`DType::U32`] tensor
+///   on the same device as `weight`.
+/// - `weight` is shaped `[vocab, hidden]` with quantization config
+///   `(group_size=64, bits=4)` (the only instantiation wired so far,
+///   matching Qwen2's production config).
+///
+/// Output is a dense `[input_ids.shape()[0], hidden]` `BF16` tensor.
+pub fn embed_tokens(input_ids: &Tensor, weight: &QuantizedWeight) -> Result<Tensor> {
+    let q = weight.quantization();
+    let (w_q, scales, biases) = weight.components();
+    let gathered_w = w_q.gather(input_ids)?;
+    let gathered_s = scales.gather(input_ids)?;
+    let gathered_b = biases.gather(input_ids)?;
+    Ok(Tensor::dequantize_affine(
+        &gathered_w,
+        &gathered_s,
+        &gathered_b,
+        q.group_size(),
+        q.bits(),
+    )?)
 }
 
 /// Build a `[1]` host-side tensor on `device` with the given value
