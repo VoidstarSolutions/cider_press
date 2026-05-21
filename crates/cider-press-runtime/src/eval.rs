@@ -971,9 +971,11 @@ fn dispatch_reduce(
 }
 
 /// Dispatch an axis-0 gather. Inputs (per `Tensor::gather`): a dense
-/// contiguous bf16 src + a dense contiguous rank-1 U32 indices tensor.
-/// The runtime layer enforces these preconditions at construction time;
-/// here we just transcribe MLX's `Gather::eval_gpu` binding.
+/// contiguous source tensor (currently `BF16` for the dense-embedding
+/// case or `U32` for the packed-quantized-weight case) of rank ≥ 1,
+/// plus a dense contiguous rank-1 `U32` indices tensor. The runtime
+/// layer enforces these preconditions at construction time; here we
+/// just transcribe MLX's `Gather::eval_gpu` binding.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn dispatch_gather(
     inner: &Arc<TensorInner>,

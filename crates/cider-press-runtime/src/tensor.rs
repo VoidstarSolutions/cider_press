@@ -199,12 +199,14 @@ pub enum OpKind {
     },
     /// Axis-0 gather (embedding-style lookup). Inputs (in
     /// [`Tensor::op_inputs`] order) are `[src, indices]` where `src`
-    /// is a dense rank-2 tensor (`[vocab, slice]`) and `indices` is a
+    /// is a dense, contiguous tensor with rank ≥ 1 and `indices` is a
     /// dense rank-1 `U32` tensor (`[n]`). Output is dense
-    /// `[n, slice]` with the same dtype as `src`. Scope mirrors the
-    /// kernels-crate `Instantiation::bf16_u32_rank1` — the JIT
-    /// machinery accepts other dtypes / index ranks / axes but the
-    /// runtime entry point hasn't grown them yet.
+    /// `indices.shape() ++ src.shape()[1..]` with the same dtype as
+    /// `src`. Wired source dtypes are `BF16` (the dense embedding
+    /// case) and `U32` (the packed-quantized-weight case used by
+    /// `nn::embed_tokens`); the underlying JIT machinery is
+    /// dtype-agnostic and other dtypes / index ranks / axes land
+    /// alongside their first consumer.
     Gather,
     /// Affine-dequantize: `out = w * scale + bias` per group. Inputs
     /// (in [`Tensor::op_inputs`] order) are `[w_q, scales, biases]`
