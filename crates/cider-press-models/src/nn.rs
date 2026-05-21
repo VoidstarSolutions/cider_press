@@ -108,7 +108,7 @@ pub fn rms_norm(x: &Tensor, gamma: &Tensor, eps: f32) -> Result<Tensor> {
 /// Precondition: `x` is on a device (not a placeholder) and has a
 /// float dtype (`f32`, `f16`, or `bf16`).
 pub fn silu(x: &Tensor) -> Result<Tensor> {
-    require_float_activation_input(x, "silu")?;
+    let _ = float_activation_device(x, "silu")?;
     let sig = x.sigmoid()?;
     Ok(x.mul(&sig)?)
 }
@@ -123,8 +123,7 @@ pub fn silu(x: &Tensor) -> Result<Tensor> {
 /// Precondition: `x` is on a device (not a placeholder) and has a
 /// float dtype.
 pub fn gelu(x: &Tensor) -> Result<Tensor> {
-    require_float_activation_input(x, "gelu")?;
-    let device = x.device().expect("checked above");
+    let device = float_activation_device(x, "gelu")?;
     let dtype = x.dtype();
 
     // 1/sqrt(2) and 0.5 flow as host-side [1] tensors broadcast against
@@ -145,14 +144,12 @@ pub fn gelu(x: &Tensor) -> Result<Tensor> {
     Ok(half_x.mul(&inner)?)
 }
 
-fn require_float_activation_input(x: &Tensor, op: &str) -> Result<()> {
-    if x.is_placeholder() {
-        return Err(Error::InvalidArgument(format!(
-            "{op}: cannot apply to a placeholder (no device)",
-        )));
-    }
+fn float_activation_device<'a>(x: &'a Tensor, op: &str) -> Result<&'a Device> {
+    let device = x.device().ok_or_else(|| {
+        Error::InvalidArgument(format!("{op}: cannot apply to a placeholder (no device)"))
+    })?;
     match x.dtype() {
-        DType::F32 | DType::F16 | DType::BF16 => Ok(()),
+        DType::F32 | DType::F16 | DType::BF16 => Ok(device),
         dtype @ (DType::I32 | DType::U32) => Err(Error::InvalidArgument(format!(
             "{op}: dtype {dtype:?} is not supported (float dtypes only)",
         ))),
