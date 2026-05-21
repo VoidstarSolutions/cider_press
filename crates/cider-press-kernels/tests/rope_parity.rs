@@ -1,11 +1,16 @@
 //! Parity test for `rope.metal` `rope_bfloat16` dispatch (branch 9).
 //!
 //! Generates a fixture at test time via `uv run scripts/dump_mlx_op.py
-//! rope` and asserts bit-exact equality with MLX for the Qwen2-shape
-//! input. The kernel does the rotation in float internally before
-//! casting back to bf16, so a bit-exact bar is reasonable — same as
-//! square / rsqrt / erf, which also go through `static_cast<float>` →
-//! op → `static_cast<T>`.
+//! rope` and compares against MLX for the Qwen2-shape input. The
+//! offset=0 case is bit-exact (cos=1 / sin=0; the rotation is the
+//! identity, so the only operations are the float→bf16 casts that
+//! square / rsqrt / erf also exercise bit-exactly).
+//!
+//! The non-zero-offset case uses a tight bf16-ULP tolerance: the kernel
+//! invokes `metal::cos` / `metal::sin`, which drift 1–2 bf16 ULPs
+//! across Apple Silicon generations (M-series local vs macos-15 CI
+//! runners), even though the kernel source matches MLX byte-for-byte.
+//! Same situation as sigmoid in [[branch6]] — see `unary_parity.rs`.
 //!
 //! The single specialization exercised is the Qwen2-inference one:
 //! `forward=true, traditional=false, hs_transpose=false`,
@@ -68,10 +73,62 @@ fn run_parity(start_pos: i32) {
 
     // SAFETY: commit_and_wait synchronised; GPU is done with `dst`.
     let out: Vec<bf16> = unsafe { dst.as_mut_slice() }.to_vec();
-    assert_eq!(
-        out, out_ref,
-        "rope_bfloat16 (offset={start_pos}) must be bit-exact vs MLX"
-    );
+    if start_pos == 0 {
+        assert_eq!(
+            out, out_ref,
+            "rope_bfloat16 (offset=0) must be bit-exact vs MLX (identity rotation)"
+        );
+    } else {
+        assert_within_tolerance(
+            &format!("rope_bfloat16 (offset={start_pos})"),
+            &out,
+            &out_ref,
+            0.005,
+            0.01,
+        );
+    }
+}
+
+fn assert_within_tolerance(
+    label: &str,
+    got: &[bf16],
+    expected: &[bf16],
+    abs_tol: f32,
+    rel_tol: f32,
+) {
+    assert_eq!(got.len(), expected.len(), "{label}: length mismatch");
+    let mut max_abs = 0.0f32;
+    let mut max_rel = 0.0f32;
+    let mut mismatches = 0usize;
+    let mut samples: Vec<(usize, f32, f32, f32)> = Vec::new();
+    for (i, (a, b)) in got.iter().zip(expected.iter()).enumerate() {
+        if a == b {
+            continue;
+        }
+        mismatches += 1;
+        let af = a.to_f32();
+        let bf = b.to_f32();
+        let abs = (af - bf).abs();
+        let rel = if bf.abs() > 1e-6 { abs / bf.abs() } else { 0.0 };
+        max_abs = max_abs.max(abs);
+        max_rel = max_rel.max(rel);
+        if samples.len() < 4 {
+            samples.push((i, af, bf, abs));
+        }
+    }
+    if max_abs > abs_tol || max_rel > rel_tol {
+        eprintln!(
+            "{label}: {mismatches}/{} mismatches, max_abs={max_abs:.6}, max_rel={max_rel:.6}",
+            got.len(),
+        );
+        for (i, g, e, abs) in samples {
+            eprintln!("  [{i}] got={g} expected={e} |diff|={abs}");
+        }
+        panic!(
+            "{label}: tolerance exceeded (max_abs={max_abs} > {abs_tol} \
+             or max_rel={max_rel} > {rel_tol})"
+        );
+    }
 }
 
 fn fixture(start_pos: i32) -> (Vec<bf16>, Vec<bf16>) {

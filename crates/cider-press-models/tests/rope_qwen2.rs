@@ -76,10 +76,50 @@ fn parity_for(n_heads: usize, start_pos: i32) {
     let out = attention::rope(&input, &offset, &config).expect("schedule rope");
     out.eval().expect("eval");
     let got: Vec<bf16> = out.cpu_to_vec().expect("dense out");
-    assert_eq!(
-        got, out_ref,
-        "qwen2::attention::rope (n_heads={n_heads}, offset={start_pos}) \
-         must match mx.fast.rope bit-exactly",
+    if start_pos == 0 {
+        assert_eq!(
+            got, out_ref,
+            "qwen2::attention::rope (n_heads={n_heads}, offset=0) \
+             must match mx.fast.rope bit-exactly",
+        );
+    } else {
+        // metal::cos / metal::sin drift 1–2 bf16 ULPs across Apple
+        // Silicon generations (M-series local vs macos-15 CI runners);
+        // same situation as sigmoid in branch 6.
+        assert_within_tolerance(
+            &format!("qwen2::attention::rope (n_heads={n_heads}, offset={start_pos})"),
+            &got,
+            &out_ref,
+            0.005,
+            0.01,
+        );
+    }
+}
+
+fn assert_within_tolerance(
+    label: &str,
+    got: &[bf16],
+    expected: &[bf16],
+    abs_tol: f32,
+    rel_tol: f32,
+) {
+    assert_eq!(got.len(), expected.len(), "{label}: length mismatch");
+    let mut max_abs = 0.0f32;
+    let mut max_rel = 0.0f32;
+    for (a, b) in got.iter().zip(expected.iter()) {
+        if a == b {
+            continue;
+        }
+        let af = a.to_f32();
+        let bf = b.to_f32();
+        let abs = (af - bf).abs();
+        let rel = if bf.abs() > 1e-6 { abs / bf.abs() } else { 0.0 };
+        max_abs = max_abs.max(abs);
+        max_rel = max_rel.max(rel);
+    }
+    assert!(
+        max_abs <= abs_tol && max_rel <= rel_tol,
+        "{label}: tolerance exceeded (max_abs={max_abs} > {abs_tol} or max_rel={max_rel} > {rel_tol})"
     );
 }
 

@@ -246,9 +246,13 @@ we'd need — both now landed (Views in branch 2; `KvCache` in branch 8).
   config-binding wrapper that pulls `rope_theta` and `head_dim`,
   living in a new `qwen2::attention` submodule that future
   attention bits (Q/K/V projections, SDPA wiring) accumulate into.
-  All three layers bit-exact vs `mx.fast.rope` at `[1, 14, 4, 64]`
-  (Q) and `[1, 2, 4, 64]` (K) for both `offset=0` (prefill) and
-  `offset=37` (decode). No real-checkpoint test because rope
+  All three layers bit-exact vs `mx.fast.rope` at `offset=0`
+  (identity rotation, cos=1/sin=0). At `offset=37` (decode), tight
+  bf16-ULP tolerance (0.005 abs / 0.01 rel — same bar as sigmoid in
+  branch 6) instead of bit-exact: `metal::cos` / `metal::sin` drift
+  1–2 bf16 ULPs across Apple Silicon generations (M-series local
+  vs macos-15 CI runners). Tested at `[1, 14, 4, 64]` (Q) and
+  `[1, 2, 4, 64]` (K). No real-checkpoint test because rope
   applies to projection *outputs* and qmv-as-`Tensor`-op lands in
   branch 11b; the full layer-0 Q-projection → rope → cache → SDPA
   integration test is a branch-11 task.
