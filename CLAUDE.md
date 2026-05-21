@@ -141,6 +141,28 @@ branch-by-branch roadmap):
   test that runs `nn::rms_norm` against the loaded layer-0
   `input_layernorm` weight at `config.rms_norm_eps`, vs a CPU f32
   reference.
+- **Branch 6 (`feat/silu-and-gelu`).** Two activation functions
+  composed from existing unary primitives. Branch surface ended up
+  meaningfully different from the original roadmap: MLX's `unary.metal`
+  doesn't ship `Silu` / `Gelu` as primitive ops — `mlx.nn.silu` and
+  `mlx.nn.gelu` are themselves compositions on the Python side. So
+  branch 6 mirrors that factoring: kernels crate adds `Sigmoid` and
+  `Erf` (6 new fns; instantiations already present in the vendored
+  `unary.metal`, no new sources), runtime adds `UnaryOp::{Sigmoid,
+  Erf}` + `Tensor::{sigmoid, erf}`, and models crate composes
+  `nn::silu(x) = x * sigmoid(x)` and exact `nn::gelu(x) = 0.5 * x *
+  (1 + erf(x / sqrt(2)))`. Sigmoid (and therefore SiLU) uses a tight
+  bf16-ULP tolerance (0.005 abs / 0.01 rel, ~2 ULPs) rather than
+  bit-exact equality: `metal::exp` inside MLX's vendored Sigmoid kernel
+  drifts 1–2 bf16 ULPs across Apple Silicon generations (M-series local
+  vs macos-15 CI runners), even though the kernel source matches MLX
+  byte-for-byte. The other unary kernels (square / rsqrt / erf) happen
+  to stay bit-exact at the shapes we test. GELU uses bf16-compose
+  tolerance (0.02 abs/rel) because MLX writes `x / sqrt(2)` (division
+  by bf16-rounded `sqrt(2)`) where we reciprocal-multiply (no divide op
+  yet); the bf16 constants differ in the last few bits. Adds `sigmoid`,
+  `erf`, `silu`, `gelu` cases to `dump_mlx_op.py` (the silu/gelu cases
+  drive against `mlx.nn`).
 
 **Concrete target: Qwen2.5-0.5B-Instruct running interactively.**
 Smallest published dense Qwen; same architecture family as the
@@ -149,13 +171,12 @@ branch-by-branch roadmap; `docs/RUNTIME_DESIGN.md` has the
 framework-gap analysis for the two structural additions we know
 we'll need (Views landed in branch 2; `KvCache` type comes later).
 
-**Next concrete step: branch 6 of the roadmap — `feat/silu-and-gelu`.**
-SiLU (used in Qwen's SwiGLU as `silu(gate) * up`) plus GELU come
-mostly for free off the same `unary.metal` we already vendored in
-branch 5 — just two new entries in `kernels::unary` + matching
-`Tensor::silu` / `Tensor::gelu`. After branch 6, branch 7 is
-`feat/gather` (embedding lookup) and the deferred quantized-gather
-decision (see open question below).
+**Next concrete step: branch 7 of the roadmap — `feat/gather`.**
+Embedding lookup for the input embedding and (since Qwen2.5 has tied
+embeddings) the LM head. Vendor MLX's gather kernel and decide the
+quantized-gather question below — leaning toward `gather →
+dequantize_row` rather than a quantized-row gather, since gather at
+decode is once per token and tiny.
 
 Open question deferred from branch 3, surfaced concretely by the
 loader: `model.embed_tokens` is *quantized*, and tied embeddings mean

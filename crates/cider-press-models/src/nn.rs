@@ -5,9 +5,10 @@
 //! orderings of existing ones. Each function schedules an op tensor
 //! and returns it unevaluated; the caller chooses when to `eval()`.
 //!
-//! Status: branch 5 ships [`rms_norm`]. `SwiGLU`, `RoPE`, `SDPA`,
-//! and the rest of the Qwen2 layer building blocks land as their
-//! underlying ops do.
+//! Status: branch 5 shipped [`rms_norm`]; branch 6 adds [`silu`] and
+//! [`gelu`] (exact, `erf`-based — matches `mlx.nn.gelu`). `SwiGLU`,
+//! `RoPE`, `SDPA`, and the rest of the Qwen2 layer building blocks
+//! land as their underlying ops do.
 
 use cider_press_runtime::{DType, Device, Tensor};
 use half::{bf16, f16};
@@ -94,6 +95,66 @@ pub fn rms_norm(x: &Tensor, gamma: &Tensor, eps: f32) -> Result<Tensor> {
 
     // * gamma (broadcasts gamma over the leading axes).
     Ok(normed.mul(gamma)?)
+}
+
+/// `SiLU` (a.k.a. Swish): `y = x * sigmoid(x)`. Element-wise; output
+/// has the same shape, dtype, and device as `x`.
+///
+/// Matches `mlx.nn.silu`. Composed from existing primitives; no fused
+/// kernel.
+///
+/// Precondition: `x` is on a device (not a placeholder) and has a
+/// float dtype (`f32`, `f16`, or `bf16`).
+pub fn silu(x: &Tensor) -> Result<Tensor> {
+    require_float_activation_input(x, "silu")?;
+    let sig = x.sigmoid()?;
+    Ok(x.mul(&sig)?)
+}
+
+/// Exact GELU: `y = 0.5 * x * (1 + erf(x / sqrt(2)))`. Element-wise;
+/// output has the same shape, dtype, and device as `x`.
+///
+/// Matches `mlx.nn.gelu` (the exact / `erf`-based variant; the
+/// tanh-approximation variant from older HF checkpoints lands as a
+/// separate function when its first consumer arrives).
+///
+/// Precondition: `x` is on a device (not a placeholder) and has a
+/// float dtype.
+pub fn gelu(x: &Tensor) -> Result<Tensor> {
+    require_float_activation_input(x, "gelu")?;
+    let device = x.device().expect("checked above");
+    let dtype = x.dtype();
+
+    // 1/sqrt(2) and 0.5 flow as host-side [1] tensors broadcast against
+    // the activation, same pattern rms_norm uses for eps. Composed in
+    // input dtype throughout to follow mlx.nn.gelu's algorithmic steps
+    // (mlx does not promote to f32 internally). f32/f16 match bit-exactly;
+    // bf16 exhibits small drift because mlx writes `x / sqrt(2)` while we
+    // reciprocal-multiply by a bf16-rounded `1/sqrt(2)` (no divide op yet),
+    // so the bf16 constants differ in the last few bits.
+    let inv_sqrt2 = scalar_tensor(device, dtype, std::f32::consts::FRAC_1_SQRT_2)?;
+    let half = scalar_tensor(device, dtype, 0.5)?;
+    let one = scalar_tensor(device, dtype, 1.0)?;
+
+    let scaled = x.mul(&inv_sqrt2)?;
+    let e = scaled.erf()?;
+    let inner = e.add(&one)?;
+    let half_x = x.mul(&half)?;
+    Ok(half_x.mul(&inner)?)
+}
+
+fn require_float_activation_input(x: &Tensor, op: &str) -> Result<()> {
+    if x.is_placeholder() {
+        return Err(Error::InvalidArgument(format!(
+            "{op}: cannot apply to a placeholder (no device)",
+        )));
+    }
+    match x.dtype() {
+        DType::F32 | DType::F16 | DType::BF16 => Ok(()),
+        dtype @ (DType::I32 | DType::U32) => Err(Error::InvalidArgument(format!(
+            "{op}: dtype {dtype:?} is not supported (float dtypes only)",
+        ))),
+    }
 }
 
 /// Build a `[1]` host-side tensor on `device` with the given value

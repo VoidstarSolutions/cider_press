@@ -210,15 +210,21 @@ pub enum BinaryOp {
 
 /// Element-wise unary operations supported by [`OpKind::Unary`].
 ///
-/// Branch 5 wires the two ops the `rms_norm` composition needs.
-/// MLX's `unary.metal` has many more (Exp / Sin / Erf / …) that land
-/// the same way when their first consumer arrives.
+/// Branch 5 wired the two ops the `rms_norm` composition needs;
+/// branch 6 adds the two primitives MLX itself composes `silu` and
+/// `gelu` from in `mlx.nn`. MLX's `unary.metal` has many more
+/// (Exp / Sin / Tanh / …) that land the same way when their first
+/// consumer arrives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnaryOp {
     /// `out = x * x`.
     Square,
     /// `out = 1 / sqrt(x)`. Maps to the hardware `metal::rsqrt`.
     Rsqrt,
+    /// `out = 1 / (1 + exp(-x))`. Primitive for `SiLU` composition.
+    Sigmoid,
+    /// `out = erf(x)`. Primitive for exact-`GELU` composition.
+    Erf,
 }
 
 /// Reduction kinds supported by [`OpKind::Reduce`].
@@ -628,6 +634,20 @@ impl Tensor {
     /// See [`Tensor::unary`] for shared preconditions.
     pub fn rsqrt(&self) -> Result<Self> {
         self.unary(UnaryOp::Rsqrt)
+    }
+
+    /// Schedule `out = 1 / (1 + exp(-x))` element-wise. Primitive for
+    /// the `silu` composition. See [`Tensor::unary`] for shared
+    /// preconditions.
+    pub fn sigmoid(&self) -> Result<Self> {
+        self.unary(UnaryOp::Sigmoid)
+    }
+
+    /// Schedule `out = erf(x)` element-wise. Primitive for the exact
+    /// `gelu` composition. See [`Tensor::unary`] for shared
+    /// preconditions.
+    pub fn erf(&self) -> Result<Self> {
+        self.unary(UnaryOp::Erf)
     }
 
     /// Schedule an element-wise unary op. Output inherits this
