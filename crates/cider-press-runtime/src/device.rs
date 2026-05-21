@@ -47,6 +47,11 @@ struct DeviceInner {
     /// so callers see a one-time pause on first reduce dispatch.
     /// Subsequent calls return the cached library.
     reduce_library: OnceLock<kernels::KernelLibrary>,
+    /// JIT'd MLX `rope.metal` library. Populated on first
+    /// [`crate::Tensor::rope`] eval; subsequent ropes hit the cached
+    /// library and look up the per-specialization pipeline from the
+    /// library's own pipeline-state cache.
+    rope_library: OnceLock<kernels::KernelLibrary>,
     /// JIT-assembled gather libraries, one entry per
     /// [`kernels::kernels::gather::Instantiation`]. Keyed by the
     /// instantiation's kernel name (which uniquely identifies the
@@ -82,6 +87,7 @@ impl Device {
                 binary_library: OnceLock::new(),
                 unary_library: OnceLock::new(),
                 reduce_library: OnceLock::new(),
+                rope_library: OnceLock::new(),
                 gather_libraries: Mutex::new(HashMap::new()),
             }),
         })
@@ -109,6 +115,7 @@ impl Device {
             binary_library: OnceLock::new(),
             unary_library: OnceLock::new(),
             reduce_library: OnceLock::new(),
+            rope_library: OnceLock::new(),
             gather_libraries: Mutex::new(HashMap::new()),
         });
         let stored = SHARED.get_or_init(|| fresh);
@@ -191,6 +198,18 @@ impl Device {
         }
         let lib = kernels::KernelLibrary::reduce(&self.inner.kernels)?;
         Ok(self.inner.reduce_library.get_or_init(|| lib))
+    }
+
+    /// Lazily JIT-compile and cache MLX's `rope.metal` library. Hosts
+    /// every rope instantiation; the per-specialization
+    /// `[[function_constant]]` pipelines live in the library's
+    /// internal pipeline cache.
+    pub(crate) fn rope_library(&self) -> Result<&kernels::KernelLibrary> {
+        if let Some(lib) = self.inner.rope_library.get() {
+            return Ok(lib);
+        }
+        let lib = kernels::KernelLibrary::rope(&self.inner.kernels)?;
+        Ok(self.inner.rope_library.get_or_init(|| lib))
     }
 
     /// Lazily JIT-compile and cache a gather library for one
