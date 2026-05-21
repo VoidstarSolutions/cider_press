@@ -8,7 +8,11 @@
 //!   `keys_view` / `values_view`, with bytes equal to what we wrote.
 //! - `position()` tracks correctly and rejects overflowing writes.
 //! - `reset()` rewinds without leaking bytes from the prior run.
-//! - Validation errors fire on dtype / shape / device mismatches.
+//! - Validation errors fire on dtype / shape mismatches. (The device
+//!   check in `validate_update_input` is correct but not exercised:
+//!   Apple Metal returns the same singleton from
+//!   `Device::system_default()`, so two distinct device handles aren't
+//!   constructible on a single-GPU Mac.)
 
 #![cfg(target_os = "macos")]
 #![allow(clippy::cast_precision_loss)]
