@@ -25,6 +25,12 @@ const VOCAB: usize = 128;
 const HIDDEN: usize = 64;
 const N_INDICES: usize = 8;
 
+// Smaller u32 case to keep test data trivial; gather is dtype-agnostic
+// so size doesn't matter for parity.
+const U32_VOCAB: usize = 32;
+const U32_HIDDEN: usize = 16;
+const U32_N: usize = 4;
+
 #[test]
 fn gather_axis0_bf16_u32_rank1_matches_mlx_bit_exact() {
     let (src_host, indices_host, out_ref) = fixture();
@@ -93,6 +99,69 @@ fn gather_axis0_bf16_u32_rank1_matches_mlx_bit_exact() {
     );
 }
 
+#[test]
+fn gather_axis0_u32_u32_rank1_matches_mlx_bit_exact() {
+    // u32 gather is the packed-quantized-weight case (uint32 rows).
+    let (src_host, indices_host, out_ref) = u32_fixture();
+    assert_eq!(src_host.len(), U32_VOCAB * U32_HIDDEN);
+    assert_eq!(out_ref.len(), U32_N * U32_HIDDEN);
+
+    let device = Device::system_default().expect("Metal device");
+    let inst = Instantiation::u32_u32_rank1();
+    let source = make_source(&inst);
+    let library = KernelLibrary::from_source(&device, &source).expect("compile JIT gather (u32)");
+
+    let src: Buffer<u32> = device.upload(&src_host).expect("upload u32 src");
+    let indices: Buffer<u32> = device.upload(&indices_host).expect("upload indices");
+    let mut out: Buffer<u32> = device.alloc_buffer(U32_N * U32_HIDDEN).expect("alloc out");
+
+    let src_shape: Buffer<i32> = device
+        .upload(&[U32_VOCAB as i32, U32_HIDDEN as i32])
+        .expect("src_shape");
+    let src_strides: Buffer<i64> = device
+        .upload(&[U32_HIDDEN as i64, 1])
+        .expect("src_strides");
+    let slice_sizes: Buffer<i32> = device.upload(&[1, U32_HIDDEN as i32]).expect("slice_sizes");
+    let axes: Buffer<i32> = device.upload(&[0]).expect("axes");
+    let idx_shapes: Buffer<i32> = device.upload(&[U32_N as i32]).expect("idx_shapes");
+    let idx_strides: Buffer<i64> = device.upload(&[1]).expect("idx_strides");
+    let idx_contigs: Buffer<u8> = device.upload(&[1u8]).expect("idx_contigs");
+
+    let mut cmds = device.commands().expect("commands");
+    {
+        let idx_refs = [&indices];
+        gather::dispatch(
+            &mut cmds,
+            &library,
+            &inst,
+            GatherDispatch {
+                src: &src,
+                out: &mut out,
+                indices: &idx_refs,
+                src_shape: &src_shape,
+                src_strides: &src_strides,
+                src_ndim: 2,
+                slice_sizes: &slice_sizes,
+                axes: &axes,
+                idx_shapes: &idx_shapes,
+                idx_strides: &idx_strides,
+                idx_contigs: &idx_contigs,
+                idx_ndim: 1,
+                grid: (U32_N, 1, U32_HIDDEN),
+            },
+        )
+        .expect("dispatch u32 gather");
+    }
+    cmds.commit_and_wait().expect("commit");
+
+    // SAFETY: commit_and_wait synchronised; GPU is done with `out`.
+    let got: Vec<u32> = unsafe { out.as_mut_slice() }.to_vec();
+    assert_eq!(
+        got, out_ref,
+        "u32 gather must be bit-exact vs mx.take on a uint32 src"
+    );
+}
+
 // ---------------------------------------------------------------------
 // fixture / harness boilerplate (mirrors the other parity tests)
 // ---------------------------------------------------------------------
@@ -100,13 +169,30 @@ fn gather_axis0_bf16_u32_rank1_matches_mlx_bit_exact() {
 fn fixture() -> (Vec<bf16>, Vec<u32>, Vec<bf16>) {
     let tmp = tempdir();
     let path = tmp.join("gather.safetensors");
-    dump_mlx(&path);
+    dump_mlx_bf16(&path);
     let bytes = std::fs::read(&path).expect("read fixture");
     let st = SafeTensors::deserialize(&bytes).expect("parse safetensors");
     (read_bf16(&st, "src"), read_u32(&st, "indices"), read_bf16(&st, "out"))
 }
 
-fn dump_mlx(out: &Path) {
+fn u32_fixture() -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    let tmp = tempdir();
+    let path = tmp.join("gather_u32.safetensors");
+    dump_mlx_u32(&path);
+    let bytes = std::fs::read(&path).expect("read u32 fixture");
+    let st = SafeTensors::deserialize(&bytes).expect("parse safetensors");
+    (read_u32(&st, "src"), read_u32(&st, "indices"), read_u32(&st, "out"))
+}
+
+fn dump_mlx_bf16(out: &Path) {
+    dump_mlx_gather(out, VOCAB, HIDDEN, N_INDICES, "bf16");
+}
+
+fn dump_mlx_u32(out: &Path) {
+    dump_mlx_gather(out, U32_VOCAB, U32_HIDDEN, U32_N, "u32");
+}
+
+fn dump_mlx_gather(out: &Path, vocab: usize, hidden: usize, n: usize, dtype: &str) {
     let script = workspace_root().join("scripts").join("dump_mlx_op.py");
     let status = Command::new("uv")
         .arg("run")
@@ -117,13 +203,13 @@ fn dump_mlx(out: &Path) {
         .arg("0")
         .arg("gather")
         .arg("--vocab")
-        .arg(VOCAB.to_string())
+        .arg(vocab.to_string())
         .arg("--hidden")
-        .arg(HIDDEN.to_string())
+        .arg(hidden.to_string())
         .arg("--n-indices")
-        .arg(N_INDICES.to_string())
+        .arg(n.to_string())
         .arg("--dtype")
-        .arg("bf16")
+        .arg(dtype)
         .status();
     let status = match status {
         Ok(s) => s,

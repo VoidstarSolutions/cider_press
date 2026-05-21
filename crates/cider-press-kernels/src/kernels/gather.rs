@@ -40,7 +40,6 @@
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
-use half::bf16;
 use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
 
 use crate::buffer::Buffer;
@@ -156,6 +155,22 @@ impl Instantiation {
         Self {
             value_type: "bfloat16_t",
             value_name: "bfloat16",
+            index_type: "uint",
+            index_name: "uint32",
+            nidx: 1,
+            idx_ndim: 1,
+            loc_type: LocType::Int32,
+        }
+    }
+
+    /// `u32` source, `u32` indices, single index buffer of rank 1,
+    /// 32-bit locator. Used for gathering rows of an affine-quantized
+    /// weight's packed `w` buffer (int4 packed 8-per-`uint32`).
+    #[must_use]
+    pub const fn u32_u32_rank1() -> Self {
+        Self {
+            value_type: "uint",
+            value_name: "uint32",
             index_type: "uint",
             index_name: "uint32",
             nidx: 1,
@@ -303,13 +318,17 @@ pub struct GatherDispatch<'a, T> {
 /// committing the encoded command buffer via [`Commands::commit_and_wait`].
 ///
 /// This intentionally takes the raw buffers — the runtime layer wraps
-/// it with type-safe `Tensor` semantics.
+/// it with type-safe `Tensor` semantics. Generic over `T`: gather's
+/// Metal binding only cares about the buffer's *size*, not its
+/// element type, so the Rust dispatch function is dtype-agnostic. The
+/// caller picks an [`Instantiation`] whose `value_type` matches `T`'s
+/// MSL representation.
 #[allow(clippy::needless_pass_by_value)]
-pub fn dispatch(
+pub fn dispatch<T>(
     commands: &mut Commands<'_>,
     library: &KernelLibrary,
     inst: &Instantiation,
-    args: GatherDispatch<'_, bf16>,
+    args: GatherDispatch<'_, T>,
 ) -> Result<()> {
     if args.indices.len() != inst.nidx as usize {
         return Err(Error::InvalidArgument(format!(
@@ -369,6 +388,12 @@ mod tests {
     fn embedding_instantiation_kernel_name_matches_mlx_format() {
         let inst = Instantiation::bf16_u32_rank1();
         assert_eq!(inst.kernel_name(), "gatherbfloat16uint32_1_1_int");
+    }
+
+    #[test]
+    fn u32_instantiation_kernel_name_matches_mlx_format() {
+        let inst = Instantiation::u32_u32_rank1();
+        assert_eq!(inst.kernel_name(), "gatheruint32uint32_1_1_int");
     }
 
     #[test]

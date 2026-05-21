@@ -304,6 +304,9 @@ def run_mul(args: argparse.Namespace) -> dict[str, mx.array]:
 # ---------------------------------------------------------------------------
 
 
+_GATHER_SRC_DTYPES = dict(_FLOAT_DTYPES, u32=mx.uint32)
+
+
 def add_gather_parser(subparsers: argparse._SubParsersAction) -> None:
     p = subparsers.add_parser(
         "gather",
@@ -312,12 +315,26 @@ def add_gather_parser(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("--vocab", type=int, required=True, help="source first-axis size, e.g. 128")
     p.add_argument("--hidden", type=int, required=True, help="source second-axis size, e.g. 64")
     p.add_argument("--n-indices", type=int, required=True, help="length of the rank-1 index tensor")
-    p.add_argument("--dtype", default="bf16", help="src/out dtype: one of f32, f16, bf16")
+    p.add_argument(
+        "--dtype",
+        default="bf16",
+        help=f"src/out dtype: one of {sorted(_GATHER_SRC_DTYPES)}",
+    )
 
 
 def run_gather(args: argparse.Namespace) -> dict[str, mx.array]:
-    dtype = _float_dtype(args.dtype)
-    src = (mx.random.uniform(shape=(args.vocab, args.hidden)) - 0.5).astype(dtype)
+    if args.dtype not in _GATHER_SRC_DTYPES:
+        raise SystemExit(
+            f"gather: unknown dtype {args.dtype!r}; expected one of {sorted(_GATHER_SRC_DTYPES)}"
+        )
+    dtype = _GATHER_SRC_DTYPES[args.dtype]
+    if dtype == mx.uint32:
+        # u32 is the packed-quantized-weight gather case (uint32 carries
+        # packed int4 values). Generate uniformly-random bits to avoid
+        # the kernel accidentally working on a degenerate `src = 0`.
+        src = mx.random.randint(0, 2**31 - 1, shape=(args.vocab, args.hidden)).astype(dtype)
+    else:
+        src = (mx.random.uniform(shape=(args.vocab, args.hidden)) - 0.5).astype(dtype)
     indices = mx.random.randint(0, args.vocab, shape=(args.n_indices,)).astype(mx.uint32)
     out = mx.take(src, indices, axis=0)
     mx.eval(src, indices, out)
