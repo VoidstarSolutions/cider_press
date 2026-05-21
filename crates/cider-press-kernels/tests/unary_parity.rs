@@ -77,10 +77,43 @@ fn parity_v_sigmoid_bf16() {
 
     // SAFETY: commit_and_wait synchronised; GPU is done with `dst`.
     let out: Vec<bf16> = unsafe { dst.as_mut_slice() }.to_vec();
+    if out != out_ref {
+        diagnose_mismatch("v_Sigmoidbfloat16bfloat16", &out, &out_ref);
+    }
     assert_eq!(
         out, out_ref,
         "v_Sigmoidbfloat16bfloat16 must be bit-exact vs MLX"
     );
+}
+
+fn diagnose_mismatch(label: &str, got: &[bf16], expected: &[bf16]) {
+    assert_eq!(got.len(), expected.len());
+    let mut max_abs = 0.0f32;
+    let mut max_rel = 0.0f32;
+    let mut mismatches = 0usize;
+    let mut samples: Vec<(usize, f32, f32, f32)> = Vec::new();
+    for (i, (a, b)) in got.iter().zip(expected.iter()).enumerate() {
+        if a == b {
+            continue;
+        }
+        mismatches += 1;
+        let af = a.to_f32();
+        let bf = b.to_f32();
+        let abs = (af - bf).abs();
+        let rel = if bf.abs() > 1e-6 { abs / bf.abs() } else { 0.0 };
+        max_abs = max_abs.max(abs);
+        max_rel = max_rel.max(rel);
+        if samples.len() < 8 {
+            samples.push((i, af, bf, abs));
+        }
+    }
+    eprintln!(
+        "{label}: {mismatches}/{} mismatches, max_abs={max_abs:.6}, max_rel={max_rel:.6}",
+        got.len(),
+    );
+    for (i, g, e, abs) in samples {
+        eprintln!("  [{i}] got={g} expected={e} |diff|={abs}");
+    }
 }
 
 #[test]
