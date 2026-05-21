@@ -1108,6 +1108,7 @@ impl Tensor {
     /// layout as `self`. The Qwen2 inference specialization
     /// (`forward=true, traditional=false, hs_transpose=false`,
     /// `with_freqs=false`) is the only one wired.
+    #[allow(clippy::too_many_lines)]
     pub fn rope(&self, offset: &Self, base: f32, scale: f32, rotary_dims: usize) -> Result<Self> {
         let device = self.inner.device.as_ref().ok_or_else(|| {
             Error::InvalidArgument("rope: cannot apply an op to a placeholder (no device)".into())
@@ -1119,6 +1120,31 @@ impl Tensor {
             return Err(Error::InvalidArgument(
                 "rope: input and offset are on different devices".into(),
             ));
+        }
+        if self.inner.view.is_some() {
+            return Err(Error::InvalidArgument(
+                "rope: view inputs are not supported; copy() first to materialise \
+                 a dense version (eval-side dispatch reads inputs as dense leaves \
+                 and does not resolve view chains)"
+                    .into(),
+            ));
+        }
+        if offset.inner.view.is_some() {
+            return Err(Error::InvalidArgument(
+                "rope: view offset is not supported; copy() first to materialise \
+                 a dense version"
+                    .into(),
+            ));
+        }
+        if !scale.is_finite() {
+            return Err(Error::InvalidArgument(format!(
+                "rope: scale must be finite (got {scale})"
+            )));
+        }
+        if !base.is_finite() || base <= 0.0 {
+            return Err(Error::InvalidArgument(format!(
+                "rope: base must be finite and > 0 (got {base})"
+            )));
         }
         if self.inner.dtype != DType::BF16 {
             return Err(Error::InvalidArgument(format!(
