@@ -14,14 +14,15 @@ use std::sync::Arc;
 
 use cider_press_kernels::{
     Buffer, Commands, KernelLibrary,
-    kernels::{binary, copy, qmv},
+    kernels::{binary, copy, qmv, reduce, unary},
 };
 
 use crate::dtype::DType;
 use crate::error::{Error, Result};
 use crate::layout::Layout;
 use crate::tensor::{
-    BinaryOp, LeafStorage, OpKind, OpNode, Tensor, TensorInner, checked_byte_count,
+    BinaryOp, LeafStorage, OpKind, OpNode, ReduceKind, Tensor, TensorInner, UnaryOp,
+    checked_byte_count,
 };
 
 pub(crate) fn eval(root: &Tensor) -> Result<()> {
@@ -200,6 +201,12 @@ fn dispatch(
         ),
         OpKind::Binary { op: binary_op } => {
             dispatch_binary(inner, op, commands, outputs, dst, index_of, binary_op)
+        }
+        OpKind::Unary { op: unary_op } => {
+            dispatch_unary(inner, op, commands, outputs, dst, index_of, unary_op)
+        }
+        OpKind::Reduce { kind, keep_dim } => {
+            dispatch_reduce(inner, op, commands, outputs, dst, index_of, kind, keep_dim)
         }
     }
 }
@@ -784,4 +791,171 @@ fn layout_strides(t: &Tensor) -> Result<&[isize]> {
             "binary: quantized input is not supported".into(),
         )),
     }
+}
+
+/// Dispatch an element-wise unary op (Square / Rsqrt). Inputs must be
+/// dense and contiguous (the runtime's `Tensor::unary` enforces this
+/// at construction time); the kernels-crate `v_*` family is the only
+/// variant currently wired.
+fn dispatch_unary(
+    inner: &Arc<TensorInner>,
+    op: &OpNode,
+    commands: &mut Commands<'_>,
+    outputs: &[Buffer<u8>],
+    dst: &mut Buffer<u8>,
+    index_of: &HashMap<*const TensorInner, usize>,
+    unary_op: UnaryOp,
+) -> Result<()> {
+    let device = inner
+        .device
+        .as_ref()
+        .expect("op nodes are always constructed with a device");
+    let input = op
+        .inputs
+        .first()
+        .ok_or_else(|| Error::InvalidArgument("Unary: missing input (inputs[0])".into()))?;
+    let library = device.unary_library()?;
+
+    let src = dense_input_buffer(input, outputs, index_of)?;
+
+    // SAFETY: dtype tag drives the reinterpret. Allocation sized the
+    // buffers as `elem_count * size_bytes`, so byte lengths divide
+    // evenly into the typed element count.
+    match inner.dtype {
+        DType::F32 => {
+            let s = unsafe { src.reinterpret_as::<f32>() };
+            let mut d = unsafe { dst.reinterpret_as::<f32>() };
+            match unary_op {
+                UnaryOp::Square => unary::v_square_f32(commands, library, &s, &mut d)?,
+                UnaryOp::Rsqrt => unary::v_rsqrt_f32(commands, library, &s, &mut d)?,
+            }
+        }
+        DType::F16 => {
+            let s = unsafe { src.reinterpret_as::<half::f16>() };
+            let mut d = unsafe { dst.reinterpret_as::<half::f16>() };
+            match unary_op {
+                UnaryOp::Square => unary::v_square_f16(commands, library, &s, &mut d)?,
+                UnaryOp::Rsqrt => unary::v_rsqrt_f16(commands, library, &s, &mut d)?,
+            }
+        }
+        DType::BF16 => {
+            let s = unsafe { src.reinterpret_as::<half::bf16>() };
+            let mut d = unsafe { dst.reinterpret_as::<half::bf16>() };
+            match unary_op {
+                UnaryOp::Square => unary::v_square_bf16(commands, library, &s, &mut d)?,
+                UnaryOp::Rsqrt => unary::v_rsqrt_bf16(commands, library, &s, &mut d)?,
+            }
+        }
+        dtype @ (DType::I32 | DType::U32) => {
+            return Err(Error::InvalidArgument(format!(
+                "unary: dtype {dtype:?} not wired for Square/Rsqrt yet \
+                 (only float dtypes are instantiated at the kernels layer)",
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Dispatch a last-axis reduction (Sum / Prod / Min / Max). The
+/// runtime's `Tensor::reduce` enforces last-axis-only and contiguous
+/// input at construction time; here we just thread the input shape
+/// (with the reduced axis re-inserted if the op tensor's shape
+/// dropped it) into the kernels-crate dispatch fn.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_reduce(
+    inner: &Arc<TensorInner>,
+    op: &OpNode,
+    commands: &mut Commands<'_>,
+    outputs: &[Buffer<u8>],
+    dst: &mut Buffer<u8>,
+    index_of: &HashMap<*const TensorInner, usize>,
+    kind: ReduceKind,
+    keep_dim: bool,
+) -> Result<()> {
+    let device = inner
+        .device
+        .as_ref()
+        .expect("op nodes are always constructed with a device");
+    let input = op
+        .inputs
+        .first()
+        .ok_or_else(|| Error::InvalidArgument("Reduce: missing input (inputs[0])".into()))?;
+    let library = device.reduce_library()?;
+
+    // The kernels-crate dispatch needs the *input* shape (it reads
+    // the last axis as the row size and the rest as the row count).
+    // Reconstructing it: if keep_dim, the input shape is identical to
+    // the output minus the last-axis size-1 (we don't have access to
+    // the original row size on this side); instead read it off the
+    // input tensor directly, which the OpNode already retains.
+    let src_dims: Vec<usize> = input.shape().dims().to_vec();
+    let _ = keep_dim; // shape inference uses the input's dims, not output's.
+
+    let src = dense_input_buffer(input, outputs, index_of)?;
+
+    // SAFETY: dtype tag drives the reinterpret; allocation byte
+    // lengths divide evenly into the typed element count.
+    match inner.dtype {
+        DType::F32 => {
+            let s = unsafe { src.reinterpret_as::<f32>() };
+            let mut d = unsafe { dst.reinterpret_as::<f32>() };
+            match kind {
+                ReduceKind::Sum => {
+                    reduce::row_reduce_sum_f32(commands, library, &s, &src_dims, &mut d)?;
+                }
+                ReduceKind::Prod => {
+                    reduce::row_reduce_prod_f32(commands, library, &s, &src_dims, &mut d)?;
+                }
+                ReduceKind::Min => {
+                    reduce::row_reduce_min_f32(commands, library, &s, &src_dims, &mut d)?;
+                }
+                ReduceKind::Max => {
+                    reduce::row_reduce_max_f32(commands, library, &s, &src_dims, &mut d)?;
+                }
+            }
+        }
+        DType::F16 => {
+            let s = unsafe { src.reinterpret_as::<half::f16>() };
+            let mut d = unsafe { dst.reinterpret_as::<half::f16>() };
+            match kind {
+                ReduceKind::Sum => {
+                    reduce::row_reduce_sum_f16(commands, library, &s, &src_dims, &mut d)?;
+                }
+                ReduceKind::Prod => {
+                    reduce::row_reduce_prod_f16(commands, library, &s, &src_dims, &mut d)?;
+                }
+                ReduceKind::Min => {
+                    reduce::row_reduce_min_f16(commands, library, &s, &src_dims, &mut d)?;
+                }
+                ReduceKind::Max => {
+                    reduce::row_reduce_max_f16(commands, library, &s, &src_dims, &mut d)?;
+                }
+            }
+        }
+        DType::BF16 => {
+            let s = unsafe { src.reinterpret_as::<half::bf16>() };
+            let mut d = unsafe { dst.reinterpret_as::<half::bf16>() };
+            match kind {
+                ReduceKind::Sum => {
+                    reduce::row_reduce_sum_bf16(commands, library, &s, &src_dims, &mut d)?;
+                }
+                ReduceKind::Prod => {
+                    reduce::row_reduce_prod_bf16(commands, library, &s, &src_dims, &mut d)?;
+                }
+                ReduceKind::Min => {
+                    reduce::row_reduce_min_bf16(commands, library, &s, &src_dims, &mut d)?;
+                }
+                ReduceKind::Max => {
+                    reduce::row_reduce_max_bf16(commands, library, &s, &src_dims, &mut d)?;
+                }
+            }
+        }
+        dtype @ (DType::I32 | DType::U32) => {
+            return Err(Error::InvalidArgument(format!(
+                "reduce: dtype {dtype:?} not wired for Sum/Prod/Min/Max yet \
+                 (only float dtypes are wired at the kernels layer)",
+            )));
+        }
+    }
+    Ok(())
 }

@@ -176,6 +176,27 @@ pub enum OpKind {
         /// Which arithmetic operation to perform.
         op: BinaryOp,
     },
+    /// Element-wise unary op on a dense contiguous input. Output has
+    /// the same shape + dtype as the input; the dispatcher uses MLX's
+    /// `v_<Op><tname><tname>` kernel (N=1 contiguous).
+    Unary {
+        /// Which unary operation to perform.
+        op: UnaryOp,
+    },
+    /// Last-axis reduction on a dense contiguous input. Output drops
+    /// the reduced axis (`keep_dim = false`) or keeps it as size 1
+    /// (`keep_dim = true`). The runtime currently only supports
+    /// reducing the *last* axis; non-last reductions can be expressed
+    /// by permuting the input first.
+    Reduce {
+        /// Which reduction kind to perform. `Mean` is not represented
+        /// here — at the runtime layer it's composed as `Sum / N`.
+        kind: ReduceKind,
+        /// `true` ⇒ output has the same rank as input with a size-1
+        /// axis at the reduced position. `false` ⇒ output drops the
+        /// reduced axis.
+        keep_dim: bool,
+    },
 }
 
 /// Element-wise binary operations supported by [`OpKind::Binary`].
@@ -185,6 +206,35 @@ pub enum BinaryOp {
     Add,
     /// `c = a * b`.
     Mul,
+}
+
+/// Element-wise unary operations supported by [`OpKind::Unary`].
+///
+/// Branch 5 wires the two ops the `rms_norm` composition needs.
+/// MLX's `unary.metal` has many more (Exp / Sin / Erf / …) that land
+/// the same way when their first consumer arrives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnaryOp {
+    /// `out = x * x`.
+    Square,
+    /// `out = 1 / sqrt(x)`. Maps to the hardware `metal::rsqrt`.
+    Rsqrt,
+}
+
+/// Reduction kinds supported by [`OpKind::Reduce`].
+///
+/// `Mean` is intentionally absent — it's composed at the runtime
+/// layer as `Sum / N`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReduceKind {
+    /// Sum of elements.
+    Sum,
+    /// Product of elements.
+    Prod,
+    /// Minimum element.
+    Min,
+    /// Maximum element.
+    Max,
 }
 
 /// User-facing lazy tensor handle.
@@ -565,6 +615,192 @@ impl Tensor {
             layout,
             OpKind::Binary { op },
             vec![lhs, rhs],
+        ))
+    }
+
+    /// Schedule `out = x * x` element-wise.
+    /// See [`Tensor::unary`] for shared preconditions.
+    pub fn square(&self) -> Result<Self> {
+        self.unary(UnaryOp::Square)
+    }
+
+    /// Schedule `out = 1 / sqrt(x)` element-wise.
+    /// See [`Tensor::unary`] for shared preconditions.
+    pub fn rsqrt(&self) -> Result<Self> {
+        self.unary(UnaryOp::Rsqrt)
+    }
+
+    /// Schedule an element-wise unary op. Output inherits this
+    /// tensor's [`Shape`], [`DType`], and [`Device`]; the output
+    /// [`Layout`] is dense and contiguous.
+    ///
+    /// Input must be dense (quantized inputs are not supported) and
+    /// contiguous in memory — the runtime currently only wires the
+    /// MLX `v_` (contiguous) kernel family for unary ops. Apply
+    /// [`Tensor::copy`] first to materialise a non-contiguous view.
+    pub fn unary(&self, op: UnaryOp) -> Result<Self> {
+        let device = self.inner.device.as_ref().ok_or_else(|| {
+            Error::InvalidArgument("unary: cannot apply an op to a placeholder (no device)".into())
+        })?;
+        if !self.inner.dtype.is_float() {
+            return Err(Error::InvalidArgument(format!(
+                "unary: dtype {:?} is not supported (only F32/F16/BF16 are wired \
+                 at the kernels layer)",
+                self.inner.dtype,
+            )));
+        }
+        let strides = match self.layout() {
+            Layout::Dense { strides } => strides,
+            Layout::Quantized(_) => {
+                return Err(Error::InvalidArgument(
+                    "unary: quantized tensors are not supported".into(),
+                ));
+            }
+        };
+        if self.inner.view.is_some() {
+            return Err(Error::InvalidArgument(
+                "unary: view inputs are not supported; copy() first to materialise \
+                 a dense version (eval-side dispatch reads inputs as dense leaves \
+                 and does not resolve view chains)"
+                    .into(),
+            ));
+        }
+        if !strides.is_contiguous(self.shape()) {
+            return Err(Error::InvalidArgument(format!(
+                "unary: input must be contiguous (got shape {:?} strides {:?}); \
+                 copy() first to materialise a dense version",
+                self.shape().dims(),
+                strides.as_slice(),
+            )));
+        }
+        let layout = dense_layout(self.shape());
+        Ok(Self::op_tensor(
+            device,
+            self.shape().clone(),
+            self.inner.dtype,
+            layout,
+            OpKind::Unary { op },
+            vec![self.clone()],
+        ))
+    }
+
+    /// Schedule a sum reduction along `axis`. See [`Tensor::reduce`]
+    /// for the shared preconditions; negative axes count from the end
+    /// (`-1` ⇒ last axis).
+    pub fn sum(&self, axis: i64, keep_dim: bool) -> Result<Self> {
+        self.reduce(ReduceKind::Sum, axis, keep_dim)
+    }
+
+    /// Schedule a product reduction along `axis`. See [`Tensor::reduce`].
+    pub fn prod(&self, axis: i64, keep_dim: bool) -> Result<Self> {
+        self.reduce(ReduceKind::Prod, axis, keep_dim)
+    }
+
+    /// Schedule a min reduction along `axis`. See [`Tensor::reduce`].
+    pub fn min(&self, axis: i64, keep_dim: bool) -> Result<Self> {
+        self.reduce(ReduceKind::Min, axis, keep_dim)
+    }
+
+    /// Schedule a max reduction along `axis`. See [`Tensor::reduce`].
+    pub fn max(&self, axis: i64, keep_dim: bool) -> Result<Self> {
+        self.reduce(ReduceKind::Max, axis, keep_dim)
+    }
+
+    /// Schedule a mean reduction along `axis`, composed as `sum / N`.
+    /// `N` is the size of the reduced axis. The divisor is built as a
+    /// 1-element tensor on the same device + dtype and multiplied
+    /// against the sum via [`Tensor::mul`]; the broadcast view is
+    /// dispatched through the existing strided binary path.
+    pub fn mean(&self, axis: i64, keep_dim: bool) -> Result<Self> {
+        let axis_resolved = resolve_axis(self.shape().rank(), axis)?;
+        let n = self.shape().dims()[axis_resolved];
+        if n == 0 {
+            return Err(Error::InvalidArgument(
+                "mean: cannot reduce a size-0 axis".into(),
+            ));
+        }
+        let summed = self.sum(axis, keep_dim)?;
+        let device = self
+            .inner
+            .device
+            .as_ref()
+            .expect("device verified by sum() above");
+
+        // Build a [1] divisor tensor with bf16-rounded `1/N` (or f32
+        // / f16 equivalent) on the same device + dtype. Done at
+        // op-construction time so the value flows through the graph
+        // alongside the sum.
+        let inv_n = recip_scalar(n, self.inner.dtype)?;
+        let divisor = host_scalar_tensor(device, self.inner.dtype, inv_n)?;
+        summed.mul(&divisor)
+    }
+
+    /// Schedule a last-axis-only reduction. `axis` accepts negative
+    /// indexing (`-1` ⇒ last axis), and must currently resolve to the
+    /// last axis — the runtime hasn't wired non-last reductions yet
+    /// (MLX's `col_reduce` family is deferred). Use [`Tensor::permute`]
+    /// to move the target axis to the end first.
+    ///
+    /// `keep_dim = true` keeps the reduced axis as a size-1 dim
+    /// (rank unchanged); `keep_dim = false` drops it.
+    pub fn reduce(&self, kind: ReduceKind, axis: i64, keep_dim: bool) -> Result<Self> {
+        let device = self.inner.device.as_ref().ok_or_else(|| {
+            Error::InvalidArgument("reduce: cannot apply an op to a placeholder (no device)".into())
+        })?;
+        if !self.inner.dtype.is_float() {
+            return Err(Error::InvalidArgument(format!(
+                "reduce: dtype {:?} is not supported (only F32/F16/BF16 are wired \
+                 at the kernels layer)",
+                self.inner.dtype,
+            )));
+        }
+        let strides = match self.layout() {
+            Layout::Dense { strides } => strides,
+            Layout::Quantized(_) => {
+                return Err(Error::InvalidArgument(
+                    "reduce: quantized tensors are not supported".into(),
+                ));
+            }
+        };
+        if self.inner.view.is_some() {
+            return Err(Error::InvalidArgument(
+                "reduce: view inputs are not supported; copy() first to materialise \
+                 a dense version (eval-side dispatch reads inputs as dense leaves \
+                 and does not resolve view chains)"
+                    .into(),
+            ));
+        }
+        if !strides.is_contiguous(self.shape()) {
+            return Err(Error::InvalidArgument(format!(
+                "reduce: input must be contiguous (got shape {:?} strides {:?}); \
+                 copy() first to materialise a dense version",
+                self.shape().dims(),
+                strides.as_slice(),
+            )));
+        }
+        let rank = self.shape().rank();
+        let axis_resolved = resolve_axis(rank, axis)?;
+        if axis_resolved != rank - 1 {
+            return Err(Error::InvalidArgument(format!(
+                "reduce: only last-axis reductions are wired (got axis {axis_resolved} of \
+                 rank {rank}); permute the target axis to the end first",
+            )));
+        }
+        let mut out_dims: Vec<usize> = self.shape().dims().to_vec();
+        if keep_dim {
+            out_dims[axis_resolved] = 1;
+        } else {
+            out_dims.remove(axis_resolved);
+        }
+        let out_shape = Shape::from(out_dims);
+        let layout = dense_layout(&out_shape);
+        Ok(Self::op_tensor(
+            device,
+            out_shape,
+            self.inner.dtype,
+            layout,
+            OpKind::Reduce { kind, keep_dim },
+            vec![self.clone()],
         ))
     }
 
@@ -1128,6 +1364,69 @@ fn dense_layout(shape: &Shape) -> Layout {
     Layout::Dense {
         strides: Strides::contiguous(shape),
     }
+}
+
+/// Resolve a possibly-negative axis index against a rank. `-1`
+/// resolves to `rank - 1`, `-rank` to `0`. Errors if out of range.
+fn resolve_axis(rank: usize, axis: i64) -> Result<usize> {
+    let rank_i64 = i64::try_from(rank)
+        .map_err(|_| Error::InvalidArgument("axis: rank exceeds i64::MAX".into()))?;
+    let resolved = if axis < 0 { axis + rank_i64 } else { axis };
+    if !(0..rank_i64).contains(&resolved) {
+        return Err(Error::InvalidArgument(format!(
+            "axis {axis} is out of range for rank {rank}",
+        )));
+    }
+    Ok(usize::try_from(resolved).expect("resolved is in [0, rank)"))
+}
+
+/// Build a `1/n` scalar in the requested dtype, in host f64 then
+/// rounded down to the target dtype's precision.
+fn recip_scalar(n: usize, dtype: DType) -> Result<[u8; 4]> {
+    if n == 0 {
+        return Err(Error::InvalidArgument("recip: divisor is zero".into()));
+    }
+    // f64 → target-dtype host bytes. Output is always padded to 4
+    // bytes; the caller knows how many to write based on dtype.
+    #[allow(clippy::cast_precision_loss)]
+    let inv = 1.0_f64 / (n as f64);
+    let mut buf = [0u8; 4];
+    match dtype {
+        DType::F32 => {
+            #[allow(clippy::cast_possible_truncation)]
+            let v = inv as f32;
+            buf.copy_from_slice(&v.to_le_bytes());
+        }
+        DType::F16 => {
+            #[allow(clippy::cast_possible_truncation)]
+            let v = half::f16::from_f32(inv as f32);
+            buf[..2].copy_from_slice(&v.to_le_bytes());
+        }
+        DType::BF16 => {
+            #[allow(clippy::cast_possible_truncation)]
+            let v = half::bf16::from_f32(inv as f32);
+            buf[..2].copy_from_slice(&v.to_le_bytes());
+        }
+        DType::I32 | DType::U32 => {
+            return Err(Error::InvalidArgument(format!(
+                "recip: integer dtype {dtype:?} is not supported for mean()",
+            )));
+        }
+    }
+    Ok(buf)
+}
+
+/// Allocate a host-side scalar tensor of shape `[1]`, dtype `dtype`,
+/// containing the value packed in `host_bytes` (interpreted per-dtype:
+/// 4 bytes for f32, 2 bytes (the low half) for f16/bf16).
+fn host_scalar_tensor(device: &Device, dtype: DType, host_bytes: [u8; 4]) -> Result<Tensor> {
+    let shape = Shape::from([1usize]);
+    let byte_count = checked_byte_count(&shape, dtype)?;
+    let mut buffer = device.kernels().alloc_buffer::<u8>(byte_count)?;
+    // SAFETY: just allocated, no GPU dispatch has referenced it.
+    unsafe { buffer.as_mut_slice() }.copy_from_slice(&host_bytes[..byte_count]);
+    let layout = dense_layout(&shape);
+    Ok(Tensor::host_leaf(device, shape, dtype, layout, buffer))
 }
 
 /// NumPy-style right-aligned broadcast of two shapes.

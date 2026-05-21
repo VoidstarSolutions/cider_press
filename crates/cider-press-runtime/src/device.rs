@@ -38,6 +38,14 @@ struct DeviceInner {
     /// op dispatch (Add / Mul today; the rest of the family lands as
     /// the runtime asks for it).
     binary_library: OnceLock<kernels::KernelLibrary>,
+    /// JIT'd MLX `unary.metal` library. Populated on first unary op
+    /// dispatch (Square / Rsqrt today).
+    unary_library: OnceLock<kernels::KernelLibrary>,
+    /// JIT'd MLX `reduce.metal` library. Cold-start cost is sizeable
+    /// (the flattened source is the largest after quantized.metal),
+    /// so callers see a one-time pause on first reduce dispatch.
+    /// Subsequent calls return the cached library.
+    reduce_library: OnceLock<kernels::KernelLibrary>,
 }
 
 /// Refcounted handle to the system's default Metal device.
@@ -62,6 +70,8 @@ impl Device {
                 copy_library: OnceLock::new(),
                 quantized_library: OnceLock::new(),
                 binary_library: OnceLock::new(),
+                unary_library: OnceLock::new(),
+                reduce_library: OnceLock::new(),
             }),
         })
     }
@@ -86,6 +96,8 @@ impl Device {
             copy_library: OnceLock::new(),
             quantized_library: OnceLock::new(),
             binary_library: OnceLock::new(),
+            unary_library: OnceLock::new(),
+            reduce_library: OnceLock::new(),
         });
         let stored = SHARED.get_or_init(|| fresh);
         Ok(Self {
@@ -146,6 +158,27 @@ impl Device {
         }
         let lib = kernels::KernelLibrary::binary(&self.inner.kernels)?;
         Ok(self.inner.binary_library.get_or_init(|| lib))
+    }
+
+    /// Lazily JIT-compile and cache MLX's `unary.metal` library.
+    pub(crate) fn unary_library(&self) -> Result<&kernels::KernelLibrary> {
+        if let Some(lib) = self.inner.unary_library.get() {
+            return Ok(lib);
+        }
+        let lib = kernels::KernelLibrary::unary(&self.inner.kernels)?;
+        Ok(self.inner.unary_library.get_or_init(|| lib))
+    }
+
+    /// Lazily JIT-compile and cache MLX's `reduce.metal` library.
+    /// First-call cost is sizeable (~several seconds cold on the dev
+    /// machine, sub-100 ms warm thanks to Metal's cross-process JIT
+    /// cache).
+    pub(crate) fn reduce_library(&self) -> Result<&kernels::KernelLibrary> {
+        if let Some(lib) = self.inner.reduce_library.get() {
+            return Ok(lib);
+        }
+        let lib = kernels::KernelLibrary::reduce(&self.inner.kernels)?;
+        Ok(self.inner.reduce_library.get_or_init(|| lib))
     }
 }
 

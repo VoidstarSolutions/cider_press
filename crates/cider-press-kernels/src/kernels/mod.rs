@@ -12,3 +12,5 @@
 pub mod binary;
 pub mod copy;
 pub mod qmv;
+pub mod reduce;
+pub mod unary;

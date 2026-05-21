@@ -92,6 +92,100 @@ def run_add(args: argparse.Namespace) -> dict[str, mx.array]:
 
 
 # ---------------------------------------------------------------------------
+# square / rsqrt: element-wise unary ops (consumed by branch 5
+# `feat/rmsnorm`). Writes `lhs`, `out`. Use uniform-in-[0.1, 1.1]
+# inputs for rsqrt to avoid the rsqrt(0) trap; square accepts any
+# real input.
+# ---------------------------------------------------------------------------
+
+
+def add_square_parser(subparsers: argparse._SubParsersAction) -> None:
+    p = subparsers.add_parser("square", help="Element-wise x*x")
+    p.add_argument("--lhs-shape", required=True, help="comma-separated, e.g. 1,8,896")
+    p.add_argument("--dtype", default="bf16", help="one of f32, f16, bf16")
+
+
+def run_square(args: argparse.Namespace) -> dict[str, mx.array]:
+    shape = _parse_shape(args.lhs_shape)
+    dtype = _float_dtype(args.dtype)
+    lhs = (mx.random.uniform(shape=shape) - 0.5).astype(dtype)
+    out = mx.square(lhs)
+    mx.eval(lhs, out)
+    return {"lhs": lhs, "out": out}
+
+
+def add_rsqrt_parser(subparsers: argparse._SubParsersAction) -> None:
+    p = subparsers.add_parser("rsqrt", help="Element-wise 1/sqrt(x); inputs are uniform in [0.1, 1.1]")
+    p.add_argument("--lhs-shape", required=True, help="comma-separated, e.g. 1,8,896")
+    p.add_argument("--dtype", default="bf16", help="one of f32, f16, bf16")
+
+
+def run_rsqrt(args: argparse.Namespace) -> dict[str, mx.array]:
+    shape = _parse_shape(args.lhs_shape)
+    dtype = _float_dtype(args.dtype)
+    # Shift the uniform distribution into [0.1, 1.1] so we never feed
+    # rsqrt() a zero/near-zero. The runtime test does not need to
+    # validate rsqrt's behaviour on degenerate inputs — that's a
+    # property of the hardware op, not our dispatch.
+    lhs = (mx.random.uniform(shape=shape) + 0.1).astype(dtype)
+    out = mx.rsqrt(lhs)
+    mx.eval(lhs, out)
+    return {"lhs": lhs, "out": out}
+
+
+# ---------------------------------------------------------------------------
+# row_sum: sum-reduce along the last axis (consumed by branch 5
+# `feat/rmsnorm`). Writes `lhs`, `out`. Output shape drops the last
+# axis (i.e. caller picks keep_dim semantics at the runtime layer).
+# ---------------------------------------------------------------------------
+
+
+def add_row_sum_parser(subparsers: argparse._SubParsersAction) -> None:
+    p = subparsers.add_parser("row_sum", help="Sum-reduce along the last axis")
+    p.add_argument("--lhs-shape", required=True, help="comma-separated, e.g. 1,8,896")
+    p.add_argument("--dtype", default="bf16", help="one of f32, f16, bf16")
+
+
+def run_row_sum(args: argparse.Namespace) -> dict[str, mx.array]:
+    shape = _parse_shape(args.lhs_shape)
+    dtype = _float_dtype(args.dtype)
+    lhs = (mx.random.uniform(shape=shape) - 0.5).astype(dtype)
+    out = mx.sum(lhs, axis=-1, keepdims=False)
+    mx.eval(lhs, out)
+    return {"lhs": lhs, "out": out}
+
+
+# ---------------------------------------------------------------------------
+# rms_norm: composed RMSNorm against MLX's reference (consumed by
+# branch 5 `feat/rmsnorm`). Writes `x`, `gamma`, `out`. eps is bound
+# at the CLI; the runtime test side uses the same value.
+# ---------------------------------------------------------------------------
+
+
+def add_rms_norm_parser(subparsers: argparse._SubParsersAction) -> None:
+    p = subparsers.add_parser(
+        "rms_norm",
+        help="MLX mx.fast.rms_norm(x, gamma, eps) — last-axis RMSNorm",
+    )
+    p.add_argument("--x-shape", required=True, help="comma-separated, e.g. 1,8,896")
+    p.add_argument("--eps", type=float, default=1e-6)
+    p.add_argument("--dtype", default="bf16", help="one of f32, f16, bf16")
+
+
+def run_rms_norm(args: argparse.Namespace) -> dict[str, mx.array]:
+    shape = _parse_shape(args.x_shape)
+    if not shape:
+        raise SystemExit("rms_norm: --x-shape must be non-empty")
+    dtype = _float_dtype(args.dtype)
+    hidden = shape[-1]
+    x = (mx.random.uniform(shape=shape) - 0.5).astype(dtype)
+    gamma = (mx.random.uniform(shape=(hidden,)) + 0.5).astype(dtype)
+    out = mx.fast.rms_norm(x, gamma, args.eps)
+    mx.eval(x, gamma, out)
+    return {"x": x, "gamma": gamma, "out": out}
+
+
+# ---------------------------------------------------------------------------
 # mul: element-wise multiply with broadcasting. Writes `lhs`, `rhs`, `out`.
 # Shares the add-style argparser and seeding convention.
 # ---------------------------------------------------------------------------
@@ -127,6 +221,10 @@ ParserBuilder = Callable[[argparse._SubParsersAction], None]
 OPS: dict[str, tuple[ParserBuilder, Runner]] = {
     "add": (add_add_parser, run_add),
     "mul": (add_mul_parser, run_mul),
+    "square": (add_square_parser, run_square),
+    "rsqrt": (add_rsqrt_parser, run_rsqrt),
+    "row_sum": (add_row_sum_parser, run_row_sum),
+    "rms_norm": (add_rms_norm_parser, run_rms_norm),
 }
 
 

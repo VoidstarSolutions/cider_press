@@ -28,6 +28,22 @@ FILES=(
     mlx/backend/metal/kernels/binary.metal
     mlx/backend/metal/kernels/binary.h
     mlx/backend/metal/kernels/binary_ops.h
+    mlx/backend/metal/kernels/unary.metal
+    mlx/backend/metal/kernels/unary.h
+    mlx/backend/metal/kernels/unary_ops.h
+    mlx/backend/metal/kernels/reduce.metal
+    mlx/backend/metal/kernels/reduce.h
+    mlx/backend/metal/kernels/reduce_utils.h
+    mlx/backend/metal/kernels/reduction/ops.h
+    mlx/backend/metal/kernels/reduction/reduce_all.h
+    mlx/backend/metal/kernels/reduction/reduce_col.h
+    mlx/backend/metal/kernels/reduction/reduce_init.h
+    mlx/backend/metal/kernels/reduction/reduce_row.h
+    mlx/backend/metal/kernels/atomic.h
+    mlx/backend/metal/kernels/cexpf.h
+    mlx/backend/metal/kernels/erf.h
+    mlx/backend/metal/kernels/expm1f.h
+    mlx/backend/metal/kernels/fp8.h
     mlx/backend/metal/kernels/quantized.metal
     mlx/backend/metal/kernels/quantized.h
     mlx/backend/metal/kernels/quantized_utils.h

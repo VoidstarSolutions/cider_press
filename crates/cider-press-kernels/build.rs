@@ -23,6 +23,8 @@ use std::path::{Path, PathBuf};
 const ENTRY_POINTS: &[(&str, &str)] = &[
     ("mlx/backend/metal/kernels/copy.metal", "copy"),
     ("mlx/backend/metal/kernels/binary.metal", "binary"),
+    ("mlx/backend/metal/kernels/unary.metal", "unary"),
+    ("mlx/backend/metal/kernels/reduce.metal", "reduce"),
     ("mlx/backend/metal/kernels/quantized.metal", "quantized"),
 ];
 
