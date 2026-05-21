@@ -65,6 +65,26 @@ impl QuantizedWeight {
                 shape,
             )));
         }
+        // K alignment is stricter than N*K alignment: components() exposes
+        // per-row packed weights (`[N, K*bits/32]`) and per-row groups
+        // (`[N, K/group_size]`), both of which need K itself to be aligned.
+        // packed_word_count / group_count only check the total below.
+        let k = shape.dims()[1];
+        let group_size = quantization.group_size() as usize;
+        if k % group_size != 0 {
+            return Err(Error::InvalidArgument(format!(
+                "QuantizedWeight: inner dim K={k} must be a multiple of \
+                 group_size={group_size} (per-row groups must divide evenly)",
+            )));
+        }
+        let bits = quantization.bits() as usize;
+        if (k * bits) % 32 != 0 {
+            return Err(Error::InvalidArgument(format!(
+                "QuantizedWeight: K*bits={} must be a multiple of 32 \
+                 (per-row packed u32 words must divide evenly)",
+                k * bits,
+            )));
+        }
         let elem_count = shape.elem_count();
         let expected_w_words = quantization.packed_word_count(elem_count)?;
         let expected_w_bytes = expected_w_words * core::mem::size_of::<u32>();
