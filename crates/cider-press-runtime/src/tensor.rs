@@ -1108,20 +1108,12 @@ impl Tensor {
     /// layout as `self`. The Qwen2 inference specialization
     /// (`forward=true, traditional=false, hs_transpose=false`,
     /// `with_freqs=false`) is the only one wired.
-    pub fn rope(
-        &self,
-        offset: &Self,
-        base: f32,
-        scale: f32,
-        rotary_dims: usize,
-    ) -> Result<Self> {
+    pub fn rope(&self, offset: &Self, base: f32, scale: f32, rotary_dims: usize) -> Result<Self> {
         let device = self.inner.device.as_ref().ok_or_else(|| {
             Error::InvalidArgument("rope: cannot apply an op to a placeholder (no device)".into())
         })?;
         let off_device = offset.inner.device.as_ref().ok_or_else(|| {
-            Error::InvalidArgument(
-                "rope: cannot use a placeholder as the offset input".into(),
-            )
+            Error::InvalidArgument("rope: cannot use a placeholder as the offset input".into())
         })?;
         if !device.ptr_eq(off_device) {
             return Err(Error::InvalidArgument(
@@ -1197,9 +1189,8 @@ impl Tensor {
 
         let out_shape = self.shape().clone();
         let layout = dense_layout(&out_shape);
-        let rotary_dims_u32 = u32::try_from(rotary_dims).map_err(|_| {
-            Error::InvalidArgument("rope: rotary_dims overflows u32".into())
-        })?;
+        let rotary_dims_u32 = u32::try_from(rotary_dims)
+            .map_err(|_| Error::InvalidArgument("rope: rotary_dims overflows u32".into()))?;
         Ok(Self::op_tensor(
             device,
             out_shape,

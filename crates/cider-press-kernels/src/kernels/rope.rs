@@ -125,9 +125,7 @@ pub fn dispatch_rope_bf16(
         .checked_mul(args.n_head as usize)
         .and_then(|x| x.checked_mul(args.seq_len as usize))
         .and_then(|x| x.checked_mul(args.head_dim as usize))
-        .ok_or_else(|| {
-            Error::InvalidArgument("rope: element count overflows usize".into())
-        })?;
+        .ok_or_else(|| Error::InvalidArgument("rope: element count overflows usize".into()))?;
     if src.len() < elem_count || dst.len() < elem_count {
         return Err(Error::InvalidArgument(format!(
             "rope: src/dst too small (need {elem_count}, got src={}, dst={})",
@@ -136,7 +134,9 @@ pub fn dispatch_rope_bf16(
         )));
     }
     if offset.is_empty() {
-        return Err(Error::InvalidArgument("rope: offset buffer is empty".into()));
+        return Err(Error::InvalidArgument(
+            "rope: offset buffer is empty".into(),
+        ));
     }
 
     let pipeline = library.pipeline_specialized(
@@ -198,8 +198,7 @@ pub fn dispatch_rope_bf16(
 
     let gx = (args.rotary_dims / 2) as usize;
     let gy = args.seq_len as usize;
-    let gz = (args.batch as usize)
-        * (args.n_head as usize).div_ceil(N_PER_THREAD as usize);
+    let gz = (args.batch as usize) * (args.n_head as usize).div_ceil(N_PER_THREAD as usize);
 
     let grid = MTLSize {
         width: gx,
@@ -244,4 +243,3 @@ fn get_block_dims(dim0: usize, dim1: usize, dim2: usize) -> MTLSize {
         }
     }
 }
-

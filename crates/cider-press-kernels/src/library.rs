@@ -85,11 +85,7 @@ impl FunctionConstant {
                 // the immediate call.
                 let ptr: NonNull<c_void> = NonNull::from(&value).cast();
                 unsafe {
-                    values.setConstantValue_type_atIndex(
-                        ptr,
-                        MTLDataType::Bool,
-                        index as usize,
-                    );
+                    values.setConstantValue_type_atIndex(ptr, MTLDataType::Bool, index as usize);
                 }
             }
         }
