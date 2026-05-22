@@ -475,6 +475,35 @@ def run_rope(args: argparse.Namespace) -> dict[str, mx.array]:
 # ---------------------------------------------------------------------------
 
 
+def add_matmul_parser(subparsers: argparse._SubParsersAction) -> None:
+    p = subparsers.add_parser(
+        "matmul",
+        help="batched dense matmul via mx.matmul",
+    )
+    p.add_argument(
+        "--lhs-shape",
+        required=True,
+        help="comma-separated, e.g. 2,14,4,64 ([..., M, K])",
+    )
+    p.add_argument(
+        "--rhs-shape",
+        required=True,
+        help="comma-separated, e.g. 2,14,64,128 ([..., K, N])",
+    )
+    p.add_argument("--dtype", default="bf16", help="one of f32, f16, bf16")
+
+
+def run_matmul(args: argparse.Namespace) -> dict[str, mx.array]:
+    lhs_shape = _parse_shape(args.lhs_shape)
+    rhs_shape = _parse_shape(args.rhs_shape)
+    dtype = _float_dtype(args.dtype)
+    lhs = (mx.random.uniform(shape=lhs_shape) * 2.0 - 1.0).astype(dtype)
+    rhs = (mx.random.uniform(shape=rhs_shape) * 2.0 - 1.0).astype(dtype)
+    out = mx.matmul(lhs, rhs)
+    mx.eval(lhs, rhs, out)
+    return {"lhs": lhs, "rhs": rhs, "out": out}
+
+
 def add_softmax_parser(subparsers: argparse._SubParsersAction) -> None:
     p = subparsers.add_parser(
         "softmax",
@@ -525,6 +554,7 @@ OPS: dict[str, tuple[ParserBuilder, Runner]] = {
     "embed_tokens": (add_embed_tokens_parser, run_embed_tokens),
     "rope": (add_rope_parser, run_rope),
     "softmax": (add_softmax_parser, run_softmax),
+    "matmul": (add_matmul_parser, run_matmul),
 }
 
 
