@@ -1285,6 +1285,14 @@ impl Tensor {
                 ));
             }
         };
+        if self.inner.view.is_some() {
+            return Err(Error::InvalidArgument(
+                "softmax: view inputs are not supported; copy() first to materialise \
+                 a dense version (eval-side dispatch reads inputs as dense leaves \
+                 and does not resolve view chains)"
+                    .into(),
+            ));
+        }
         if !strides.is_contiguous(self.shape()) {
             return Err(Error::InvalidArgument(format!(
                 "softmax: input must be contiguous (got shape {:?} strides {:?}); \
