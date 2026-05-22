@@ -263,6 +263,19 @@ pub enum OpKind {
         /// choice for bf16 attention scores in inference).
         precise: bool,
     },
+    /// Batched dense matrix multiply. Inputs (in [`Tensor::op_inputs`]
+    /// order) are `[a, b]` — both dense, contiguous, [`DType::BF16`]
+    /// tensors with matching leading dims and aligned matmul
+    /// dimensions: `a.shape() = [..., M, K]`,
+    /// `b.shape() = [..., K, N]`. Output is dense bf16 with shape
+    /// `[..., M, N]`.
+    ///
+    /// Dispatches to cider-press's own naive `gemm_bfloat16` kernel
+    /// (not MLX-derived); steel-tiled GEMM is deferred to branch 15
+    /// per `docs/QWEN_PATH.md`. Non-contiguous inputs (transposed
+    /// views) materialize via [`Tensor::copy`] first — same
+    /// contract as `softmax` / `rope` / reductions.
+    MatMul,
 }
 
 /// Element-wise binary operations supported by [`OpKind::Binary`].
@@ -1330,6 +1343,97 @@ impl Tensor {
         ))
     }
 
+    /// Schedule a batched dense matrix multiply.
+    ///
+    /// `self.shape() = [..., M, K]`, `other.shape() = [..., K, N]`;
+    /// the leading dims must match exactly (no broadcasting at the
+    /// runtime layer — callers broadcast via [`Tensor::broadcast_to`]
+    /// + [`Tensor::copy`] first, as GQA does). Output is `[..., M, N]` dense bf16.
+    ///
+    /// Preconditions (mirroring the kernels-crate scope):
+    ///
+    /// - Both inputs dense, contiguous, [`DType::BF16`], on the same
+    ///   device, rank ≥ 2.
+    /// - `self.shape()[-1] == other.shape()[-2]`.
+    /// - Every dim except the last two is identical between `self`
+    ///   and `other`.
+    ///
+    /// Transposed views (e.g. `K^T` in `Q @ K^T`) must be
+    /// materialized via [`Tensor::copy`] before calling — the kernel
+    /// does not currently take strides. Branch 15 will revisit this
+    /// when migrating to MLX's tiled `steel_gemm` family.
+    pub fn matmul(&self, other: &Tensor) -> Result<Self> {
+        let device = self.inner.device.as_ref().ok_or_else(|| {
+            Error::InvalidArgument("matmul: cannot apply an op to a placeholder (no device)".into())
+        })?;
+        let other_device = other.inner.device.as_ref().ok_or_else(|| {
+            Error::InvalidArgument("matmul: cannot apply an op to a placeholder (no device)".into())
+        })?;
+        if !device.ptr_eq(other_device) {
+            return Err(Error::InvalidArgument(
+                "matmul: both inputs must be on the same device".into(),
+            ));
+        }
+        let lhs_dtype = self.inner.dtype;
+        let rhs_dtype = other.inner.dtype;
+        if lhs_dtype != DType::BF16 || rhs_dtype != DType::BF16 {
+            return Err(Error::InvalidArgument(format!(
+                "matmul: only BF16 is wired (got {lhs_dtype:?} × {rhs_dtype:?})",
+            )));
+        }
+        let lhs_strides = match self.layout() {
+            Layout::Dense { strides } => strides,
+            Layout::Quantized(_) => {
+                return Err(Error::InvalidArgument(
+                    "matmul: quantized inputs are not supported (use Tensor::dequantize_affine \
+                     or the quantized-matmul path landing in branch 11b)"
+                        .into(),
+                ));
+            }
+        };
+        let rhs_strides = match other.layout() {
+            Layout::Dense { strides } => strides,
+            Layout::Quantized(_) => {
+                return Err(Error::InvalidArgument(
+                    "matmul: quantized inputs are not supported".into(),
+                ));
+            }
+        };
+        if !lhs_strides.is_contiguous(self.shape()) {
+            return Err(Error::InvalidArgument(format!(
+                "matmul: LHS must be contiguous (got shape {:?} strides {:?}); \
+                 copy() first to materialise",
+                self.shape().dims(),
+                lhs_strides.as_slice(),
+            )));
+        }
+        if !rhs_strides.is_contiguous(other.shape()) {
+            return Err(Error::InvalidArgument(format!(
+                "matmul: RHS must be contiguous (got shape {:?} strides {:?}); \
+                 copy() first to materialise",
+                other.shape().dims(),
+                rhs_strides.as_slice(),
+            )));
+        }
+
+        let (m, n, _k_lhs, lead) = matmul_shapes(self.shape().dims(), other.shape().dims())?;
+        let lhs_dims = self.shape().dims();
+
+        let mut out_dims: Vec<usize> = lhs_dims[..lead].to_vec();
+        out_dims.push(m);
+        out_dims.push(n);
+        let out_shape = Shape::from(out_dims);
+        let layout = dense_layout(&out_shape);
+        Ok(Self::op_tensor(
+            device,
+            out_shape,
+            DType::BF16,
+            layout,
+            OpKind::MatMul,
+            vec![self.clone(), other.clone()],
+        ))
+    }
+
     /// Build a contiguous view of this tensor with a new shape.
     ///
     /// Zero-copy: the result shares the source's backing leaf. The
@@ -1962,6 +2066,48 @@ fn host_scalar_tensor(device: &Device, dtype: DType, host_bytes: [u8; 4]) -> Res
 /// when one of them is 1. Inputs of different rank are aligned on the
 /// right; the shorter shape is implicitly padded with size-1 leading
 /// axes.
+/// Validate a matmul's shape contract and return `(M, N, K, lead)`
+/// where `lead = lhs_dims.len() - 2` is the count of leading
+/// (batch) dims. Pulled out of [`Tensor::matmul`] to keep that
+/// constructor under the `too_many_lines` lint and so future
+/// matmul-shaped ops (qmm in branch 11b) can reuse the same
+/// validation.
+fn matmul_shapes(lhs_dims: &[usize], rhs_dims: &[usize]) -> Result<(usize, usize, usize, usize)> {
+    if lhs_dims.len() < 2 || rhs_dims.len() < 2 {
+        return Err(Error::InvalidArgument(format!(
+            "matmul: both inputs must have rank ≥ 2 (got {lhs_dims:?} × {rhs_dims:?})",
+        )));
+    }
+    if lhs_dims.len() != rhs_dims.len() {
+        return Err(Error::InvalidArgument(format!(
+            "matmul: leading-rank mismatch (got {lhs_dims:?} × {rhs_dims:?}); \
+             broadcast + copy before matmul if you need GQA-style fan-out",
+        )));
+    }
+    let lead = lhs_dims.len() - 2;
+    if lhs_dims[..lead] != rhs_dims[..lead] {
+        return Err(Error::InvalidArgument(format!(
+            "matmul: leading dims must match (got {lhs_dims:?} × {rhs_dims:?})",
+        )));
+    }
+    let m = lhs_dims[lead];
+    let k_lhs = lhs_dims[lead + 1];
+    let k_rhs = rhs_dims[lead];
+    let n = rhs_dims[lead + 1];
+    if k_lhs != k_rhs {
+        return Err(Error::InvalidArgument(format!(
+            "matmul: inner dimension mismatch (LHS K={k_lhs} vs RHS K={k_rhs}); \
+             shapes {lhs_dims:?} × {rhs_dims:?}",
+        )));
+    }
+    if m == 0 || n == 0 || k_lhs == 0 {
+        return Err(Error::InvalidArgument(format!(
+            "matmul: zero-sized matmul dimensions (M={m}, N={n}, K={k_lhs})",
+        )));
+    }
+    Ok((m, n, k_lhs, lead))
+}
+
 fn broadcast_shape(a: &Shape, b: &Shape) -> Result<Shape> {
     let a_dims = a.dims();
     let b_dims = b.dims();
