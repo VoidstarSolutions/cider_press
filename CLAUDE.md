@@ -256,15 +256,40 @@ we'd need — both now landed (Views in branch 2; `KvCache` in branch 8).
   applies to projection *outputs* and qmv-as-`Tensor`-op lands in
   branch 11b; the full layer-0 Q-projection → rope → cache → SDPA
   integration test is a branch-11 task.
+- **Branch 10 (`feat/softmax`).** Numerically-stable last-axis
+  softmax for attention scores. MLX ships `softmax.metal`
+  precompiled (24 LOC entry-points + `softmax.h` 191 LOC) —
+  another `OnceLock<KernelLibrary>` slot. **Correction to a
+  branch-9 note: softmax does NOT use `[[function_constant]]`
+  specialization** — variants are selected by kernel name
+  (`block_softmax_<dtype>` vs `looped_softmax_<dtype>`, with
+  `_precise_` mirrors that swap the half-precision accumulator
+  for `float`). So `FunctionConstant` stays `Bool`-only; SDPA
+  is the next candidate to need extension. Two entry points
+  wired: `block_softmax_bfloat16` (bf16 accumulator,
+  `precise=False`) and `block_softmax_precise_bfloat16` (float
+  accumulator, `precise=True`). Looped + f32/f16 dtypes stay
+  dormant. Threadgroup math ports MLX's `Softmax::eval_gpu`
+  arithmetic verbatim (`SIMD_SIZE=32`, `N_READS=4`,
+  `BLOCK_AXIS_LIMIT=4096`). `Tensor::softmax(&self, precise:
+  bool)` is last-axis-only; the constructor hard-errors on
+  axis sizes above `BLOCK_AXIS_LIMIT` rather than silently
+  producing wrong output. Tolerance bars (not bit-exact) match
+  the unary sigmoid story — `simd_max` / `simd_sum` reductions
+  depend on lane-order summation and `metal::fast::exp` carries
+  a relative-precision bound. The precise variant is ~2× tighter
+  than the default because its float accumulator absorbs the
+  lane-summation drift before the final bf16 cast.
 
-**Next concrete step: branch 10 of the roadmap — `feat/softmax`.**
-Stable softmax for attention scores. Check upstream: MLX has
-`softmax.metal` (precompiled, `OnceLock` pattern). Same scope shape
-as rope — kernels / runtime / models parity, Qwen2 attention-score
-shape `[B, H_q, T, T]` at bf16. Three function-constant slots on
-the kernel (`AXIS_SIZE_KNOWN_BOUND`, `block_size_KNOWN_BOUND`,
-`PRECISE`) suggest minor `FunctionConstant` extension (`U32` /
-`Bool` mix) — already foreseen in branch 9's enum doc.
+**Next concrete step: branch 11 of the roadmap — `feat/sdpa-split`.**
+Scaled dot-product attention as three composed ops: `qk_matmul`,
+`softmax(scale + mask)`, `attn_matmul`. The first time a branch
+spans more than one new primitive — `qk_matmul` is a dense
+matmul (not the qmv from the Stage-4 spike; that's branch 11b),
+and `attn_matmul` is dense × dense. Branch 10's softmax slots in
+between, with the scale + mask applied via the existing binary
+broadcast path. The "real-checkpoint" integration test for rope +
+KV-cache + SDPA on layer-0 Q/K/V/O of Qwen2.5-0.5B lands here.
 
 Quantized-embedding decision resolved in branch 7: neither
 quantized-row gather nor `gather → dequantize_row`. Instead,

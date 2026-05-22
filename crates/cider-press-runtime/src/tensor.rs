@@ -249,6 +249,20 @@ pub enum OpKind {
         /// Equals `head_dim` for full-rotation models like Qwen2.
         rotary_dims: u32,
     },
+    /// Numerically-stable softmax along the trailing axis. Inputs (in
+    /// [`Tensor::op_inputs`] order) are `[input]` — a dense,
+    /// contiguous, BF16 tensor with rank ≥ 1 whose trailing axis size
+    /// is ≤ `kernels::softmax::BLOCK_AXIS_LIMIT` (4096). Output has
+    /// the same shape and dtype. Non-last-axis and `looped_softmax_*`
+    /// (axis > 4096) land alongside their first consumer.
+    Softmax {
+        /// `false` ⇒ `block_softmax_bfloat16` (bf16 accumulator;
+        /// matches `mx.softmax(x, precise=False)`). `true` ⇒
+        /// `block_softmax_precise_bfloat16` (float accumulator;
+        /// matches `mx.softmax(x, precise=True)`, the standard
+        /// choice for bf16 attention scores in inference).
+        precise: bool,
+    },
 }
 
 /// Element-wise binary operations supported by [`OpKind::Binary`].
@@ -1228,6 +1242,91 @@ impl Tensor {
                 rotary_dims: rotary_dims_u32,
             },
             vec![self.clone(), offset.clone()],
+        ))
+    }
+
+    /// Schedule a numerically-stable softmax along the trailing axis.
+    ///
+    /// Preconditions (mirroring the kernels-crate scope; broader
+    /// instantiations land alongside their first consumer):
+    ///
+    /// - `self` is dense, contiguous, [`DType::BF16`], rank ≥ 1.
+    /// - The trailing axis size is ≤
+    ///   [`cider_press_kernels::kernels::softmax::BLOCK_AXIS_LIMIT`]
+    ///   (4096). Above this MLX swaps to a looped variant which isn't
+    ///   wired yet; the op constructor rejects oversized inputs.
+    /// - Non-last-axis softmax is not supported — permute the target
+    ///   axis to the end first.
+    ///
+    /// `precise = false` matches `mx.softmax(x, precise=False)` (bf16
+    /// accumulator). `precise = true` matches `mx.softmax(x,
+    /// precise=True)` (float accumulator on the running `sum(exp)`)
+    /// — the standard choice for bf16 attention scores in inference.
+    ///
+    /// Output has the same shape, dtype, and (dense, contiguous)
+    /// layout as `self`.
+    pub fn softmax(&self, precise: bool) -> Result<Self> {
+        let device = self.inner.device.as_ref().ok_or_else(|| {
+            Error::InvalidArgument(
+                "softmax: cannot apply an op to a placeholder (no device)".into(),
+            )
+        })?;
+        if self.inner.dtype != DType::BF16 {
+            return Err(Error::InvalidArgument(format!(
+                "softmax: only BF16 is wired (got {:?})",
+                self.inner.dtype,
+            )));
+        }
+        let strides = match self.layout() {
+            Layout::Dense { strides } => strides,
+            Layout::Quantized(_) => {
+                return Err(Error::InvalidArgument(
+                    "softmax: quantized input is not supported".into(),
+                ));
+            }
+        };
+        if self.inner.view.is_some() {
+            return Err(Error::InvalidArgument(
+                "softmax: view inputs are not supported; copy() first to materialise \
+                 a dense version (eval-side dispatch reads inputs as dense leaves \
+                 and does not resolve view chains)"
+                    .into(),
+            ));
+        }
+        if !strides.is_contiguous(self.shape()) {
+            return Err(Error::InvalidArgument(format!(
+                "softmax: input must be contiguous (got shape {:?} strides {:?}); \
+                 copy() first to materialise a dense version",
+                self.shape().dims(),
+                strides.as_slice(),
+            )));
+        }
+        let dims = self.shape().dims();
+        let axis_size = *dims
+            .last()
+            .ok_or_else(|| Error::InvalidArgument("softmax: input must have rank ≥ 1".into()))?;
+        if axis_size == 0 {
+            return Err(Error::InvalidArgument(
+                "softmax: trailing axis must be non-zero".into(),
+            ));
+        }
+        if axis_size > cider_press_kernels::kernels::softmax::BLOCK_AXIS_LIMIT {
+            return Err(Error::InvalidArgument(format!(
+                "softmax: trailing axis size {axis_size} exceeds wired BLOCK_AXIS_LIMIT={}; \
+                 looped variant is not wired yet",
+                cider_press_kernels::kernels::softmax::BLOCK_AXIS_LIMIT,
+            )));
+        }
+
+        let out_shape = self.shape().clone();
+        let layout = dense_layout(&out_shape);
+        Ok(Self::op_tensor(
+            device,
+            out_shape,
+            DType::BF16,
+            layout,
+            OpKind::Softmax { precise },
+            vec![self.clone()],
         ))
     }
 

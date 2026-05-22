@@ -52,6 +52,12 @@ struct DeviceInner {
     /// library and look up the per-specialization pipeline from the
     /// library's own pipeline-state cache.
     rope_library: OnceLock<kernels::KernelLibrary>,
+    /// JIT'd MLX `softmax.metal` library. Populated on first
+    /// [`crate::Tensor::softmax`] eval. Variant selection (default vs
+    /// `_precise_`, block vs looped) is by kernel name, so the
+    /// library's pipeline-state cache picks up each consumer's
+    /// specialization automatically.
+    softmax_library: OnceLock<kernels::KernelLibrary>,
     /// JIT-assembled gather libraries, one entry per
     /// [`kernels::kernels::gather::Instantiation`]. Keyed by the
     /// instantiation's kernel name (which uniquely identifies the
@@ -88,6 +94,7 @@ impl Device {
                 unary_library: OnceLock::new(),
                 reduce_library: OnceLock::new(),
                 rope_library: OnceLock::new(),
+                softmax_library: OnceLock::new(),
                 gather_libraries: Mutex::new(HashMap::new()),
             }),
         })
@@ -116,6 +123,7 @@ impl Device {
             unary_library: OnceLock::new(),
             reduce_library: OnceLock::new(),
             rope_library: OnceLock::new(),
+            softmax_library: OnceLock::new(),
             gather_libraries: Mutex::new(HashMap::new()),
         });
         let stored = SHARED.get_or_init(|| fresh);
@@ -210,6 +218,17 @@ impl Device {
         }
         let lib = kernels::KernelLibrary::rope(&self.inner.kernels)?;
         Ok(self.inner.rope_library.get_or_init(|| lib))
+    }
+
+    /// Lazily JIT-compile and cache MLX's `softmax.metal` library.
+    /// Hosts both block / looped × default / precise variants; the
+    /// per-variant pipelines live in the library's internal cache.
+    pub(crate) fn softmax_library(&self) -> Result<&kernels::KernelLibrary> {
+        if let Some(lib) = self.inner.softmax_library.get() {
+            return Ok(lib);
+        }
+        let lib = kernels::KernelLibrary::softmax(&self.inner.kernels)?;
+        Ok(self.inner.softmax_library.get_or_init(|| lib))
     }
 
     /// Lazily JIT-compile and cache a gather library for one

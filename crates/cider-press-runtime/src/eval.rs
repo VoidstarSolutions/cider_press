@@ -227,6 +227,9 @@ fn dispatch(
             scale,
             rotary_dims,
         ),
+        OpKind::Softmax { precise } => {
+            dispatch_softmax(inner, op, commands, outputs, dst, index_of, precise)
+        }
     }
 }
 
@@ -1221,6 +1224,60 @@ fn dispatch_rope(
         &off_typed,
         args,
     )?;
+    Ok(())
+}
+
+/// Dispatch a last-axis softmax. `Tensor::softmax` already enforces
+/// contiguity + BF16 + bounded axis size, so here we just compute
+/// `n_rows = elem_count / axis_size` and route to the kernels-layer
+/// dispatch fn (default vs precise selected by the `precise` flag).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_softmax(
+    inner: &Arc<TensorInner>,
+    op: &OpNode,
+    commands: &mut Commands<'_>,
+    outputs: &[Buffer<u8>],
+    dst: &mut Buffer<u8>,
+    index_of: &HashMap<*const TensorInner, usize>,
+    precise: bool,
+) -> Result<()> {
+    let device = inner
+        .device
+        .as_ref()
+        .expect("op nodes are always constructed with a device");
+
+    let input = op
+        .inputs
+        .first()
+        .ok_or_else(|| Error::InvalidArgument("Softmax: missing input (inputs[0])".into()))?;
+    let in_bytes = dense_input_buffer(input, outputs, index_of)?;
+    let in_typed = unsafe { in_bytes.reinterpret_as::<half::bf16>() };
+    let mut dst_typed = unsafe { dst.reinterpret_as::<half::bf16>() };
+
+    let dims = input.shape().dims();
+    let axis_size = *dims.last().expect("Tensor::softmax enforces rank ≥ 1");
+    let n_rows = input.shape().elem_count() / axis_size;
+
+    let library = device.softmax_library()?;
+    if precise {
+        cider_press_kernels::kernels::softmax::dispatch_block_softmax_precise_bf16(
+            commands,
+            library,
+            &in_typed,
+            &mut dst_typed,
+            axis_size,
+            n_rows,
+        )?;
+    } else {
+        cider_press_kernels::kernels::softmax::dispatch_block_softmax_bf16(
+            commands,
+            library,
+            &in_typed,
+            &mut dst_typed,
+            axis_size,
+            n_rows,
+        )?;
+    }
     Ok(())
 }
 

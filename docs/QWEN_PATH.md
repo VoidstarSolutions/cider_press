@@ -86,7 +86,7 @@ that introduced them, instead of three branches later in some composition.
 | 7 | (done) `feat/gather` | Embedding lookup end-to-end against Qwen2's quantized embed_tokens. First JIT-assembled kernel family — MLX has no precompiled `gather.metal`; source is generated per `(T, IdxT, NIDX, IDX_NDIM, LocT)` instantiation. Vendored `indexing/{indexing,gather}.h`; build.rs grows a `HEADER_BUNDLES` pass for header-only sources. Kernels: `gather::{Instantiation, make_source, dispatch}` (bf16+u32 instantiations) + `affine_dequantize_bf16_gs64_b4` (reuses existing `quantized.metal` library). Runtime: per-instantiation `Mutex<HashMap>` library cache on `Device`, `Tensor::gather` (BF16+U32 src), `OpKind::Dequantize` + `Tensor::dequantize_affine`, `QuantizedWeight::components()` exposing the packed triple as three dense Tensors sharing the underlying buffers. Models: `nn::embed_tokens` composes `gather × 3 → dequantize_affine`. The "decision" called out in the original entry resolved to "neither" — gather works on the components directly; dequantize is a single fused kernel over the gathered triple. | Bit-exact at every layer: gather is a pure data-mover, per-row dequantize is per-row identical between MLX and us. Real-checkpoint test exercises the full path on Qwen2.5-0.5B's loaded `embed_tokens` (6 token IDs across the vocab) vs CPU per-row dequantize from raw loaded bytes. |
 | 8 | (done) `feat/kv-cache` | `KvCache` type (separate from `Tensor`) — first runtime-side abstraction that isn't a lazy-graph op. Pre-allocated `[max_tokens, n_kv_heads, head_dim]` slabs per K/V; `update(k, v)` is eager — materializes the source tensors then `memcpy`s their bytes into the slab via the unified-memory host pointer (Apple Silicon's shared storage makes this a host-side write, no Metal dispatch). `keys_view()`/`values_view()` return zero-copy `Tensor`s over the populated prefix via `Tensor::host_leaf` + a refcount-bumped `Buffer<u8>` clone. Aliasing contract documented: callers drop view tensors before the next `update`. Same-eval batching (folding the cache write into the SDPA command buffer) deferred to branch 11 if perf demands. | Roundtrip across multi-chunk `update`s reads back bit-exactly via `cpu_to_vec`; `reset()` rewinds; overflow / dtype / shape / device validation each rejected. No MLX parity needed (KvCache is a pure data-mover). |
 | 9 | (done) `feat/rope` | MLX ships `rope.metal` precompiled — fused path, `OnceLock<KernelLibrary>` slot. First op needing Metal `[[function_constant]]` specialization, so kernels crate also gains `FunctionConstant::Bool { index, value }` + `KernelLibrary::pipeline_specialized(name, &[FunctionConstant])` with index-sorted cache key. One dispatch wired (`rope_bfloat16` with `forward=true, traditional=false, hs_transpose=false`, `with_freqs=false`, int32 indexing); seven other instantiations dormant. Runtime: `OpKind::Rope { base_log2, scale, rotary_dims }` with `(input, offset)` graph edges (offset is a length-1 I32 tensor, mirroring MLX's `set_input_array(offset, 2)`); `Tensor::rope(&self, offset, base, scale, rotary_dims)`. Drops `Eq` derive on `OpKind` (f32 params); `PartialEq` still gives test ergonomics. Models: `qwen2::attention::rope(x, offset, &Qwen2Config)` config-binding wrapper in a new `qwen2::attention` submodule that future attention bits accumulate into. | Bit-exact vs `mx.fast.rope` at every layer for `[1, 14, 4, 64]` (Q) and `[1, 2, 4, 64]` (K), `offset=0` and `offset=37`. No real-checkpoint case — rope applies to projection outputs; the full layer-0 Q-projection → rope → cache → SDPA flow is a branch-11 integration test. |
-| 10 | `feat/softmax` | `OpKind::Softmax` (reduction along last axis, reuses branch-5's reduction primitive); needed by SDPA and the router (later MoE) | MLX parity |
+| 10 | (done) `feat/softmax` | MLX ships `softmax.metal` precompiled — fused path, `OnceLock<KernelLibrary>` slot. Surprise vs the branch-9 note: softmax does NOT use `[[function_constant]]` specialization (variants are by kernel name — `block_softmax_<dtype>` ≤ 4096-axis, `looped_softmax_<dtype>` > 4096-axis, `_precise_` mirrors using `float` accumulator). So `FunctionConstant` stays `Bool`-only. Two entry points wired: `block_softmax_bfloat16` (`precise=False`) and `block_softmax_precise_bfloat16` (`precise=True`, the inference choice). Looped + f32/f16 dtypes dormant; non-last-axis hard-errors. Threadgroup math ports MLX's `Softmax::eval_gpu` verbatim (`SIMD_SIZE=32`, `N_READS=4`, `BLOCK_AXIS_LIMIT=4096`). `Tensor::softmax(&self, precise: bool)`; `OpKind::Softmax { precise }`. | Tolerance bars (not bit-exact) at Qwen2 attention-score shape `[1, 14, T, T]` for T=4/32/256, both `precise=True` (~0.005 abs / 0.01 rel) and `precise=False` (~0.01 abs / 0.04 rel). Float accumulator buys ~2× tighter agreement by absorbing lane-summation drift before the final bf16 cast. |
 | 11 | `feat/sdpa-split` | SDPA as **three ops**: `qk_matmul`, `softmax(scale + mask)`, `attn_matmul`. Composes the previous primitives. Defer fused SDPA. | MLX parity on a single attention block driven from real layer 0 weights |
 | 11b | `feat/quantized-matmul` | `qmv` (decode, batch=1) + `qmm` (prefill) wired through the runtime as `Tensor::quantized_matmul` (the Stage-4 spike already validated `qmv` bit-exactly at the kernels layer). Needed before the tied LM head in branch 12c — the LM head reads the same quantized weight as `embed_tokens` but in the transpose direction, so dequantizing the full vocab table per step is the wrong move. | MLX parity on Qwen2's Q/K/V/O projection shapes + lm_head shape at bf16 tolerance |
 | 12a | `feat/models-linear-rmsnorm` | `cider-press-models` scaffold; `Linear` and `RmsNormLayer` (thin wrappers around qmv / composed rmsnorm). Module trait/pattern lands here. | Unit tests against MLX equivalents |
@@ -119,30 +119,41 @@ for "it's fast and clean" but can wait until branch 15+:
 
 ## What to do next time we sit down
 
-Branch 10 (`feat/softmax`). Specifically:
+Branch 11 (`feat/sdpa-split`). Specifically:
 
-1. Vendor MLX's `softmax.metal` (precompiled entry point — same camp
-   as binary / unary / reduce). Add a new `softmax_library` `OnceLock`
-   slot on `Device`.
-2. Survey the kernel's `[[function_constant]]` slots and extend
-   `FunctionConstant` if needed — branch 9's `Bool`-only surface is
-   the right starting point but softmax may want `U32` (block-size /
-   axis-size known bounds). Adding a new variant is one match arm in
-   `apply` + one in `write_cache_token`.
-3. Wire `Tensor::softmax(&self, axis: isize, precise: bool)` (or
-   similar — last-axis-only is the right starting scope, matching
-   branch 5's reduce surface). The reduction primitive from branch 5
-   doesn't compose to a numerically stable softmax cheaply, so use
-   the fused `softmax.metal` kernel.
-4. Three-layer parity (kernels / runtime / models) at Qwen2
-   attention-score shape `[B, H_q, T, T]` at bf16. No real-checkpoint
-   layer for the same reason as rope: softmax operates on attention
-   scores, not weights — full integration test waits for branch 11.
+1. Decide on the three-op split shape. The roadmap calls for
+   `qk_matmul` (dense × dense), `softmax(scale + mask)` (branch 10
+   + branch 4 broadcast add), and `attn_matmul` (dense × dense).
+   First branch that wants a dense matmul — qmv from the Stage-4
+   spike is bf16 × int4, not what SDPA needs here. Check whether
+   MLX's GEMM (`steel_gemm_*.metal` in the vendored steel/ tree)
+   covers the bf16 × bf16 case at the shapes we want, or whether
+   it's better to start with a simple unfused dense matmul kernel
+   and let perf measurement drive the steel migration in branch 15.
+2. Function-constant decision rerun. SDPA in MLX has
+   `mx.fast.scaled_dot_product_attention` with bool flags
+   (`with_mask`, `with_score_mod`) — likely the first place we'll
+   want `FunctionConstant::Bool` *and* maybe `U32` (for `D_h`
+   known-bound). Survey the upstream kernel's `[[function_constant]]`
+   slots before deciding.
+3. Three-layer parity (kernels / runtime / models) at Qwen2 SDPA
+   shape. **First branch with a real-checkpoint integration test**:
+   load layer-0 Q/K/V/O projections of Qwen2.5-0.5B (still gated on
+   `CIDER_QWEN_CHECKPOINT_PATH`), apply rope to Q/K, write K/V into
+   the KvCache, run SDPA, and compare against MLX's
+   `mx.fast.scaled_dot_product_attention` on the same inputs.
+   Tolerance bar at bf16-compose precision — every primitive in the
+   chain is already pinned at the bf16 ULP window, so SDPA's
+   end-to-end drift should be predictable.
+4. `nn::sdpa` or `qwen2::attention::sdpa` decision: probably the
+   latter (Qwen2-specific GQA broadcast of K/V to match Q's head
+   count is one of the model-specific bits), but stay open to a
+   generic helper if the shape works out.
 
-Branches still ahead of first end-to-end inference (br14): 10
-(softmax), 11 (SDPA-split), 11b (quantized matmul), 12a/b/c (models
-layers + Qwen2 assembly), 13 (tokenizer), 14 (CLI + greedy decode).
-7 branches between us and the first runnable Qwen2.5-0.5B.
+Branches still ahead of first end-to-end inference (br14): 11
+(SDPA-split), 11b (quantized matmul), 12a/b/c (models layers +
+Qwen2 assembly), 13 (tokenizer), 14 (CLI + greedy decode). 6
+branches between us and the first runnable Qwen2.5-0.5B.
 
 Open question carried forward from branch 7: the per-instantiation
 JIT cache on `Device` now holds one library per unique kernel name.
