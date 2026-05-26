@@ -382,12 +382,33 @@ we'd need — both now landed (Views in branch 2; `KvCache` in branch 8).
   combined `|a-b| ≤ atol + rtol*|b|` bound to absorb the ~9-op
   composed chain.
 
-**Next concrete step: branch 12a of the roadmap — `feat/models-linear-rmsnorm`.**
-Scaffold `cider-press-models` with thin wrapper modules: `Linear`
-(around `Tensor::quantized_matmul`; handles optional dense additive
-bias) and `RmsNormLayer` (around the composed `nn::rms_norm`), and
-introduce the `Module` trait/pattern that `Attention::forward` and
-`Mlp::forward` will implement in branch 12b.
+- **Branch 12a (`feat/models-linear-rmsnorm`).** First stateful
+  model-layer abstractions. Introduces the forward-only `Module`
+  trait (`forward(&self, x: &Tensor) -> Result<Tensor>`) that this
+  crate's layers implement, plus the first two: `Linear` (quantized
+  projection `y = x @ W^T (+ bias)` wrapping `Tensor::quantized_matmul`
+  — `affine_qmv` for M=1, `affine_qmm_t` for M>1 — with an optional
+  rank-1 dense bias broadcast over leading dims; owns its
+  `QuantizedWeight` so a loaded checkpoint can be moved into a module
+  tree, and rejects a mismatched-length bias at construction) and
+  `RmsNormLayer` (carries gamma + eps, wraps the composed
+  `nn::rms_norm`). The trait is single-input by design — auxiliary
+  state (attention's RoPE offset, the `KvCache`) flows through a
+  layer's own constructor/methods, not `forward`. Both live in
+  `nn.rs` alongside the existing free functions. Parity validated
+  against the existing `qmm` and `rms_norm` MLX dump fixtures (no new
+  Python harness surface): `Linear` with/without bias vs
+  `mx.quantized_matmul` at Qwen2.5 `[896, 896]` decode+prefill,
+  `RmsNormLayer` vs `mx.fast.rms_norm` at `[1, 8, 896]`. `Linear` is
+  quantized-only for now (Qwen2 has no dense Linears).
+
+**Next concrete step: branch 12b of the roadmap — `feat/models-attention-mlp`.**
+Build `Attention` and `Mlp` as `Module`-implementing structs that own
+their `Linear` / `RmsNormLayer` sub-modules. `Attention::forward`
+folds the existing `qwen2::attention` free helpers (`project_qkv`,
+`rope`, `sdpa`, `project_output`) plus the `KvCache`; `Mlp` composes
+the SwiGLU `gate`/`up`/`down` projections with `nn::silu`. Per-module
+parity against MLX layer 0.
 
 Quantized-embedding decision resolved in branch 7: neither
 quantized-row gather nor `gather → dequantize_row`. Instead,
