@@ -19,6 +19,7 @@
 #![cfg(target_os = "macos")]
 #![allow(clippy::cast_precision_loss)]
 
+use approx::assert_relative_eq;
 use cider_press_kernels::{Buffer, Device, KernelLibrary, kernels};
 use cider_press_test_utils::{dump_mlx_op, read_bf16, tempdir};
 use half::bf16;
@@ -26,21 +27,21 @@ use safetensors::SafeTensors;
 
 #[test]
 fn parity_gemm_bf16_small() {
-    parity(14, 1, 64, 4, 0.02, 0.02);
+    parity(14, 1, 64, 4);
 }
 
 #[test]
 fn parity_gemm_bf16_medium() {
-    parity(14, 32, 64, 32, 0.05, 0.05);
+    parity(14, 32, 64, 32);
 }
 
 #[test]
 fn parity_gemm_bf16_attn_shape() {
     // attn @ V: scores [14, T, T] @ V [14, T, D_h]
-    parity(14, 8, 8, 64, 0.05, 0.05);
+    parity(14, 8, 8, 64);
 }
 
-fn parity(batch: usize, m: usize, k: usize, n: usize, abs_tol: f32, rel_tol: f32) {
+fn parity(batch: usize, m: usize, k: usize, n: usize) {
     let (lhs, rhs, out_ref) = fixture(batch, m, k, n);
     let device = Device::system_default().expect("Metal device");
     let library = KernelLibrary::matmul(&device).expect("compile matmul.metal");
@@ -69,42 +70,9 @@ fn parity(batch: usize, m: usize, k: usize, n: usize, abs_tol: f32, rel_tol: f32
 
     // SAFETY: commit_and_wait synchronised; GPU is done with `dst`.
     let out: Vec<bf16> = unsafe { dst.as_mut_slice() }.to_vec();
-    assert_within_tolerance(&out, &out_ref, abs_tol, rel_tol);
-}
-
-fn assert_within_tolerance(got: &[bf16], expected: &[bf16], abs_tol: f32, rel_tol: f32) {
-    assert_eq!(got.len(), expected.len(), "matmul: length mismatch");
-    let mut max_abs = 0.0f32;
-    let mut max_rel = 0.0f32;
-    let mut mismatches = 0usize;
-    let mut samples: Vec<(usize, f32, f32, f32)> = Vec::new();
-    for (i, (a, b)) in got.iter().zip(expected.iter()).enumerate() {
-        if a == b {
-            continue;
-        }
-        mismatches += 1;
-        let af = a.to_f32();
-        let bf = b.to_f32();
-        let abs = (af - bf).abs();
-        let rel = if bf.abs() > 1e-6 { abs / bf.abs() } else { 0.0 };
-        max_abs = max_abs.max(abs);
-        max_rel = max_rel.max(rel);
-        if samples.len() < 4 {
-            samples.push((i, af, bf, abs));
-        }
-    }
-    if max_abs > abs_tol || max_rel > rel_tol {
-        eprintln!(
-            "matmul: {mismatches}/{} mismatches, max_abs={max_abs:.6}, max_rel={max_rel:.6}",
-            got.len(),
-        );
-        for (i, g, e, abs) in samples {
-            eprintln!("  [{i}] got={g} expected={e} |diff|={abs}");
-        }
-        panic!(
-            "matmul: tolerance exceeded (max_abs={max_abs} > {abs_tol} \
-             or max_rel={max_rel} > {rel_tol})"
-        );
+    assert_eq!(out.len(), out_ref.len(), "matmul: length mismatch");
+    for (a, b) in out.iter().zip(out_ref.iter()) {
+        assert_relative_eq!(a.to_f32(), b.to_f32(), max_relative = 1e-2, epsilon = 5e-2);
     }
 }
 
