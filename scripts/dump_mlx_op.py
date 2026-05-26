@@ -607,11 +607,9 @@ def run_qmm(args: argparse.Namespace) -> dict[str, mx.array]:
 # setter.
 #
 # This is a checkpoint-loading case: it requires `mlx_lm` (>=0.21) and a
-# local MLX-format checkpoint directory. It is NOT registered in the OPS
-# table (which drives `--help`-listed synthetic ops); instead it is invoked
-# via the `attention_layer0` sub-parser registered below and called from
-# the Rust integration test via `dump_mlx_op` helper with a `--checkpoint`
-# arg.
+# local MLX-format checkpoint directory. It is registered in the OPS table
+# and invoked via the `attention_layer0` sub-parser; the Rust integration
+# test calls it via the `dump_mlx_op` helper with a `--checkpoint` arg.
 # ---------------------------------------------------------------------------
 
 
