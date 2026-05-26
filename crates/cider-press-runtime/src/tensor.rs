@@ -562,7 +562,7 @@ impl Tensor {
     }
 
     /// Crate-private constructor for op tensors (used by op builders
-    /// like [`Tensor::copy`] and [`QuantizedWeight::matvec`](crate::QuantizedWeight::matvec)).
+    /// like [`Tensor::copy`] and [`Tensor::quantized_matmul`]).
     pub(crate) fn op_tensor(
         device: &Device,
         shape: Shape,
