@@ -3562,4 +3562,84 @@ mod tests {
         let read_back = dst.cpu_slice::<u32>().expect("cpu_slice");
         assert_eq!(read_back, data.as_slice());
     }
+
+    // ── quantized_matmul constructor tests ──────────────────────────────────
+
+    // N=4, K=64, Q4_GS64:
+    //   w_bytes   = N * K * bits / 32 * sizeof(u32) = 4 * 64 * 4 / 32 * 4 = 128
+    //   aux_bytes = N * K / group_size * sizeof(bf16) = 4 * 64 / 64 * 2    =   8
+    const QMM_N: usize = 4;
+    const QMM_K: usize = 64;
+    const QMM_W_BYTES: usize = QMM_N * QMM_K * 4 / 32 * 4; // 128
+    const QMM_AUX_BYTES: usize = QMM_N * QMM_K / 64 * 2; // 8
+
+    fn make_test_qw(device: &crate::Device) -> crate::QuantizedWeight {
+        crate::QuantizedWeight::from_bytes(
+            device,
+            [QMM_N, QMM_K],
+            crate::Quantization::Q4_GS64,
+            &[0u8; QMM_W_BYTES],
+            &[0u8; QMM_AUX_BYTES],
+            &[0u8; QMM_AUX_BYTES],
+        )
+        .expect("build synthetic QuantizedWeight")
+    }
+
+    #[test]
+    fn quantized_matmul_builds_op() {
+        let device = Device::shared().expect("device");
+        let qw = make_test_qw(&device);
+
+        let x_bytes = QMM_K * 2; // bf16 = 2 bytes/elem
+        let x = Tensor::from_bytes(&device, &vec![0u8; x_bytes], [QMM_K], DType::BF16)
+            .expect("build activation");
+
+        let y = x.quantized_matmul(&qw).expect("quantized_matmul");
+
+        assert!(!y.is_materialized(), "output must be lazy");
+        assert_eq!(
+            y.op_kind(),
+            Some(OpKind::QuantizedMatMul {
+                group_size: crate::Quantization::Q4_GS64.group_size(),
+                bits: crate::Quantization::Q4_GS64.bits(),
+            })
+        );
+        assert_eq!(y.shape().dims(), &[QMM_N]);
+        assert_eq!(y.dtype(), DType::BF16);
+    }
+
+    #[test]
+    fn quantized_matmul_rejects_wrong_activation_dtype() {
+        let device = Device::shared().expect("device");
+        let qw = make_test_qw(&device);
+
+        // F32 activation — wrong dtype.
+        let x_bytes = QMM_K * 4; // f32 = 4 bytes/elem
+        let x = Tensor::from_bytes(&device, &vec![0u8; x_bytes], [QMM_K], DType::F32)
+            .expect("build f32 activation");
+
+        let err = x.quantized_matmul(&qw).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(_)),
+            "expected InvalidArgument, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn quantized_matmul_rejects_inner_dim_mismatch() {
+        let device = Device::shared().expect("device");
+        let qw = make_test_qw(&device);
+
+        // Activation with K+1 — inner dim mismatch.
+        let wrong_k = QMM_K + 1;
+        let x_bytes = wrong_k * 2; // bf16
+        let x = Tensor::from_bytes(&device, &vec![0u8; x_bytes], [wrong_k], DType::BF16)
+            .expect("build mismatched activation");
+
+        let err = x.quantized_matmul(&qw).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(_)),
+            "expected InvalidArgument, got {err:?}"
+        );
+    }
 }

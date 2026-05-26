@@ -38,14 +38,12 @@ fn fixture_path() -> PathBuf {
 #[test]
 fn qmm_through_runtime_matches_mlx() {
     let path = fixture_path();
-    if !path.exists() {
-        eprintln!(
-            "skipping: fixture missing at {}; run `uv run scripts/gen_qmm_fixture.py` \
-             from the workspace root to regenerate it",
-            path.display(),
-        );
-        return;
-    }
+    assert!(
+        path.exists(),
+        "missing parity fixture at {}; run `uv run scripts/gen_qmm_fixture.py` \
+         from the workspace root to regenerate it",
+        path.display(),
+    );
 
     let bytes = std::fs::read(&path).expect("read fixture");
     let st = SafeTensors::deserialize(&bytes).expect("parse safetensors");
