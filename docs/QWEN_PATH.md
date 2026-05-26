@@ -88,7 +88,7 @@ that introduced them, instead of three branches later in some composition.
 | 9 | (done) `feat/rope` | MLX ships `rope.metal` precompiled — fused path, `OnceLock<KernelLibrary>` slot. First op needing Metal `[[function_constant]]` specialization, so kernels crate also gains `FunctionConstant::Bool { index, value }` + `KernelLibrary::pipeline_specialized(name, &[FunctionConstant])` with index-sorted cache key. One dispatch wired (`rope_bfloat16` with `forward=true, traditional=false, hs_transpose=false`, `with_freqs=false`, int32 indexing); seven other instantiations dormant. Runtime: `OpKind::Rope { base_log2, scale, rotary_dims }` with `(input, offset)` graph edges (offset is a length-1 I32 tensor, mirroring MLX's `set_input_array(offset, 2)`); `Tensor::rope(&self, offset, base, scale, rotary_dims)`. Drops `Eq` derive on `OpKind` (f32 params); `PartialEq` still gives test ergonomics. Models: `qwen2::attention::rope(x, offset, &Qwen2Config)` config-binding wrapper in a new `qwen2::attention` submodule that future attention bits accumulate into. | Bit-exact vs `mx.fast.rope` at every layer for `[1, 14, 4, 64]` (Q) and `[1, 2, 4, 64]` (K), `offset=0` and `offset=37`. No real-checkpoint case — rope applies to projection outputs; the full layer-0 Q-projection → rope → cache → SDPA flow is a branch-11 integration test. |
 | 10 | (done) `feat/softmax` | MLX ships `softmax.metal` precompiled — fused path, `OnceLock<KernelLibrary>` slot. Surprise vs the branch-9 note: softmax does NOT use `[[function_constant]]` specialization (variants are by kernel name — `block_softmax_<dtype>` ≤ 4096-axis, `looped_softmax_<dtype>` > 4096-axis, `_precise_` mirrors using `float` accumulator). So `FunctionConstant` stays `Bool`-only. Two entry points wired: `block_softmax_bfloat16` (`precise=False`) and `block_softmax_precise_bfloat16` (`precise=True`, the inference choice). Looped + f32/f16 dtypes dormant; non-last-axis hard-errors. Threadgroup math ports MLX's `Softmax::eval_gpu` verbatim (`SIMD_SIZE=32`, `N_READS=4`, `BLOCK_AXIS_LIMIT=4096`). `Tensor::softmax(&self, precise: bool)`; `OpKind::Softmax { precise }`. | Tolerance bars (not bit-exact) at Qwen2 attention-score shape `[1, 14, T, T]` for T=4/32/256, both `precise=True` (~0.005 abs / 0.01 rel) and `precise=False` (~0.01 abs / 0.04 rel). Float accumulator buys ~2× tighter agreement by absorbing lane-summation drift before the final bf16 cast. |
 | 11 | (done) `feat/sdpa-split` | SDPA as three composed ops. **First non-MLX kernel in the tree**: a naive bf16 batched matmul (`kernels/matmul.metal`, one thread per output element, float accumulator) instead of MLX's templated `steel_gemm_*` family (deferred to branch 15 per the "perf-driven steel migration" call). Kernels: `kernels::matmul::dispatch_gemm_bf16`. Runtime: `OpKind::MatMul` + `Tensor::matmul`; the matmul-shape validation lives in a `matmul_shapes()` helper that 11b's `qmm` will reuse. `dispatch_matmul` walks reshape-view chains (SDPA produces `probs_3d.reshape([B, H_q, T, T_c])` view inputs) via a new `matmul_input_bytes` helper; non-zero view byte-offsets hard-error. Models: `qwen2::attention::sdpa(q, k, v, mask, &Qwen2Config)` with GQA broadcast (`reshape → broadcast_to → copy → reshape`). Scores reshape from rank-4 to rank-3 for the scale-mul / mask-add / softmax stretch — branch 4 only wired `g{1,2,3}` strided binaries, so rank-4 broadcast binary stays deferred. The **layer-0 real-checkpoint integration test the roadmap originally placed here is moved to 11b** — it requires Q/K/V/O projections of loaded quantized weights, which needs `Tensor::quantized_matmul`. | Synthetic-input parity at all three layers vs `mx.matmul` (kernels + runtime) and `mx.fast.scaled_dot_product_attention` (models) at Qwen2.5-0.5B decode (`T=1, T_cache=8`) and prefill-causal (`T=T_cache=8`) shapes; bf16-compose tolerance using the np.allclose-style combined `atol + rtol*|b|` bound. |
-| 11b | `feat/quantized-matmul` | `qmv` (decode, batch=1) + `qmm` (prefill) wired through the runtime as `Tensor::quantized_matmul` (the Stage-4 spike already validated `qmv` bit-exactly at the kernels layer). Needed before the tied LM head in branch 12c — the LM head reads the same quantized weight as `embed_tokens` but in the transpose direction, so dequantizing the full vocab table per step is the wrong move. | MLX parity on Qwen2's Q/K/V/O projection shapes + lm_head shape at bf16 tolerance |
+| 11b | (done) `feat/quantized-matmul` | Lifted MLX's `affine_qmm_t` (aligned, transposed, batch=1) kernel into `kernels::qmm::affine_qmm_t_bf16` reusing `Device::quantized_library()`; binding contract and dispatch geometry transcribed from `mlx/backend/metal/quantized.cpp`. Promoted the rank-1-only `QuantizedWeight::matvec` to a general `Tensor::quantized_matmul`; `OpKind::Qmv` renamed to `OpKind::QuantizedMatMul`; M=1 dispatches the existing `affine_qmv` kernel, M>1 dispatches the new `affine_qmm_t`. Aligned-only this branch (`N % 32 == 0`); generic path deferred to its first unaligned consumer. Transpose=false direction (tied LM head) deferred to branch 12c. Three rejection unit tests (dtype, inner-dim, happy-path constructor). Models crate adds `qwen2::attention::project_qkv` and `project_output` — thin compositions over `quantized_matmul + add + reshape + permute + copy`; branch 12b folds them into `Attention::forward`. New `qmm` and `attention_layer0` cases in `scripts/dump_mlx_op.py`; uniform `(-0.5, 0.5)` distribution convention matches `gen_qmm_fixture.py`. Layer-0 attention real-checkpoint integration test landed (`tests/attention_layer0.rs`, gated on `CIDER_QWEN_CHECKPOINT_PATH`): prefill (T=8) drives qmm_t, decode (T=1, offset=7) drives qmv; `mlx_lm.models.cache.KVCache.state` setter primes the MLX-side cache to an arbitrary offset. | Kernels/runtime qmm parity: `max_relative=1e-2, epsilon=5e-2` (bf16-tolerance, consistent with stage4_qmv). Models layer-0 integration test: ATOL=5e-2, RTOL=5e-2 (np.allclose-style combined bound) to absorb the ~9-op composed chain. |
 | 12a | `feat/models-linear-rmsnorm` | `cider-press-models` scaffold; `Linear` and `RmsNormLayer` (thin wrappers around qmv / composed rmsnorm). Module trait/pattern lands here. | Unit tests against MLX equivalents |
 | 12b | `feat/models-attention-mlp` | `Attention` (Q/K/V proj + RoPE + KV cache + SDPA + O proj) and `Mlp` (SwiGLU) | Per-module parity against MLX layer 0 |
 | 12c | `feat/models-qwen2` | `TransformerBlock` + `Qwen2Model`; tied embedding handling; final norm + LM head | Logits parity vs MLX-LM on prefill of a fixed prompt |
@@ -119,41 +119,35 @@ for "it's fast and clean" but can wait until branch 15+:
 
 ## What to do next time we sit down
 
-Branch 11b (`feat/quantized-matmul`). Specifically:
+Branch 12a (`feat/models-linear-rmsnorm`). Specifically:
 
-1. Promote `qmv` (the Stage-4 spike's already-bit-exact bf16 × int4
-   path) into a runtime op. The current `QuantizedWeight::matvec`
-   is rank-1-input-only (`[K] → [N]`); a real flow needs batched
-   matvec for `T > 1` prefill at least. Decide whether to keep the
-   `QuantizedWeight::matvec` ergonomic and add a separate
-   `Tensor::quantized_matmul`, or replace matvec with the general
-   form. Reuse the `matmul_shapes()` helper that branch 11
-   factored out.
-2. Add `qmm` (batched / prefill case). MLX has multiple `qmm_*`
-   instantiations in `quantized.metal`; pick the bf16 × int4
-   `group_size=64` family that matches Qwen2.5's pinned quant. The
-   binding contract is more complex than `qmv` (shapes + strides
-   bind when batch > 1). Read `mlx/backend/metal/quantized.cpp`'s
-   `Quantized::eval_gpu` for the dispatch transcript.
-3. **Layer-0 attention real-checkpoint integration test** (deferred
-   from branch 11). Load layer-0 Q/K/V/O of Qwen2.5-0.5B (still
-   gated on `CIDER_QWEN_CHECKPOINT_PATH`), project the hidden state
-   via `Tensor::quantized_matmul`, apply rope to Q/K, push K/V into
-   `KvCache`, run `qwen2::attention::sdpa`, compare against MLX's
-   `mx.fast.scaled_dot_product_attention` over the same inputs.
-   Tolerance: bf16-compose using the same combined `atol + rtol*|b|`
-   bound branch 11's `sdpa_qwen2.rs` introduced.
-4. Tied LM head dispatch decision: the LM head reuses the
-   `embed_tokens` quantized weight but in the transpose direction
-   (Qwen2's `tie_word_embeddings = true`). Decide whether to expose
-   that via a `transpose` flag on `Tensor::quantized_matmul` (less
-   API surface, matches MLX's `mx.quantized_matmul(transpose=True)`)
-   or via a separate path. Defers a bit to branch 12c.
+1. Scaffold `cider-press-models` with thin wrapper modules: `Linear`
+   (wraps `Tensor::quantized_matmul` for the M=1 and M>1 paths;
+   handles optional dense additive bias via the existing `add` op)
+   and `RmsNormLayer` (wraps the composed `nn::rms_norm` from
+   branch 5, carrying the gamma weight). Introduce the `Module`
+   trait/pattern — the shape of `forward(x: Tensor) -> Result<Tensor>`
+   that `Attention::forward` and `Mlp::forward` will implement in
+   branch 12b.
+2. Unit-test both wrappers against MLX equivalents at Qwen2.5
+   projection and norm shapes.
 
-Branches still ahead of first end-to-end inference (br14): 11b
-(quantized matmul), 12a/b/c (models layers + Qwen2 assembly), 13
-(tokenizer), 14 (CLI + greedy decode). 5 branches between us and
-the first runnable Qwen2.5-0.5B.
+Open follow-up items from branch 11b worth tracking:
+- The `assert_close` helper is duplicated across
+  `cider-press-models/tests/qmm_qwen2.rs`, `sdpa_qwen2.rs`, and
+  `attention_layer0.rs` — candidate cleanup for `cider-press-test-utils`
+  in a future branch.
+- The `attention_layer0.rs` ATOL=5e-2/RTOL=5e-2 tolerance was set
+  analytically for the ~9-op composed chain; a real-checkpoint run is
+  needed to confirm the headroom is not too tight on the macos-15 CI
+  runner. Run locally before declaring CI green.
+- Transpose=false direction for `Tensor::quantized_matmul` (tied LM
+  head) is deferred to branch 12c; generic (non-aligned) `qmm_t`
+  is deferred to its first unaligned consumer.
+
+Branches still ahead of first end-to-end inference (br14): 12a/b/c
+(models layers + Qwen2 assembly), 13 (tokenizer), 14 (CLI + greedy
+decode). 4 branches between us and the first runnable Qwen2.5-0.5B.
 
 Open question carried forward from branch 7: the per-instantiation
 JIT cache on `Device` now holds one library per unique kernel name.
