@@ -91,14 +91,31 @@ pub fn dispatch_gemm_bf16(
         ))
     })?;
 
-    let need_a = batch
+    // Highest element index touched is `(batch - 1) * stride + tile_elems`,
+    // not `batch * stride`. The latter understates the requirement when a
+    // caller intentionally aliases a tile across batches via `stride = 0`
+    // (the doc-string explicitly leaves room for that) and the kernel
+    // would still read `tile_elems` per batch slot.
+    let a_tile = m
+        .checked_mul(k)
+        .ok_or_else(|| Error::InvalidArgument("matmul: A tile size overflows usize".into()))?;
+    let b_tile = k
+        .checked_mul(n)
+        .ok_or_else(|| Error::InvalidArgument("matmul: B tile size overflows usize".into()))?;
+    let c_tile = m
+        .checked_mul(n)
+        .ok_or_else(|| Error::InvalidArgument("matmul: C tile size overflows usize".into()))?;
+    let need_a = (batch - 1)
         .checked_mul(a_batch_stride)
+        .and_then(|x| x.checked_add(a_tile))
         .ok_or_else(|| Error::InvalidArgument("matmul: A footprint overflows usize".into()))?;
-    let need_b = batch
+    let need_b = (batch - 1)
         .checked_mul(b_batch_stride)
+        .and_then(|x| x.checked_add(b_tile))
         .ok_or_else(|| Error::InvalidArgument("matmul: B footprint overflows usize".into()))?;
-    let need_c = batch
+    let need_c = (batch - 1)
         .checked_mul(c_batch_stride)
+        .and_then(|x| x.checked_add(c_tile))
         .ok_or_else(|| Error::InvalidArgument("matmul: C footprint overflows usize".into()))?;
     if src_a.len() < need_a || src_b.len() < need_b || dst.len() < need_c {
         return Err(Error::InvalidArgument(format!(
