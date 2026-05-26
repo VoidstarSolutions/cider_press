@@ -475,6 +475,87 @@ def run_rope(args: argparse.Namespace) -> dict[str, mx.array]:
 # ---------------------------------------------------------------------------
 
 
+def add_sdpa_parser(subparsers: argparse._SubParsersAction) -> None:
+    p = subparsers.add_parser(
+        "sdpa",
+        help="GQA-broadcast scaled dot-product attention via mx.fast.scaled_dot_product_attention",
+    )
+    p.add_argument("--batch", type=int, required=True)
+    p.add_argument("--h-q", type=int, required=True)
+    p.add_argument("--h-kv", type=int, required=True)
+    p.add_argument("--seq-q", type=int, required=True, help="Q sequence length (T)")
+    p.add_argument(
+        "--seq-kv",
+        type=int,
+        required=True,
+        help="K/V sequence length (T_cache)",
+    )
+    p.add_argument("--head-dim", type=int, required=True)
+    p.add_argument("--dtype", default="bf16", help="one of f32, f16, bf16")
+    p.add_argument(
+        "--causal",
+        action="store_true",
+        help="apply a causal mask aligned to the last `seq_q` rows of the [seq_q, seq_kv] grid",
+    )
+
+
+def run_sdpa(args: argparse.Namespace) -> dict[str, mx.array]:
+    dtype = _float_dtype(args.dtype)
+    b, h_q, h_kv = args.batch, args.h_q, args.h_kv
+    t, t_kv, d = args.seq_q, args.seq_kv, args.head_dim
+    if h_q % h_kv != 0:
+        raise SystemExit(f"h_q ({h_q}) must be divisible by h_kv ({h_kv})")
+    q = (mx.random.uniform(shape=(b, h_q, t, d)) * 2.0 - 1.0).astype(dtype)
+    k = (mx.random.uniform(shape=(b, h_kv, t_kv, d)) * 2.0 - 1.0).astype(dtype)
+    v = (mx.random.uniform(shape=(b, h_kv, t_kv, d)) * 2.0 - 1.0).astype(dtype)
+    scale = 1.0 / (d**0.5)
+    if args.causal:
+        # Causal mask aligned to the last `t` rows of the [t, t_kv] grid
+        # — same shape MLX's `mask="causal"` shortcut produces when
+        # `t_kv >= t`.
+        offsets = t_kv - t
+        i = mx.arange(t).reshape(t, 1)
+        j = mx.arange(t_kv).reshape(1, t_kv)
+        mask_bool = (j <= (i + offsets))
+        mask = mx.where(mask_bool, mx.array(0.0, dtype=dtype), mx.array(-mx.inf, dtype=dtype))
+        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
+        result = {"q": q, "k": k, "v": v, "mask": mask, "out": out}
+    else:
+        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale)
+        result = {"q": q, "k": k, "v": v, "out": out}
+    mx.eval(*result.values())
+    return result
+
+
+def add_matmul_parser(subparsers: argparse._SubParsersAction) -> None:
+    p = subparsers.add_parser(
+        "matmul",
+        help="batched dense matmul via mx.matmul",
+    )
+    p.add_argument(
+        "--lhs-shape",
+        required=True,
+        help="comma-separated, e.g. 2,14,4,64 ([..., M, K])",
+    )
+    p.add_argument(
+        "--rhs-shape",
+        required=True,
+        help="comma-separated, e.g. 2,14,64,128 ([..., K, N])",
+    )
+    p.add_argument("--dtype", default="bf16", help="one of f32, f16, bf16")
+
+
+def run_matmul(args: argparse.Namespace) -> dict[str, mx.array]:
+    lhs_shape = _parse_shape(args.lhs_shape)
+    rhs_shape = _parse_shape(args.rhs_shape)
+    dtype = _float_dtype(args.dtype)
+    lhs = (mx.random.uniform(shape=lhs_shape) * 2.0 - 1.0).astype(dtype)
+    rhs = (mx.random.uniform(shape=rhs_shape) * 2.0 - 1.0).astype(dtype)
+    out = mx.matmul(lhs, rhs)
+    mx.eval(lhs, rhs, out)
+    return {"lhs": lhs, "rhs": rhs, "out": out}
+
+
 def add_softmax_parser(subparsers: argparse._SubParsersAction) -> None:
     p = subparsers.add_parser(
         "softmax",
@@ -525,6 +606,8 @@ OPS: dict[str, tuple[ParserBuilder, Runner]] = {
     "embed_tokens": (add_embed_tokens_parser, run_embed_tokens),
     "rope": (add_rope_parser, run_rope),
     "softmax": (add_softmax_parser, run_softmax),
+    "matmul": (add_matmul_parser, run_matmul),
+    "sdpa": (add_sdpa_parser, run_sdpa),
 }
 
 

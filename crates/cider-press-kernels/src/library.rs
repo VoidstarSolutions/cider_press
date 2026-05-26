@@ -55,6 +55,12 @@ const SOFTMAX_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/softmax_inl
 /// Pre-flattened MLX `quantized.metal`, produced by `build.rs`.
 const QUANTIZED_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/quantized_inlined.metal"));
 
+/// Cider-press own bf16 batched matmul (not MLX-derived). Lives next
+/// to the dispatch routine in `kernels/matmul.metal`; included
+/// directly, no `build.rs` flattening needed since there are no MLX
+/// `#include` paths to resolve.
+const MATMUL_SOURCE: &str = include_str!("kernels/matmul.metal");
+
 /// One specialization value bound to a kernel's `[[function_constant(N)]]`
 /// slot at pipeline build time.
 ///
@@ -193,6 +199,13 @@ impl KernelLibrary {
     /// `kernels-mlx/`).
     pub fn quantized(device: &Device) -> Result<Self> {
         Self::from_source(device, QUANTIZED_SOURCE)
+    }
+
+    /// JIT-compile cider-press's own naive bf16 batched matmul kernel
+    /// (`kernels/matmul.metal` next to this crate's source). Used by
+    /// branch-11 SDPA composition; not derived from MLX.
+    pub fn matmul(device: &Device) -> Result<Self> {
+        Self::from_source(device, MATMUL_SOURCE)
     }
 
     /// Look up a kernel function by its `[[host_name]]` and return a

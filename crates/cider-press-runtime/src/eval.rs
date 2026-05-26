@@ -230,6 +230,7 @@ fn dispatch(
         OpKind::Softmax { precise } => {
             dispatch_softmax(inner, op, commands, outputs, dst, index_of, precise)
         }
+        OpKind::MatMul => dispatch_matmul(inner, op, commands, outputs, dst, index_of),
     }
 }
 
@@ -1278,6 +1279,93 @@ fn dispatch_softmax(
             n_rows,
         )?;
     }
+    Ok(())
+}
+
+/// Resolve a matmul input's backing bytes. `Tensor::matmul` enforces
+/// contiguous strides over the input shape; this function additionally
+/// asserts the resolved view chain lands at byte offset 0 — non-zero
+/// offsets would require a `setBuffer:offset:` bind that the kernel
+/// doesn't currently take.
+fn matmul_input_bytes(
+    input: &Tensor,
+    outputs: &[Buffer<u8>],
+    index_of: &HashMap<*const TensorInner, usize>,
+) -> Result<Buffer<u8>> {
+    if input.inner.view.is_some() {
+        let (buf, byte_offset) = resolve_view_storage(input, outputs, index_of)?;
+        if byte_offset != 0 {
+            return Err(Error::InvalidArgument(format!(
+                "matmul: non-zero view byte offset {byte_offset} is not supported by the \
+                 contiguous matmul kernel; add a `setBuffer:offset:` bind when the first \
+                 slice-into-matmul case appears",
+            )));
+        }
+        return Ok(buf);
+    }
+    dense_input_buffer(input, outputs, index_of)
+}
+
+/// Dispatch a batched bf16 matmul. `Tensor::matmul` already
+/// enforced contiguity + matching leading dims + aligned inner
+/// dimension, so here we just extract `(batch, M, N, K)` and
+/// route to the kernels-layer dispatch fn.
+fn dispatch_matmul(
+    inner: &Arc<TensorInner>,
+    op: &OpNode,
+    commands: &mut Commands<'_>,
+    outputs: &[Buffer<u8>],
+    dst: &mut Buffer<u8>,
+    index_of: &HashMap<*const TensorInner, usize>,
+) -> Result<()> {
+    let device = inner
+        .device
+        .as_ref()
+        .expect("op nodes are always constructed with a device");
+
+    let lhs = op
+        .inputs
+        .first()
+        .ok_or_else(|| Error::InvalidArgument("MatMul: missing LHS (inputs[0])".into()))?;
+    let rhs = op
+        .inputs
+        .get(1)
+        .ok_or_else(|| Error::InvalidArgument("MatMul: missing RHS (inputs[1])".into()))?;
+
+    // `Tensor::matmul` enforces contiguous strides on each input, but
+    // a reshape-of-op still leaves a view in the chain (e.g. SDPA's
+    // `probs_3d.reshape([B, H_q, T, T_c])` view of the softmax result).
+    // Walk the chain to the storage owner; the contract guarantees a
+    // byte-offset of zero and contiguous bytes thereafter.
+    let lhs_bytes = matmul_input_bytes(lhs, outputs, index_of)?;
+    let rhs_bytes = matmul_input_bytes(rhs, outputs, index_of)?;
+    let lhs_typed = unsafe { lhs_bytes.reinterpret_as::<half::bf16>() };
+    let rhs_typed = unsafe { rhs_bytes.reinterpret_as::<half::bf16>() };
+    let mut dst_typed = unsafe { dst.reinterpret_as::<half::bf16>() };
+
+    let lhs_dims = lhs.shape().dims();
+    let rhs_dims = rhs.shape().dims();
+    let lead = lhs_dims.len() - 2;
+    let m = lhs_dims[lead];
+    let k = lhs_dims[lead + 1];
+    let n = rhs_dims[lead + 1];
+    let batch: usize = lhs_dims[..lead].iter().product::<usize>().max(1);
+
+    let library = device.matmul_library()?;
+    cider_press_kernels::kernels::matmul::dispatch_gemm_bf16(
+        commands,
+        library,
+        &lhs_typed,
+        &rhs_typed,
+        &mut dst_typed,
+        m,
+        n,
+        k,
+        batch,
+        m * k,
+        k * n,
+        m * n,
+    )?;
     Ok(())
 }
 

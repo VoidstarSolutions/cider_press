@@ -67,6 +67,10 @@ struct DeviceInner {
     /// is a separate compiled library, matching MLX's own
     /// `d.get_library(lib_name, builder)` pattern.
     gather_libraries: Mutex<HashMap<String, Arc<kernels::KernelLibrary>>>,
+    /// JIT'd cider-press matmul library (our own kernel, not
+    /// MLX-derived — see `crates/cider-press-kernels/src/kernels/matmul.metal`).
+    /// Populated on first [`crate::Tensor::matmul`] eval.
+    matmul_library: OnceLock<kernels::KernelLibrary>,
 }
 
 /// Refcounted handle to the system's default Metal device.
@@ -96,6 +100,7 @@ impl Device {
                 rope_library: OnceLock::new(),
                 softmax_library: OnceLock::new(),
                 gather_libraries: Mutex::new(HashMap::new()),
+                matmul_library: OnceLock::new(),
             }),
         })
     }
@@ -125,6 +130,7 @@ impl Device {
             rope_library: OnceLock::new(),
             softmax_library: OnceLock::new(),
             gather_libraries: Mutex::new(HashMap::new()),
+            matmul_library: OnceLock::new(),
         });
         let stored = SHARED.get_or_init(|| fresh);
         Ok(Self {
@@ -257,6 +263,17 @@ impl Device {
         )?);
         libs.insert(kernel_name, lib.clone());
         Ok(lib)
+    }
+
+    /// Lazily JIT-compile and cache cider-press's own bf16 matmul
+    /// library (`kernels/matmul.metal`). See [`Device::copy_library`]
+    /// for cache semantics.
+    pub(crate) fn matmul_library(&self) -> Result<&kernels::KernelLibrary> {
+        if let Some(lib) = self.inner.matmul_library.get() {
+            return Ok(lib);
+        }
+        let lib = kernels::KernelLibrary::matmul(&self.inner.kernels)?;
+        Ok(self.inner.matmul_library.get_or_init(|| lib))
     }
 }
 

@@ -281,15 +281,64 @@ we'd need — both now landed (Views in branch 2; `KvCache` in branch 8).
   than the default because its float accumulator absorbs the
   lane-summation drift before the final bf16 cast.
 
-**Next concrete step: branch 11 of the roadmap — `feat/sdpa-split`.**
-Scaled dot-product attention as three composed ops: `qk_matmul`,
-`softmax(scale + mask)`, `attn_matmul`. The first time a branch
-spans more than one new primitive — `qk_matmul` is a dense
-matmul (not the qmv from the Stage-4 spike; that's branch 11b),
-and `attn_matmul` is dense × dense. Branch 10's softmax slots in
-between, with the scale + mask applied via the existing binary
-broadcast path. The "real-checkpoint" integration test for rope +
-KV-cache + SDPA on layer-0 Q/K/V/O of Qwen2.5-0.5B lands here.
+- **Branch 11 (`feat/sdpa-split`).** Scaled dot-product attention
+  as three composed ops: `qk_matmul`, `softmax(scale + mask)`,
+  `attn_matmul`. **First non-MLX kernel in the tree** — MLX's
+  precompiled GEMM is the templated `steel_gemm_*.metal` family
+  (header-only, register-tiled), too much surface area for a
+  branch whose goal is the *composition*, so we shipped our own
+  naive bf16 batched matmul (`crates/cider-press-kernels/src/kernels/matmul.metal`,
+  one thread per output element, float accumulator). The roadmap
+  flags steel migration as branch-15 perf work. Build.rs gains
+  no new entry — the kernel is `include_str!`'d directly from the
+  crate (no MLX includes to resolve), parallel to the
+  `KernelLibrary::matmul()` slot. Kernels crate: one dispatch
+  fn (`kernels::matmul::dispatch_gemm_bf16`) taking
+  `(A, B, C, M, N, K, batch, a_batch_stride, b_batch_stride, c_batch_stride)`
+  in elements. Runtime: `OpKind::MatMul` + `Tensor::matmul(&self,
+  other)` validating dense-contiguous-bf16-same-leading-dims, with
+  the matmul-shape validation extracted to a `matmul_shapes()`
+  helper that 11b's `qmm` can reuse. `dispatch_matmul` walks
+  reshape-view chains via a new `matmul_input_bytes` helper —
+  the SDPA composition produces `probs_3d.reshape([B, H_q, T,
+  T_c])` view inputs that the dense matmul kernel can still read
+  contiguously (asserts zero byte-offset; non-zero would need a
+  `setBuffer:offset:` bind). Models crate ships
+  `qwen2::attention::sdpa(q, k, v, mask, &Qwen2Config)`:
+  GQA-broadcasts K/V via `reshape → broadcast_to → copy →
+  reshape` (zero-copy through the view; one materializing copy
+  to land contiguous bytes for matmul), runs `Q @ K^T` via
+  `permute([0,1,3,2]).copy()` + matmul, then reshapes scores
+  from rank-4 `[B, H_q, T, T_c]` to rank-3 `[B*H_q, T, T_c]` for
+  the scale-mul / mask-add / softmax stretch (branch-4 only wired
+  binary `g{1,2,3}` strided paths — rank-4 strided binary lands
+  alongside its first consumer), reshapes back, then `probs @
+  V`. Validated at all three layers vs `mx.matmul` (kernels +
+  runtime) and `mx.fast.scaled_dot_product_attention` (models)
+  at Qwen2.5-0.5B decode (`T=1, T_cache=8`) and prefill-causal
+  (`T=T_cache=8`) shapes. Tolerance bar is bf16-compose
+  precision; the models test uses the np.allclose-style
+  combined bound `|a-b| ≤ atol + rtol*|b|` rather than the
+  pure-AND form earlier branches use, because the composed-SDPA
+  chain produces 1-ULP-near-zero drift that pure relative
+  comparison flags spuriously. **Deferred: the layer-0
+  real-checkpoint integration test** the roadmap calls for
+  here. It requires Q/K/V/O projections of the loaded quantized
+  weights, which means `Tensor::quantized_matmul` (qmv batched +
+  qmm) — that's branch 11b's surface. Doing it here via
+  `dequantize → matmul` would be throwaway scaffolding for 11b
+  to rewrite. So branch 11 lands SDPA's three-op composition
+  with synthetic-input parity; the end-to-end real-checkpoint
+  attention integration test lands in 11b once
+  `quantized_matmul` is the supported runtime op.
+
+**Next concrete step: branch 11b of the roadmap — `feat/quantized-matmul`.**
+Wire `qmv` (decode, batch=1) + `qmm` (prefill) through the runtime as
+`Tensor::quantized_matmul`. The Stage-4 spike already validated `qmv`
+bit-exactly at the kernels layer; this branch adds the lazy-graph
+op + runtime dispatch, and is the unblocker for the deferred
+layer-0 attention real-checkpoint test (Q/K/V/O + rope + KvCache +
+SDPA against `mx.fast.scaled_dot_product_attention`).
 
 Quantized-embedding decision resolved in branch 7: neither
 quantized-row gather nor `gather → dequantize_row`. Instead,
