@@ -578,12 +578,9 @@ def add_qmm_parser(subparsers: argparse._SubParsersAction) -> None:
 
 def run_qmm(args: argparse.Namespace) -> dict[str, mx.array]:
     dtype = _float_dtype(args.dtype)
-    # Use uniform-in-[-0.5, 0.5) for both weight and activation. This
-    # matches `gen_qmm_fixture.py` and avoids large-magnitude normal
-    # samples that expose numerical drift in MLX's qmm kernel vs f32
-    # reference (see branch 11b notes). The kernel correctness story is
-    # against the uniform-data pre-committed fixture; this case's job is
-    # to confirm parity at the models-crate level.
+    # Uniform [-0.5, 0.5) matches gen_qmm_fixture.py / gen_stage4_fixtures.py:
+    # at K=896, normal-distributed inputs produce output magnitudes large
+    # enough that bf16 LSB precision exceeds the M>1 tolerance bar.
     w = (mx.random.uniform(shape=(args.n, args.k)) - 0.5).astype(dtype)
     w_q, scales, biases = mx.quantize(w, group_size=args.group_size, bits=args.bits)
     if args.m == 1:
