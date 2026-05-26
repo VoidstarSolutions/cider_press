@@ -10,7 +10,7 @@
 //! `N=896, K=896` matches Qwen2.5-0.5B's Q-projection weight shape
 //! (`[H_q * D_h, hidden_size]` = `[14 * 64, 896]` = `[896, 896]`).
 //!
-//! Tolerance: 0.02 abs / 0.02 rel (np.allclose-style combined bound).
+//! Tolerance: 0.05 abs / 0.01 rel (np.allclose-style combined bound).
 
 #![cfg(target_os = "macos")]
 
