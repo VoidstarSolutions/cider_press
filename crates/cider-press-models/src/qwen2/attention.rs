@@ -3,10 +3,10 @@
 //! Branch 9 landed [`rope`]. Branch 11 lands [`sdpa`], the three-op
 //! SDPA composition (`qk_matmul` → scale + mask + softmax →
 //! `attn_matmul`) with Qwen2-specific GQA broadcast of K/V to match
-//! Q's head count. The remaining attention path pieces (Q/K/V
-//! projections, output projection, KV-cache write threading) compose
-//! in branches 11b / 12b once `quantized_matmul` is wired through
-//! the runtime.
+//! Q's head count. Branch 11b lands [`project_qkv`] and
+//! [`project_output`], the Q/K/V/O linear projections using
+//! `quantized_matmul`. Branch 12b will fold them into
+//! `Attention::forward`.
 //!
 //! Lives in the `qwen2` submodule rather than the generic [`crate::nn`]
 //! surface because the bind-config-to-op idiom is per-model: Qwen2.5
@@ -17,12 +17,12 @@
 //! Matches MLX's `Qwen2Attention.__call__` rope step in
 //! `mlx-lm/models/qwen2.py`.
 
-use cider_press_runtime::{DType, Tensor};
+use cider_press_runtime::{DType, QuantizedWeight, Tensor};
 use half::bf16;
 
 use crate::error::{Error, Result};
 
-use super::Qwen2Config;
+use super::{Qwen2AttentionWeights, Qwen2Config};
 
 /// Apply rotary positional embedding to a Qwen2 attention projection
 /// (Q or K) at sequence position `offset`.
@@ -189,6 +189,120 @@ pub fn sdpa(
 
     let out = probs.matmul(&v_full)?; // [B, H_q, T, D_h]
     Ok(out)
+}
+
+/// Apply Q/K/V linear projections to a Qwen2 hidden state, producing
+/// per-head-laid-out tensors ready for [`rope`] and [`sdpa`].
+///
+/// Inputs:
+/// - `hidden`: `[B, T, hidden_size]`, dense contiguous BF16.
+/// - `weights`: the layer's `Qwen2AttentionWeights`.
+/// - `config`: pulls `H_q`, `H_kv`, `D_h`, `hidden_size`.
+///
+/// Outputs `(q, k, v)`:
+/// - `q`: `[B, H_q, T, D_h]`
+/// - `k`: `[B, H_kv, T, D_h]`
+/// - `v`: `[B, H_kv, T, D_h]`
+///
+/// No rope applied. Composition mirrors `mlx_lm.models.qwen2.Attention`.
+#[allow(clippy::many_single_char_names)]
+pub fn project_qkv(
+    hidden: &Tensor,
+    weights: &Qwen2AttentionWeights,
+    config: &Qwen2Config,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let hidden_size = config.hidden_size;
+    let head_dim = config.head_dim()?;
+    let h_q = config.num_attention_heads;
+    let h_kv = config.num_key_value_heads;
+
+    let dims = hidden.shape().dims();
+    if dims.len() != 3 {
+        return Err(Error::InvalidArgument(format!(
+            "project_qkv: hidden must be rank 3 [B, T, hidden_size]; got rank {}",
+            dims.len()
+        )));
+    }
+    if dims[2] != hidden_size {
+        return Err(Error::InvalidArgument(format!(
+            "project_qkv: hidden last dim ({}) != config.hidden_size ({})",
+            dims[2], hidden_size,
+        )));
+    }
+    if hidden.dtype() != DType::BF16 {
+        return Err(Error::InvalidArgument(format!(
+            "project_qkv: hidden must be BF16; got {:?}",
+            hidden.dtype()
+        )));
+    }
+    let b = dims[0];
+    let t = dims[1];
+
+    let project_one = |proj: &QuantizedWeight, bias: &Tensor, h: usize| -> Result<Tensor> {
+        // [B, T, H * D_h]
+        let out = hidden.quantized_matmul(proj)?;
+        // Reshape bias [H * D_h] → [1, 1, H * D_h] so the trailing
+        // broadcast aligns without needing explicit broadcast_to.
+        let bias_3d = bias.reshape([1usize, 1, h * head_dim])?;
+        let out = out.add(&bias_3d)?;
+        // [B, T, H * D_h] → [B, T, H, D_h]
+        let out = out.reshape([b, t, h, head_dim])?;
+        // [B, T, H, D_h] → [B, H, T, D_h]; copy to land contiguous bytes
+        // for the downstream matmul kernel.
+        let out = out.permute(&[0, 2, 1, 3])?.copy()?;
+        Ok(out)
+    };
+
+    let q = project_one(&weights.q_proj, &weights.q_bias, h_q)?;
+    let k = project_one(&weights.k_proj, &weights.k_bias, h_kv)?;
+    let v = project_one(&weights.v_proj, &weights.v_bias, h_kv)?;
+    Ok((q, k, v))
+}
+
+/// Apply the O linear projection to attention output.
+///
+/// Input: `[B, H_q, T, D_h]`, dense contiguous BF16.
+/// Output: `[B, T, hidden_size]`.
+///
+/// Qwen2's `o_proj` has no additive bias.
+pub fn project_output(
+    attn_out: &Tensor,
+    weights: &Qwen2AttentionWeights,
+    config: &Qwen2Config,
+) -> Result<Tensor> {
+    let head_dim = config.head_dim()?;
+    let h_q = config.num_attention_heads;
+
+    let dims = attn_out.shape().dims();
+    if dims.len() != 4 {
+        return Err(Error::InvalidArgument(format!(
+            "project_output: attn_out must be rank 4 [B, H_q, T, D_h]; got rank {}",
+            dims.len()
+        )));
+    }
+    let (b, t) = (dims[0], dims[2]);
+    if dims[1] != h_q || dims[3] != head_dim {
+        return Err(Error::InvalidArgument(format!(
+            "project_output: attn_out shape {dims:?} does not match \
+             config [B, {h_q}, T, {head_dim}]",
+        )));
+    }
+    if attn_out.dtype() != DType::BF16 {
+        return Err(Error::InvalidArgument(format!(
+            "project_output: attn_out must be BF16; got {:?}",
+            attn_out.dtype()
+        )));
+    }
+
+    // [B, H_q, T, D_h] → [B, T, H_q, D_h]; copy to materialize
+    // contiguous bytes before reshape.
+    let collapsed = attn_out
+        .permute(&[0, 2, 1, 3])?
+        .copy()?
+        .reshape([b, t, h_q * head_dim])?;
+
+    // [B, T, H_q * D_h] × [hidden_size, H_q * D_h]^T → [B, T, hidden_size]
+    Ok(collapsed.quantized_matmul(&weights.o_proj)?)
 }
 
 /// Reshape `[B, H_kv, T_c, D_h]` to `[B, H_q, T_c, D_h]` by fanning

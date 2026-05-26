@@ -556,6 +556,50 @@ def run_matmul(args: argparse.Namespace) -> dict[str, mx.array]:
     return {"lhs": lhs, "rhs": rhs, "out": out}
 
 
+# ---------------------------------------------------------------------------
+# qmm: quantized matmul — covers the qmv path (M=1 decode) and the
+# qmm_t path (M>1 prefill). Consumed by branch 11b `feat/quantized-matmul`.
+# Writes `x`, `w_q`, `scales`, `biases`, `y`.
+# ---------------------------------------------------------------------------
+
+
+def add_qmm_parser(subparsers: argparse._SubParsersAction) -> None:
+    p = subparsers.add_parser(
+        "qmm",
+        help="Quantized matmul (qmv path for M=1, qmm_t for M>1)",
+    )
+    p.add_argument("--m", type=int, required=True, help="activation rows (1 for decode)")
+    p.add_argument("--n", type=int, required=True, help="output cols (weight rows)")
+    p.add_argument("--k", type=int, required=True, help="inner dim (weight cols / activation cols)")
+    p.add_argument("--group-size", type=int, default=64)
+    p.add_argument("--bits", type=int, default=4)
+    p.add_argument("--dtype", default="bf16", help="one of f32, f16, bf16")
+
+
+def run_qmm(args: argparse.Namespace) -> dict[str, mx.array]:
+    dtype = _float_dtype(args.dtype)
+    # Use uniform-in-[-0.5, 0.5) for both weight and activation. This
+    # matches `gen_qmm_fixture.py` and avoids large-magnitude normal
+    # samples that expose numerical drift in MLX's qmm kernel vs f32
+    # reference (see branch 11b notes). The kernel correctness story is
+    # against the uniform-data pre-committed fixture; this case's job is
+    # to confirm parity at the models-crate level.
+    w = (mx.random.uniform(shape=(args.n, args.k)) - 0.5).astype(dtype)
+    w_q, scales, biases = mx.quantize(w, group_size=args.group_size, bits=args.bits)
+    if args.m == 1:
+        x = (mx.random.uniform(shape=(args.k,)) - 0.5).astype(dtype)
+    else:
+        x = (mx.random.uniform(shape=(args.m, args.k)) - 0.5).astype(dtype)
+    y = mx.quantized_matmul(
+        x, w_q, scales, biases,
+        transpose=True,
+        group_size=args.group_size,
+        bits=args.bits,
+    )
+    mx.eval(x, w_q, scales, biases, y)
+    return {"x": x, "w_q": w_q, "scales": scales, "biases": biases, "y": y}
+
+
 def add_softmax_parser(subparsers: argparse._SubParsersAction) -> None:
     p = subparsers.add_parser(
         "softmax",
@@ -608,6 +652,7 @@ OPS: dict[str, tuple[ParserBuilder, Runner]] = {
     "softmax": (add_softmax_parser, run_softmax),
     "matmul": (add_matmul_parser, run_matmul),
     "sdpa": (add_sdpa_parser, run_sdpa),
+    "qmm": (add_qmm_parser, run_qmm),
 }
 
 
