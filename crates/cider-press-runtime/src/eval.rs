@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use cider_press_kernels::{
     Buffer, Commands, KernelLibrary,
-    kernels::{binary, copy, qmv, reduce, unary},
+    kernels::{binary, copy, qmm, qmv, reduce, unary},
 };
 
 use crate::dtype::DType;
@@ -175,10 +175,10 @@ fn quantized_input_buffers(input: &Tensor) -> Result<(Buffer<u8>, Buffer<u8>, Bu
             Ok((w, s, b))
         }
         Some(LeafStorage::Dense(_)) => Err(Error::InvalidArgument(
-            "eval: Qmv expected a quantized weight leaf, found dense".into(),
+            "eval: QuantizedMatMul expected a quantized weight leaf, found dense".into(),
         )),
         None => Err(Error::InvalidArgument(
-            "eval: Qmv weight input is not materialized (placeholder or unevaluated op?)".into(),
+            "eval: QuantizedMatMul weight input is not materialized (placeholder or unevaluated op?)".into(),
         )),
     }
 }
@@ -196,7 +196,7 @@ fn dispatch(
         .expect("topo invariant: only op nodes here");
     match op.kind {
         OpKind::Copy => dispatch_copy(inner, op, commands, outputs, dst, index_of),
-        OpKind::Qmv { group_size, bits } => dispatch_qmv(
+        OpKind::QuantizedMatMul { group_size, bits } => dispatch_quantized_matmul(
             inner, op, commands, outputs, dst, index_of, group_size, bits,
         ),
         OpKind::Binary { op: binary_op } => {
@@ -491,8 +491,8 @@ fn contiguous_strides_i64(shape: &[i32]) -> Vec<i64> {
     strides
 }
 
-#[allow(clippy::too_many_arguments)]
-fn dispatch_qmv(
+#[allow(clippy::too_many_arguments, clippy::many_single_char_names)]
+fn dispatch_quantized_matmul(
     inner: &Arc<TensorInner>,
     op: &OpNode,
     commands: &mut Commands<'_>,
@@ -506,12 +506,11 @@ fn dispatch_qmv(
         .device
         .as_ref()
         .expect("op nodes are always constructed with a device");
-    let weight = op
-        .inputs
-        .first()
-        .ok_or_else(|| Error::InvalidArgument("Qmv: missing weight input (inputs[0])".into()))?;
+    let weight = op.inputs.first().ok_or_else(|| {
+        Error::InvalidArgument("QuantizedMatMul: missing weight input (inputs[0])".into())
+    })?;
     let x_tensor = op.inputs.get(1).ok_or_else(|| {
-        Error::InvalidArgument("Qmv: missing activation input (inputs[1])".into())
+        Error::InvalidArgument("QuantizedMatMul: missing activation input (inputs[1])".into())
     })?;
 
     let (w_bytes, scales_bytes, biases_bytes) = quantized_input_buffers(weight)?;
@@ -529,17 +528,50 @@ fn dispatch_qmv(
     let x_typed = unsafe { x_bytes.reinterpret_as::<half::bf16>() };
     let mut y_typed = unsafe { dst.reinterpret_as::<half::bf16>() };
 
-    qmv::affine_qmv_bf16(
-        commands,
-        library,
-        &w_typed,
-        &scales_typed,
-        &biases_typed,
-        &x_typed,
-        &mut y_typed,
-        group_size,
-        u32::from(bits),
-    )?;
+    // Compute M from the activation's shape. Rank-1 activation is the
+    // M=1 decode case; for rank ≥ 2 collapse all dims except the last
+    // two (K) into the batch/leading dims and multiply by the second-
+    // to-last dim to get M.
+    let x_dims = x_tensor.shape().dims();
+    let m: usize = if x_dims.len() == 1 {
+        1
+    } else {
+        let lead: usize = x_dims[..x_dims.len() - 2].iter().product::<usize>().max(1);
+        lead * x_dims[x_dims.len() - 2]
+    };
+    // N = weight[0], K = weight[1]; validated at op construction.
+    let w_dims = weight.shape().dims();
+    let n = w_dims[0];
+    let k = w_dims[1];
+
+    if m == 1 {
+        qmv::affine_qmv_bf16(
+            commands,
+            library,
+            &w_typed,
+            &scales_typed,
+            &biases_typed,
+            &x_typed,
+            &mut y_typed,
+            group_size,
+            u32::from(bits),
+        )?;
+    } else {
+        qmm::affine_qmm_t_bf16(
+            commands,
+            library,
+            &w_typed,
+            &scales_typed,
+            &biases_typed,
+            &x_typed,
+            &mut y_typed,
+            m,
+            n,
+            k,
+            group_size,
+            u32::from(bits),
+        )?;
+    }
 
     Ok(())
 }

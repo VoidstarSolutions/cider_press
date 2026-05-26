@@ -155,13 +155,16 @@ pub enum OpKind {
     /// the same shape, dtype, and values as the input. Mirrors MLX's
     /// `mx.copy` and dispatches to the vendored `v_copy` kernel.
     Copy,
-    /// Affine-quantized matrix-vector multiply: `y = x · dequant(w)ᵀ`.
+    /// Affine-quantized matrix multiply: `y = x · dequant(w)ᵀ`.
     /// Inputs (in [`Tensor::op_inputs`] order) are `[w, x]` where `w`
     /// is a [`Layout::Quantized`] tensor and `x` is a dense bf16
-    /// vector. `group_size` and `bits` are duplicated from `w`'s
+    /// tensor of shape `[…, M, K]` (rank-1 `[K]` is the decode / M=1
+    /// case). `group_size` and `bits` are duplicated from `w`'s
     /// [`Quantization`](crate::Quantization) descriptor so the
     /// dispatcher doesn't have to introspect the input's layout.
-    Qmv {
+    /// The eval-side dispatcher picks `affine_qmv` for M=1 and
+    /// `affine_qmm_t` for M>1.
+    QuantizedMatMul {
         /// Quantization group size (elements per scale/bias). Must
         /// match the input weight's [`Quantization::group_size`].
         group_size: u32,
@@ -1340,6 +1343,91 @@ impl Tensor {
             layout,
             OpKind::Softmax { precise },
             vec![self.clone()],
+        ))
+    }
+
+    /// Schedule an affine-quantized matrix multiply: `y = self · dequant(weight)ᵀ`.
+    ///
+    /// `self` is a dense, contiguous BF16 activation of shape `[…, M, K]`
+    /// (rank-1 `[K]` is the M=1 decode path). `weight` is rank-2 `[N, K]`.
+    /// Output is dense BF16 `[…, M, N]`, or `[N]` for rank-1 input.
+    ///
+    /// The eval-side dispatcher routes M=1 to `affine_qmv` and M>1 to
+    /// `affine_qmm_t`, both compiled from the vendored `quantized.metal`.
+    ///
+    /// Preconditions:
+    /// - `self` has a device; `weight` has a device; same device.
+    /// - `self.dtype() == BF16` and `self.layout()` is dense contiguous.
+    /// - `weight.shape()` is rank-2.
+    /// - Inner dim of `self` (last axis) matches `weight`'s K (second axis).
+    pub fn quantized_matmul(&self, weight: &crate::QuantizedWeight) -> Result<Self> {
+        let device = self.inner.device.as_ref().ok_or_else(|| {
+            Error::InvalidArgument(
+                "quantized_matmul: activation has no device (placeholder?)".into(),
+            )
+        })?;
+        let w_device = weight.tensor().inner.device.as_ref().ok_or_else(|| {
+            Error::InvalidArgument("quantized_matmul: weight has no device (placeholder?)".into())
+        })?;
+        if !device.ptr_eq(w_device) {
+            return Err(Error::InvalidArgument(
+                "quantized_matmul: activation and weight are on different devices".into(),
+            ));
+        }
+        if self.inner.dtype != DType::BF16 {
+            return Err(Error::InvalidArgument(format!(
+                "quantized_matmul: activation must be BF16; got {:?}",
+                self.inner.dtype
+            )));
+        }
+        let strides = match self.layout() {
+            Layout::Dense { strides } => strides,
+            Layout::Quantized(_) => {
+                return Err(Error::InvalidArgument(
+                    "quantized_matmul: activation must be a dense tensor".into(),
+                ));
+            }
+        };
+        if !strides.is_contiguous(self.shape()) {
+            return Err(Error::InvalidArgument(format!(
+                "quantized_matmul: activation must be contiguous \
+                 (shape {:?} strides {:?}); copy() first",
+                self.shape().dims(),
+                strides.as_slice(),
+            )));
+        }
+        let w_dims = weight.tensor().shape().dims();
+        if w_dims.len() != 2 {
+            return Err(Error::InvalidArgument(format!(
+                "quantized_matmul: weight must be rank 2; got rank {}",
+                w_dims.len()
+            )));
+        }
+        let (n, k) = (w_dims[0], w_dims[1]);
+        let x_dims = self.shape().dims();
+        let x_k = *x_dims.last().expect("shape is non-empty");
+        if x_k != k {
+            return Err(Error::InvalidArgument(format!(
+                "quantized_matmul: inner dim mismatch: activation last dim {x_k} != weight K {k}",
+            )));
+        }
+        let q = weight.quantization();
+        // Build output shape: leading dims of self (all but last), then N.
+        // For rank-1 activation [K] the leading dims are empty → output is [N].
+        let mut out_dims: Vec<usize> = x_dims[..x_dims.len() - 1].to_vec();
+        out_dims.push(n);
+        let out_shape = Shape::from(out_dims);
+        let out_layout = dense_layout(&out_shape);
+        Ok(Self::op_tensor(
+            device,
+            out_shape,
+            DType::BF16,
+            out_layout,
+            OpKind::QuantizedMatMul {
+                group_size: q.group_size(),
+                bits: q.bits(),
+            },
+            vec![weight.tensor().clone(), self.clone()],
         ))
     }
 
