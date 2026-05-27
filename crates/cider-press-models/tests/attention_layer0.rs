@@ -190,7 +190,7 @@ fn run_layer0(checkpoint: &Path, seq_len: usize, offset: usize) {
         .forward(&hidden, None, &offset_t, &mut cache)
         .expect("Attention::forward");
 
-    // ── 10. Eval and compare ──────────────────────────────────────────────────
+    // ── 9. Eval and compare ───────────────────────────────────────────────────
     out.eval().expect("eval");
     let got: Vec<bf16> = out.cpu_to_vec().expect("cpu_to_vec");
 
