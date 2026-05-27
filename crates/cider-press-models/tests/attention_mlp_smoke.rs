@@ -206,11 +206,8 @@ fn mlp_new_rejects_biased_linear() {
     let up_qw = zero_qw(&device, INTERMEDIATE, HIDDEN_SIZE);
     let down_qw = zero_qw(&device, HIDDEN_SIZE, INTERMEDIATE);
 
-    let biased_gate = Linear::new(
-        gate_qw.clone(),
-        Some(zero_bf16_1d(&device, INTERMEDIATE)),
-    )
-    .expect("biased gate Linear");
+    let biased_gate = Linear::new(gate_qw.clone(), Some(zero_bf16_1d(&device, INTERMEDIATE)))
+        .expect("biased gate Linear");
     let up = Linear::new(up_qw.clone(), None).expect("up");
     let down = Linear::new(down_qw.clone(), None).expect("down");
     assert!(
