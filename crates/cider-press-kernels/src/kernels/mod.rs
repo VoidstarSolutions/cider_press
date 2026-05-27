@@ -14,6 +14,7 @@ pub mod copy;
 pub mod dequantize;
 pub mod gather;
 pub mod matmul;
+pub mod qmm;
 pub mod qmv;
 pub mod reduce;
 pub mod rope;

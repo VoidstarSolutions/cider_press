@@ -3,6 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #   "mlx>=0.18",
+#   "mlx_lm>=0.21",
 #   "numpy>=1.26",
 # ]
 # ///
@@ -556,6 +557,105 @@ def run_matmul(args: argparse.Namespace) -> dict[str, mx.array]:
     return {"lhs": lhs, "rhs": rhs, "out": out}
 
 
+# ---------------------------------------------------------------------------
+# qmm: quantized matmul — covers the qmv path (M=1 decode) and the
+# qmm_t path (M>1 prefill). Consumed by branch 11b `feat/quantized-matmul`.
+# Writes `x`, `w_q`, `scales`, `biases`, `y`.
+# ---------------------------------------------------------------------------
+
+
+def add_qmm_parser(subparsers: argparse._SubParsersAction) -> None:
+    p = subparsers.add_parser(
+        "qmm",
+        help="Quantized matmul (qmv path for M=1, qmm_t for M>1)",
+    )
+    p.add_argument("--m", type=int, required=True, help="activation rows (1 for decode)")
+    p.add_argument("--n", type=int, required=True, help="output cols (weight rows)")
+    p.add_argument("--k", type=int, required=True, help="inner dim (weight cols / activation cols)")
+    p.add_argument("--group-size", type=int, default=64)
+    p.add_argument("--bits", type=int, default=4)
+    p.add_argument("--dtype", default="bf16", help="one of f32, f16, bf16")
+
+
+def run_qmm(args: argparse.Namespace) -> dict[str, mx.array]:
+    dtype = _float_dtype(args.dtype)
+    # Uniform [-0.5, 0.5) matches gen_qmm_fixture.py / gen_stage4_fixtures.py:
+    # at K=896, normal-distributed inputs produce output magnitudes large
+    # enough that bf16 LSB precision exceeds the M>1 tolerance bar.
+    w = (mx.random.uniform(shape=(args.n, args.k)) - 0.5).astype(dtype)
+    w_q, scales, biases = mx.quantize(w, group_size=args.group_size, bits=args.bits)
+    if args.m == 1:
+        x = (mx.random.uniform(shape=(args.k,)) - 0.5).astype(dtype)
+    else:
+        x = (mx.random.uniform(shape=(args.m, args.k)) - 0.5).astype(dtype)
+    y = mx.quantized_matmul(
+        x, w_q, scales, biases,
+        transpose=True,
+        group_size=args.group_size,
+        bits=args.bits,
+    )
+    mx.eval(x, w_q, scales, biases, y)
+    return {"x": x, "w_q": w_q, "scales": scales, "biases": biases, "y": y}
+
+
+# ---------------------------------------------------------------------------
+# attention_layer0: run layer-0 self-attention on a loaded Qwen2.5 MLX
+# checkpoint. Writes `x`, `y`. Loads the checkpoint via `mlx_lm.utils.load`,
+# constructs a random hidden state, and calls `model.model.layers[0].self_attn`
+# directly. For offset=0 (prefill) the cache is None; for offset>0 (decode)
+# the KVCache is pre-primed with `offset` zero rows via the `state` property
+# setter.
+#
+# This is a checkpoint-loading case: it requires `mlx_lm` (>=0.21) and a
+# local MLX-format checkpoint directory. It is registered in the OPS table
+# and invoked via the `attention_layer0` sub-parser; the Rust integration
+# test calls it via the `dump_mlx_op` helper with a `--checkpoint` arg.
+# ---------------------------------------------------------------------------
+
+
+def add_attention_layer0_parser(subparsers: argparse._SubParsersAction) -> None:
+    p = subparsers.add_parser(
+        "attention_layer0",
+        help="Run layer-0 self-attention on a loaded Qwen2.5 MLX checkpoint",
+    )
+    p.add_argument("--checkpoint", required=True, help="path to the MLX checkpoint directory")
+    p.add_argument("--seq-len", type=int, required=True, help="sequence length (T)")
+    p.add_argument("--offset", type=int, default=0, help="KV cache offset (0 for prefill)")
+
+
+def run_attention_layer0(args: argparse.Namespace) -> dict[str, mx.array]:
+    from mlx_lm.utils import load
+    from mlx_lm.models.cache import KVCache
+
+    model, _tokenizer = load(args.checkpoint)
+    attn = model.model.layers[0].self_attn
+    hidden_size: int = model.args.hidden_size
+    n_kv_heads: int = attn.n_kv_heads
+    # head_dim = hidden_size // n_heads; same formula as Attention.__init__
+    head_dim: int = hidden_size // model.args.num_attention_heads
+
+    x = (mx.random.uniform(shape=(1, args.seq_len, hidden_size)) - 0.5).astype(mx.bfloat16)
+
+    if args.offset == 0:
+        # Prefill: no cache — mlx_lm.Qwen2Attention.__call__ uses offset=0 RoPE
+        # and omits the KV-cache update when cache=None.
+        out = attn(x, mask=None, cache=None)
+    else:
+        # Decode: pre-prime the KVCache with `offset` zero rows so that
+        # mlx_lm's attention uses `cache.offset` for RoPE positioning.
+        # `KVCache.state` setter assigns keys/values and sets
+        # `self.offset = keys.shape[2]`, giving us arbitrary-offset seeding
+        # without patching mlx_lm internals.
+        cache = KVCache()
+        pad_k = mx.zeros((1, n_kv_heads, args.offset, head_dim), dtype=mx.bfloat16)
+        pad_v = mx.zeros_like(pad_k)
+        cache.state = (pad_k, pad_v)
+        out = attn(x, mask=None, cache=cache)
+
+    mx.eval(x, out)
+    return {"x": x, "y": out}
+
+
 def add_softmax_parser(subparsers: argparse._SubParsersAction) -> None:
     p = subparsers.add_parser(
         "softmax",
@@ -608,6 +708,8 @@ OPS: dict[str, tuple[ParserBuilder, Runner]] = {
     "softmax": (add_softmax_parser, run_softmax),
     "matmul": (add_matmul_parser, run_matmul),
     "sdpa": (add_sdpa_parser, run_sdpa),
+    "qmm": (add_qmm_parser, run_qmm),
+    "attention_layer0": (add_attention_layer0_parser, run_attention_layer0),
 }
 
 

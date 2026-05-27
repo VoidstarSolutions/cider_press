@@ -13,9 +13,9 @@
 //!
 //! - [`Tensor::copy`] — element-wise identity (`f32`, `f16`, `bf16`,
 //!   `i32`, `u32` — every dtype the runtime currently models).
-//! - [`QuantizedWeight::matvec`] — affine-quantized matvec (bf16
-//!   inputs, bf16 output; bit-exact parity with MLX's
-//!   `mx.quantized_matmul` on the Stage-4 fixture).
+//! - [`Tensor::quantized_matmul`] — affine-quantized matmul (bf16
+//!   inputs, bf16 output; parity with MLX's `mx.quantized_matmul`;
+//!   routes M=1 to `affine_qmv` and M>1 to `affine_qmm_t`).
 //!
 //! [`Tensor::eval`] is the synchronous boundary that walks the
 //! graph, dispatches MLX kernels via [`cider_press_kernels`], blocks

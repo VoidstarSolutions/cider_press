@@ -1,16 +1,11 @@
-//! Runtime-level parity test for `Tensor::quantized_matmul` (M=1 decode path)
+//! Runtime-level parity test for `Tensor::quantized_matmul` (M=8 prefill path)
 //! against MLX's `mx.quantized_matmul`.
 //!
-//! Reuses the Stage-4 fixture from the kernels crate
-//! (`crates/cider-press-kernels/tests/fixtures/stage4_qmv.safetensors`)
+//! Reuses the Task-1 fixture from the kernels crate
+//! (`crates/cider-press-kernels/tests/fixtures/qmm_qwen2.safetensors`)
 //! but drives the dispatch through the runtime API: build a
-//! `QuantizedWeight`, build an activation tensor, schedule
+//! `QuantizedWeight`, build an `[M=8, K=896]` activation tensor, schedule
 //! `quantized_matmul`, `eval()`, and read the result back.
-//!
-//! The kernels-level test [crates/cider-press-kernels/tests/stage4_qmv.rs]
-//! has a relaxed bf16 tolerance to absorb GPU-family differences when
-//! run on multiple machines. The same kernel is being called here, so
-//! the comparison passes at the same tolerance.
 
 #![cfg(target_os = "macos")]
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
@@ -23,8 +18,10 @@ use cider_press_test_utils::read_bf16;
 use half::bf16;
 use safetensors::SafeTensors;
 
-const K: usize = 512;
-const N: usize = 512;
+// Test dims — must match scripts/gen_qmm_fixture.py.
+const M: usize = 8;
+const K: usize = 896;
+const N: usize = 896;
 
 fn fixture_path() -> PathBuf {
     // The fixture is committed under the kernels crate; reuse it from
@@ -35,15 +32,15 @@ fn fixture_path() -> PathBuf {
         .join("cider-press-kernels")
         .join("tests")
         .join("fixtures")
-        .join("stage4_qmv.safetensors")
+        .join("qmm_qwen2.safetensors")
 }
 
 #[test]
-fn qmv_through_runtime_matches_mlx() {
+fn qmm_through_runtime_matches_mlx() {
     let path = fixture_path();
     assert!(
         path.exists(),
-        "missing parity fixture at {}; run `uv run scripts/gen_stage4_fixtures.py` \
+        "missing parity fixture at {}; run `uv run scripts/gen_qmm_fixture.py` \
          from the workspace root to regenerate it",
         path.display(),
     );
@@ -57,10 +54,11 @@ fn qmv_through_runtime_matches_mlx() {
     let w_bytes = bytes_for(&st, "w_q");
     let scales_bytes = bytes_for(&st, "scales");
     let biases_bytes = bytes_for(&st, "biases");
-    let x_bytes = bytes_for(&st, "x");
+    let x_raw = read_bf16(&st, "x");
     let y_ref = read_bf16(&st, "y_ref");
 
-    assert_eq!(y_ref.len(), N);
+    assert_eq!(x_raw.len(), M * K);
+    assert_eq!(y_ref.len(), M * N);
 
     let device = Device::shared().expect("device");
 
@@ -74,21 +72,21 @@ fn qmv_through_runtime_matches_mlx() {
     )
     .expect("build QuantizedWeight");
 
-    let x = Tensor::from_bytes(&device, x_bytes, [K], DType::BF16).expect("upload x");
+    let x = Tensor::from_slice(&device, &x_raw, [M, K]).expect("upload x");
 
     let y = x.quantized_matmul(&qw).expect("schedule quantized_matmul");
     assert!(!y.is_materialized(), "quantized_matmul is lazy");
+    assert_eq!(y.shape().dims(), &[M, N]);
+    assert_eq!(y.dtype(), DType::BF16);
 
     y.eval().expect("eval");
     assert!(y.is_materialized());
 
     let y_out = y.cpu_slice::<bf16>().expect("cpu_slice bf16");
-    assert_eq!(y_out.len(), N);
+    assert_eq!(y_out.len(), M * N);
 
-    // Same kernel as Stage 4 ⇒ same per-element tolerance. The
-    // kernels-level test documents why this isn't bit-exact across
-    // all Apple Silicon families even though the spike measured
-    // max_relative=max_absolute=0 on the development machine.
+    // Same tolerance as the kernels-layer test: bit-exact on identical
+    // hardware, 1–2 ULP drift across Apple Silicon generations.
     for (a, e) in y_out.iter().zip(y_ref.iter()) {
         let af = a.to_f32();
         let ef = e.to_f32();

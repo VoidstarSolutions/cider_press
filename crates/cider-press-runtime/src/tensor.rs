@@ -155,13 +155,16 @@ pub enum OpKind {
     /// the same shape, dtype, and values as the input. Mirrors MLX's
     /// `mx.copy` and dispatches to the vendored `v_copy` kernel.
     Copy,
-    /// Affine-quantized matrix-vector multiply: `y = x · dequant(w)ᵀ`.
+    /// Affine-quantized matrix multiply: `y = x · dequant(w)ᵀ`.
     /// Inputs (in [`Tensor::op_inputs`] order) are `[w, x]` where `w`
     /// is a [`Layout::Quantized`] tensor and `x` is a dense bf16
-    /// vector. `group_size` and `bits` are duplicated from `w`'s
+    /// tensor of shape `[…, M, K]` (rank-1 `[K]` is the decode / M=1
+    /// case). `group_size` and `bits` are duplicated from `w`'s
     /// [`Quantization`](crate::Quantization) descriptor so the
     /// dispatcher doesn't have to introspect the input's layout.
-    Qmv {
+    /// The eval-side dispatcher picks `affine_qmv` for M=1 and
+    /// `affine_qmm_t` for M>1.
+    QuantizedMatMul {
         /// Quantization group size (elements per scale/bias). Must
         /// match the input weight's [`Quantization::group_size`].
         group_size: u32,
@@ -559,7 +562,7 @@ impl Tensor {
     }
 
     /// Crate-private constructor for op tensors (used by op builders
-    /// like [`Tensor::copy`] and [`QuantizedWeight::matvec`](crate::QuantizedWeight::matvec)).
+    /// like [`Tensor::copy`] and [`Tensor::quantized_matmul`]).
     pub(crate) fn op_tensor(
         device: &Device,
         shape: Shape,
@@ -1340,6 +1343,91 @@ impl Tensor {
             layout,
             OpKind::Softmax { precise },
             vec![self.clone()],
+        ))
+    }
+
+    /// Schedule an affine-quantized matrix multiply: `y = self · dequant(weight)ᵀ`.
+    ///
+    /// `self` is a dense, contiguous BF16 activation of shape `[…, M, K]`
+    /// (rank-1 `[K]` is the M=1 decode path). `weight` is rank-2 `[N, K]`.
+    /// Output is dense BF16 `[…, M, N]`, or `[N]` for rank-1 input.
+    ///
+    /// The eval-side dispatcher routes M=1 to `affine_qmv` and M>1 to
+    /// `affine_qmm_t`, both compiled from the vendored `quantized.metal`.
+    ///
+    /// Preconditions:
+    /// - `self` has a device; `weight` has a device; same device.
+    /// - `self.dtype() == BF16` and `self.layout()` is dense contiguous.
+    /// - `weight.shape()` is rank-2.
+    /// - Inner dim of `self` (last axis) matches `weight`'s K (second axis).
+    pub fn quantized_matmul(&self, weight: &crate::QuantizedWeight) -> Result<Self> {
+        let device = self.inner.device.as_ref().ok_or_else(|| {
+            Error::InvalidArgument(
+                "quantized_matmul: activation has no device (placeholder?)".into(),
+            )
+        })?;
+        let w_device = weight.tensor().inner.device.as_ref().ok_or_else(|| {
+            Error::InvalidArgument("quantized_matmul: weight has no device (placeholder?)".into())
+        })?;
+        if !device.ptr_eq(w_device) {
+            return Err(Error::InvalidArgument(
+                "quantized_matmul: activation and weight are on different devices".into(),
+            ));
+        }
+        if self.inner.dtype != DType::BF16 {
+            return Err(Error::InvalidArgument(format!(
+                "quantized_matmul: activation must be BF16; got {:?}",
+                self.inner.dtype
+            )));
+        }
+        let strides = match self.layout() {
+            Layout::Dense { strides } => strides,
+            Layout::Quantized(_) => {
+                return Err(Error::InvalidArgument(
+                    "quantized_matmul: activation must be a dense tensor".into(),
+                ));
+            }
+        };
+        if !strides.is_contiguous(self.shape()) {
+            return Err(Error::InvalidArgument(format!(
+                "quantized_matmul: activation must be contiguous \
+                 (shape {:?} strides {:?}); copy() first",
+                self.shape().dims(),
+                strides.as_slice(),
+            )));
+        }
+        let w_dims = weight.tensor().shape().dims();
+        if w_dims.len() != 2 {
+            return Err(Error::InvalidArgument(format!(
+                "quantized_matmul: weight must be rank 2; got rank {}",
+                w_dims.len()
+            )));
+        }
+        let (n, k) = (w_dims[0], w_dims[1]);
+        let x_dims = self.shape().dims();
+        let x_k = *x_dims.last().expect("shape is non-empty");
+        if x_k != k {
+            return Err(Error::InvalidArgument(format!(
+                "quantized_matmul: inner dim mismatch: activation last dim {x_k} != weight K {k}",
+            )));
+        }
+        let q = weight.quantization();
+        // Build output shape: leading dims of self (all but last), then N.
+        // For rank-1 activation [K] the leading dims are empty → output is [N].
+        let mut out_dims: Vec<usize> = x_dims[..x_dims.len() - 1].to_vec();
+        out_dims.push(n);
+        let out_shape = Shape::from(out_dims);
+        let out_layout = dense_layout(&out_shape);
+        Ok(Self::op_tensor(
+            device,
+            out_shape,
+            DType::BF16,
+            out_layout,
+            OpKind::QuantizedMatMul {
+                group_size: q.group_size(),
+                bits: q.bits(),
+            },
+            vec![weight.tensor().clone(), self.clone()],
         ))
     }
 
@@ -3473,5 +3561,85 @@ mod tests {
         dst.eval().expect("eval");
         let read_back = dst.cpu_slice::<u32>().expect("cpu_slice");
         assert_eq!(read_back, data.as_slice());
+    }
+
+    // ── quantized_matmul constructor tests ──────────────────────────────────
+
+    // N=4, K=64, Q4_GS64:
+    //   w_bytes   = N * K * bits / 32 * sizeof(u32) = 4 * 64 * 4 / 32 * 4 = 128
+    //   aux_bytes = N * K / group_size * sizeof(bf16) = 4 * 64 / 64 * 2    =   8
+    const QMM_N: usize = 4;
+    const QMM_K: usize = 64;
+    const QMM_W_BYTES: usize = QMM_N * QMM_K * 4 / 32 * 4; // 128
+    const QMM_AUX_BYTES: usize = QMM_N * QMM_K / 64 * 2; // 8
+
+    fn make_test_qw(device: &crate::Device) -> crate::QuantizedWeight {
+        crate::QuantizedWeight::from_bytes(
+            device,
+            [QMM_N, QMM_K],
+            crate::Quantization::Q4_GS64,
+            &[0u8; QMM_W_BYTES],
+            &[0u8; QMM_AUX_BYTES],
+            &[0u8; QMM_AUX_BYTES],
+        )
+        .expect("build synthetic QuantizedWeight")
+    }
+
+    #[test]
+    fn quantized_matmul_builds_op() {
+        let device = Device::shared().expect("device");
+        let qw = make_test_qw(&device);
+
+        let x_bytes = QMM_K * 2; // bf16 = 2 bytes/elem
+        let x = Tensor::from_bytes(&device, &vec![0u8; x_bytes], [QMM_K], DType::BF16)
+            .expect("build activation");
+
+        let y = x.quantized_matmul(&qw).expect("quantized_matmul");
+
+        assert!(!y.is_materialized(), "output must be lazy");
+        assert_eq!(
+            y.op_kind(),
+            Some(OpKind::QuantizedMatMul {
+                group_size: crate::Quantization::Q4_GS64.group_size(),
+                bits: crate::Quantization::Q4_GS64.bits(),
+            })
+        );
+        assert_eq!(y.shape().dims(), &[QMM_N]);
+        assert_eq!(y.dtype(), DType::BF16);
+    }
+
+    #[test]
+    fn quantized_matmul_rejects_wrong_activation_dtype() {
+        let device = Device::shared().expect("device");
+        let qw = make_test_qw(&device);
+
+        // F32 activation — wrong dtype.
+        let x_bytes = QMM_K * 4; // f32 = 4 bytes/elem
+        let x = Tensor::from_bytes(&device, &vec![0u8; x_bytes], [QMM_K], DType::F32)
+            .expect("build f32 activation");
+
+        let err = x.quantized_matmul(&qw).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(_)),
+            "expected InvalidArgument, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn quantized_matmul_rejects_inner_dim_mismatch() {
+        let device = Device::shared().expect("device");
+        let qw = make_test_qw(&device);
+
+        // Activation with K+1 — inner dim mismatch.
+        let wrong_k = QMM_K + 1;
+        let x_bytes = wrong_k * 2; // bf16
+        let x = Tensor::from_bytes(&device, &vec![0u8; x_bytes], [wrong_k], DType::BF16)
+            .expect("build mismatched activation");
+
+        let err = x.quantized_matmul(&qw).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(_)),
+            "expected InvalidArgument, got {err:?}"
+        );
     }
 }

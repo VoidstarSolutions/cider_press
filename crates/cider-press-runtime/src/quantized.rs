@@ -3,12 +3,12 @@
 //! Quantized weights are a different beast than dense tensors: they
 //! carry three buffers (packed lanes, per-group scales, per-group
 //! biases), they require a [`Quantization`] descriptor to interpret,
-//! and they only participate in a small set of ops (chiefly `qmv` and
-//! eventually `qmm`). The design doc's recommendation: encode the
-//! "this is a quantized weight" precondition in the type system at
-//! the op boundary, so op signatures stay infallible at the type
-//! level and end-users can't accidentally hand a dense tensor to
-//! [`QuantizedWeight::matvec`].
+//! and they only participate in a small set of ops (chiefly
+//! [`Tensor::quantized_matmul`]). The design doc's recommendation:
+//! encode the "this is a quantized weight" precondition in the type
+//! system at the op boundary, so op signatures stay infallible at the
+//! type level and end-users can't accidentally hand a dense tensor to
+//! the quantized-matmul path.
 //!
 //! [`QuantizedWeight`] is a thin newtype around [`Tensor`]: the
 //! underlying graph node carries [`Layout::Quantized`] and the
@@ -23,9 +23,9 @@ use crate::Shape;
 use crate::Tensor;
 use crate::dtype::DType;
 use crate::error::{Error, Result};
-use crate::tensor::{LeafStorage, OpKind};
+use crate::tensor::LeafStorage;
 
-/// A quantized weight matrix, ready for [`QuantizedWeight::matvec`].
+/// A quantized weight matrix, ready for [`Tensor::quantized_matmul`].
 ///
 /// Construct via [`QuantizedWeight::from_bytes`]. Cheap to clone
 /// (same `Arc<TensorInner>` underlying the wrapped [`Tensor`]).
@@ -122,69 +122,6 @@ impl QuantizedWeight {
         let tensor =
             Tensor::host_quantized_leaf(device, shape, layout, weights_buf, scales_buf, biases_buf);
         Ok(Self { tensor })
-    }
-
-    /// Schedule a quantized matrix-vector multiply: `y = x · dequant(w)ᵀ`.
-    ///
-    /// `x` must be a dense bf16 vector of length `K` (the weight's
-    /// inner dim). The returned [`Tensor`] is a lazy op node
-    /// representing the output bf16 vector of length `N`. No GPU
-    /// work runs until [`Tensor::eval`].
-    ///
-    /// Currently only bf16 inputs are supported; the underlying
-    /// kernel is MLX's `affine_qmv_bf16` family.
-    pub fn matvec(&self, x: &Tensor) -> Result<Tensor> {
-        let device = self.tensor.device().ok_or_else(|| {
-            Error::InvalidArgument("QuantizedWeight::matvec: weight has no device".into())
-        })?;
-        let x_device = x.device().ok_or_else(|| {
-            Error::InvalidArgument(
-                "QuantizedWeight::matvec: activation x is a placeholder (no device)".into(),
-            )
-        })?;
-        if !device.ptr_eq(x_device) {
-            return Err(Error::InvalidArgument(
-                "QuantizedWeight::matvec: weight and activation are on different devices".into(),
-            ));
-        }
-        if x.dtype() != DType::BF16 {
-            return Err(Error::InvalidArgument(format!(
-                "QuantizedWeight::matvec: activation must be bf16; got {}",
-                x.dtype()
-            )));
-        }
-        if !matches!(x.layout(), Layout::Dense { .. }) {
-            return Err(Error::InvalidArgument(
-                "QuantizedWeight::matvec: activation must be dense".into(),
-            ));
-        }
-        // Shape: weight is [N, K], activation must be [K], output is [N].
-        let weight_shape = self.tensor.shape();
-        let dims = weight_shape.dims();
-        let (n, k) = (dims[0], dims[1]);
-        let x_shape = x.shape();
-        let x_dims = x_shape.dims();
-        if x_dims.len() != 1 || x_dims[0] != k {
-            return Err(Error::InvalidArgument(format!(
-                "QuantizedWeight::matvec: activation shape must be [{k}]; got {x_shape:?}"
-            )));
-        }
-        let q = self.quantization();
-        let out_shape = Shape::from([n]);
-        let out_layout = Layout::Dense {
-            strides: crate::Strides::contiguous(&out_shape),
-        };
-        Ok(Tensor::op_tensor(
-            device,
-            out_shape,
-            DType::BF16,
-            out_layout,
-            OpKind::Qmv {
-                group_size: q.group_size(),
-                bits: q.bits(),
-            },
-            vec![self.tensor.clone(), x.clone()],
-        ))
     }
 
     /// The underlying [`Tensor`] handle. Use this when an API wants a
@@ -396,78 +333,6 @@ mod tests {
             &vec![0; aux_bytes],
         )
         .unwrap_err();
-        assert!(matches!(err, Error::InvalidArgument(_)));
-    }
-
-    #[test]
-    fn matvec_builds_qmv_op() {
-        let device = Device::shared().expect("device");
-        let q = Quantization::Q4_GS64;
-        let (w_bytes, aux_bytes) = fixture_sizes(512, 512, q);
-        let qw = QuantizedWeight::from_bytes(
-            &device,
-            [512, 512],
-            q,
-            &vec![0; w_bytes],
-            &vec![0; aux_bytes],
-            &vec![0; aux_bytes],
-        )
-        .expect("build");
-
-        let x_data = vec![half::bf16::ZERO; 512];
-        let x = Tensor::from_slice(&device, &x_data, [512]).expect("x");
-        let y = qw.matvec(&x).expect("matvec");
-
-        assert_eq!(
-            y.op_kind(),
-            Some(OpKind::Qmv {
-                group_size: 64,
-                bits: 4,
-            })
-        );
-        assert!(!y.is_materialized());
-        assert_eq!(y.shape(), &Shape::from([512]));
-        assert_eq!(y.dtype(), DType::BF16);
-    }
-
-    #[test]
-    fn matvec_rejects_wrong_activation_dtype() {
-        let device = Device::shared().expect("device");
-        let q = Quantization::Q4_GS64;
-        let (w_bytes, aux_bytes) = fixture_sizes(64, 64, q);
-        let qw = QuantizedWeight::from_bytes(
-            &device,
-            [64, 64],
-            q,
-            &vec![0; w_bytes],
-            &vec![0; aux_bytes],
-            &vec![0; aux_bytes],
-        )
-        .expect("build");
-
-        let x = Tensor::zeros(&device, [64], DType::F32).expect("x");
-        let err = qw.matvec(&x).unwrap_err();
-        assert!(matches!(err, Error::InvalidArgument(_)));
-    }
-
-    #[test]
-    fn matvec_rejects_wrong_activation_shape() {
-        let device = Device::shared().expect("device");
-        let q = Quantization::Q4_GS64;
-        let (w_bytes, aux_bytes) = fixture_sizes(64, 64, q);
-        let qw = QuantizedWeight::from_bytes(
-            &device,
-            [64, 64],
-            q,
-            &vec![0; w_bytes],
-            &vec![0; aux_bytes],
-            &vec![0; aux_bytes],
-        )
-        .expect("build");
-
-        let x_data = vec![half::bf16::ZERO; 32];
-        let x = Tensor::from_slice(&device, &x_data, [32]).expect("x");
-        let err = qw.matvec(&x).unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)));
     }
 }
