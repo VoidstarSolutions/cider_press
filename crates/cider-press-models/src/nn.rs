@@ -246,6 +246,26 @@ impl Linear {
                     bias.shape().dims(),
                 )));
             }
+            // The bias adds to the BF16 projection output on the weight's
+            // device, so it must match both — otherwise `forward`'s `add`
+            // would fail late. Reject the mismatch at construction.
+            let weight_device = weight.tensor().device().ok_or_else(|| {
+                Error::InvalidArgument("Linear: weight has no device (placeholder?)".into())
+            })?;
+            let bias_device = bias.device().ok_or_else(|| {
+                Error::InvalidArgument("Linear: bias has no device (placeholder?)".into())
+            })?;
+            if !weight_device.ptr_eq(bias_device) {
+                return Err(Error::InvalidArgument(
+                    "Linear: bias and weight are on different devices".into(),
+                ));
+            }
+            if bias.dtype() != DType::BF16 {
+                return Err(Error::InvalidArgument(format!(
+                    "Linear: bias must be BF16 to match the projection output; got {:?}",
+                    bias.dtype(),
+                )));
+            }
         }
         Ok(Self { weight, bias })
     }

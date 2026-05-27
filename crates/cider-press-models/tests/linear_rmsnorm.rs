@@ -61,6 +61,10 @@ fn assert_close(label: &str, out: &[bf16], reference: &[bf16], atol: f32, rtol: 
         }
         let af = a.to_f32();
         let bf = b.to_f32();
+        assert!(
+            !af.is_nan() && !bf.is_nan(),
+            "{label}: NaN at element [{i}] got={af} want={bf}"
+        );
         let diff = (af - bf).abs();
         let bound = atol + rtol * bf.abs();
         let excess = diff - bound;

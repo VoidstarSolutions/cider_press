@@ -3663,4 +3663,39 @@ mod tests {
             "expected InvalidArgument, got {err:?}"
         );
     }
+
+    #[test]
+    fn quantized_matmul_rejects_rank_0_activation() {
+        let device = Device::shared().expect("device");
+        let qw = make_test_qw(&device);
+
+        // Rank-0 (scalar) activation — has no inner K axis.
+        let x = Tensor::from_bytes(&device, &[0u8; 2], [], DType::BF16)
+            .expect("build rank-0 activation");
+
+        let err = x.quantized_matmul(&qw).unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidArgument(msg) if msg.contains("rank >= 1")),
+            "expected rank >= 1 rejection, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn quantized_matmul_rejects_unaligned_n_for_prefill() {
+        let device = Device::shared().expect("device");
+        // make_test_qw has N=4, which is not a multiple of 32.
+        let qw = make_test_qw(&device);
+
+        // M=2 (>1) prefill path, K matches — only N alignment is wrong.
+        let m = 2;
+        let x_bytes = m * QMM_K * 2; // bf16
+        let x = Tensor::from_bytes(&device, &vec![0u8; x_bytes], [m, QMM_K], DType::BF16)
+            .expect("build prefill activation");
+
+        let err = x.quantized_matmul(&qw).unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidArgument(msg) if msg.contains("multiple of 32")),
+            "expected aligned-N rejection, got {err:?}"
+        );
+    }
 }
