@@ -171,6 +171,11 @@ pub enum OpKind {
         /// Quantization bit-width (e.g. 4 for int4 weights). Must
         /// match the input weight's [`Quantization::bits`].
         bits: u8,
+        /// `true` means `y = x @ W^T` (weight stored `[N, K]`, output dim `N`).
+        /// This is the only direction currently implemented; `false` returns
+        /// `Unimplemented` from the dispatcher (the tied LM head uses
+        /// `transpose=true`, so no consumer needs `false` yet).
+        transpose: bool,
     },
     /// Element-wise binary op with `NumPy` broadcasting. Inputs (in
     /// [`Tensor::op_inputs`] order) are `[lhs, rhs]`, both dense
@@ -1360,7 +1365,20 @@ impl Tensor {
     /// - `self.dtype() == BF16` and `self.layout()` is dense contiguous.
     /// - `weight.shape()` is rank-2.
     /// - Inner dim of `self` (last axis) matches `weight`'s K (second axis).
-    pub fn quantized_matmul(&self, weight: &crate::QuantizedWeight) -> Result<Self> {
+    /// - `transpose` must be `true`; `transpose=false` (needed for the tied LM
+    ///   head) is not yet implemented and returns `Err` immediately.
+    pub fn quantized_matmul(
+        &self,
+        weight: &crate::QuantizedWeight,
+        transpose: bool,
+    ) -> Result<Self> {
+        if !transpose {
+            return Err(Error::InvalidArgument(
+                "quantized_matmul: transpose=false direction is not implemented yet \
+                 (only the standard `y = x @ W^T` direction is wired)"
+                    .into(),
+            ));
+        }
         let device = self.inner.device.as_ref().ok_or_else(|| {
             Error::InvalidArgument(
                 "quantized_matmul: activation has no device (placeholder?)".into(),
@@ -1447,6 +1465,7 @@ impl Tensor {
             OpKind::QuantizedMatMul {
                 group_size: q.group_size(),
                 bits: q.bits(),
+                transpose,
             },
             vec![weight.tensor().clone(), self.clone()],
         ))
@@ -3615,7 +3634,7 @@ mod tests {
         let x = Tensor::from_bytes(&device, &vec![0u8; x_bytes], [QMM_K], DType::BF16)
             .expect("build activation");
 
-        let y = x.quantized_matmul(&qw).expect("quantized_matmul");
+        let y = x.quantized_matmul(&qw, true).expect("quantized_matmul");
 
         assert!(!y.is_materialized(), "output must be lazy");
         assert_eq!(
@@ -3623,6 +3642,7 @@ mod tests {
             Some(OpKind::QuantizedMatMul {
                 group_size: crate::Quantization::Q4_GS64.group_size(),
                 bits: crate::Quantization::Q4_GS64.bits(),
+                transpose: true,
             })
         );
         assert_eq!(y.shape().dims(), &[QMM_N]);
@@ -3639,7 +3659,7 @@ mod tests {
         let x = Tensor::from_bytes(&device, &vec![0u8; x_bytes], [QMM_K], DType::F32)
             .expect("build f32 activation");
 
-        let err = x.quantized_matmul(&qw).unwrap_err();
+        let err = x.quantized_matmul(&qw, true).unwrap_err();
         assert!(
             matches!(err, Error::InvalidArgument(_)),
             "expected InvalidArgument, got {err:?}"
@@ -3657,7 +3677,7 @@ mod tests {
         let x = Tensor::from_bytes(&device, &vec![0u8; x_bytes], [wrong_k], DType::BF16)
             .expect("build mismatched activation");
 
-        let err = x.quantized_matmul(&qw).unwrap_err();
+        let err = x.quantized_matmul(&qw, true).unwrap_err();
         assert!(
             matches!(err, Error::InvalidArgument(_)),
             "expected InvalidArgument, got {err:?}"
@@ -3673,7 +3693,7 @@ mod tests {
         let x = Tensor::from_bytes(&device, &[0u8; 2], [], DType::BF16)
             .expect("build rank-0 activation");
 
-        let err = x.quantized_matmul(&qw).unwrap_err();
+        let err = x.quantized_matmul(&qw, true).unwrap_err();
         assert!(
             matches!(&err, Error::InvalidArgument(msg) if msg.contains("rank >= 1")),
             "expected rank >= 1 rejection, got {err:?}"
@@ -3692,10 +3712,26 @@ mod tests {
         let x = Tensor::from_bytes(&device, &vec![0u8; x_bytes], [m, QMM_K], DType::BF16)
             .expect("build prefill activation");
 
-        let err = x.quantized_matmul(&qw).unwrap_err();
+        let err = x.quantized_matmul(&qw, true).unwrap_err();
         assert!(
             matches!(&err, Error::InvalidArgument(msg) if msg.contains("multiple of 32")),
             "expected aligned-N rejection, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn quantized_matmul_rejects_transpose_false() {
+        let device = Device::shared().expect("device");
+        let qw = make_test_qw(&device);
+        let x_bytes = QMM_K * 2;
+        let x = Tensor::from_bytes(&device, &vec![0u8; x_bytes], [QMM_K], DType::BF16)
+            .expect("build activation");
+
+        let err = x.quantized_matmul(&qw, false).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("transpose=false") && msg.contains("not implemented"),
+            "expected Unimplemented for transpose=false; got: {msg}"
         );
     }
 }

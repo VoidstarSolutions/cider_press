@@ -285,7 +285,7 @@ impl Linear {
 
 impl Module for Linear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let y = x.quantized_matmul(&self.weight)?;
+        let y = x.quantized_matmul(&self.weight, true)?;
         match &self.bias {
             Some(bias) => Ok(y.add(bias)?),
             None => Ok(y),

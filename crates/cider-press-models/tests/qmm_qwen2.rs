@@ -128,7 +128,7 @@ fn run_case(m: usize) {
     };
 
     // Run quantized_matmul and eval.
-    let y = x.quantized_matmul(&qw).expect("quantized_matmul");
+    let y = x.quantized_matmul(&qw, true).expect("quantized_matmul");
     y.eval().expect("eval");
     let got: Vec<bf16> = y.cpu_to_vec().expect("cpu_to_vec");
 

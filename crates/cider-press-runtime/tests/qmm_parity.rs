@@ -74,7 +74,7 @@ fn qmm_through_runtime_matches_mlx() {
 
     let x = Tensor::from_slice(&device, &x_raw, [M, K]).expect("upload x");
 
-    let y = x.quantized_matmul(&qw).expect("schedule quantized_matmul");
+    let y = x.quantized_matmul(&qw, true).expect("schedule quantized_matmul");
     assert!(!y.is_materialized(), "quantized_matmul is lazy");
     assert_eq!(y.shape().dims(), &[M, N]);
     assert_eq!(y.dtype(), DType::BF16);
