@@ -1,14 +1,16 @@
-//! Synthetic (no-checkpoint) shape/dtype/lazy smoke tests for the
-//! branch-12b model layers. This task adds the `Mlp::forward` case;
-//! Task 2 extends the file with an `Attention::forward` case.
+//! Synthetic (no-checkpoint) tests for the branch-12b model layers:
+//! shape/dtype/lazy smoke coverage plus `Attention::forward`'s input
+//! rejection paths (the negative coverage carried over from the removed
+//! `projections_smoke.rs`).
 //!
 //! Numerical parity against MLX is covered by the gated `mlp_layer0.rs`
-//! and `attention_layer0.rs` integration tests. These tests just
-//! confirm the lazy graph builds with the right output shape/dtype on
-//! zero-filled Qwen2.5-0.5B-shaped weights.
+//! and `attention_layer0.rs` integration tests. The positive tests here
+//! just confirm the lazy graph builds with the right output shape/dtype
+//! on zero-filled Qwen2.5-0.5B-shaped weights.
 
 #![cfg(target_os = "macos")]
 
+use cider_press_models::Error;
 use cider_press_models::nn::{Linear, Mlp, Module};
 use cider_press_models::qwen2::{Qwen2AttentionWeights, Qwen2Config, attention::Attention};
 use cider_press_runtime::{DType, Device, KvCache, Quantization, QuantizedWeight, Tensor};
@@ -103,6 +105,75 @@ fn attention_forward_shape_dtype_and_lazy() {
     assert_eq!(out.shape().dims(), &[1, T, HIDDEN_SIZE], "attn out shape");
     assert_eq!(out.dtype(), DType::BF16, "attn out dtype");
     assert!(!out.is_materialized(), "attn out should be lazy");
+}
+
+/// Build an `Attention` plus a fresh cache + offset for the rejection
+/// tests, returning the pieces the caller drives `forward` with.
+fn attention_fixture() -> (Attention, Tensor, KvCache) {
+    let device = Device::shared().expect("device");
+    let config = synthetic_config();
+    let weights = synthetic_attention_weights(&device);
+    let attn = Attention::from_weights(&weights, &config).expect("from_weights");
+    let offset = Tensor::from_slice(&device, &[0i32], [1usize]).expect("offset");
+    let cache =
+        KvCache::new(&device, T + 4, NUM_KV_HEADS, HEAD_DIM, DType::BF16).expect("KvCache::new");
+    (attn, offset, cache)
+}
+
+#[test]
+fn attention_forward_rejects_rank2_hidden() {
+    let device = Device::shared().expect("device");
+    let (attn, offset, mut cache) = attention_fixture();
+    // Rank-2 input: missing the batch dimension.
+    let hidden = Tensor::from_slice(
+        &device,
+        &vec![bf16::ZERO; T * HIDDEN_SIZE],
+        [T, HIDDEN_SIZE],
+    )
+    .expect("rank-2 hidden");
+    let err = attn
+        .forward(&hidden, None, &offset, &mut cache)
+        .expect_err("should reject rank-2 hidden");
+    assert!(
+        matches!(err, Error::InvalidArgument(_)),
+        "expected InvalidArgument, got {err:?}"
+    );
+}
+
+#[test]
+fn attention_forward_rejects_batch_gt_1() {
+    let device = Device::shared().expect("device");
+    let (attn, offset, mut cache) = attention_fixture();
+    // B=2: KvCache is single-sequence, so batch > 1 must be rejected.
+    let hidden = Tensor::from_slice(
+        &device,
+        &vec![bf16::ZERO; 2 * T * HIDDEN_SIZE],
+        [2usize, T, HIDDEN_SIZE],
+    )
+    .expect("B=2 hidden");
+    let err = attn
+        .forward(&hidden, None, &offset, &mut cache)
+        .expect_err("should reject batch > 1");
+    assert!(
+        matches!(err, Error::InvalidArgument(_)),
+        "expected InvalidArgument, got {err:?}"
+    );
+}
+
+#[test]
+fn attention_forward_rejects_wrong_hidden_size() {
+    let device = Device::shared().expect("device");
+    let (attn, offset, mut cache) = attention_fixture();
+    // Correct rank-3, B=1, but wrong hidden size (512 != 896).
+    let hidden = Tensor::from_slice(&device, &vec![bf16::ZERO; T * 512], [1usize, T, 512])
+        .expect("wrong-hidden hidden");
+    let err = attn
+        .forward(&hidden, None, &offset, &mut cache)
+        .expect_err("should reject wrong hidden size");
+    assert!(
+        matches!(err, Error::InvalidArgument(_)),
+        "expected InvalidArgument, got {err:?}"
+    );
 }
 
 #[test]
