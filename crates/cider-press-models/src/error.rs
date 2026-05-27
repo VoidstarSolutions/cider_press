@@ -38,6 +38,9 @@ pub enum Error {
     /// Failed to parse JSON (typically `config.json`).
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    /// Failed to load or run a tokenizer.
+    #[error("tokenizer: {0}")]
+    Tokenizer(#[from] tokenizers::Error),
     /// Runtime-layer error (allocation, upload, …) bubbling up
     /// through the loader path.
     #[error("runtime: {0}")]

@@ -23,6 +23,7 @@ tokenizers = { workspace = true }
 
 [dev-dependencies]
 cider-press-test-utils = { path = "../cider-press-test-utils" }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

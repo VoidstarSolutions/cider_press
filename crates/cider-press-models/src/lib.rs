@@ -24,5 +24,7 @@ mod error;
 pub mod nn;
 pub mod qwen2;
 pub mod safetensors_io;
+pub mod tokenizer;
 
 pub use error::{Error, Result};
+pub use tokenizer::Tokenizer;
