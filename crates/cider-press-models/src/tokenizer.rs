@@ -9,7 +9,7 @@ use std::path::Path;
 
 use crate::error::{Error, Result};
 
-/// BPE tokenizer wrapping `tokenizers::Tokenizer`.
+/// Tokenizer loaded from a `tokenizer.json`, wrapping `tokenizers::Tokenizer`.
 ///
 /// Construct once per process (`from_file` parses the entire
 /// `tokenizer.json` up front) and share by reference; `encode` /
