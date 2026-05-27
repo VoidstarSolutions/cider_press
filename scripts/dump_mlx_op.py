@@ -656,6 +656,37 @@ def run_attention_layer0(args: argparse.Namespace) -> dict[str, mx.array]:
     return {"x": x, "y": out}
 
 
+# ---------------------------------------------------------------------------
+# mlp_layer0: run layer-0 SwiGLU MLP on a loaded Qwen2.5 MLX checkpoint.
+# Writes `x`, `y`. Loads via `mlx_lm.utils.load`, builds a random hidden
+# state, and calls `model.model.layers[0].mlp` directly. Checkpoint-loading
+# case (requires `mlx_lm` + a local MLX checkpoint dir); invoked from the
+# Rust integration test with `--checkpoint` / `--seq-len`.
+# ---------------------------------------------------------------------------
+
+
+def add_mlp_layer0_parser(subparsers: argparse._SubParsersAction) -> None:
+    p = subparsers.add_parser(
+        "mlp_layer0",
+        help="Run layer-0 SwiGLU MLP on a loaded Qwen2.5 MLX checkpoint",
+    )
+    p.add_argument("--checkpoint", required=True, help="path to the MLX checkpoint directory")
+    p.add_argument("--seq-len", type=int, required=True, help="sequence length (T)")
+
+
+def run_mlp_layer0(args: argparse.Namespace) -> dict[str, mx.array]:
+    from mlx_lm.utils import load
+
+    model, _tokenizer = load(args.checkpoint)
+    mlp = model.model.layers[0].mlp
+    hidden_size: int = model.args.hidden_size
+
+    x = (mx.random.uniform(shape=(1, args.seq_len, hidden_size)) - 0.5).astype(mx.bfloat16)
+    out = mlp(x)
+    mx.eval(x, out)
+    return {"x": x, "y": out}
+
+
 def add_softmax_parser(subparsers: argparse._SubParsersAction) -> None:
     p = subparsers.add_parser(
         "softmax",
@@ -710,6 +741,7 @@ OPS: dict[str, tuple[ParserBuilder, Runner]] = {
     "sdpa": (add_sdpa_parser, run_sdpa),
     "qmm": (add_qmm_parser, run_qmm),
     "attention_layer0": (add_attention_layer0_parser, run_attention_layer0),
+    "mlp_layer0": (add_mlp_layer0_parser, run_mlp_layer0),
 }
 
 

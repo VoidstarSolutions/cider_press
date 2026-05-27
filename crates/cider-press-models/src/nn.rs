@@ -330,6 +330,67 @@ impl Module for RmsNormLayer {
     }
 }
 
+/// Qwen2-family `SwiGLU` MLP as a [`Module`].
+///
+/// Owns three bias-free quantized projections (enforced by
+/// [`Mlp::new`]). `forward` computes `down(silu(gate(x)) * up(x))` —
+/// mirroring MLX's `swiglu(a, b) = silu(a) * b`
+/// (`mlx_lm/models/qwen2.py::MLP`).
+///
+/// Generic over the three [`Linear`]s rather than bound to a specific
+/// checkpoint's weight struct, matching how [`Linear`] / [`RmsNormLayer`]
+/// stay model-agnostic. The caller binds checkpoint weights into the
+/// `Linear`s (e.g. `Linear::new(weights.gate_proj.clone(), None)`).
+#[derive(Clone, Debug)]
+pub struct Mlp {
+    gate: Linear,
+    up: Linear,
+    down: Linear,
+}
+
+impl Mlp {
+    /// Construct from the three bias-free projections. Rejects any
+    /// [`Linear`] carrying an additive bias — Qwen2's `SwiGLU` MLP
+    /// projections are bias-free, and mixing in a biased projection
+    /// would silently produce a different op.
+    pub fn new(gate: Linear, up: Linear, down: Linear) -> Result<Self> {
+        for (which, lin) in [("gate", &gate), ("up", &up), ("down", &down)] {
+            if lin.bias().is_some() {
+                return Err(Error::InvalidArgument(format!(
+                    "Mlp::new: {which} must be a bias-free Linear",
+                )));
+            }
+        }
+        Ok(Self { gate, up, down })
+    }
+
+    /// The gate projection.
+    #[must_use]
+    pub fn gate(&self) -> &Linear {
+        &self.gate
+    }
+
+    /// The up projection.
+    #[must_use]
+    pub fn up(&self) -> &Linear {
+        &self.up
+    }
+
+    /// The down projection.
+    #[must_use]
+    pub fn down(&self) -> &Linear {
+        &self.down
+    }
+}
+
+impl Module for Mlp {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let gated = silu(&self.gate.forward(x)?)?;
+        let up = self.up.forward(x)?;
+        self.down.forward(&gated.mul(&up)?)
+    }
+}
+
 /// Build a `[1]` host-side tensor on `device` with the given value
 /// rounded into `dtype`. Used by [`rms_norm`] to flow `eps` into the
 /// graph as a regular leaf rather than wiring scalar-binding kernels.

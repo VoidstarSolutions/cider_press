@@ -3,10 +3,12 @@
 //! Branch 9 landed [`rope`]. Branch 11 lands [`sdpa`], the three-op
 //! SDPA composition (`qk_matmul` → scale + mask + softmax →
 //! `attn_matmul`) with Qwen2-specific GQA broadcast of K/V to match
-//! Q's head count. Branch 11b lands [`project_qkv`] and
-//! [`project_output`], the Q/K/V/O linear projections using
-//! `quantized_matmul`. Branch 12b will fold them into
-//! `Attention::forward`.
+//! Q's head count. Branch 12b lands [`Attention`], which folds the
+//! former `project_qkv` / `project_output` helpers into a single
+//! `forward` over the [`crate::nn::Linear`] projections plus [`rope`],
+//! the [`cider_press_runtime::KvCache`], and [`sdpa`]. `rope` and
+//! `sdpa` remain free helpers (reused by `Attention` and future
+//! models).
 //!
 //! Lives in the `qwen2` submodule rather than the generic [`crate::nn`]
 //! surface because the bind-config-to-op idiom is per-model: Qwen2.5
@@ -17,10 +19,11 @@
 //! Matches MLX's `Qwen2Attention.__call__` rope step in
 //! `mlx-lm/models/qwen2.py`.
 
-use cider_press_runtime::{DType, QuantizedWeight, Tensor};
+use cider_press_runtime::{DType, KvCache, Tensor};
 use half::bf16;
 
 use crate::error::{Error, Result};
+use crate::nn::{Linear, Module};
 
 use super::{Qwen2AttentionWeights, Qwen2Config};
 
@@ -191,118 +194,172 @@ pub fn sdpa(
     Ok(out)
 }
 
-/// Apply Q/K/V linear projections to a Qwen2 hidden state, producing
-/// per-head-laid-out tensors ready for [`rope`] and [`sdpa`].
+/// Qwen2 multi-head self-attention with grouped-query attention (GQA)
+/// and a `RoPE`-positioned KV cache.
 ///
-/// Inputs:
-/// - `hidden`: `[B, T, hidden_size]`, dense contiguous BF16.
-/// - `weights`: the layer's `Qwen2AttentionWeights`.
-/// - `config`: pulls `H_q`, `H_kv`, `D_h`, `hidden_size`.
+/// Owns the four projections as [`Linear`]s (`q`/`k`/`v` carry the
+/// dense additive bias; `o` does not) plus a cloned [`Qwen2Config`]
+/// so [`Attention::forward`] can drive the [`rope`] / [`sdpa`] helpers.
 ///
-/// Outputs `(q, k, v)`:
-/// - `q`: `[B, H_q, T, D_h]`
-/// - `k`: `[B, H_kv, T, D_h]`
-/// - `v`: `[B, H_kv, T, D_h]`
-///
-/// No rope applied. Composition mirrors `mlx_lm.models.qwen2.Attention`.
-#[allow(clippy::many_single_char_names)]
-pub fn project_qkv(
-    hidden: &Tensor,
-    weights: &Qwen2AttentionWeights,
-    config: &Qwen2Config,
-) -> Result<(Tensor, Tensor, Tensor)> {
-    let hidden_size = config.hidden_size;
-    let head_dim = config.head_dim()?;
-    let h_q = config.num_attention_heads;
-    let h_kv = config.num_key_value_heads;
-
-    let dims = hidden.shape().dims();
-    if dims.len() != 3 {
-        return Err(Error::InvalidArgument(format!(
-            "project_qkv: hidden must be rank 3 [B, T, hidden_size]; got rank {}",
-            dims.len()
-        )));
-    }
-    if dims[2] != hidden_size {
-        return Err(Error::InvalidArgument(format!(
-            "project_qkv: hidden last dim ({}) != config.hidden_size ({})",
-            dims[2], hidden_size,
-        )));
-    }
-    if hidden.dtype() != DType::BF16 {
-        return Err(Error::InvalidArgument(format!(
-            "project_qkv: hidden must be BF16; got {:?}",
-            hidden.dtype()
-        )));
-    }
-    let b = dims[0];
-    let t = dims[1];
-
-    let project_one = |proj: &QuantizedWeight, bias: &Tensor, h: usize| -> Result<Tensor> {
-        // [B, T, H * D_h]
-        let out = hidden.quantized_matmul(proj)?;
-        // Reshape bias [H * D_h] → [1, 1, H * D_h] so the trailing
-        // broadcast aligns without needing explicit broadcast_to.
-        let bias_3d = bias.reshape([1usize, 1, h * head_dim])?;
-        let out = out.add(&bias_3d)?;
-        // [B, T, H * D_h] → [B, T, H, D_h]
-        let out = out.reshape([b, t, h, head_dim])?;
-        // [B, T, H, D_h] → [B, H, T, D_h]; copy to land contiguous bytes
-        // for the downstream matmul kernel.
-        let out = out.permute(&[0, 2, 1, 3])?.copy()?;
-        Ok(out)
-    };
-
-    let q = project_one(&weights.q_proj, &weights.q_bias, h_q)?;
-    let k = project_one(&weights.k_proj, &weights.k_bias, h_kv)?;
-    let v = project_one(&weights.v_proj, &weights.v_bias, h_kv)?;
-    Ok((q, k, v))
+/// Deliberately does **not** implement [`crate::nn::Module`]: its
+/// forward genuinely needs the attention mask, the `RoPE` offset, and a
+/// mutable [`KvCache`] — mirroring MLX's `Attention.__call__(x, mask,
+/// cache)`. Branch 12a kept `Module` single-input and documented that
+/// auxiliary state flows through a layer's own methods; this is that
+/// case.
+#[derive(Clone, Debug)]
+pub struct Attention {
+    q_proj: Linear,
+    k_proj: Linear,
+    v_proj: Linear,
+    o_proj: Linear,
+    config: Qwen2Config,
 }
 
-/// Apply the O linear projection to attention output.
-///
-/// Input: `[B, H_q, T, D_h]`, dense contiguous BF16.
-/// Output: `[B, T, hidden_size]`.
-///
-/// Qwen2's `o_proj` has no additive bias.
-pub fn project_output(
-    attn_out: &Tensor,
-    weights: &Qwen2AttentionWeights,
-    config: &Qwen2Config,
+impl Attention {
+    /// Build from a layer's loaded attention weights and the model
+    /// config. Clones the weights (cheap refcount bumps on shared
+    /// device buffers) into owned [`Linear`]s.
+    pub fn from_weights(weights: &Qwen2AttentionWeights, config: &Qwen2Config) -> Result<Self> {
+        Ok(Self {
+            q_proj: Linear::new(weights.q_proj.clone(), Some(weights.q_bias.clone()))?,
+            k_proj: Linear::new(weights.k_proj.clone(), Some(weights.k_bias.clone()))?,
+            v_proj: Linear::new(weights.v_proj.clone(), Some(weights.v_bias.clone()))?,
+            o_proj: Linear::new(weights.o_proj.clone(), None)?,
+            config: config.clone(),
+        })
+    }
+
+    /// Run self-attention on `hidden` (`[1, T, hidden_size]`, dense
+    /// BF16).
+    ///
+    /// - `mask`: optional additive BF16 mask. [`sdpa`] flattens the
+    ///   score tensor to rank-3 `[H_q, T, T_cache]` before the
+    ///   mask-add, so `mask` must broadcast against that shape — in
+    ///   practice `[T, T_cache]` (the causal prefill mask) or
+    ///   `[H_q, T, T_cache]`. Pass `None` for full attention.
+    /// - `offset`: length-1 I32 tensor — the number of tokens already
+    ///   in `cache` (the `RoPE` position base). Must equal
+    ///   `cache.position()` before this call for correct positioning.
+    /// - `cache`: the KV cache; `forward` appends this step's K/V.
+    ///
+    /// Returns `[1, T, hidden_size]`, lazy.
+    ///
+    /// Batch is fixed at 1 — [`KvCache`] is single-sequence
+    /// (`[max_tokens, n_kv_heads, head_dim]`, no batch axis).
+    ///
+    /// **Aliasing contract:** the returned tensor's graph reads the
+    /// cache's backing buffer (the populated prefix). `eval()` it
+    /// before the next [`KvCache::update`] on the same cache;
+    /// `update` writes the shared slab in place. A decode loop
+    /// satisfies this naturally (sampling forces the eval).
+    pub fn forward(
+        &self,
+        hidden: &Tensor,
+        mask: Option<&Tensor>,
+        offset: &Tensor,
+        cache: &mut KvCache,
+    ) -> Result<Tensor> {
+        let config = &self.config;
+        let head_dim = config.head_dim()?;
+        let h_q = config.num_attention_heads;
+        let h_kv = config.num_key_value_heads;
+        let hidden_size = config.hidden_size;
+
+        let dims = hidden.shape().dims();
+        if dims.len() != 3 {
+            return Err(Error::InvalidArgument(format!(
+                "Attention::forward: hidden must be rank 3 [B, T, hidden_size]; got rank {}",
+                dims.len()
+            )));
+        }
+        if dims[0] != 1 {
+            return Err(Error::InvalidArgument(format!(
+                "Attention::forward: batch must be 1 (KvCache is single-sequence); got B={}",
+                dims[0]
+            )));
+        }
+        if dims[2] != hidden_size {
+            return Err(Error::InvalidArgument(format!(
+                "Attention::forward: hidden last dim ({}) != config.hidden_size ({hidden_size})",
+                dims[2]
+            )));
+        }
+        if hidden.dtype() != DType::BF16 {
+            return Err(Error::InvalidArgument(format!(
+                "Attention::forward: hidden must be BF16; got {:?}",
+                hidden.dtype()
+            )));
+        }
+        let t = dims[1];
+
+        // Project + lay out per head: [1, T, H*D_h] -> [1, H, T, D_h].
+        let q = project_heads(&self.q_proj, hidden, t, h_q, head_dim)?;
+        let k = project_heads(&self.k_proj, hidden, t, h_kv, head_dim)?;
+        let v = project_heads(&self.v_proj, hidden, t, h_kv, head_dim)?;
+
+        // RoPE on Q and K (V is unrotated).
+        let q = rope(&q, offset, config)?;
+        let k = rope(&k, offset, config)?;
+
+        // KvCache stores [step_t, n_kv_heads, head_dim]. K/V are
+        // [1, H_kv, T, D_h]; permute (2,1,3,0) -> [T, H_kv, D_h, 1],
+        // reshape to [T, H_kv, D_h] (safe: B==1). copy() lands the
+        // contiguous bytes update() memcpys from.
+        let k_upd = k
+            .permute(&[2, 1, 3, 0])?
+            .copy()?
+            .reshape([t, h_kv, head_dim])?;
+        let v_upd = v
+            .permute(&[2, 1, 3, 0])?
+            .copy()?
+            .reshape([t, h_kv, head_dim])?;
+        cache.update(&k_upd, &v_upd)?;
+
+        // Read the populated prefix. keys_view()/values_view() are
+        // [T_cache, H_kv, D_h] (T-outer). sdpa wants [1, H_kv, T_cache,
+        // D_h], so permute the T_cache/H_kv axes (1,0,2) then add the
+        // leading batch axis. A plain reshape here would transpose the
+        // data incorrectly when H_kv>1 and T_cache>1.
+        let t_cache = cache.position();
+        let k_sdpa = cache
+            .keys_view()
+            .permute(&[1, 0, 2])?
+            .copy()?
+            .reshape([1usize, h_kv, t_cache, head_dim])?;
+        let v_sdpa = cache
+            .values_view()
+            .permute(&[1, 0, 2])?
+            .copy()?
+            .reshape([1usize, h_kv, t_cache, head_dim])?;
+
+        let attn = sdpa(&q, &k_sdpa, &v_sdpa, mask, config)?; // [1, H_q, T, D_h]
+
+        // Collapse heads: [1, H_q, T, D_h] -> [1, T, H_q*D_h], then O proj.
+        let collapsed =
+            attn.permute(&[0, 2, 1, 3])?
+                .copy()?
+                .reshape([1usize, t, h_q * head_dim])?;
+        self.o_proj.forward(&collapsed)
+    }
+}
+
+/// Project `hidden` through `proj` and lay the result out per head:
+/// `[1, T, H*D_h] -> [1, H, T, D_h]`. The `copy()` materializes the
+/// permuted view into contiguous bytes for the downstream matmul /
+/// `RoPE` kernels.
+fn project_heads(
+    proj: &Linear,
+    hidden: &Tensor,
+    t: usize,
+    h: usize,
+    head_dim: usize,
 ) -> Result<Tensor> {
-    let head_dim = config.head_dim()?;
-    let h_q = config.num_attention_heads;
-
-    let dims = attn_out.shape().dims();
-    if dims.len() != 4 {
-        return Err(Error::InvalidArgument(format!(
-            "project_output: attn_out must be rank 4 [B, H_q, T, D_h]; got rank {}",
-            dims.len()
-        )));
-    }
-    let (b, t) = (dims[0], dims[2]);
-    if dims[1] != h_q || dims[3] != head_dim {
-        return Err(Error::InvalidArgument(format!(
-            "project_output: attn_out shape {dims:?} does not match \
-             config [B, {h_q}, T, {head_dim}]",
-        )));
-    }
-    if attn_out.dtype() != DType::BF16 {
-        return Err(Error::InvalidArgument(format!(
-            "project_output: attn_out must be BF16; got {:?}",
-            attn_out.dtype()
-        )));
-    }
-
-    // [B, H_q, T, D_h] → [B, T, H_q, D_h]; copy to materialize
-    // contiguous bytes before reshape.
-    let collapsed = attn_out
+    let out = proj.forward(hidden)?; // [1, T, H*D_h]
+    Ok(out
+        .reshape([1usize, t, h, head_dim])?
         .permute(&[0, 2, 1, 3])?
-        .copy()?
-        .reshape([b, t, h_q * head_dim])?;
-
-    // [B, T, H_q * D_h] × [hidden_size, H_q * D_h]^T → [B, T, hidden_size]
-    Ok(collapsed.quantized_matmul(&weights.o_proj)?)
+        .copy()?)
 }
 
 /// Reshape `[B, H_kv, T_c, D_h]` to `[B, H_q, T_c, D_h]` by fanning
