@@ -233,8 +233,11 @@ impl Attention {
     /// Run self-attention on `hidden` (`[1, T, hidden_size]`, dense
     /// BF16).
     ///
-    /// - `mask`: optional additive mask broadcastable to
-    ///   `[1, H_q, T, T_cache]` (BF16). Pass `None` for full attention.
+    /// - `mask`: optional additive BF16 mask. [`sdpa`] flattens the
+    ///   score tensor to rank-3 `[H_q, T, T_cache]` before the
+    ///   mask-add, so `mask` must broadcast against that shape — in
+    ///   practice `[T, T_cache]` (the causal prefill mask) or
+    ///   `[H_q, T, T_cache]`. Pass `None` for full attention.
     /// - `offset`: length-1 I32 tensor — the number of tokens already
     ///   in `cache` (the `RoPE` position base). Must equal
     ///   `cache.position()` before this call for correct positioning.
