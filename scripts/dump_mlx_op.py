@@ -687,6 +687,37 @@ def run_mlp_layer0(args: argparse.Namespace) -> dict[str, mx.array]:
     return {"x": x, "y": out}
 
 
+# ---------------------------------------------------------------------------
+# qwen2_logits: full Qwen2 prefill on a loaded MLX checkpoint. Tokenizes a
+# caller-supplied prompt, runs the model forward, and writes `input_ids`
+# (u32) + `logits` (bf16). Checkpoint-loading case; invoked from the Rust
+# integration test with `--checkpoint` / `--prompt`.
+# ---------------------------------------------------------------------------
+
+
+def add_qwen2_logits_parser(subparsers: argparse._SubParsersAction) -> None:
+    p = subparsers.add_parser(
+        "qwen2_logits",
+        help="Run full Qwen2 prefill on a loaded MLX checkpoint and dump logits",
+    )
+    p.add_argument("--checkpoint", required=True, help="path to the MLX checkpoint directory")
+    p.add_argument("--prompt", required=True, help="prompt text (kept short; T <= ~16)")
+
+
+def run_qwen2_logits(args: argparse.Namespace) -> dict[str, mx.array]:
+    from mlx_lm.utils import load
+
+    model, tokenizer = load(args.checkpoint)
+    # Tokenize the raw prompt directly — no chat template — so the same
+    # string maps to the same ids on both sides of the parity check.
+    ids = tokenizer.encode(args.prompt)
+    input_ids = mx.array([ids], dtype=mx.uint32)
+
+    logits = model(input_ids)  # [1, T, vocab]
+    mx.eval(input_ids, logits)
+    return {"input_ids": input_ids, "logits": logits.astype(mx.bfloat16)}
+
+
 def add_softmax_parser(subparsers: argparse._SubParsersAction) -> None:
     p = subparsers.add_parser(
         "softmax",
@@ -742,6 +773,7 @@ OPS: dict[str, tuple[ParserBuilder, Runner]] = {
     "qmm": (add_qmm_parser, run_qmm),
     "attention_layer0": (add_attention_layer0_parser, run_attention_layer0),
     "mlp_layer0": (add_mlp_layer0_parser, run_mlp_layer0),
+    "qwen2_logits": (add_qwen2_logits_parser, run_qwen2_logits),
 }
 
 
