@@ -402,13 +402,46 @@ we'd need — both now landed (Views in branch 2; `KvCache` in branch 8).
   `RmsNormLayer` vs `mx.fast.rms_norm` at `[1, 8, 896]`. `Linear` is
   quantized-only for now (Qwen2 has no dense Linears).
 
-**Next concrete step: branch 12b of the roadmap — `feat/models-attention-mlp`.**
-Build `Attention` and `Mlp` as `Module`-implementing structs that own
-their `Linear` / `RmsNormLayer` sub-modules. `Attention::forward`
-folds the existing `qwen2::attention` free helpers (`project_qkv`,
-`rope`, `sdpa`, `project_output`) plus the `KvCache`; `Mlp` composes
-the SwiGLU `gate`/`up`/`down` projections with `nn::silu`. Per-module
-parity against MLX layer 0.
+- **Branch 12b (`feat/models-attention-mlp`).** `Attention` and `Mlp`
+  as the next model-layer abstractions built on the branch-12a
+  `Module`/`Linear` base. `Mlp` is a generic `Module` in `nn.rs` —
+  owns three bias-free `Linear`s (`gate`, `up`, `down`) and computes
+  `down(silu(gate(x)) * up(x))` (MLX's `swiglu(a,b) = silu(a)*b`
+  factoring). Constructed via `Mlp::new(gate, up, down)` rather than
+  a qwen2-bound `from_weights`, deliberately keeping `nn.rs`
+  model-agnostic. `Attention` lives in `qwen2::attention` and owns
+  four `Linear`s (q/k/v with dense bias, o without) plus a cloned
+  `Qwen2Config`; inherent `forward(&self, hidden, mask: Option<&Tensor>,
+  offset: &Tensor, cache: &mut KvCache)` folds the full pipeline —
+  Q/K/V project → per-head reshape → RoPE → `KvCache::update` →
+  `keys_view`/`values_view` → SDPA → O-project — and deliberately
+  does NOT implement `Module` (mirrors MLX's `Attention.__call__(x,
+  mask, cache)`; auxiliary state through its own method signature,
+  per the 12a design note). The former free functions `project_qkv`
+  and `project_output` are absorbed into `Attention::forward` and
+  removed; `rope` and `sdpa` are kept as reusable free helpers.
+  Corrected a latent KV-cache view transpose bug: `keys_view()`/
+  `values_view()` return `[T_cache, H_kv, D_h]`; conversion to
+  SDPA's `[1, H_kv, T_cache, D_h]` now uses `permute([1,0,2]).copy()`
+  before the reshape rather than a bare reshape — the old
+  `attention_layer0.rs` reshape transposed axes silently whenever
+  `H_kv > 1` and `T_cache > 1`. Tests: synthetic
+  `attention_mlp_smoke.rs` (shape/dtype/lazy, no checkpoint);
+  `attention_layer0.rs` rewritten to drive `Attention::forward`;
+  `projections_smoke.rs` removed; new gated `mlp_layer0.rs` +
+  `mlp_layer0` case in `scripts/dump_mlx_op.py`. **The gated
+  `attention_layer0` and `mlp_layer0` parity tests were not run
+  against a real checkpoint during the implementing session — run
+  locally with `CIDER_QWEN_CHECKPOINT_PATH` before merge (the
+  KV-view transpose fix is only exercised numerically there).**
+
+**Next concrete step: branch 12c of the roadmap — `feat/models-qwen2`.**
+Build `TransformerBlock` (residual connections wrapping
+`input_layernorm → Attention` and `post_attention_layernorm → Mlp`)
+and `Qwen2Model` (embed → N blocks → final norm), plus the tied LM
+head via a `transpose` flag on `Tensor::quantized_matmul` (deferred
+from branch 11b). Per-token logits parity vs MLX-LM on a fixed prompt
+prefill.
 
 Quantized-embedding decision resolved in branch 7: neither
 quantized-row gather nor `gather → dequantize_row`. Instead,

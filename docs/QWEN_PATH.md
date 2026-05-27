@@ -90,7 +90,7 @@ that introduced them, instead of three branches later in some composition.
 | 11 | (done) `feat/sdpa-split` | SDPA as three composed ops. **First non-MLX kernel in the tree**: a naive bf16 batched matmul (`kernels/matmul.metal`, one thread per output element, float accumulator) instead of MLX's templated `steel_gemm_*` family (deferred to branch 15 per the "perf-driven steel migration" call). Kernels: `kernels::matmul::dispatch_gemm_bf16`. Runtime: `OpKind::MatMul` + `Tensor::matmul`; the matmul-shape validation lives in a `matmul_shapes()` helper that 11b's `qmm` will reuse. `dispatch_matmul` walks reshape-view chains (SDPA produces `probs_3d.reshape([B, H_q, T, T_c])` view inputs) via a new `matmul_input_bytes` helper; non-zero view byte-offsets hard-error. Models: `qwen2::attention::sdpa(q, k, v, mask, &Qwen2Config)` with GQA broadcast (`reshape → broadcast_to → copy → reshape`). Scores reshape from rank-4 to rank-3 for the scale-mul / mask-add / softmax stretch — branch 4 only wired `g{1,2,3}` strided binaries, so rank-4 broadcast binary stays deferred. The **layer-0 real-checkpoint integration test the roadmap originally placed here is moved to 11b** — it requires Q/K/V/O projections of loaded quantized weights, which needs `Tensor::quantized_matmul`. | Synthetic-input parity at all three layers vs `mx.matmul` (kernels + runtime) and `mx.fast.scaled_dot_product_attention` (models) at Qwen2.5-0.5B decode (`T=1, T_cache=8`) and prefill-causal (`T=T_cache=8`) shapes; bf16-compose tolerance using the np.allclose-style combined `atol + rtol*|b|` bound. |
 | 11b | (done) `feat/quantized-matmul` | Lifted MLX's `affine_qmm_t` (aligned, transposed, batch=1) kernel into `kernels::qmm::affine_qmm_t_bf16` reusing `Device::quantized_library()`; binding contract and dispatch geometry transcribed from `mlx/backend/metal/quantized.cpp`. Promoted the rank-1-only `QuantizedWeight::matvec` to a general `Tensor::quantized_matmul`; `OpKind::Qmv` renamed to `OpKind::QuantizedMatMul`; M=1 dispatches the existing `affine_qmv` kernel, M>1 dispatches the new `affine_qmm_t`. Aligned-only this branch (`N % 32 == 0`); generic path deferred to its first unaligned consumer. Transpose=false direction (tied LM head) deferred to branch 12c. Three rejection unit tests (dtype, inner-dim, happy-path constructor). Models crate adds `qwen2::attention::project_qkv` and `project_output` — thin compositions over `quantized_matmul + add + reshape + permute + copy`; branch 12b folds them into `Attention::forward`. New `qmm` and `attention_layer0` cases in `scripts/dump_mlx_op.py`; uniform `(-0.5, 0.5)` distribution convention matches `gen_qmm_fixture.py`. Layer-0 attention real-checkpoint integration test landed (`tests/attention_layer0.rs`, gated on `CIDER_QWEN_CHECKPOINT_PATH`): prefill (T=8) drives qmm_t, decode (T=1, offset=7) drives qmv; `mlx_lm.models.cache.KVCache.state` setter primes the MLX-side cache to an arbitrary offset. | Kernels/runtime qmm parity: `max_relative=1e-2, epsilon=5e-2` (bf16-tolerance, consistent with stage4_qmv). Models layer-0 integration test: ATOL=5e-2, RTOL=5e-2 (np.allclose-style combined bound) to absorb the ~9-op composed chain. |
 | 12a | (done) `feat/models-linear-rmsnorm` | Forward-only `Module` trait (`forward(&self, &Tensor) -> Result<Tensor>`) that this crate's stateful layers implement, plus the first two: `Linear` (quantized projection `y = x @ W^T (+ bias)` over `Tensor::quantized_matmul` with optional rank-1 dense bias; owns its `QuantizedWeight`, rejects mismatched-length bias at construction) and `RmsNormLayer` (carries gamma + eps, wraps the composed `nn::rms_norm`). | Parity vs the existing `qmm` / `rms_norm` MLX dump fixtures (no new Python surface): `Linear` with/without bias vs `mx.quantized_matmul` at `[896,896]` decode+prefill; `RmsNormLayer` vs `mx.fast.rms_norm` at `[1,8,896]`. |
-| 12b | `feat/models-attention-mlp` | `Attention` (Q/K/V proj + RoPE + KV cache + SDPA + O proj) and `Mlp` (SwiGLU) | Per-module parity against MLX layer 0 |
+| 12b | (done) `feat/models-attention-mlp` | `Attention` and `Mlp` as `Module`-based layers on the `Linear` base; absorbed `project_qkv`/`project_output` helpers into `Attention::forward`; corrected KV-view transpose (`permute([1,0,2]).copy()` before reshape) | Synthetic smoke (`attention_mlp_smoke.rs`); gated layer-0 MLX parity for attention (`attention_layer0.rs`) and MLP (`mlp_layer0.rs`) — **gated checkpoint run pending before merge** |
 | 12c | `feat/models-qwen2` | `TransformerBlock` + `Qwen2Model`; tied embedding handling; final norm + LM head | Logits parity vs MLX-LM on prefill of a fixed prompt |
 | 13 | `feat/tokenizer` | BPE tokenizer (probably `tokenizers` crate from HF for Qwen's BPE vocab) | Round-trip encode/decode against HF tokenizer |
 | 14 | `feat/cli + greedy decode` | CLI: load model, take prompt, prefill, decode loop, greedy argmax sampling, streamed detokenize | Generate a coherent completion |
@@ -119,44 +119,51 @@ for "it's fast and clean" but can wait until branch 15+:
 
 ## What to do next time we sit down
 
-Branch 12b (`feat/models-attention-mlp`). Specifically:
+**Before merging branch 12b:** run the gated checkpoint tests locally
+with `CIDER_QWEN_CHECKPOINT_PATH` set to a Qwen2.5-0.5B-Instruct-4bit
+MLX checkout. The KV-view transpose fix in `Attention::forward`
+(permute before reshape) is only exercised numerically by
+`attention_layer0_decode` (offset=7 pushes `T_cache=8 > H_kv=2`);
+and `mlp_layer0` is new and has no non-gated parity coverage. Both
+must pass at ATOL=5e-2/RTOL=5e-2 before the branch is merged.
 
-1. Build `Attention` and `Mlp` as `Module`-implementing structs that
-   own their `Linear` (and `RmsNormLayer`) sub-modules. `Attention`
-   folds the existing `qwen2::attention` free helpers (`project_qkv`,
-   `rope`, `sdpa`, `project_output`) plus the `KvCache` into a single
-   `forward`; `Mlp` composes the SwiGLU `gate/up/down` projections
-   with `nn::silu`. Note the trait's single-input shape: attention's
-   RoPE offset + KV cache flow through the struct's own constructor /
-   methods, not through `forward`'s signature (see the `Module` doc).
-2. Per-module parity against MLX layer 0 (the
-   `attention_layer0.rs`-style gated real-checkpoint pattern).
+Branch 12c (`feat/models-qwen2`). Specifically:
 
-Branch-12a notes carried forward:
-- `Linear` is quantized-only (Qwen2 has no dense Linears). A dense
-  variant lands with its first consumer; the tied LM head (transpose
-  direction) is still a branch-12c `quantized_matmul` flag, not a
-  `Linear` concern.
-- The `assert_close` helper is now duplicated a fourth time
-  (`linear_rmsnorm.rs`) — the `cider-press-test-utils` extraction
-  noted below is increasingly worth doing.
+1. Build `TransformerBlock` (two residual sub-layers: `x = x +
+   attn(input_layernorm(x), ...)` and `x = x +
+   mlp(post_attention_layernorm(x))`). Owns one `RmsNormLayer` pair,
+   one `Attention`, one `Mlp`. `forward` takes `(hidden, mask, offset,
+   cache)` mirroring `Attention::forward`'s signature; does NOT
+   implement `Module` for the same reason as `Attention`.
+2. Build `Qwen2Model` that owns the embed table, 24 `TransformerBlock`s,
+   and the final `RmsNormLayer`. `forward` takes token-id tensor +
+   mask + per-layer caches; returns final hidden states.
+3. Tied LM head: `quantized_matmul(hidden_states, embed_tokens_weight,
+   transpose=true)`. Adds a `transpose: bool` flag to
+   `Tensor::quantized_matmul` (and the eval-side dispatcher) — this is
+   the direction deferred from branch 11b. Transpose=true dispatches the
+   existing `affine_qmm_t` (weight already in row-major `[N, K]` form);
+   transpose=false (the standard direction) passes through unchanged.
+4. Logits parity vs `mlx_lm.models.qwen2` on a fixed short prompt
+   prefill — the first test that exercises the complete forward pass.
 
-Open follow-up items from branch 11b worth tracking:
-- The `assert_close` helper is duplicated across
-  `cider-press-models/tests/qmm_qwen2.rs`, `sdpa_qwen2.rs`, and
-  `attention_layer0.rs` — candidate cleanup for `cider-press-test-utils`
-  in a future branch.
-- The `attention_layer0.rs` ATOL=5e-2/RTOL=5e-2 tolerance was set
-  analytically for the ~9-op composed chain; a real-checkpoint run is
-  needed to confirm the headroom is not too tight on the macos-15 CI
-  runner. Run locally before declaring CI green.
-- Transpose=false direction for `Tensor::quantized_matmul` (tied LM
-  head) is deferred to branch 12c; generic (non-aligned) `qmm_t`
-  is deferred to its first unaligned consumer.
+Open follow-up items still tracking:
+- **Gated attention/mlp checkpoint run** (see above — pre-merge
+  requirement for branch 12b).
+- **`assert_close` extraction**: now duplicated across `qmm_qwen2.rs`,
+  `sdpa_qwen2.rs`, `attention_layer0.rs`, `mlp_layer0.rs`, and
+  `linear_rmsnorm.rs`. Candidate for `cider-press-test-utils` in a
+  future cleanup branch.
+- **Transpose=false / generic (non-aligned) `qmm_t`**: transpose=false
+  lands in 12c (tied LM head); generic path deferred to its first
+  unaligned consumer.
+- **`assert_close` tolerance for the composed attention chain**: set
+  analytically at ATOL=5e-2/RTOL=5e-2; a real-checkpoint run (above)
+  confirms the headroom is not too tight on the macos-15 CI runner.
 
-Branches still ahead of first end-to-end inference (br14): 12a/b/c
-(models layers + Qwen2 assembly), 13 (tokenizer), 14 (CLI + greedy
-decode). 4 branches between us and the first runnable Qwen2.5-0.5B.
+Branches still ahead of first end-to-end inference (br14): 12c (models
+assembly), 13 (tokenizer), 14 (CLI + greedy decode). 3 branches between
+us and the first runnable Qwen2.5-0.5B.
 
 Open question carried forward from branch 7: the per-instantiation
 JIT cache on `Device` now holds one library per unique kernel name.
