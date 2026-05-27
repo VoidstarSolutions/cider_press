@@ -10,13 +10,17 @@
 #![cfg(target_os = "macos")]
 
 use cider_press_models::nn::{Linear, Mlp, Module};
-use cider_press_runtime::{DType, Device, Quantization, QuantizedWeight, Tensor};
+use cider_press_models::qwen2::{Qwen2AttentionWeights, Qwen2Config, attention::Attention};
+use cider_press_runtime::{DType, Device, KvCache, Quantization, QuantizedWeight, Tensor};
 use half::bf16;
 
 // Qwen2.5-0.5B-Instruct dimensions.
 const HIDDEN_SIZE: usize = 896;
 const INTERMEDIATE: usize = 4864;
 const T: usize = 4;
+const NUM_Q_HEADS: usize = 14;
+const NUM_KV_HEADS: usize = 2;
+const HEAD_DIM: usize = 64;
 
 /// Zero-filled `QuantizedWeight` with logical `[n, k]`, q4-gs64.
 fn zero_qw(device: &Device, n: usize, k: usize) -> QuantizedWeight {
@@ -32,6 +36,73 @@ fn zero_qw(device: &Device, n: usize, k: usize) -> QuantizedWeight {
         &vec![0u8; aux_bytes],
     )
     .expect("zero QuantizedWeight")
+}
+
+fn synthetic_config() -> Qwen2Config {
+    // Qwen2.5-0.5B-Instruct architecture fields. Constructed via
+    // `from_json_bytes` because `Qwen2Config` is `#[non_exhaustive]`.
+    Qwen2Config::from_json_bytes(
+        br#"{
+            "hidden_size": 896,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 14,
+            "num_key_value_heads": 2,
+            "intermediate_size": 4864,
+            "vocab_size": 151936,
+            "max_position_embeddings": 32768,
+            "rope_theta": 1000000.0,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": true,
+            "quantization": { "group_size": 64, "bits": 4 }
+        }"#,
+    )
+    .expect("synthetic config")
+}
+
+/// Build a zero-filled dense BF16 tensor of the given 1D length.
+fn zero_bf16_1d(device: &Device, len: usize) -> Tensor {
+    Tensor::from_slice(device, &vec![bf16::ZERO; len], [len]).expect("zero bf16 tensor")
+}
+
+fn synthetic_attention_weights(device: &Device) -> Qwen2AttentionWeights {
+    let q_dim = NUM_Q_HEADS * HEAD_DIM; // 896
+    let kv_dim = NUM_KV_HEADS * HEAD_DIM; // 128
+
+    Qwen2AttentionWeights {
+        q_proj: zero_qw(device, q_dim, HIDDEN_SIZE),
+        k_proj: zero_qw(device, kv_dim, HIDDEN_SIZE),
+        v_proj: zero_qw(device, kv_dim, HIDDEN_SIZE),
+        o_proj: zero_qw(device, HIDDEN_SIZE, q_dim),
+        q_bias: zero_bf16_1d(device, q_dim),
+        k_bias: zero_bf16_1d(device, kv_dim),
+        v_bias: zero_bf16_1d(device, kv_dim),
+    }
+}
+
+#[test]
+fn attention_forward_shape_dtype_and_lazy() {
+    let device = Device::shared().expect("device");
+    let config = synthetic_config();
+    let weights = synthetic_attention_weights(&device);
+    let attn = Attention::from_weights(&weights, &config).expect("from_weights");
+
+    let hidden = Tensor::from_slice(
+        &device,
+        &vec![bf16::ZERO; T * HIDDEN_SIZE],
+        [1usize, T, HIDDEN_SIZE],
+    )
+    .expect("hidden");
+    let offset = Tensor::from_slice(&device, &[0i32], [1usize]).expect("offset");
+    let mut cache =
+        KvCache::new(&device, T + 4, NUM_KV_HEADS, HEAD_DIM, DType::BF16).expect("KvCache::new");
+
+    let out = attn
+        .forward(&hidden, None, &offset, &mut cache)
+        .expect("attention forward");
+
+    assert_eq!(out.shape().dims(), &[1, T, HIDDEN_SIZE], "attn out shape");
+    assert_eq!(out.dtype(), DType::BF16, "attn out dtype");
+    assert!(!out.is_materialized(), "attn out should be lazy");
 }
 
 #[test]

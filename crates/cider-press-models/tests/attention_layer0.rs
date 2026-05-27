@@ -1,14 +1,10 @@
 //! Layer-0 attention real-checkpoint integration test.
 //!
 //! Closes the deferred integration test from branch 11. Loads
-//! Qwen2.5-0.5B layer 0 (gated on `CIDER_QWEN_CHECKPOINT_PATH`), runs
-//! the full attention pipeline:
-//!
-//! ```text
-//! project_qkv → rope → KvCache → sdpa → project_output
-//! ```
-//!
-//! and compares to `mlx_lm.models.qwen2.Attention.__call__`'s output at
+//! Qwen2.5-0.5B layer 0 (gated on `CIDER_QWEN_CHECKPOINT_PATH`), drives
+//! the full attention pipeline via [`Attention::forward`]
+//! (project Q/K/V → rope → `KvCache` → sdpa → output projection), and
+//! compares to `mlx_lm.models.qwen2.Attention.__call__`'s output at
 //! bf16-compose tolerance.
 //!
 //! Two sub-tests:
@@ -150,36 +146,11 @@ fn run_layer0(checkpoint: &Path, seq_len: usize, offset: usize) {
     let hidden = Tensor::from_slice(&device, &x_ref, [1usize, seq_len, config.hidden_size])
         .expect("hidden tensor");
 
-    // ── 5. project Q / K / V ──────────────────────────────────────────────────
-    // Outputs: q [1, H_q, T, D_h], k [1, H_kv, T, D_h], v [1, H_kv, T, D_h].
-    let (q, k, v) =
-        attention::project_qkv(&hidden, &layer0.attention, &config).expect("project_qkv");
+    // ── 5. Build the Attention module from layer-0 weights ────────────────────
+    let attn = attention::Attention::from_weights(&layer0.attention, &config)
+        .expect("Attention::from_weights");
 
-    // ── 6. RoPE ───────────────────────────────────────────────────────────────
-    // `offset` matches `cache.offset` on the Python side.
-    let offset_i32 = i32::try_from(offset).expect("offset fits in i32");
-    let offset_t = Tensor::from_slice(&device, &[offset_i32], [1usize]).expect("offset tensor");
-    let q = attention::rope(&q, &offset_t, &config).expect("rope Q");
-    let k = attention::rope(&k, &offset_t, &config).expect("rope K");
-
-    // ── 7. KvCache update ─────────────────────────────────────────────────────
-    // `KvCache::update` expects K/V in [step_t, n_kv_heads, head_dim] order.
-    // After `project_qkv` + `rope`, K/V are [B=1, H_kv, T, D_h].
-    // Permute to [T, H_kv, D_h, B] via axes (2, 1, 3, 0), then reshape to
-    // [T, H_kv, D_h] (safe because B=1).
-    let k_upd = k
-        .permute(&[2, 1, 3, 0])
-        .expect("permute k [1,H_kv,T,D] → [T,H_kv,D,1]")
-        .reshape([seq_len, config.num_key_value_heads, head_dim])
-        .expect("reshape k_upd");
-    let v_upd = v
-        .permute(&[2, 1, 3, 0])
-        .expect("permute v [1,H_kv,T,D] → [T,H_kv,D,1]")
-        .reshape([seq_len, config.num_key_value_heads, head_dim])
-        .expect("reshape v_upd");
-
-    // Allocate cache with capacity for offset + seq_len tokens (plus a small
-    // headroom so the assertions don't trip on exact-capacity).
+    // ── 6. KV cache sized for offset + seq_len (+ headroom) ───────────────────
     let max_tokens = offset + seq_len + 4;
     let mut cache = KvCache::new(
         &device,
@@ -191,8 +162,8 @@ fn run_layer0(checkpoint: &Path, seq_len: usize, offset: usize) {
     .expect("KvCache::new");
 
     if offset > 0 {
-        // Prime the cache with `offset` zero rows to mirror the Python side's
-        // `KVCache.state = (zeros, zeros)` seed.  Shape: [offset, H_kv, D_h].
+        // Prime with `offset` zero rows to mirror the Python side's
+        // `KVCache.state = (zeros, zeros)` seed. Shape [offset, H_kv, D_h].
         let pad_elems = offset * config.num_key_value_heads * head_dim;
         let zeros: Vec<bf16> = vec![bf16::ZERO; pad_elems];
         let pad_k = Tensor::from_slice(
@@ -210,32 +181,14 @@ fn run_layer0(checkpoint: &Path, seq_len: usize, offset: usize) {
         cache.update(&pad_k, &pad_v).expect("cache prime");
     }
 
-    cache.update(&k_upd, &v_upd).expect("cache update");
+    // ── 7. RoPE offset == tokens already cached ───────────────────────────────
+    let offset_i32 = i32::try_from(offset).expect("offset fits in i32");
+    let offset_t = Tensor::from_slice(&device, &[offset_i32], [1usize]).expect("offset tensor");
 
-    // Wrap the populated prefix as [1, H_kv, T_cache, D_h] for sdpa.
-    let t_cache = cache.position();
-    let k_view = cache.keys_view(); // [T_cache, H_kv, D_h]
-    let v_view = cache.values_view(); // [T_cache, H_kv, D_h]
-
-    let k_sdpa = k_view
-        .reshape([1usize, config.num_key_value_heads, t_cache, head_dim])
-        .expect("reshape k_view for sdpa");
-    let v_sdpa = v_view
-        .reshape([1usize, config.num_key_value_heads, t_cache, head_dim])
-        .expect("reshape v_view for sdpa");
-
-    // ── 8. SDPA (no causal mask — mirrors Python `mask=None`) ─────────────────
-    let attn_out = attention::sdpa(&q, &k_sdpa, &v_sdpa, None, &config).expect("sdpa");
-
-    // ── 9. Output projection ──────────────────────────────────────────────────
-    // Drop the sdpa-input cache views before eval so they don't alias the
-    // underlying KvCache slab in a way that future update() calls would reject.
-    // (No future update in this test, but drop is good hygiene.)
-    drop(k_sdpa);
-    drop(v_sdpa);
-
-    let out =
-        attention::project_output(&attn_out, &layer0.attention, &config).expect("project_output");
+    // ── 8. Full attention forward (mask=None mirrors Python mask=None) ────────
+    let out = attn
+        .forward(&hidden, None, &offset_t, &mut cache)
+        .expect("Attention::forward");
 
     // ── 10. Eval and compare ──────────────────────────────────────────────────
     out.eval().expect("eval");
