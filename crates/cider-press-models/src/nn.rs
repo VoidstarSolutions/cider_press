@@ -332,9 +332,10 @@ impl Module for RmsNormLayer {
 
 /// Qwen2-family `SwiGLU` MLP as a [`Module`].
 ///
-/// Owns three bias-free quantized projections. `forward` computes
-/// `down(silu(gate(x)) * up(x))` — mirroring MLX's
-/// `swiglu(a, b) = silu(a) * b` (`mlx_lm/models/qwen2.py::MLP`).
+/// Owns three bias-free quantized projections (enforced by
+/// [`Mlp::new`]). `forward` computes `down(silu(gate(x)) * up(x))` —
+/// mirroring MLX's `swiglu(a, b) = silu(a) * b`
+/// (`mlx_lm/models/qwen2.py::MLP`).
 ///
 /// Generic over the three [`Linear`]s rather than bound to a specific
 /// checkpoint's weight struct, matching how [`Linear`] / [`RmsNormLayer`]
@@ -348,10 +349,19 @@ pub struct Mlp {
 }
 
 impl Mlp {
-    /// Construct from the three bias-free projections.
-    #[must_use]
-    pub fn new(gate: Linear, up: Linear, down: Linear) -> Self {
-        Self { gate, up, down }
+    /// Construct from the three bias-free projections. Rejects any
+    /// [`Linear`] carrying an additive bias — Qwen2's `SwiGLU` MLP
+    /// projections are bias-free, and mixing in a biased projection
+    /// would silently produce a different op.
+    pub fn new(gate: Linear, up: Linear, down: Linear) -> Result<Self> {
+        for (which, lin) in [("gate", &gate), ("up", &up), ("down", &down)] {
+            if lin.bias().is_some() {
+                return Err(Error::InvalidArgument(format!(
+                    "Mlp::new: {which} must be a bias-free Linear",
+                )));
+            }
+        }
+        Ok(Self { gate, up, down })
     }
 
     /// The gate projection.

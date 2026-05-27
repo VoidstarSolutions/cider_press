@@ -183,7 +183,7 @@ fn mlp_forward_shape_dtype_and_lazy() {
     let gate = Linear::new(zero_qw(&device, INTERMEDIATE, HIDDEN_SIZE), None).expect("gate");
     let up = Linear::new(zero_qw(&device, INTERMEDIATE, HIDDEN_SIZE), None).expect("up");
     let down = Linear::new(zero_qw(&device, HIDDEN_SIZE, INTERMEDIATE), None).expect("down");
-    let mlp = Mlp::new(gate, up, down);
+    let mlp = Mlp::new(gate, up, down).expect("mlp");
 
     let x = Tensor::from_slice(
         &device,
@@ -196,4 +196,25 @@ fn mlp_forward_shape_dtype_and_lazy() {
     assert_eq!(out.shape().dims(), &[1, T, HIDDEN_SIZE], "mlp out shape");
     assert_eq!(out.dtype(), DType::BF16, "mlp out dtype");
     assert!(!out.is_materialized(), "mlp out should be lazy");
+}
+
+#[test]
+fn mlp_new_rejects_biased_linear() {
+    let device = Device::shared().expect("device");
+
+    let gate_qw = zero_qw(&device, INTERMEDIATE, HIDDEN_SIZE);
+    let up_qw = zero_qw(&device, INTERMEDIATE, HIDDEN_SIZE);
+    let down_qw = zero_qw(&device, HIDDEN_SIZE, INTERMEDIATE);
+
+    let biased_gate = Linear::new(
+        gate_qw.clone(),
+        Some(zero_bf16_1d(&device, INTERMEDIATE)),
+    )
+    .expect("biased gate Linear");
+    let up = Linear::new(up_qw.clone(), None).expect("up");
+    let down = Linear::new(down_qw.clone(), None).expect("down");
+    assert!(
+        Mlp::new(biased_gate, up, down).is_err(),
+        "Mlp::new must reject a biased gate projection",
+    );
 }

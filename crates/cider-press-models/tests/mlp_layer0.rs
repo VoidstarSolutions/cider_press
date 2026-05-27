@@ -103,7 +103,8 @@ fn run_layer0_mlp(checkpoint: &Path, seq_len: usize) {
         Linear::new(mlp_w.gate_proj.clone(), None).expect("gate Linear"),
         Linear::new(mlp_w.up_proj.clone(), None).expect("up Linear"),
         Linear::new(mlp_w.down_proj.clone(), None).expect("down Linear"),
-    );
+    )
+    .expect("mlp");
 
     let hidden = Tensor::from_slice(&device, &x_ref, [1usize, seq_len, config.hidden_size])
         .expect("hidden tensor");
