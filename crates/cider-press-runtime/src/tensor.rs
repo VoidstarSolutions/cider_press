@@ -1405,10 +1405,31 @@ impl Tensor {
         }
         let (n, k) = (w_dims[0], w_dims[1]);
         let x_dims = self.shape().dims();
+        if x_dims.is_empty() {
+            return Err(Error::InvalidArgument(
+                "quantized_matmul: activation must have rank >= 1".into(),
+            ));
+        }
         let x_k = *x_dims.last().expect("shape is non-empty");
         if x_k != k {
             return Err(Error::InvalidArgument(format!(
                 "quantized_matmul: inner dim mismatch: activation last dim {x_k} != weight K {k}",
+            )));
+        }
+        // The M>1 prefill path dispatches `affine_qmm_t`, whose wired
+        // instantiation is aligned-only (N % 32 == 0). Reject the
+        // unaligned M>1 case here rather than letting eval fail late;
+        // M=1 decode routes to the generic `affine_qmv`, which has no
+        // such constraint.
+        let m: usize = if x_dims.len() == 1 {
+            1
+        } else {
+            x_dims[..x_dims.len() - 1].iter().product::<usize>()
+        };
+        if m > 1 && n % 32 != 0 {
+            return Err(Error::InvalidArgument(format!(
+                "quantized_matmul: weight N ({n}) must be a multiple of 32 for the M>1 \
+                 (prefill) path; only the aligned affine_qmm_t variant is wired",
             )));
         }
         let q = weight.quantization();
