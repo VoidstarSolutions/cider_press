@@ -92,7 +92,7 @@ that introduced them, instead of three branches later in some composition.
 | 12a | (done) `feat/models-linear-rmsnorm` | Forward-only `Module` trait (`forward(&self, &Tensor) -> Result<Tensor>`) that this crate's stateful layers implement, plus the first two: `Linear` (quantized projection `y = x @ W^T (+ bias)` over `Tensor::quantized_matmul` with optional rank-1 dense bias; owns its `QuantizedWeight`, rejects mismatched-length bias at construction) and `RmsNormLayer` (carries gamma + eps, wraps the composed `nn::rms_norm`). | Parity vs the existing `qmm` / `rms_norm` MLX dump fixtures (no new Python surface): `Linear` with/without bias vs `mx.quantized_matmul` at `[896,896]` decode+prefill; `RmsNormLayer` vs `mx.fast.rms_norm` at `[1,8,896]`. |
 | 12b | (done) `feat/models-attention-mlp` | `Mlp` as a `Module` layer (SwiGLU over three bias-free `Linear`s, enforced in `Mlp::new`) and `Attention` as an inherent-forward layer built on the `Linear` base — deliberately **not** a `Module` since `forward` takes the mask, RoPE offset, and a mutable `KvCache`. Absorbed `project_qkv`/`project_output` helpers into `Attention::forward`; corrected KV-view transpose (`permute([1,0,2]).copy()` before reshape) | Synthetic smoke (`attention_mlp_smoke.rs`); gated layer-0 MLX parity for attention (`attention_layer0.rs`) and MLP (`mlp_layer0.rs`) — **gated checkpoint run pending before merge** |
 | 12c | (done) `feat/models-qwen2` | `transpose: bool` flag on `Tensor::quantized_matmul` — `true` (existing orientation: `affine_qmv` / `affine_qmm_t`) or `false` (not yet wired; constructor rejects with `Unimplemented` until a non-tied consumer arrives; same rejection pattern as dtype/inner-dim checks). `TransformerBlock` in `qwen2::block` owns `RmsNormLayer × 2`, `Attention`, `Mlp`; `forward(hidden, mask, offset, cache)` mirrors `Attention::forward` and deliberately does NOT impl `Module`; pre-norm + residual: `hidden + attn(input_ln(hidden))` then `after_attn + mlp(post_ln(after_attn))`. `Qwen2Model` in `qwen2::model` owns the quantized `embed` weight, `Vec<TransformerBlock>` (length = `num_hidden_layers`), and the final `RmsNormLayer`; forward: `embed_tokens → N blocks → final norm → tied LM head` via `quantized_matmul(.., transpose=true)` (embed weight `[vocab, D]` already in the orientation the tied-head direction wants). Caller owns `&mut [KvCache]` slice so branch-14's decode loop persists state across calls. Gated `qwen2_logits` test exercises the complete wiring (ATOL=5e-2, RTOL=5e-2 combined np.allclose-style bound; explicit `[1, 1, T, T]` BF16 causal mask with `−1e4` upper-triangle, matched against `mlx_lm.Qwen2Model.__call__` on a fixed prompt prefill). | Gated `qwen2_logits` test on `CIDER_QWEN_CHECKPOINT_PATH`: logits parity vs `mlx_lm.Qwen2Model` at ATOL=5e-2/RTOL=5e-2 across the full vocab dimension; exercises every wiring path |
-| 13 | `feat/tokenizer` | BPE tokenizer (probably `tokenizers` crate from HF for Qwen's BPE vocab) | Round-trip encode/decode against HF tokenizer |
+| 13 | (done) `feat/tokenizer` | New `Tokenizer` type in `cider_press_models` wrapping HF's `tokenizers` crate (workspace dep `=0.23.1`, `default-features = false`, `fancy-regex` feature — pure-Rust regex backend, no `onig` C bindings). Surface: `from_file(path) -> Result<Self>`, `encode(text) -> Result<Vec<u32>>`, `decode(ids) -> Result<String>`; `add_special_tokens=false`, `skip_special_tokens=false`. Chat-template + BOS/EOS framing deferred to branch 14. New `Error::Tokenizer(#[from] tokenizers::Error)` variant on `crate::error::Error` — matches the existing `Safetensors`/`Json` thiserror pattern. `dev_dep: tempfile = "=3.19.1"` added at workspace level for the unit smoke. New `scripts/dump_tokenizer.py` PEP 723 harness that encodes a 6-string corpus via `transformers.AutoTokenizer` and writes the ids + per-entry metadata as u32 safetensors tensors. | Unit smoke: in-memory minimal BPE tokenizer built via `tokenizers::Tokenizer::save` into a tempdir + `from_file` + round-trip. Gated `tokenizer_parity_round_trip` (`tests/tokenizer_parity.rs`): exact-id equality against `transformers.AutoTokenizer` at the pinned `HF_REVISION` over a 6-string corpus (ASCII, multi-byte Unicode, leading whitespace, BPE-merge edge, numeric, empty) + decode round-trip on the Rust side. |
 | 14 | `feat/cli + greedy decode` | CLI: load model, take prompt, prefill, decode loop, greedy argmax sampling, streamed detokenize | Generate a coherent completion |
 | 15 | `feat/perf-measurement` | Tokens/sec bench against MLX-LM; memory profile; identify hot spots | Numbers documented in `docs/QWEN_PERF.md` |
 
@@ -119,44 +119,52 @@ for "it's fast and clean" but can wait until branch 15+:
 
 ## What to do next time we sit down
 
-**Before merging branch 12c:** run the gated `qwen2_logits` test
-locally with `CIDER_QWEN_CHECKPOINT_PATH` set to a Qwen2.5-0.5B-Instruct-4bit
-MLX checkout. This is the first test that exercises the complete
-forward pass end-to-end and is the only gating acceptance criterion
-for the branch.
+Branches 12c (`feat/models-qwen2`) and 13 (`feat/tokenizer`) are both
+done; the route to first-token inference is just branch 14 away.
 
-Branch 13 (`feat/tokenizer`). Specifically:
+**Before merging branch 13:** run the gated `tokenizer_parity_round_trip`
+test locally with `CIDER_QWEN_CHECKPOINT_PATH` set to a
+Qwen2.5-0.5B-Instruct-4bit MLX checkout. Verifies exact-id equality vs
+`transformers.AutoTokenizer` and decode round-trip across the 6-string
+corpus. Must pass before merge.
 
-1. Load `tokenizer.json` from the same HF checkpoint directory pointed
-   at by `CIDER_QWEN_CHECKPOINT_PATH` (same revision pinned in
-   `Qwen2Config::HF_REVISION`). Use the `tokenizers` crate from
-   HuggingFace — it handles Qwen's BPE vocab without a custom
-   implementation.
-2. Expose a thin Rust API: `Tokenizer::from_file(path: &Path) ->
-   Result<Tokenizer>`, `Tokenizer::encode(&self, text: &str) ->
-   Vec<u32>`, `Tokenizer::decode(&self, ids: &[u32]) -> String`.
-   Keep the wrapper minimal — the `tokenizers` crate's `Tokenizer`
-   type does the heavy lifting.
-3. Validate by round-tripping a small fixed corpus through both the
-   Rust tokenizer and the HF Python tokenizer (`transformers.AutoTokenizer`
-   at the pinned revision): the token-ID sequences must match exactly.
-   The corpus can be a handful of short strings covering BPE merges,
-   multi-byte Unicode, and whitespace edge cases.
+Branch 14 (`feat/cli + greedy decode`). Specifically:
 
-Open follow-up items still tracking:
+1. Build a CLI binary (`crates/cider-press/src/bin/cider-press.rs`, or
+   extend the existing `cider-press` facade crate) that:
+   - Accepts `--checkpoint <path>` and a prompt (positional or `--prompt`).
+   - Loads `Qwen2Config`, `Qwen2Weights`, `Qwen2Model`, and the
+     `Tokenizer` from the checkpoint dir.
+   - Prefills the prompt through `Qwen2Model::forward`.
+   - Loops: argmax-sample the next token from the last position's logits,
+     append to ids, call `forward` with `T=1` and the previous
+     `KvCache`s, repeat until EOS (`config.eos_token_id`) or a
+     `--max-tokens` cap.
+2. Streamed detokenize: decode incrementally as ids are sampled so the
+   user sees output as it generates.
+3. EOS / special-token IDs: read from `tokenizer_config.json` (`eos_token`
+   mapped to id via the tokenizer) — or hardcode the known Qwen2.5 id and
+   document it.
+4. Optional: greedy argmax is fine for branch 14; top-k / top-p stay
+   deferred.
+
+Open carry-forward items:
 - **`assert_close` extraction**: now duplicated across `qmm_qwen2.rs`,
   `sdpa_qwen2.rs`, `attention_layer0.rs`, `mlp_layer0.rs`,
-  `linear_rmsnorm.rs`, and `qwen2_logits.rs` (6 sites after 12c lands).
-  Candidate for `cider-press-test-utils` in a future cleanup branch.
-- **Transpose=false direction** of `Tensor::quantized_matmul` is still
+  `linear_rmsnorm.rs`, and `qwen2_logits.rs` (6 sites). Candidate for
+  `cider-press-test-utils` in a future cleanup branch. Tokenizer test
+  uses `assert_eq!` — doesn't add to the count.
+- **Transpose=false direction of `Tensor::quantized_matmul`**: still
   `Unimplemented`. Lands with its first non-tied consumer — Qwen2.5
   universally ties the LM head, so this may never arrive.
-- **Generic non-aligned `affine_qmm`** deferred to its first unaligned
+- **Generic non-aligned `affine_qmm`**: deferred to its first unaligned
   consumer; current path requires `N % 32 == 0`.
+- **Chat-template / special-token surface**: branch 14 owns it
+  (`add_special_tokens`, BOS/EOS framing, `tokenizer_config.json` lookup).
 
-Branches still ahead of first end-to-end inference (br14): 13
-(tokenizer), 14 (CLI + greedy decode). 2 branches between us and the
-first runnable Qwen2.5-0.5B.
+Branches still ahead of first end-to-end inference (br14): 14 (CLI +
+greedy decode). One branch between us and the first runnable
+Qwen2.5-0.5B.
 
 Open question carried forward from branch 7: the per-instantiation
 JIT cache on `Device` now holds one library per unique kernel name.
