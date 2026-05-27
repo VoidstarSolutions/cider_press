@@ -514,7 +514,12 @@ fn dispatch_quantized_matmul(
     })?;
 
     let (w_bytes, scales_bytes, biases_bytes) = quantized_input_buffers(weight)?;
-    let x_bytes = dense_input_buffer(x_tensor, outputs, index_of)?;
+    // The activation may be a contiguous *view* (e.g. a `reshape` of an
+    // op output) — `Tensor::quantized_matmul` accepts those. Resolve
+    // through the view chain like the dense matmul path does; the qmv/qmm
+    // kernels read contiguous bytes from offset 0, which `matmul_input_bytes`
+    // enforces.
+    let x_bytes = matmul_input_bytes("quantized_matmul", x_tensor, outputs, index_of)?;
 
     let library = device.quantized_library()?;
 
@@ -1320,6 +1325,7 @@ fn dispatch_softmax(
 /// offsets would require a `setBuffer:offset:` bind that the kernel
 /// doesn't currently take.
 fn matmul_input_bytes(
+    op: &str,
     input: &Tensor,
     outputs: &[Buffer<u8>],
     index_of: &HashMap<*const TensorInner, usize>,
@@ -1328,7 +1334,7 @@ fn matmul_input_bytes(
         let (buf, byte_offset) = resolve_view_storage(input, outputs, index_of)?;
         if byte_offset != 0 {
             return Err(Error::InvalidArgument(format!(
-                "matmul: non-zero view byte offset {byte_offset} is not supported by the \
+                "{op}: non-zero view byte offset {byte_offset} is not supported by the \
                  contiguous matmul kernel; add a `setBuffer:offset:` bind when the first \
                  slice-into-matmul case appears",
             )));
@@ -1369,8 +1375,8 @@ fn dispatch_matmul(
     // `probs_3d.reshape([B, H_q, T, T_c])` view of the softmax result).
     // Walk the chain to the storage owner; the contract guarantees a
     // byte-offset of zero and contiguous bytes thereafter.
-    let lhs_bytes = matmul_input_bytes(lhs, outputs, index_of)?;
-    let rhs_bytes = matmul_input_bytes(rhs, outputs, index_of)?;
+    let lhs_bytes = matmul_input_bytes("matmul", lhs, outputs, index_of)?;
+    let rhs_bytes = matmul_input_bytes("matmul", rhs, outputs, index_of)?;
     let lhs_typed = unsafe { lhs_bytes.reinterpret_as::<half::bf16>() };
     let rhs_typed = unsafe { rhs_bytes.reinterpret_as::<half::bf16>() };
     let mut dst_typed = unsafe { dst.reinterpret_as::<half::bf16>() };

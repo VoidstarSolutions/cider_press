@@ -8,9 +8,12 @@
 //! Status: branch 5 shipped [`rms_norm`]; branch 6 adds [`silu`] and
 //! [`gelu`] (exact, `erf`-based — matches `mlx.nn.gelu`); branch 7
 //! adds [`embed_tokens`] (gather + dequantize composition over a
-//! [`QuantizedWeight`] embedding table). `SwiGLU`, `RoPE`, `SDPA`,
-//! and the rest of the Qwen2 layer building blocks land as their
-//! underlying ops do.
+//! [`QuantizedWeight`] embedding table). Branch 12a adds the
+//! [`Module`] trait and the first stateful building blocks built on
+//! it — [`Linear`] (a quantized projection with optional dense bias)
+//! and [`RmsNormLayer`] (the composed [`rms_norm`] carrying its gamma
+//! weight). `SwiGLU`, `RoPE`, `SDPA`, and the rest of the Qwen2 layer
+//! building blocks land as their underlying ops do.
 
 use cider_press_runtime::{DType, Device, QuantizedWeight, Tensor};
 use half::{bf16, f16};
@@ -188,6 +191,143 @@ pub fn embed_tokens(input_ids: &Tensor, weight: &QuantizedWeight) -> Result<Tens
         q.group_size(),
         q.bits(),
     )?)
+}
+
+/// A forward-only transformer building block.
+///
+/// `forward` schedules ops onto the runtime's lazy graph and returns
+/// the output tensor *unevaluated* — the caller decides when to
+/// `eval()`. This is the uniform shape that the stateful layers in
+/// this crate implement: [`Linear`] and [`RmsNormLayer`] here, then
+/// `Attention` / `Mlp` (branch 12b) and `TransformerBlock` (12c),
+/// so a model is "just" a composition of `Module::forward` calls.
+///
+/// Single-input/single-output by design — it covers every Qwen2 layer.
+/// Modules that need auxiliary state (attention's `RoPE` offset, the
+/// [`cider_press_runtime::KvCache`]) take it through their own typed
+/// constructors / methods rather than widening this signature.
+pub trait Module {
+    /// Schedule this module's computation on `x`, returning the lazy
+    /// output tensor.
+    fn forward(&self, x: &Tensor) -> Result<Tensor>;
+}
+
+/// A quantized linear projection: `y = x @ W^T (+ bias)`.
+///
+/// Wraps [`Tensor::quantized_matmul`] (MLX's `affine_qmv` for the M=1
+/// decode path, `affine_qmm_t` for M>1 prefill) plus an optional dense
+/// additive bias that broadcasts over the leading dims. Qwen2's Q/K/V
+/// projections carry a bias; the O and MLP projections do not.
+///
+/// Owns its weights (refcounted device buffers — `Clone` is cheap), so
+/// a loaded checkpoint can be moved into a tree of modules.
+#[derive(Clone, Debug)]
+pub struct Linear {
+    weight: QuantizedWeight,
+    bias: Option<Tensor>,
+}
+
+impl Linear {
+    /// Construct from a quantized weight and an optional dense bias.
+    ///
+    /// `weight` is logical `[N, K]`; `forward` maps `[..., K]` to
+    /// `[..., N]`. If `bias` is `Some`, it must be a rank-1 tensor of
+    /// length `N` (the weight's output dim) so it broadcasts against the
+    /// `[..., N]` projection output. A shape mismatch is rejected here
+    /// rather than deferred to `forward`.
+    pub fn new(weight: QuantizedWeight, bias: Option<Tensor>) -> Result<Self> {
+        if let Some(bias) = &bias {
+            let n = weight.shape().dims()[0];
+            if bias.rank() != 1 || bias.shape().dims() != [n] {
+                return Err(Error::InvalidArgument(format!(
+                    "Linear: bias must be rank-1 of size {n} (weight output dim); \
+                     got rank {} shape {:?}",
+                    bias.rank(),
+                    bias.shape().dims(),
+                )));
+            }
+            // The bias adds to the BF16 projection output on the weight's
+            // device, so it must match both — otherwise `forward`'s `add`
+            // would fail late. Reject the mismatch at construction.
+            let weight_device = weight.tensor().device().ok_or_else(|| {
+                Error::InvalidArgument("Linear: weight has no device (placeholder?)".into())
+            })?;
+            let bias_device = bias.device().ok_or_else(|| {
+                Error::InvalidArgument("Linear: bias has no device (placeholder?)".into())
+            })?;
+            if !weight_device.ptr_eq(bias_device) {
+                return Err(Error::InvalidArgument(
+                    "Linear: bias and weight are on different devices".into(),
+                ));
+            }
+            if bias.dtype() != DType::BF16 {
+                return Err(Error::InvalidArgument(format!(
+                    "Linear: bias must be BF16 to match the projection output; got {:?}",
+                    bias.dtype(),
+                )));
+            }
+        }
+        Ok(Self { weight, bias })
+    }
+
+    /// The quantized projection weight (logical `[N, K]`).
+    #[must_use]
+    pub fn weight(&self) -> &QuantizedWeight {
+        &self.weight
+    }
+
+    /// The dense additive bias, if this projection has one.
+    #[must_use]
+    pub fn bias(&self) -> Option<&Tensor> {
+        self.bias.as_ref()
+    }
+}
+
+impl Module for Linear {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let y = x.quantized_matmul(&self.weight)?;
+        match &self.bias {
+            Some(bias) => Ok(y.add(bias)?),
+            None => Ok(y),
+        }
+    }
+}
+
+/// `RMSNorm` as a [`Module`]: carries the gamma weight and epsilon and
+/// applies the composed [`rms_norm`] on `forward`.
+///
+/// Owns its gamma weight (refcounted device buffer — `Clone` is cheap).
+#[derive(Clone, Debug)]
+pub struct RmsNormLayer {
+    gamma: Tensor,
+    eps: f32,
+}
+
+impl RmsNormLayer {
+    /// Construct from a gamma weight (rank-1 `[hidden_size]`, validated
+    /// against the input at `forward`) and a normalization epsilon.
+    #[must_use]
+    pub fn new(gamma: Tensor, eps: f32) -> Self {
+        Self { gamma, eps }
+    }
+
+    /// The norm's gamma (scale) weight.
+    #[must_use]
+    pub fn gamma(&self) -> &Tensor {
+        &self.gamma
+    }
+
+    /// The normalization epsilon.
+    #[must_use]
+    pub fn eps(&self) -> f32 {
+        self.eps
+    }
+}
+
+impl Module for RmsNormLayer {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        rms_norm(x, &self.gamma, self.eps)
+    }
 }
 
 /// Build a `[1]` host-side tensor on `device` with the given value

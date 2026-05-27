@@ -103,41 +103,18 @@ pub fn affine_qmm_t_bf16(
         )));
     }
 
-    let expected_w_q = n * k * (bits as usize) / 32;
-    if w_q.len() != expected_w_q {
-        return Err(Error::InvalidArgument(format!(
-            "affine_qmm_t: w_q.len()={} != N*K*bits/32 ({expected_w_q})",
-            w_q.len(),
-        )));
-    }
-    let groups_per_row = k / (group_size as usize);
-    let expected_groups = n * groups_per_row;
-    if scales.len() != expected_groups {
-        return Err(Error::InvalidArgument(format!(
-            "affine_qmm_t: scales.len()={} != N*K/group_size ({expected_groups})",
-            scales.len(),
-        )));
-    }
-    if biases.len() != expected_groups {
-        return Err(Error::InvalidArgument(format!(
-            "affine_qmm_t: biases.len()={} != N*K/group_size ({expected_groups})",
-            biases.len(),
-        )));
-    }
-    if x.len() != m * k {
-        return Err(Error::InvalidArgument(format!(
-            "affine_qmm_t: x.len()={} != M*K ({})",
-            x.len(),
-            m * k,
-        )));
-    }
-    if y.len() != m * n {
-        return Err(Error::InvalidArgument(format!(
-            "affine_qmm_t: y.len()={} != M*N ({})",
-            y.len(),
-            m * n,
-        )));
-    }
+    validate_qmm_buffer_lens(
+        w_q.len(),
+        scales.len(),
+        biases.len(),
+        x.len(),
+        y.len(),
+        m,
+        n,
+        k,
+        group_size,
+        bits,
+    )?;
 
     // transpose=true, aligned=true (N % 32 == 0), batched=false (B=1).
     let kernel_name = format!("affine_qmm_t_bfloat16_t_gs_{group_size}_b_{bits}_alN_true_batch_0");
@@ -174,5 +151,67 @@ pub fn affine_qmm_t_bf16(
         depth: 2,
     };
     encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, threadgroup);
+    Ok(())
+}
+
+/// Validate the five buffer lengths against the logical `(M, N, K)`
+/// geometry. Uses checked arithmetic so an `i32`-valid-but-huge shape
+/// can't wrap a product into a small expected length and let an
+/// undersized buffer reach the kernel.
+#[allow(clippy::too_many_arguments)]
+fn validate_qmm_buffer_lens(
+    w_q_len: usize,
+    scales_len: usize,
+    biases_len: usize,
+    x_len: usize,
+    y_len: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    group_size: u32,
+    bits: u32,
+) -> Result<()> {
+    let nk = n
+        .checked_mul(k)
+        .ok_or_else(|| Error::InvalidArgument("affine_qmm_t: N*K overflows usize".into()))?;
+    let expected_w_q = nk
+        .checked_mul(bits as usize)
+        .ok_or_else(|| Error::InvalidArgument("affine_qmm_t: N*K*bits overflows usize".into()))?
+        / 32;
+    if w_q_len != expected_w_q {
+        return Err(Error::InvalidArgument(format!(
+            "affine_qmm_t: w_q.len()={w_q_len} != N*K*bits/32 ({expected_w_q})",
+        )));
+    }
+    let groups_per_row = k / (group_size as usize);
+    let expected_groups = n.checked_mul(groups_per_row).ok_or_else(|| {
+        Error::InvalidArgument("affine_qmm_t: N*(K/group_size) overflows usize".into())
+    })?;
+    if scales_len != expected_groups {
+        return Err(Error::InvalidArgument(format!(
+            "affine_qmm_t: scales.len()={scales_len} != N*K/group_size ({expected_groups})",
+        )));
+    }
+    if biases_len != expected_groups {
+        return Err(Error::InvalidArgument(format!(
+            "affine_qmm_t: biases.len()={biases_len} != N*K/group_size ({expected_groups})",
+        )));
+    }
+    let expected_x = m
+        .checked_mul(k)
+        .ok_or_else(|| Error::InvalidArgument("affine_qmm_t: M*K overflows usize".into()))?;
+    if x_len != expected_x {
+        return Err(Error::InvalidArgument(format!(
+            "affine_qmm_t: x.len()={x_len} != M*K ({expected_x})",
+        )));
+    }
+    let expected_y = m
+        .checked_mul(n)
+        .ok_or_else(|| Error::InvalidArgument("affine_qmm_t: M*N overflows usize".into()))?;
+    if y_len != expected_y {
+        return Err(Error::InvalidArgument(format!(
+            "affine_qmm_t: y.len()={y_len} != M*N ({expected_y})",
+        )));
+    }
     Ok(())
 }
