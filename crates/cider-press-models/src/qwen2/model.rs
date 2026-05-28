@@ -7,7 +7,7 @@ use super::block::TransformerBlock;
 use super::config::Qwen2Config;
 use super::weights::Qwen2Weights;
 use crate::error::{Error, Result};
-use crate::nn::{embed_tokens, Module, RmsNormLayer};
+use crate::nn::{Module, RmsNormLayer, embed_tokens};
 
 /// Qwen2-family causal language model.
 ///
@@ -62,7 +62,9 @@ impl Qwen2Model {
 
     /// Forward through the full model.
     ///
-    /// - `input_ids`: `[1, T]` U32 token ids.
+    /// - `input_ids`: `[1, T]` U32 token ids. Flattened to rank-1 for the
+    ///   embedding gather, then reshaped back to `[1, T, hidden_size]`
+    ///   before the transformer blocks.
     /// - `mask`: optional additive attention mask broadcastable to
     ///   `[1, H_q, T, T_cache]` (BF16). Pass `None` for full attention
     ///   (decode of T=1 typically passes `None`).
@@ -87,7 +89,18 @@ impl Qwen2Model {
             )));
         }
 
-        let mut hidden = embed_tokens(input_ids, &self.embed)?;
+        // embed_tokens takes rank-1 ids and returns [T, hidden]; the blocks
+        // require [1, T, hidden]. Flatten on the way in, restore the leading
+        // batch axis on the way out.
+        let t = input_ids.elem_count();
+        // reshape returns a view; gather and the downstream unary/reduce
+        // dispatchers read inputs as dense leaves and don't resolve view
+        // chains, so materialise both ends with copy().
+        let flat_ids = input_ids.reshape([t])?.copy()?;
+        let embedded = embed_tokens(&flat_ids, &self.embed)?;
+        let mut hidden = embedded
+            .reshape([1usize, t, self.config.hidden_size])?
+            .copy()?;
         for (block, cache) in self.layers.iter().zip(caches.iter_mut()) {
             hidden = block.forward(&hidden, mask, offset, cache)?;
         }
