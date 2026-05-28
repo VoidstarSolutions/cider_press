@@ -43,11 +43,19 @@ fn assert_close(label: &str, got: &[bf16], expected: &[bf16]) {
     let mut worst_at = 0usize;
     let mut worst_pair = (0.0f32, 0.0f32);
     for (i, (a, b)) in got.iter().zip(expected.iter()).enumerate() {
+        let af = a.to_f32();
+        let bfv = b.to_f32();
+        if !af.is_finite() || !bfv.is_finite() {
+            // NaN/Inf would otherwise short-circuit the tolerance math
+            // (NaN comparisons fall back to false) — force a failure.
+            worst_excess = f32::INFINITY;
+            worst_at = i;
+            worst_pair = (af, bfv);
+            break;
+        }
         if a == b {
             continue;
         }
-        let af = a.to_f32();
-        let bfv = b.to_f32();
         let diff = (af - bfv).abs();
         let bound = ATOL + RTOL * bfv.abs();
         let excess = diff - bound;
