@@ -67,10 +67,14 @@ fn assert_close(label: &str, got: &[bf16], expected: &[bf16]) {
     );
 }
 
-/// Build a causal additive mask `[1, 1, T, T]` BF16: 0 on/below the
+/// Build a causal additive mask `[T, T]` BF16: 0 on/below the
 /// diagonal, large-negative above. Magnitude `-1e4` keeps the softmax
 /// accumulator inside bf16's representable range while still acting as
 /// a hard mask (softmax subtracts the max before exp).
+///
+/// Shape is rank-2 so it broadcasts against `sdpa`'s rank-3 score
+/// tensor `[B*H_q, T, T_cache]` via the wired `g3_*` binary path —
+/// rank-4 strided binary isn't wired yet.
 fn causal_mask_bf16(device: &Device, t: usize) -> Tensor {
     let neg = bf16::from_f32(-1.0e4);
     let zero = bf16::ZERO;
@@ -80,7 +84,7 @@ fn causal_mask_bf16(device: &Device, t: usize) -> Tensor {
             data[row * t + col] = neg;
         }
     }
-    Tensor::from_slice(device, &data, [1usize, 1, t, t]).expect("causal mask tensor")
+    Tensor::from_slice(device, &data, [t, t]).expect("causal mask tensor")
 }
 
 fn run_qwen2_logits(checkpoint: &Path) {
