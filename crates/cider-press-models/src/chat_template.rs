@@ -120,15 +120,19 @@ impl ChatTemplate {
         // eos_token_id: int OR [int, int, ...]
         if let Some(v) = cfg.get("eos_token_id") {
             if let Some(n) = v.as_u64() {
-                if let Ok(id) = u32::try_from(n) {
-                    eos_ids.insert(id);
-                }
+                let id = u32::try_from(n).map_err(|_| {
+                    Error::InvalidArgument(format!("eos_token_id value {n} exceeds u32::MAX"))
+                })?;
+                eos_ids.insert(id);
             } else if let Some(arr) = v.as_array() {
                 for item in arr {
                     if let Some(n) = item.as_u64() {
-                        if let Ok(id) = u32::try_from(n) {
-                            eos_ids.insert(id);
-                        }
+                        let id = u32::try_from(n).map_err(|_| {
+                            Error::InvalidArgument(format!(
+                                "eos_token_id value {n} exceeds u32::MAX"
+                            ))
+                        })?;
+                        eos_ids.insert(id);
                     }
                 }
             }
@@ -189,10 +193,10 @@ mod tests {
         // Register "<eos>" as a special (non-splitting) token so the
         // tokenizer returns it as a single token rather than splitting
         // into individual characters.
-        let _ = hf.add_special_tokens([tokenizers::AddedToken::from(
-            "<eos>".to_string(),
-            true,
-        )]);
+        let added = hf
+            .add_special_tokens([tokenizers::AddedToken::from("<eos>".to_string(), true)])
+            .expect("add_special_tokens");
+        assert_eq!(added, 1, "add_special_tokens failed to register <eos>");
         let path = dir.join("tokenizer.json");
         hf.save(path.to_str().unwrap(), false).expect("save tokenizer");
         Tokenizer::from_file(&path).expect("load tokenizer")
@@ -247,5 +251,29 @@ mod tests {
         std::fs::write(&cfg_path, serde_json::to_vec(&cfg).unwrap()).expect("write config");
         let err = ChatTemplate::from_file(&cfg_path, &tok).unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn resolves_eos_token_as_added_token_object() {
+        let dir = tempdir().expect("tempdir");
+        let tok = minimal_tokenizer(dir.path());
+
+        let cfg = serde_json::json!({
+            "chat_template": "{{ '' }}",
+            "eos_token": {
+                "content": "<eos>",
+                "lstrip": false,
+                "rstrip": false,
+                "single_word": false,
+                "special": true,
+            },
+        });
+        let cfg_path = dir.path().join("tokenizer_config.json");
+        std::fs::write(&cfg_path, serde_json::to_vec(&cfg).unwrap())
+            .expect("write config");
+
+        let ct = ChatTemplate::from_file(&cfg_path, &tok).expect("load template");
+        let ids: HashSet<u32> = ct.eos_ids().collect();
+        assert_eq!(ids, HashSet::from([0u32]));
     }
 }
