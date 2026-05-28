@@ -20,8 +20,11 @@ use safetensors::SafeTensors;
 #[command(name = "cider-press", version, about = "Greedy decode against a Qwen2 checkpoint")]
 struct Args {
     /// Checkpoint directory holding config.json, tokenizer.json,
-    /// tokenizer_config.json, and a single-file model.safetensors.
-    #[arg(long)]
+    /// `tokenizer_config.json`, and a single-file model.safetensors.
+    #[arg(
+        long,
+        help = "Checkpoint directory holding config.json, tokenizer.json, tokenizer_config.json, and a single-file model.safetensors"
+    )]
     checkpoint: PathBuf,
     /// User message.
     #[arg(long)]
@@ -33,11 +36,11 @@ struct Args {
     /// Maximum new tokens to generate.
     #[arg(long, default_value_t = 256)]
     max_tokens: usize,
-    /// Pre-allocated KvCache window in tokens.
-    #[arg(long, default_value_t = 4096)]
+    /// Pre-allocated `KvCache` window in tokens.
+    #[arg(long, default_value_t = 4096, help = "Pre-allocated KvCache window in tokens")]
     context_window: usize,
-    /// Skip ChatTemplate; encode the bare --prompt.
-    #[arg(long)]
+    /// Skip `ChatTemplate`; encode the bare --prompt.
+    #[arg(long, help = "Skip ChatTemplate; encode the bare --prompt")]
     no_chat_template: bool,
 }
 
