@@ -196,8 +196,12 @@ fn dispatch(
         .expect("topo invariant: only op nodes here");
     match op.kind {
         OpKind::Copy => dispatch_copy(inner, op, commands, outputs, dst, index_of),
-        OpKind::QuantizedMatMul { group_size, bits } => dispatch_quantized_matmul(
-            inner, op, commands, outputs, dst, index_of, group_size, bits,
+        OpKind::QuantizedMatMul {
+            group_size,
+            bits,
+            transpose,
+        } => dispatch_quantized_matmul(
+            inner, op, commands, outputs, dst, index_of, group_size, bits, transpose,
         ),
         OpKind::Binary { op: binary_op } => {
             dispatch_binary(inner, op, commands, outputs, dst, index_of, binary_op)
@@ -501,7 +505,16 @@ fn dispatch_quantized_matmul(
     index_of: &HashMap<*const TensorInner, usize>,
     group_size: u32,
     bits: u8,
+    transpose: bool,
 ) -> Result<()> {
+    if !transpose {
+        // `Tensor::quantized_matmul` rejects `transpose=false` at construction;
+        // a runtime guard here keeps release builds honest if the construction
+        // check ever drifts.
+        return Err(Error::InvalidArgument(
+            "QuantizedMatMul: transpose=false is not yet implemented in the dispatcher".into(),
+        ));
+    }
     let device = inner
         .device
         .as_ref()

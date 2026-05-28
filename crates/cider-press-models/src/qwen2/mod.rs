@@ -14,8 +14,14 @@
 //! revision pinned in [`HF_REVISION`].
 
 pub mod attention;
+pub mod block;
 mod config;
 mod weights;
+
+pub mod model;
+
+pub use block::TransformerBlock;
+pub use model::Qwen2Model;
 
 pub use config::{HF_REPO, HF_REVISION, Qwen2Config, Qwen2QuantizationConfig};
 pub use weights::{
