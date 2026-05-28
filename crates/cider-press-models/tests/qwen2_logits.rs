@@ -13,6 +13,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use cider_press_models::nn;
 use cider_press_models::qwen2::{Qwen2Config, Qwen2Model, load_qwen2_weights};
 use cider_press_runtime::{DType, Device, KvCache, Tensor};
 use cider_press_test_utils::{dump_mlx_op, read_bf16, read_u32, tempdir};
@@ -84,26 +85,6 @@ fn assert_close(label: &str, got: &[bf16], expected: &[bf16]) {
     );
 }
 
-/// Build a causal additive mask `[T, T]` BF16: 0 on/below the
-/// diagonal, large-negative above. Magnitude `-1e4` keeps the softmax
-/// accumulator inside bf16's representable range while still acting as
-/// a hard mask (softmax subtracts the max before exp).
-///
-/// Shape is rank-2 so it broadcasts against `sdpa`'s rank-3 score
-/// tensor `[B*H_q, T, T_cache]` via the wired `g3_*` binary path —
-/// rank-4 strided binary isn't wired yet.
-fn causal_mask_bf16(device: &Device, t: usize) -> Tensor {
-    let neg = bf16::from_f32(-1.0e4);
-    let zero = bf16::ZERO;
-    let mut data = vec![zero; t * t];
-    for row in 0..t {
-        for col in (row + 1)..t {
-            data[row * t + col] = neg;
-        }
-    }
-    Tensor::from_slice(device, &data, [t, t]).expect("causal mask tensor")
-}
-
 fn run_qwen2_logits(checkpoint: &Path) {
     let tmp = tempdir("models-qwen2-logits");
     let fixture_path = tmp.join("qwen2-logits.safetensors");
@@ -152,7 +133,7 @@ fn run_qwen2_logits(checkpoint: &Path) {
 
     let input_ids = Tensor::from_slice(&device, &input_ids_ref, [1usize, t]).expect("input_ids");
     let offset_t = Tensor::from_slice(&device, &[0i32], [1usize]).expect("offset tensor");
-    let mask = causal_mask_bf16(&device, t);
+    let mask = nn::causal_mask(&device, t).expect("causal mask");
 
     // T tokens go into the cache during prefill; size slabs accordingly with
     // a little headroom.
