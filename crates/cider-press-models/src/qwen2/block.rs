@@ -3,11 +3,11 @@
 
 use cider_press_runtime::{KvCache, Tensor};
 
-use crate::error::Result;
-use crate::nn::{Linear, Mlp, Module, RmsNormLayer};
 use super::attention::Attention;
 use super::config::Qwen2Config;
 use super::weights::Qwen2LayerWeights;
+use crate::error::Result;
+use crate::nn::{Linear, Mlp, Module, RmsNormLayer};
 
 /// One layer of Qwen2: pre-norm self-attention with a residual, then
 /// pre-norm `SwiGLU` MLP with a residual.
