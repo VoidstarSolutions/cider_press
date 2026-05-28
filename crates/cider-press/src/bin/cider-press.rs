@@ -47,8 +47,12 @@ struct Args {
         help = "Pre-allocated KvCache window in tokens"
     )]
     context_window: usize,
-    /// Skip `ChatTemplate`; encode the bare --prompt.
-    #[arg(long, help = "Skip ChatTemplate; encode the bare --prompt")]
+    /// Skip `ChatTemplate` rendering; encode the bare --prompt.
+    /// `tokenizer_config.json` is still read for the EOS token ids.
+    #[arg(
+        long,
+        help = "Skip ChatTemplate rendering; encode the bare --prompt. tokenizer_config.json is still read for the EOS token ids."
+    )]
     no_chat_template: bool,
 }
 
