@@ -171,10 +171,13 @@ pub enum OpKind {
         /// Quantization bit-width (e.g. 4 for int4 weights). Must
         /// match the input weight's [`Quantization::bits`].
         bits: u8,
-        /// `true` means `y = x @ W^T` (weight stored `[N, K]`, output dim `N`).
-        /// This is the only direction currently implemented; `false` returns
-        /// `Unimplemented` from the dispatcher (the tied LM head uses
-        /// `transpose=true`, so no consumer needs `false` yet).
+        /// `true` means `y = x @ W^T` (weight stored `[N, K]`, output dim
+        /// `N`). This is the only direction currently implemented:
+        /// `false` is rejected at op construction by
+        /// [`Tensor::quantized_matmul`] with [`Error::InvalidArgument`].
+        /// The tied LM head also uses `transpose=true` (same weight
+        /// orientation as the standard `Linear`), so no consumer needs
+        /// `false` yet.
         transpose: bool,
     },
     /// Element-wise binary op with `NumPy` broadcasting. Inputs (in
@@ -1365,8 +1368,10 @@ impl Tensor {
     /// - `self.dtype() == BF16` and `self.layout()` is dense contiguous.
     /// - `weight.shape()` is rank-2.
     /// - Inner dim of `self` (last axis) matches `weight`'s K (second axis).
-    /// - `transpose` must be `true`; `transpose=false` (needed for the tied LM
-    ///   head) is not yet implemented and returns `Err` immediately.
+    /// - `transpose` must be `true` (i.e. `y = x @ W^T`, the standard
+    ///   `Linear` orientation that the tied LM head also uses);
+    ///   `transpose=false` is not yet implemented and returns `Err`
+    ///   immediately.
     pub fn quantized_matmul(
         &self,
         weight: &crate::QuantizedWeight,
