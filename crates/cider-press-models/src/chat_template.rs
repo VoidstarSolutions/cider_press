@@ -275,9 +275,7 @@ mod tests {
         std::fs::write(dir.path().join("chat_template.jinja"), template)
             .expect("write chat_template.jinja");
         let ct = ChatTemplate::from_file(&cfg_path, &tok).expect("load template");
-        let rendered = ct
-            .render(&[Message::user("hi")])
-            .expect("render");
+        let rendered = ct.render(&[Message::user("hi")]).expect("render");
         assert_eq!(rendered, "<user>hi</user>");
     }
 
