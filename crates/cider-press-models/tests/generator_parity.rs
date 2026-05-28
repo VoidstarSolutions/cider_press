@@ -12,10 +12,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use cider_press_models::Tokenizer;
 use cider_press_models::chat_template::{ChatTemplate, Message};
 use cider_press_models::generator::Generator;
 use cider_press_models::qwen2::{Qwen2Config, Qwen2Model, load_qwen2_weights};
-use cider_press_models::Tokenizer;
 use cider_press_runtime::Device;
 use cider_press_test_utils::{read_u32, tempdir, workspace_root};
 use safetensors::SafeTensors;
@@ -44,7 +44,9 @@ fn checkpoint_path() -> Option<PathBuf> {
 fn run_mlx_harness(checkpoint: &Path, messages: &[Message], max_tokens: usize) -> Vec<u32> {
     let tmp = tempdir("models-generator-parity");
     let out = tmp.join("ids.safetensors");
-    let script = workspace_root().join("scripts").join("dump_mlx_generate.py");
+    let script = workspace_root()
+        .join("scripts")
+        .join("dump_mlx_generate.py");
     let messages_json = serde_json::to_string(messages).expect("serialize messages");
     let status = Command::new("uv")
         .arg("run")
@@ -105,18 +107,16 @@ fn generator_parity_greedy_qwen2() {
 
     let tokenizer =
         Tokenizer::from_file(&checkpoint.join("tokenizer.json")).expect("load tokenizer");
-    let chat_template = ChatTemplate::from_file(
-        &checkpoint.join("tokenizer_config.json"),
-        &tokenizer,
-    )
-    .expect("load chat template");
+    let chat_template =
+        ChatTemplate::from_file(&checkpoint.join("tokenizer_config.json"), &tokenizer)
+            .expect("load chat template");
 
     let prompt = chat_template.render(&messages).expect("render prompt");
     let ids = tokenizer.encode(&prompt).expect("encode prompt");
 
     let eos: HashSet<u32> = chat_template.eos_ids().collect();
-    let mut generator = Generator::new(model, ids.len() + MAX_NEW_TOKENS + 1, eos)
-        .expect("Generator::new");
+    let mut generator =
+        Generator::new(model, ids.len() + MAX_NEW_TOKENS + 1, eos).expect("Generator::new");
 
     let rust_ids: Vec<u32> = generator
         .generate(&ids, MAX_NEW_TOKENS)

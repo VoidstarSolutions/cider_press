@@ -11,8 +11,8 @@ use std::collections::HashSet;
 
 use cider_press_models::generator::Generator;
 use cider_press_models::qwen2::{
-    Qwen2AttentionWeights, Qwen2Config, Qwen2LayerWeights, Qwen2MlpWeights,
-    Qwen2Model, Qwen2Weights,
+    Qwen2AttentionWeights, Qwen2Config, Qwen2LayerWeights, Qwen2MlpWeights, Qwen2Model,
+    Qwen2Weights,
 };
 use cider_press_runtime::{Device, Quantization, QuantizedWeight, Tensor};
 use half::bf16;
@@ -131,8 +131,8 @@ fn synthetic_model(device: &Device) -> Qwen2Model {
 fn generator_yields_max_new_tokens_when_eos_unreachable() {
     let device = Device::shared().expect("device");
     let model = synthetic_model(&device);
-    let mut generator = Generator::new(model, 64, HashSet::from([u32::MAX]))
-        .expect("Generator::new");
+    let mut generator =
+        Generator::new(model, 64, HashSet::from([u32::MAX])).expect("Generator::new");
     let ids: Vec<u32> = generator
         .generate(&[1, 2, 3], 4)
         .expect("generate")
@@ -146,8 +146,8 @@ fn generator_terminates_when_first_id_is_eos() {
     let device = Device::shared().expect("device");
     let model = synthetic_model(&device);
     // First pass: see what the first sampled id will be.
-    let mut generator1 = Generator::new(model, 64, HashSet::from([u32::MAX]))
-        .expect("Generator::new");
+    let mut generator1 =
+        Generator::new(model, 64, HashSet::from([u32::MAX])).expect("Generator::new");
     let first = generator1
         .generate(&[1, 2, 3], 1)
         .expect("generate")
@@ -156,8 +156,7 @@ fn generator_terminates_when_first_id_is_eos() {
         .expect("first id ok");
     // Rebuild with that id as the only EOS; should yield exactly it then stop.
     let model = synthetic_model(&device);
-    let mut generator2 = Generator::new(model, 64, HashSet::from([first]))
-        .expect("Generator::new");
+    let mut generator2 = Generator::new(model, 64, HashSet::from([first])).expect("Generator::new");
     let ids: Vec<u32> = generator2
         .generate(&[1, 2, 3], 8)
         .expect("generate")
@@ -186,8 +185,8 @@ fn generator_rejects_empty_eos_ids() {
 fn generator_rejects_zero_max_new_tokens() {
     let device = Device::shared().expect("device");
     let model = synthetic_model(&device);
-    let mut generator = Generator::new(model, 64, HashSet::from([u32::MAX]))
-        .expect("Generator::new");
+    let mut generator =
+        Generator::new(model, 64, HashSet::from([u32::MAX])).expect("Generator::new");
     let err = generator.generate(&[1, 2, 3], 0).unwrap_err();
     assert!(format!("{err}").contains("max_new_tokens"), "got: {err}");
 }

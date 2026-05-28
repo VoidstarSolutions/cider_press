@@ -20,8 +20,8 @@ compile_error!(
      Build on an aarch64-apple-darwin host."
 );
 
-mod error;
 pub mod chat_template;
+mod error;
 pub mod generator;
 pub mod nn;
 pub mod qwen2;

@@ -13,7 +13,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
-use minijinja::{context, Environment};
+use minijinja::{Environment, context};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -33,15 +33,24 @@ pub struct Message {
 impl Message {
     /// Construct a `system` turn.
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: Role::System, content: content.into() }
+        Self {
+            role: Role::System,
+            content: content.into(),
+        }
     }
     /// Construct a `user` turn.
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: Role::User, content: content.into() }
+        Self {
+            role: Role::User,
+            content: content.into(),
+        }
     }
     /// Construct an `assistant` turn.
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: Role::Assistant, content: content.into() }
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+        }
     }
 }
 
@@ -78,10 +87,7 @@ impl ChatTemplate {
     /// those ids are union'd in.
     pub fn from_file(path: &Path, tokenizer: &Tokenizer) -> Result<Self> {
         let bytes = fs::read(path).map_err(|e| {
-            Error::InvalidArgument(format!(
-                "ChatTemplate::from_file({}): {e}",
-                path.display()
-            ))
+            Error::InvalidArgument(format!("ChatTemplate::from_file({}): {e}", path.display()))
         })?;
         let cfg: Value = serde_json::from_slice(&bytes)?;
 
@@ -103,7 +109,9 @@ impl ChatTemplate {
         // eos_token: string OR {"content": "..."} object.
         if let Some(tok) = cfg.get("eos_token") {
             let content = tok.as_str().map(str::to_string).or_else(|| {
-                tok.get("content").and_then(Value::as_str).map(str::to_string)
+                tok.get("content")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
             });
             if let Some(s) = content {
                 let ids = tokenizer.encode(&s)?;
@@ -172,18 +180,15 @@ impl ChatTemplate {
 mod tests {
     use super::*;
     use tempfile::tempdir;
-    use tokenizers::models::bpe::BPE;
     use tokenizers::Tokenizer as HfTokenizer;
+    use tokenizers::models::bpe::BPE;
 
     fn minimal_tokenizer(dir: &Path) -> Tokenizer {
         // Put "<eos>" directly in the BPE vocab at id 0 so that
         // `tokenizer.encode("<eos>")` returns `[0]`. BPE requires at
         // least one merge or the builder treats isolated chars as the
         // model, so also provide "[UNK]" at id 1 as the unknown token.
-        let vocab = [
-            ("<eos>".to_string(), 0u32),
-            ("[UNK]".to_string(), 1u32),
-        ];
+        let vocab = [("<eos>".to_string(), 0u32), ("[UNK]".to_string(), 1u32)];
         let bpe = BPE::builder()
             .vocab_and_merges(vocab, vec![])
             .unk_token("[UNK]".to_string())
@@ -198,7 +203,8 @@ mod tests {
             .expect("add_special_tokens");
         assert_eq!(added, 1, "add_special_tokens failed to register <eos>");
         let path = dir.join("tokenizer.json");
-        hf.save(path.to_str().unwrap(), false).expect("save tokenizer");
+        hf.save(path.to_str().unwrap(), false)
+            .expect("save tokenizer");
         Tokenizer::from_file(&path).expect("load tokenizer")
     }
 
@@ -269,8 +275,7 @@ mod tests {
             },
         });
         let cfg_path = dir.path().join("tokenizer_config.json");
-        std::fs::write(&cfg_path, serde_json::to_vec(&cfg).unwrap())
-            .expect("write config");
+        std::fs::write(&cfg_path, serde_json::to_vec(&cfg).unwrap()).expect("write config");
 
         let ct = ChatTemplate::from_file(&cfg_path, &tok).expect("load template");
         let ids: HashSet<u32> = ct.eos_ids().collect();

@@ -34,11 +34,7 @@ impl Generator {
     /// - `eos_ids.is_empty()` — without an EOS the loop has no
     ///   natural terminator besides `max_new_tokens`; we reject so a
     ///   caller can't accidentally rely on that.
-    pub fn new(
-        model: Qwen2Model,
-        context_window: usize,
-        eos_ids: HashSet<u32>,
-    ) -> Result<Self> {
+    pub fn new(model: Qwen2Model, context_window: usize, eos_ids: HashSet<u32>) -> Result<Self> {
         if context_window == 0 {
             return Err(Error::InvalidArgument(
                 "Generator::new: context_window must be > 0".into(),
@@ -116,14 +112,11 @@ impl Generator {
                     .into(),
             ));
         }
-        let total = input_ids
-            .len()
-            .checked_add(max_new_tokens)
-            .ok_or_else(|| {
-                Error::InvalidArgument(
-                    "Generator::generate: input_ids.len() + max_new_tokens overflow".into(),
-                )
-            })?;
+        let total = input_ids.len().checked_add(max_new_tokens).ok_or_else(|| {
+            Error::InvalidArgument(
+                "Generator::generate: input_ids.len() + max_new_tokens overflow".into(),
+            )
+        })?;
         if total > self.context_window {
             return Err(Error::InvalidArgument(format!(
                 "Generator::generate: input_ids.len() ({}) + max_new_tokens ({}) > context_window ({})",
@@ -140,12 +133,9 @@ impl Generator {
         let ids_tensor = Tensor::from_slice(&device, input_ids, [1, prefill_len])?;
         let offset = Tensor::from_slice(&device, &[0i32], [1])?;
         let mask = causal_mask(&device, prefill_len)?;
-        let logits = self.model.forward(
-            &ids_tensor,
-            Some(&mask),
-            &offset,
-            &mut self.caches,
-        )?;
+        let logits = self
+            .model
+            .forward(&ids_tensor, Some(&mask), &offset, &mut self.caches)?;
         let first = argmax_last_position(&logits, self.model.config().vocab_size)?;
 
         Ok(GenerateIter {
@@ -208,12 +198,10 @@ impl GenerateIter<'_> {
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let pos = (self.prefill_len + self.step - 1) as i32;
         let offset = Tensor::from_slice(&self.device, &[pos], [1])?;
-        let logits = self.owner.model.forward(
-            &ids,
-            None,
-            &offset,
-            &mut self.owner.caches,
-        )?;
+        let logits = self
+            .owner
+            .model
+            .forward(&ids, None, &offset, &mut self.owner.caches)?;
         argmax_last_position(&logits, self.owner.model.config().vocab_size)
     }
 }
@@ -233,7 +221,8 @@ fn argmax_last_position(logits: &Tensor, vocab: usize) -> Result<u32> {
         )
     })?;
     debug_assert_eq!(
-        elements.len() % vocab, 0,
+        elements.len() % vocab,
+        0,
         "argmax_last_position: logits length {} is not a multiple of vocab={vocab}",
         elements.len(),
     );

@@ -11,13 +11,17 @@ use clap::Parser;
 
 use cider_press_models::chat_template::{ChatTemplate, Message};
 use cider_press_models::generator::Generator;
-use cider_press_models::qwen2::{load_qwen2_weights, Qwen2Config, Qwen2Model};
+use cider_press_models::qwen2::{Qwen2Config, Qwen2Model, load_qwen2_weights};
 use cider_press_models::tokenizer::Tokenizer;
 use cider_press_runtime::Device;
 use safetensors::SafeTensors;
 
 #[derive(Parser, Debug)]
-#[command(name = "cider-press", version, about = "Greedy decode against a Qwen2 checkpoint")]
+#[command(
+    name = "cider-press",
+    version,
+    about = "Greedy decode against a Qwen2 checkpoint"
+)]
 struct Args {
     /// Checkpoint directory holding config.json, tokenizer.json,
     /// `tokenizer_config.json`, and a single-file model.safetensors.
@@ -37,7 +41,11 @@ struct Args {
     #[arg(long, default_value_t = 256)]
     max_tokens: usize,
     /// Pre-allocated `KvCache` window in tokens.
-    #[arg(long, default_value_t = 4096, help = "Pre-allocated KvCache window in tokens")]
+    #[arg(
+        long,
+        default_value_t = 4096,
+        help = "Pre-allocated KvCache window in tokens"
+    )]
     context_window: usize,
     /// Skip `ChatTemplate`; encode the bare --prompt.
     #[arg(long, help = "Skip ChatTemplate; encode the bare --prompt")]
@@ -63,10 +71,8 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // responsible for prompt framing; we still need *some* EOS, so
     // fall back to encoding the tokenizer's default eos_token via the
     // tokenizer_config.json file (always present in HF checkpoints).
-    let chat_template = ChatTemplate::from_file(
-        &args.checkpoint.join("tokenizer_config.json"),
-        &tokenizer,
-    )?;
+    let chat_template =
+        ChatTemplate::from_file(&args.checkpoint.join("tokenizer_config.json"), &tokenizer)?;
     let eos_ids: HashSet<u32> = chat_template.eos_ids().collect();
 
     let prompt = if args.no_chat_template {

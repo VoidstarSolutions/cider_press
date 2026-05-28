@@ -65,8 +65,8 @@ impl Tokenizer {
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
-    use tokenizers::models::bpe::BPE;
     use tokenizers::Tokenizer as HfTokenizer;
+    use tokenizers::models::bpe::BPE;
 
     use super::*;
 

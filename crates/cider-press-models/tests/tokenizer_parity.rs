@@ -91,7 +91,11 @@ fn tokenizer_parity_round_trip() {
         let ids_len = meta[0] as usize;
 
         let ids_raw = read_u32(&st, &format!("corpus_{i}_ids"));
-        let expected: &[u32] = if ids_len == 0 { &[] } else { &ids_raw[..ids_len] };
+        let expected: &[u32] = if ids_len == 0 {
+            &[]
+        } else {
+            &ids_raw[..ids_len]
+        };
 
         let got = tokenizer.encode(text).expect("encode");
         assert_eq!(
