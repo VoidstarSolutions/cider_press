@@ -19,7 +19,7 @@ categories = ["science"]
 approx = "=0.5.1"
 clap = { version = "=4.5.21", features = ["derive"] }
 half = "=2.7.1"
-minijinja = "=2.5.0"
+minijinja = { version = "=2.5.0", features = ["loader"] }
 objc2 = "=0.6.4"
 objc2-foundation = "=0.3.2"
 objc2-metal = "=0.3.2"
