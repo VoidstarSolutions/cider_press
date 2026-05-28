@@ -181,3 +181,13 @@ fn generator_rejects_empty_eos_ids() {
     let err = Generator::new(model, 64, HashSet::new()).unwrap_err();
     assert!(format!("{err}").contains("eos_ids"), "got: {err}");
 }
+
+#[test]
+fn generator_rejects_zero_max_new_tokens() {
+    let device = Device::shared().expect("device");
+    let model = synthetic_model(&device);
+    let mut generator = Generator::new(model, 64, HashSet::from([u32::MAX]))
+        .expect("Generator::new");
+    let err = generator.generate(&[1, 2, 3], 0).unwrap_err();
+    assert!(format!("{err}").contains("max_new_tokens"), "got: {err}");
+}

@@ -86,8 +86,19 @@ impl Generator {
     /// terminates on EOS or after `max_new_tokens` items.
     ///
     /// # Errors
+    ///
+    /// `generate()` itself returns `Err` for construction-time validation:
     /// - `input_ids.is_empty()`
+    /// - `max_new_tokens == 0`
+    /// - `input_ids.len() + max_new_tokens` overflows `usize`
     /// - `input_ids.len() + max_new_tokens > context_window`
+    /// - Device acquisition or prefill-forward failure (rare; surfaces
+    ///   construction-time runtime errors as the `?` propagates).
+    ///
+    /// Per-step forward-pass errors during decode surface as
+    /// `Some(Err(...))` from the returned iterator, NOT as an `Err` on
+    /// `generate()`. Callers iterating manually (rather than with
+    /// `.collect::<Result<_, _>>()`) need to handle the `Some(Err)` case.
     pub fn generate(
         &mut self,
         input_ids: &[u32],
@@ -96,6 +107,13 @@ impl Generator {
         if input_ids.is_empty() {
             return Err(Error::InvalidArgument(
                 "Generator::generate: input_ids must be non-empty".into(),
+            ));
+        }
+        if max_new_tokens == 0 {
+            return Err(Error::InvalidArgument(
+                "Generator::generate: max_new_tokens must be > 0 \
+                 (the iterator yields the prefill argmax as its first item)"
+                    .into(),
             ));
         }
         let total = input_ids
@@ -142,6 +160,7 @@ impl Generator {
 }
 
 /// Iterator yielding `Result<u32>` sampled ids. Borrows `&mut Generator`.
+#[derive(Debug)]
 pub struct GenerateIter<'a> {
     owner: &'a mut Generator,
     device: Device,
@@ -158,7 +177,16 @@ impl Iterator for GenerateIter<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let id = self.next_input.take()?;
-        // Hand the just-decided id to the caller, then prepare the next.
+        // `next_input` always holds the id we're about to yield — it was
+        // pre-computed during the previous call's `advance()` (or during
+        // `Generator::generate()` for the very first yield, which is the
+        // prefill argmax). The pattern per call: (1) take that pre-decided
+        // id, (2) increment `step`, (3) check whether this id terminates
+        // the sequence (EOS or max_new_tokens hit), (4) if not terminal,
+        // run one decode `advance()` to pre-fetch the *next* id into
+        // `next_input` for the following call, then (5) yield the id we
+        // took. Terminal cases yield the id but leave `next_input = None`
+        // so the subsequent `next()` returns None.
         self.step += 1;
         if id_is_terminal(id, &self.owner.eos_ids) || self.step >= self.max_new_tokens {
             // Don't run another forward; iterator ends after we hand this id back.
@@ -204,6 +232,11 @@ fn argmax_last_position(logits: &Tensor, vocab: usize) -> Result<u32> {
                 .into(),
         )
     })?;
+    debug_assert_eq!(
+        elements.len() % vocab, 0,
+        "argmax_last_position: logits length {} is not a multiple of vocab={vocab}",
+        elements.len(),
+    );
     if elements.len() < vocab {
         return Err(Error::InvalidArgument(format!(
             "argmax_last_position: logits has {} elements; need at least vocab={vocab}",
