@@ -64,22 +64,24 @@ def main() -> None:
     )
     prompt_ids = tokenizer.encode(prompt)
 
-    # mlx_lm.generate returns a string by default; the lower-level
-    # generate_step yields (token_id, logprobs). We want the ids so we
-    # use generate_step directly with greedy sampling (temp=0.0).
-    from mlx_lm.utils import generate_step
-    import mlx.core as mx
+    # `stream_generate` yields GenerationResponse objects with a
+    # `.token` field. Passing no `sampler` selects argmax — equivalent
+    # to the old `temp=0.0` greedy path. mlx_lm filters the EOS token
+    # internally; we keep the explicit set check as a safety net.
+    from mlx_lm import stream_generate
 
+    eos_set = (
+        set(tokenizer.eos_token_ids)
+        if hasattr(tokenizer, "eos_token_ids")
+        else {tokenizer.eos_token_id}
+    )
     sampled: list[int] = []
-    prompt_tokens = mx.array(prompt_ids)
-    for (token, _logprobs), step in zip(
-        generate_step(prompt_tokens, model, temp=0.0),
-        range(args.max_tokens),
+    for response in stream_generate(
+        model, tokenizer, prompt_ids, max_tokens=args.max_tokens
     ):
-        tok_int = int(token.item()) if hasattr(token, "item") else int(token)
+        tok_int = int(response.token)
         sampled.append(tok_int)
-        if tok_int in (tokenizer.eos_token_ids if hasattr(tokenizer, "eos_token_ids")
-                       else {tokenizer.eos_token_id}):
+        if tok_int in eos_set:
             break
 
     ids_arr = (
