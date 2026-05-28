@@ -91,15 +91,27 @@ impl ChatTemplate {
         })?;
         let cfg: Value = serde_json::from_slice(&bytes)?;
 
-        let template_src = cfg
-            .get("chat_template")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                Error::InvalidArgument(
-                    "tokenizer_config.json: chat_template field missing or non-string".into(),
-                )
+        let template_src = if let Some(s) = cfg.get("chat_template").and_then(Value::as_str) {
+            s.to_string()
+        } else {
+            // Newer `transformers` / `tokenizers` versions write the
+            // jinja template out to a sibling `chat_template.jinja`
+            // file instead of inlining it as a string in
+            // `tokenizer_config.json`. Fall back to that.
+            let sibling = path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("chat_template.jinja");
+            fs::read_to_string(&sibling).map_err(|_| {
+                Error::InvalidArgument(format!(
+                    "no chat template found: tokenizer_config.json ({}) has no \
+                     `chat_template` field, and sibling `chat_template.jinja` \
+                     ({}) was not readable",
+                    path.display(),
+                    sibling.display(),
+                ))
             })?
-            .to_string();
+        };
 
         let mut env = Environment::new();
         env.add_template_owned("chat", template_src)?;
@@ -246,6 +258,27 @@ mod tests {
         std::fs::write(&cfg_path, serde_json::to_vec(&cfg).unwrap()).expect("write config");
         let err = ChatTemplate::from_file(&cfg_path, &tok).unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn falls_back_to_sibling_jinja_file() {
+        // Newer transformers writes the chat template to a sibling
+        // `chat_template.jinja` file instead of inlining it in
+        // `tokenizer_config.json`. Verify the fallback.
+        let dir = tempdir().expect("tempdir");
+        let tok = minimal_tokenizer(dir.path());
+        let cfg = serde_json::json!({ "eos_token": "<eos>" });
+        let cfg_path = dir.path().join("tokenizer_config.json");
+        std::fs::write(&cfg_path, serde_json::to_vec(&cfg).unwrap()).expect("write config");
+        let template =
+            "{% for m in messages %}<{{ m.role }}>{{ m.content }}</{{ m.role }}>{% endfor %}";
+        std::fs::write(dir.path().join("chat_template.jinja"), template)
+            .expect("write chat_template.jinja");
+        let ct = ChatTemplate::from_file(&cfg_path, &tok).expect("load template");
+        let rendered = ct
+            .render(&[Message::user("hi")])
+            .expect("render");
+        assert_eq!(rendered, "<user>hi</user>");
     }
 
     #[test]
