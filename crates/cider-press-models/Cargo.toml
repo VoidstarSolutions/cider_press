@@ -14,10 +14,11 @@ categories.workspace = true
 
 [dependencies]
 cider-press-runtime = { path = "../cider-press-runtime" }
+half = { workspace = true }
+minijinja = { workspace = true }
 safetensors = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-half = { workspace = true }
 thiserror = { workspace = true }
 tokenizers = { workspace = true }
 
