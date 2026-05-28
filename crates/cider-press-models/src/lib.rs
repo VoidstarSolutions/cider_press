@@ -22,6 +22,7 @@ compile_error!(
 
 mod error;
 pub mod chat_template;
+pub mod generator;
 pub mod nn;
 pub mod qwen2;
 pub mod safetensors_io;
