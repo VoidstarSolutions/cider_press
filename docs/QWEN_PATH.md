@@ -93,7 +93,7 @@ that introduced them, instead of three branches later in some composition.
 | 12b | (done) `feat/models-attention-mlp` | `Mlp` as a `Module` layer (SwiGLU over three bias-free `Linear`s, enforced in `Mlp::new`) and `Attention` as an inherent-forward layer built on the `Linear` base — deliberately **not** a `Module` since `forward` takes the mask, RoPE offset, and a mutable `KvCache`. Absorbed `project_qkv`/`project_output` helpers into `Attention::forward`; corrected KV-view transpose (`permute([1,0,2]).copy()` before reshape) | Synthetic smoke (`attention_mlp_smoke.rs`); gated layer-0 MLX parity for attention (`attention_layer0.rs`) and MLP (`mlp_layer0.rs`) — **gated checkpoint run pending before merge** |
 | 12c | (done) `feat/models-qwen2` | `transpose: bool` flag on `Tensor::quantized_matmul` — `true` (existing orientation: `affine_qmv` / `affine_qmm_t`) or `false` (not yet wired; constructor rejects with `Unimplemented` until a non-tied consumer arrives; same rejection pattern as dtype/inner-dim checks). `TransformerBlock` in `qwen2::block` owns `RmsNormLayer × 2`, `Attention`, `Mlp`; `forward(hidden, mask, offset, cache)` mirrors `Attention::forward` and deliberately does NOT impl `Module`; pre-norm + residual: `hidden + attn(input_ln(hidden))` then `after_attn + mlp(post_ln(after_attn))`. `Qwen2Model` in `qwen2::model` owns the quantized `embed` weight, `Vec<TransformerBlock>` (length = `num_hidden_layers`), and the final `RmsNormLayer`; forward: `embed_tokens → N blocks → final norm → tied LM head` via `quantized_matmul(.., transpose=true)` (embed weight `[vocab, D]` already in the orientation the tied-head direction wants). Caller owns `&mut [KvCache]` slice so branch-14's decode loop persists state across calls. Gated `qwen2_logits` test exercises the complete wiring (ATOL=5e-2, RTOL=5e-2 combined np.allclose-style bound; explicit `[1, 1, T, T]` BF16 causal mask with `−1e4` upper-triangle, matched against `mlx_lm.Qwen2Model.__call__` on a fixed prompt prefill). | Gated `qwen2_logits` test on `CIDER_QWEN_CHECKPOINT_PATH`: logits parity vs `mlx_lm.Qwen2Model` at ATOL=5e-2/RTOL=5e-2 across the full vocab dimension; exercises every wiring path |
 | 13 | (done) `feat/tokenizer` | New `Tokenizer` type in `cider_press_models` wrapping HF's `tokenizers` crate (workspace dep `=0.23.1`, `default-features = false`, `fancy-regex` feature — pure-Rust regex backend, no `onig` C bindings). Surface: `from_file(path) -> Result<Self>`, `encode(text) -> Result<Vec<u32>>`, `decode(ids) -> Result<String>`; `add_special_tokens=false`, `skip_special_tokens=false`. Chat-template + BOS/EOS framing deferred to branch 14. New `Error::Tokenizer(#[from] tokenizers::Error)` variant on `crate::error::Error` — matches the existing `Safetensors`/`Json` thiserror pattern. `dev_dep: tempfile = "=3.19.1"` added at workspace level for the unit smoke. New `scripts/dump_tokenizer.py` PEP 723 harness that encodes a 6-string corpus via `transformers.AutoTokenizer` and writes the ids + per-entry metadata as u32 safetensors tensors. | Unit smoke: in-memory minimal BPE tokenizer built via `tokenizers::Tokenizer::save` into a tempdir + `from_file` + round-trip. Gated `tokenizer_parity_round_trip` (`tests/tokenizer_parity.rs`): exact-id equality against `transformers.AutoTokenizer` at the pinned `HF_REVISION` over a 6-string corpus (ASCII, multi-byte Unicode, leading whitespace, BPE-merge edge, numeric, empty) + decode round-trip on the Rust side. |
-| 14 | `feat/cli + greedy decode` | CLI: load model, take prompt, prefill, decode loop, greedy argmax sampling, streamed detokenize | Generate a coherent completion |
+| 14 | (done) `feat/cli + greedy decode` | New `cider-press-models::chat_template` (minijinja over `tokenizer_config.json`; renders `Message{system,user,assistant}` with `add_generation_prompt=true`; resolves `eos_token`/`eos_token_id` via `Tokenizer`) + `cider-press-models::generator` (`Generator { model, caches, eos_ids, context_window }`, concrete-on-`Qwen2Model`; `generate(ids, max_new_tokens) -> impl Iterator<Item=Result<u32>>` running prefill with `nn::causal_mask` then T=1 decode loop; CPU argmax over the last-position `[vocab]` BF16 slice). New `crates/cider-press/src/bin/cider-press.rs` clap-derive CLI composing the two with `Tokenizer::decode_stream` for streamed UTF-8-safe output. Workspace deps `clap=4.5.21` (derive) and `minijinja=2.5.0`. `nn::causal_mask` lifted out of `tests/qwen2_logits.rs`; `Error::ChatTemplate(minijinja::Error)` added with the `#[from]` pattern. | Unit smoke (`generator_smoke.rs`): synthetic 2-layer/vocab=128 Qwen2Model exercises iterator semantics on real Metal dispatches (max_new_tokens cap, EOS early-exit, context_window/eos_ids validation). Gated `generator_parity_greedy_qwen2` on `CIDER_QWEN_CHECKPOINT_PATH`: shells out to `scripts/dump_mlx_generate.py` and asserts exact id-sequence equality vs `mlx_lm.generate_step(temp=0.0)` for a fixed system+user prompt at `max_new_tokens=16`. |
 | 15 | `feat/perf-measurement` | Tokens/sec bench against MLX-LM; memory profile; identify hot spots | Numbers documented in `docs/QWEN_PERF.md` |
 
 ## Things deferred past first-token
@@ -119,65 +119,38 @@ for "it's fast and clean" but can wait until branch 15+:
 
 ## What to do next time we sit down
 
-Branches 12c (`feat/models-qwen2`) and 13 (`feat/tokenizer`) are both
-done; the route to first-token inference is just branch 14 away.
+Branches 12c (model), 13 (tokenizer), and 14 (CLI + greedy decode)
+are all done. The CLI runs end-to-end on Qwen2.5-0.5B-Instruct-4bit.
 
-**Before merging branch 13:** run the gated `tokenizer_parity_round_trip`
-test locally with `CIDER_QWEN_CHECKPOINT_PATH` set to a
-Qwen2.5-0.5B-Instruct-4bit MLX checkout. Verifies exact-id equality vs
-`transformers.AutoTokenizer` and decode round-trip across the 6-string
-corpus. Must pass before merge.
+**Before merging branch 14:** run the gated `generator_parity_greedy_qwen2`
+test locally with `CIDER_QWEN_CHECKPOINT_PATH` set. The exact-id bar
+is informative; if bf16 argmax-tie drift causes divergence, capture
+the diff before relaxing the assertion.
 
-Branch 14 (`feat/cli + greedy decode`). Specifically:
+Branch 15 (`feat/perf-measurement`). Specifically:
 
-1. Build a CLI binary (`crates/cider-press/src/bin/cider-press.rs`, or
-   extend the existing `cider-press` facade crate) that:
-   - Accepts `--checkpoint <path>` and a prompt (positional or `--prompt`).
-   - Loads `Qwen2Config`, `Qwen2Weights`, `Qwen2Model`, and the
-     `Tokenizer` from the checkpoint dir.
-   - Prefills the prompt through `Qwen2Model::forward`.
-   - Loops: argmax-sample the next token from the last position's logits,
-     append to ids, call `forward` with `T=1` and the previous
-     `KvCache`s, repeat until EOS (`config.eos_token_id`) or a
-     `--max-tokens` cap.
-2. Streamed detokenize: decode incrementally as ids are sampled so the
-   user sees output as it generates.
-3. EOS / special-token IDs: read from `tokenizer_config.json` (`eos_token`
-   mapped to id via the tokenizer) — or hardcode the known Qwen2.5 id and
-   document it.
-4. Optional: greedy argmax is fine for branch 14; top-k / top-p stay
-   deferred.
+1. Bench tokens/sec end-to-end via the CLI on a fixed prompt at
+   fixed `--max-tokens`. Time the generate loop excluding load.
+2. Compare against `mlx_lm.generate` on the same prompt + greedy.
+3. Memory profile (peak RSS during decode).
+4. Identify hot spots — likely candidates remain: per-dispatch
+   commit/wait overhead (the spike's 1.5× gap), per-step bf16
+   round-trip for argmax, per-step KvCache memcpy.
+5. Document numbers in `docs/QWEN_PERF.md`.
 
 Open carry-forward items:
-- **`assert_close` extraction**: now duplicated across `qmm_qwen2.rs`,
-  `sdpa_qwen2.rs`, `attention_layer0.rs`, `mlp_layer0.rs`,
-  `linear_rmsnorm.rs`, and `qwen2_logits.rs` (6 sites). Candidate for
-  `cider-press-test-utils` in a future cleanup branch. Tokenizer test
-  uses `assert_eq!` — doesn't add to the count.
+- **`LanguageModel` trait extraction**: `Generator` is concrete-on-`Qwen2Model`;
+  lift when a second architecture lands.
+- **Sampling beyond greedy**: top-k / top-p / temperature.
+- **Interactive / multi-turn REPL**: a future `cider-press chat` subcommand;
+  the existing Generator just needs an optional `reset()` skip.
+- **`assert_close` extraction**: still six sites in `cider-press-models/tests`.
 - **Transpose=false direction of `Tensor::quantized_matmul`**: still
-  `Unimplemented`. Lands with its first non-tied consumer — Qwen2.5
-  universally ties the LM head, so this may never arrive.
+  `Unimplemented`; Qwen2.5 ties the LM head so this may never arrive.
 - **Generic non-aligned `affine_qmm`**: deferred to its first unaligned
-  consumer; current path requires `N % 32 == 0`.
-- **Chat-template / special-token surface**: branch 14 owns it
-  (`add_special_tokens`, BOS/EOS framing, `tokenizer_config.json` lookup).
+  consumer.
+- **GPU argmax**: CPU scan over `[vocab]` is fine at sub-second
+  decode speeds; lift to GPU when measurement justifies it.
 
-Branches still ahead of first end-to-end inference (br14): 14 (CLI +
-greedy decode). One branch between us and the first runnable
-Qwen2.5-0.5B.
-
-Open question carried forward from branch 7: the per-instantiation
-JIT cache on `Device` now holds one library per unique kernel name.
-For softmax / RoPE / SDPA the instantiation space is larger (more
-template parameters), but the same `Mutex<HashMap>` pattern carries
-forward. Worth noting that the cross-process Metal cache also
-amortizes per-instantiation, so the wall-clock cost only matters on
-first-ever invocation per instantiation per system.
-
-Open question carried forward from branch 5 reduce-scope discussion:
-whether the deferred kernel variants (`row_reduce_simple` for high
-out-count cases, `all_reduce` for full-tensor collapse, `col_reduce`
-for non-last reductions) should be wired alongside their first
-consumer or in a dedicated reduction perf pass. Leaning the former
-for `row_reduce_simple` (softmax on branch 10 wants it for prefill
-perf) and the latter for the rest.
+Branches still ahead of perf measurement: 15 (perf). One branch
+between us and `docs/QWEN_PERF.md`.
