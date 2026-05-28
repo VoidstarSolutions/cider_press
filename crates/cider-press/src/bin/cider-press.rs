@@ -20,27 +20,28 @@ use safetensors::SafeTensors;
 #[command(name = "cider-press", version, about = "Greedy decode against a Qwen2 checkpoint")]
 struct Args {
     /// Checkpoint directory holding config.json, tokenizer.json,
-    /// `tokenizer_config.json`, and the safetensors shards.
+    /// tokenizer_config.json, and a single-file model.safetensors.
     #[arg(long)]
     checkpoint: PathBuf,
     /// User message.
     #[arg(long)]
     prompt: String,
     /// Optional system message; omitted means no system turn.
-    #[arg(long)]
+    /// Conflicts with --no-chat-template (no template, no role framing).
+    #[arg(long, conflicts_with = "no_chat_template")]
     system: Option<String>,
     /// Maximum new tokens to generate.
     #[arg(long, default_value_t = 256)]
     max_tokens: usize,
-    /// Pre-allocated `KvCache` window in tokens.
+    /// Pre-allocated KvCache window in tokens.
     #[arg(long, default_value_t = 4096)]
     context_window: usize,
-    /// Skip `ChatTemplate`; encode the bare --prompt.
+    /// Skip ChatTemplate; encode the bare --prompt.
     #[arg(long)]
     no_chat_template: bool,
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Args::parse();
 
     let device = Device::shared()?;
@@ -86,7 +87,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     for id_result in generator.generate(&ids, args.max_tokens)? {
         let id = id_result?;
-        if let Some(text) = stream.step(id).map_err(|e| -> Box<dyn std::error::Error> { e })? {
+        if let Some(text) = stream.step(id)? {
             handle.write_all(text.as_bytes())?;
             handle.flush()?;
         }
