@@ -41,7 +41,16 @@ fn checkpoint_path() -> Option<PathBuf> {
     Some(path)
 }
 
-fn run_mlx_harness(checkpoint: &Path, messages: &[Message], max_tokens: usize) -> Vec<u32> {
+/// What the MLX harness produced: the sampled token ids and the exact
+/// EOS set `mlx_lm` stopped on. The Rust side drives its `Generator` with
+/// this same set so a parity mismatch can only mean a decode divergence,
+/// never a termination-policy one.
+struct MlxRun {
+    ids: Vec<u32>,
+    eos: HashSet<u32>,
+}
+
+fn run_mlx_harness(checkpoint: &Path, messages: &[Message], max_tokens: usize) -> MlxRun {
     let tmp = tempdir("models-generator-parity");
     let out = tmp.join("ids.safetensors");
     let script = workspace_root()
@@ -72,12 +81,18 @@ fn run_mlx_harness(checkpoint: &Path, messages: &[Message], max_tokens: usize) -
     let bytes = fs::read(&out).expect("read mlx output safetensors");
     let st = SafeTensors::deserialize(&bytes).expect("parse safetensors");
 
-    // meta[0] = num_ids, meta[1] = num_prompt_ids — used to disambiguate
-    // 1-element placeholder arrays when either list is empty.
+    // meta[0] = num_ids, meta[1] = num_prompt_ids, meta[2] = num_eos —
+    // used to disambiguate 1-element placeholder arrays when a list is
+    // empty.
     let meta = read_u32(&st, "meta");
     let num_ids = meta[0] as usize;
-    let all_ids = read_u32(&st, "ids");
-    all_ids[..num_ids].to_vec()
+    let num_eos = meta[2] as usize;
+    let ids = read_u32(&st, "ids")[..num_ids].to_vec();
+    let eos: HashSet<u32> = read_u32(&st, "eos_ids")[..num_eos]
+        .iter()
+        .copied()
+        .collect();
+    MlxRun { ids, eos }
 }
 
 #[test]
@@ -114,18 +129,25 @@ fn generator_parity_greedy_qwen2() {
     let prompt = chat_template.render(&messages).expect("render prompt");
     let ids = tokenizer.encode(&prompt).expect("encode prompt");
 
-    let eos: HashSet<u32> = chat_template.eos_ids().collect();
+    // ── MLX side ──────────────────────────────────────────────────────────────
+    // Run first so the Rust Generator can adopt MLX's exact EOS set —
+    // any parity mismatch is then a decode divergence, not a different
+    // stop policy. (chat_template only resolves tokenizer_config.json's
+    // eos_token; mlx_lm also folds in generation_config.json, so the two
+    // sets are not guaranteed equal.)
+    let MlxRun {
+        ids: mlx_ids,
+        eos: mlx_eos,
+    } = run_mlx_harness(&checkpoint, &messages, MAX_NEW_TOKENS);
+
     let mut generator =
-        Generator::new(model, ids.len() + MAX_NEW_TOKENS + 1, eos).expect("Generator::new");
+        Generator::new(model, ids.len() + MAX_NEW_TOKENS + 1, mlx_eos).expect("Generator::new");
 
     let rust_ids: Vec<u32> = generator
         .generate(&ids, MAX_NEW_TOKENS)
         .expect("generate")
         .collect::<Result<_, _>>()
         .expect("collect generated ids");
-
-    // ── MLX side ──────────────────────────────────────────────────────────────
-    let mlx_ids = run_mlx_harness(&checkpoint, &messages, MAX_NEW_TOKENS);
 
     assert_eq!(
         rust_ids, mlx_ids,

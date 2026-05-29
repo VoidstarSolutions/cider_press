@@ -28,8 +28,12 @@ Output safetensors keys:
                prompt (decoded tokens only, in generation order).
   prompt_ids : uint32 1-D — token ids of the rendered chat prompt
                (post chat-template, what mlx_lm received as input).
-  meta       : uint32 1-D [num_ids, num_prompt_ids] — disambiguates
-               1-element placeholders if either list is empty.
+  eos_ids    : uint32 1-D — sorted EOS token ids mlx_lm stops on, so
+               the Rust parity test drives its Generator with the
+               identical stop policy (not its own chat_template set).
+  meta       : uint32 1-D [num_ids, num_prompt_ids, num_eos] —
+               disambiguates 1-element placeholders if any list is
+               empty.
 """
 
 from __future__ import annotations
@@ -84,6 +88,8 @@ def main() -> None:
         if tok_int in eos_set:
             break
 
+    eos_sorted = sorted(int(t) for t in eos_set)
+
     ids_arr = (
         np.array([0], dtype=np.uint32) if not sampled
         else np.array(sampled, dtype=np.uint32)
@@ -92,10 +98,21 @@ def main() -> None:
         np.array([0], dtype=np.uint32) if not prompt_ids
         else np.array(prompt_ids, dtype=np.uint32)
     )
-    meta = np.array([len(sampled), len(prompt_ids)], dtype=np.uint32)
+    eos_arr = (
+        np.array([0], dtype=np.uint32) if not eos_sorted
+        else np.array(eos_sorted, dtype=np.uint32)
+    )
+    meta = np.array(
+        [len(sampled), len(prompt_ids), len(eos_sorted)], dtype=np.uint32
+    )
 
     save_file(
-        {"ids": ids_arr, "prompt_ids": prompt_arr, "meta": meta},
+        {
+            "ids": ids_arr,
+            "prompt_ids": prompt_arr,
+            "eos_ids": eos_arr,
+            "meta": meta,
+        },
         args.output,
     )
     print(f"wrote {args.output}: {len(sampled)} sampled ids, "
