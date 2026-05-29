@@ -30,9 +30,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import time
 
-import mlx.core as mx
 from mlx_lm import load, stream_generate
 
 
@@ -45,7 +43,15 @@ def main() -> None:
     )
     parser.add_argument("--system", default=None)
     parser.add_argument("--max-tokens", type=int, default=128)
-    parser.add_argument("--warmup", type=int, default=8)
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=8,
+        help=(
+            "informational only; mlx_lm's generation_tps already excludes"
+            " prompt-eval time"
+        ),
+    )
     args = parser.parse_args()
 
     model, tokenizer = load(args.checkpoint)
@@ -54,56 +60,38 @@ def main() -> None:
     if args.system:
         messages.append({"role": "system", "content": args.system})
     messages.append({"role": "user", "content": args.prompt})
-
-    # apply_chat_template with tokenize=False + encode matches
-    # dump_mlx_generate.py's working pattern for mlx_lm 0.20+.
     prompt_text = tokenizer.apply_chat_template(
         messages, add_generation_prompt=True, tokenize=False
     )
     prompt_ids = tokenizer.encode(prompt_text)
-    prompt_len = len(prompt_ids)
 
-    mx.reset_peak_memory()
+    # Drive mlx_lm's own pipelined generation and read its built-in
+    # measurements from the terminal GenerationResponse. This matches the
+    # numbers `mlx_lm.generate --verbose` reports — injecting our own
+    # mx.eval() per step would serialize mlx_lm's async pipeline and make
+    # its decode throughput look slower than it really is.
+    last = None
+    for response in stream_generate(
+        model, tokenizer, prompt_ids, max_tokens=args.max_tokens
+    ):
+        last = response
+    if last is None:
+        raise SystemExit("stream_generate produced no tokens")
 
-    # Drive stream_generate (mlx_lm 0.20+ greedy: no sampler = argmax).
-    # We time the first response as the prefill step (processes the whole
-    # prompt) and subsequent responses as decode tokens.
-    gen = stream_generate(model, tokenizer, prompt_ids, max_tokens=args.max_tokens)
-
-    t_prefill_start = time.perf_counter()
-    first_response = next(gen)
-    mx.eval()  # flush any pending Metal work
-    prefill_dur = time.perf_counter() - t_prefill_start
-
-    produced = 1  # the prefill/first token above
-    timed = 0
-    decode_dur = 0.0
-    decode_start: float | None = None
-
-    for response in gen:
-        mx.eval()  # synchronise each step for an honest per-token time
-        produced += 1
-        if produced == args.warmup:
-            decode_start = time.perf_counter()
-        elif produced > args.warmup:
-            timed += 1
-        if produced >= args.max_tokens:
-            break
-
-    if decode_start is not None:
-        decode_dur = time.perf_counter() - decode_start
-
-    peak_mib = mx.get_peak_memory() / (1024 * 1024)
-    prefill_tok_s = prompt_len / prefill_dur if prefill_dur else 0.0
-    decode_tok_s = timed / decode_dur if decode_dur else 0.0
+    prompt_len = last.prompt_tokens
+    prefill_tok_s = last.prompt_tps
+    decode_tok_s = last.generation_tps
+    generated = last.generation_tokens
+    # last.peak_memory is in GB; report MiB to match `cider-press bench`.
+    peak_mib = last.peak_memory * 1e9 / (1024 * 1024)
 
     print("mlx_lm bench")
     print(f"  checkpoint     {args.checkpoint}")
     print(f"  prompt tokens  {prompt_len}")
-    print(f"  generated      {produced} (warmup {args.warmup}, timed {timed})")
+    print(f"  generated      {generated}")
     print()
-    print(f"  prefill        {prefill_dur * 1e3:8.3f} ms   {prefill_tok_s:8.1f} tok/s")
-    print(f"  decode         {decode_dur * 1e3:8.3f} ms   {decode_tok_s:8.1f} tok/s")
+    print(f"  prefill        {prefill_tok_s:8.1f} tok/s")
+    print(f"  decode         {decode_tok_s:8.1f} tok/s")
     print(f"  peak memory    {peak_mib:8.1f} MiB")
 
 
