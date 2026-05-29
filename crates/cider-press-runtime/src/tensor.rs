@@ -3806,4 +3806,43 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn slice_update_accepts_reshape_view_src() {
+        // The real consumer (attention's `k_upd`/`v_upd`) passes a
+        // contiguous reshape *view* of a copy op as `src`, not a dense
+        // leaf. Exercise that path so the dispatcher resolves the view
+        // chain rather than rejecting it.
+        let device = Device::shared().expect("system default device");
+        let slab = Tensor::zeros(&device, [4usize, 2, 3], DType::BF16).expect("slab");
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "values 1..=6 fit exactly in f32"
+        )]
+        let src_vals: Vec<bf16> = (1..=6).map(|i| bf16::from_f32(i as f32)).collect();
+        // copy() -> op node; reshape() -> contiguous view of that op.
+        let src = Tensor::from_slice(&device, &src_vals, [2usize, 3])
+            .expect("base")
+            .copy()
+            .expect("copy")
+            .reshape([1usize, 2, 3])
+            .expect("reshape view");
+        assert!(src.inner.view.is_some(), "src must be a view for this test");
+
+        let updated = slab.slice_update(&src, 1).expect("slice_update");
+        updated.eval().expect("eval");
+
+        let out = updated.cpu_to_vec::<bf16>().expect("out bytes");
+        let zero = bf16::from_f32(0.0);
+        for (i, &x) in out.iter().enumerate() {
+            if (6..12).contains(&i) {
+                assert_eq!(x, src_vals[i - 6], "row 1 element {i} should be written");
+            } else {
+                assert_eq!(
+                    x, zero,
+                    "element {i} outside the written row must stay zero"
+                );
+            }
+        }
+    }
 }

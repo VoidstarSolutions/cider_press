@@ -361,7 +361,13 @@ fn dispatch_slice_update(
     let row_elems = src_dims[1] * src_dims[2];
     let dst_byte_offset = offset_rows * row_elems * DType::BF16.size_bytes();
 
-    let src_bytes = dense_input_buffer(src, outputs, index_of)?;
+    // `src` is typically a contiguous reshape *view* of a copy op (the
+    // `k_upd`/`v_upd` produced by attention), so resolve through the view
+    // chain like the matmul path does — `dense_input_buffer` only handles
+    // direct op outputs / cached leaves and would reject a view. The
+    // contiguous-offset-0 assertion in `matmul_input_bytes` holds because
+    // the reshape just reinterprets a dense buffer's shape.
+    let src_bytes = matmul_input_bytes("slice_update", src, outputs, index_of)?;
     // SAFETY: the dtype guard above pinned this op to BF16; the buffers
     // were sized as `elem_count * size_bytes`, so the byte length divides
     // evenly into the bf16 element count. dst is the slab buffer; the
