@@ -26,6 +26,7 @@ use crate::tensor::{
 };
 
 pub(crate) fn eval(root: &Tensor) -> Result<()> {
+    let _span = crate::profile::span("tensor.eval");
     // Step 1: topological order of unevaluated op nodes reachable from
     // `root`. Reverse-postorder DFS, deduped by `Arc` pointer identity.
     // Skips placeholders, already-materialized leaves, and op nodes

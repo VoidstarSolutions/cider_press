@@ -181,6 +181,7 @@ impl KvCache {
     /// SDPA reads the cache anyway), then their bytes are `memcpy`'d
     /// into the slabs via the unified-memory host pointer.
     pub fn update(&mut self, k: &Tensor, v: &Tensor) -> Result<()> {
+        let _span = crate::profile::span("kvcache.update");
         // See the module-level "Aliasing contract" doc for why this
         // check exists. `&mut self` rules out concurrent `keys_view` /
         // `values_view` calls, so the count can only stay or decrease
@@ -229,15 +230,18 @@ impl KvCache {
         debug_assert_eq!(k_bytes.len(), write_bytes);
         debug_assert_eq!(v_bytes.len(), write_bytes);
 
-        // SAFETY: no GPU dispatch is reading the slab during update
-        // (callers drop any prior keys_view/values_view tensors before
-        // calling update — documented contract). Host writes into
-        // shared-storage buffers on Apple Silicon are immediately
-        // visible to subsequent GPU dispatches that bind the same
-        // buffer.
-        unsafe {
-            self.keys.as_mut_slice()[offset..offset + write_bytes].copy_from_slice(k_bytes);
-            self.values.as_mut_slice()[offset..offset + write_bytes].copy_from_slice(v_bytes);
+        {
+            let _memcpy = crate::profile::span("kvcache.memcpy");
+            // SAFETY: no GPU dispatch is reading the slab during update
+            // (callers drop any prior keys_view/values_view tensors before
+            // calling update — documented contract). Host writes into
+            // shared-storage buffers on Apple Silicon are immediately
+            // visible to subsequent GPU dispatches that bind the same
+            // buffer.
+            unsafe {
+                self.keys.as_mut_slice()[offset..offset + write_bytes].copy_from_slice(k_bytes);
+                self.values.as_mut_slice()[offset..offset + write_bytes].copy_from_slice(v_bytes);
+            }
         }
         self.position += step_t;
         Ok(())
