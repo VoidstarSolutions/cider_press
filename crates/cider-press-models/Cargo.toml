@@ -12,6 +12,11 @@ categories.workspace = true
 
 [lib]
 
+[features]
+# Enables the runtime profiling facility through this crate so model-layer
+# spans (e.g. argmax) record when the crate is built with --features profiling.
+profiling = ["cider-press-runtime/profiling"]
+
 [dependencies]
 cider-press-runtime = { path = "../cider-press-runtime" }
 half = { workspace = true }

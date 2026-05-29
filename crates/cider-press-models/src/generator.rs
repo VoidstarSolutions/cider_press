@@ -213,6 +213,7 @@ fn id_is_terminal(id: u32, eos_ids: &HashSet<u32>) -> bool {
 /// Argmax over the last position of a `[1, T, vocab]` BF16 logits tensor.
 fn argmax_last_position(logits: &Tensor, vocab: usize) -> Result<u32> {
     logits.eval()?;
+    let _span = cider_press_runtime::profile::span("argmax");
     let elements: Vec<bf16> = logits.cpu_to_vec().ok_or_else(|| {
         Error::InvalidArgument(
             "argmax_last_position: cpu_to_vec returned None \
