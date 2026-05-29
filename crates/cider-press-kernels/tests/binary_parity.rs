@@ -12,8 +12,8 @@
 //! - **vv** — same-shape `[1, S, H]` bf16 add, exercises `vv_Addbfloat16`.
 //! - **broadcast** — `[1, S, H] + [H]` bf16 add, exercises
 //!   `g3_Addbfloat16` with rhs strides `[0, 0, 1]`. This is the
-//!   per-channel-bias shape that rmsnorm and the Q/K/V/O Linear
-//!   biases hit.
+//!   per-channel-bias shape that rmsnorm and the Q/K/V Linear
+//!   biases hit (O projection has no additive `.bias`).
 //!
 //! Bit-exact: bf16 add is a single rounded op, so MLX and us must
 //! agree on every byte. If this drifts to a tolerance check, something

@@ -49,7 +49,7 @@ A Cargo workspace; each layer is its own member crate so the dispatch
 surface, the runtime, and the model layer can be depended on (and
 published) independently.
 
-```
+```text
 cider-press/
 ├── kernels-mlx/                        # vendored MLX kernel sources (MIT)
 │   └── mlx/backend/metal/kernels/      # full upstream path preserved
