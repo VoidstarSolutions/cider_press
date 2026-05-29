@@ -343,21 +343,18 @@ fn dispatch_slice_update(
         .device
         .as_ref()
         .expect("op nodes are always constructed with a device");
-    if inner.dtype != DType::BF16 {
-        return Err(Error::InvalidArgument(format!(
-            "SliceUpdate: spike wires BF16 only (got {:?})",
-            inner.dtype
-        )));
-    }
+    // Preconditions (bf16, rank-3, matching row shape, in-bounds offset)
+    // are enforced by `Tensor::slice_update` at construction; re-assert
+    // the dtype in debug builds as a tripwire.
+    debug_assert_eq!(
+        inner.dtype,
+        DType::BF16,
+        "slice_update dispatch: non-bf16 reached eval"
+    );
     let src = op.inputs.get(1).ok_or_else(|| {
         Error::InvalidArgument("SliceUpdate: missing src input (inputs[1])".into())
     })?;
     let src_dims = src.shape().dims();
-    if src_dims.len() != 3 {
-        return Err(Error::InvalidArgument(format!(
-            "SliceUpdate: spike expects rank-3 src [step_t, n_kv_heads, head_dim] (got {src_dims:?})"
-        )));
-    }
     let row_elems = src_dims[1] * src_dims[2];
     let dst_byte_offset = offset_rows * row_elems * DType::BF16.size_bytes();
 

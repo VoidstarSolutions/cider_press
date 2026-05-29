@@ -643,12 +643,62 @@ impl Tensor {
     ///
     /// `self` must be a dense bf16 rank-3 slab
     /// (`[max_rows, n_kv_heads, head_dim]`); `src` must be dense bf16
-    /// rank-3 with the same trailing two dims. Preconditions beyond
-    /// device-presence are checked at dispatch for the spike.
+    /// rank-3 with the same trailing two dims. Preconditions (bf16,
+    /// rank-3 slab and src, matching row shape `[n_kv_heads, head_dim]`,
+    /// and an in-bounds `offset_rows`) are validated here at construction.
     pub fn slice_update(&self, src: &Tensor, offset_rows: usize) -> Result<Self> {
         let device = self.inner.device.as_ref().ok_or_else(|| {
             Error::InvalidArgument("slice_update: slab is a placeholder (no device)".into())
         })?;
+        // Spike scope: bf16 / rank-3 slab. The KV cache is the only
+        // consumer and is bf16; broaden when a second consumer needs it.
+        if self.inner.dtype != DType::BF16 {
+            return Err(Error::InvalidArgument(format!(
+                "slice_update: only BF16 slabs are supported (got {:?})",
+                self.inner.dtype
+            )));
+        }
+        if src.inner.dtype != DType::BF16 {
+            return Err(Error::InvalidArgument(format!(
+                "slice_update: src must be BF16 (got {:?})",
+                src.inner.dtype
+            )));
+        }
+        let slab_dims = self.inner.shape.dims();
+        let src_dims = src.inner.shape.dims();
+        if slab_dims.len() != 3 || src_dims.len() != 3 {
+            return Err(Error::InvalidArgument(format!(
+                "slice_update: slab and src must be rank-3 \
+                 [rows, n_kv_heads, head_dim] (slab {slab_dims:?}, src {src_dims:?})"
+            )));
+        }
+        if slab_dims[1..] != src_dims[1..] {
+            return Err(Error::InvalidArgument(format!(
+                "slice_update: src row shape {:?} must match slab row shape {:?}",
+                &src_dims[1..],
+                &slab_dims[1..]
+            )));
+        }
+        if !self.layout().is_dense_contiguous(self.shape()) {
+            return Err(Error::InvalidArgument(
+                "slice_update: slab must be dense and contiguous".into(),
+            ));
+        }
+        if !src.layout().is_dense_contiguous(src.shape()) {
+            return Err(Error::InvalidArgument(
+                "slice_update: src must be dense and contiguous".into(),
+            ));
+        }
+        let end = offset_rows.checked_add(src_dims[0]).ok_or_else(|| {
+            Error::InvalidArgument("slice_update: offset_rows + src rows overflows usize".into())
+        })?;
+        if end > slab_dims[0] {
+            return Err(Error::InvalidArgument(format!(
+                "slice_update: write of {} rows at offset {offset_rows} is out of bounds \
+                 for a slab with {} rows",
+                src_dims[0], slab_dims[0]
+            )));
+        }
         Ok(Self::op_tensor(
             device,
             self.inner.shape.clone(),
@@ -3844,5 +3894,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn slice_update_rejects_offset_past_end() {
+        let device = Device::shared().expect("device");
+        let slab = Tensor::zeros(&device, [4usize, 2, 3], DType::BF16).expect("slab");
+        let src = Tensor::zeros(&device, [2usize, 2, 3], DType::BF16).expect("src");
+        // offset 3 + 2 rows = 5 > 4 max rows.
+        let err = slab.slice_update(&src, 3).unwrap_err();
+        assert!(
+            format!("{err}").contains("out of bounds"),
+            "expected an out-of-bounds error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn slice_update_rejects_mismatched_row_shape() {
+        let device = Device::shared().expect("device");
+        let slab = Tensor::zeros(&device, [4usize, 2, 3], DType::BF16).expect("slab");
+        // src row shape [2, 4] != slab row shape [2, 3].
+        let src = Tensor::zeros(&device, [1usize, 2, 4], DType::BF16).expect("src");
+        let err = slab.slice_update(&src, 0).unwrap_err();
+        assert!(
+            format!("{err}").contains("row shape"),
+            "expected a row-shape mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn slice_update_rejects_non_bf16() {
+        let device = Device::shared().expect("device");
+        let slab = Tensor::zeros(&device, [4usize, 2, 3], DType::F32).expect("slab");
+        let src = Tensor::zeros(&device, [1usize, 2, 3], DType::F32).expect("src");
+        let err = slab.slice_update(&src, 0).unwrap_err();
+        assert!(
+            format!("{err}").contains("BF16"),
+            "expected a BF16-only error, got: {err}"
+        );
     }
 }
