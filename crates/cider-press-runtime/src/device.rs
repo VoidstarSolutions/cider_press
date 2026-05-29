@@ -169,11 +169,10 @@ impl Device {
 
     /// Lazily JIT-compile and cache MLX's `quantized.metal` library.
     ///
-    /// Cold-start cost is significant (~29 s on first compile, per
-    /// Stage-4 spike findings); Metal caches the result to disk
-    /// across processes, so subsequent runs are sub-100 ms. Cached
-    /// in-process so a long-running session pays the warm cost only
-    /// once.
+    /// Cold-start cost is significant (~29 s on first compile); Metal
+    /// caches the result to disk across processes, so subsequent runs are
+    /// sub-100 ms. Cached in-process so a long-running session pays the
+    /// warm cost only once.
     pub(crate) fn quantized_library(&self) -> Result<&kernels::KernelLibrary> {
         if let Some(lib) = self.inner.quantized_library.get() {
             return Ok(lib);

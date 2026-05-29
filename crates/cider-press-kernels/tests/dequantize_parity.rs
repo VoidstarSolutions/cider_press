@@ -1,7 +1,7 @@
 //! Parity test for `affine_dequantize_bf16_gs64_b4` against
 //! `mx.dequantize`.
 //!
-//! Same Qwen2 q4/gs64 config as Stage-4 qmv. The kernel is a pure
+//! Same Qwen2 q4/gs64 config as the qmv parity test. The kernel is a pure
 //! deterministic function of `(w_q, scales, biases)` so the bar is
 //! bit-exact.
 

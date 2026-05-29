@@ -87,10 +87,10 @@ fn qmv_through_runtime_matches_mlx() {
     let y_out = y.cpu_slice::<bf16>().expect("cpu_slice bf16");
     assert_eq!(y_out.len(), N);
 
-    // Same kernel as Stage 4 ⇒ same per-element tolerance. The
-    // kernels-level test documents why this isn't bit-exact across
-    // all Apple Silicon families even though the spike measured
-    // max_relative=max_absolute=0 on the development machine.
+    // Same kernel ⇒ same per-element tolerance. The kernels-level test
+    // documents why this isn't bit-exact across all Apple Silicon families
+    // even though qmv parity measured max_relative=max_absolute=0 on the
+    // development machine.
     for (a, e) in y_out.iter().zip(y_ref.iter()) {
         let af = a.to_f32();
         let ef = e.to_f32();

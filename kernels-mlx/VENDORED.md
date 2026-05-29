@@ -54,8 +54,8 @@ vendored — they're resolved by Apple's Metal compiler at JIT time.
 local MLX checkout into this directory. Set `MLX_DIR` to the checkout
 path; the script errors out cleanly if it is unset. After syncing,
 update the "Upstream commit" SHA above and run
-`cargo test --workspace --release` — Stage 4's bit-exact parity test
-is the canary for MLX-side changes that break us.
+`cargo test --workspace --release` — the qmv parity test is the canary
+for MLX-side changes that break us.
 
 ```sh
 git clone https://github.com/ml-explore/mlx.git ~/src/mlx

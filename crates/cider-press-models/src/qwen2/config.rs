@@ -164,7 +164,7 @@ mod tests {
     }
 
     #[test]
-    fn computed_dims_match_qwen_path_doc() {
+    fn computed_dims_match_architecture_doc() {
         let cfg = Qwen2Config::from_json_bytes(PINNED_CONFIG_JSON.as_bytes()).expect("parse");
         assert_eq!(cfg.head_dim().unwrap(), 64);
         assert_eq!(cfg.gqa_ratio().unwrap(), 7);

@@ -1,6 +1,6 @@
 //! Parity test for `binary.metal` Add dispatch.
 //!
-//! Unlike the stage-3/4 parity tests, the fixture is generated at test
+//! Unlike the copy/qmv parity tests, the fixture is generated at test
 //! time by shelling out to `uv run scripts/dump_mlx_op.py add ...`
 //! against MLX's own reference implementation. Fixture bytes are kept
 //! out of the repo so the activation-dump harness stays the single
