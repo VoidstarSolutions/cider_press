@@ -27,7 +27,11 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 const DEFAULT_BENCH_PROMPT: &str = "Write a short paragraph about the city of Seattle.";
 
 #[derive(Parser, Debug)]
-#[command(name = "cider-press", version, about = "Cold-pressed LLM inference for Apple Silicon")]
+#[command(
+    name = "cider-press",
+    version,
+    about = "Cold-pressed LLM inference for Apple Silicon"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -226,7 +230,10 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
     println!("cider-press bench");
     println!("  checkpoint     {}", args.checkpoint.display());
     println!("  prompt tokens  {prompt_len}");
-    println!("  generated      {produced} (warmup {}, timed {timed})", args.warmup);
+    println!(
+        "  generated      {produced} (warmup {}, timed {timed})",
+        args.warmup
+    );
     println!();
     println!("  load           {:>8.3} s", load_dur.as_secs_f64());
     println!(
@@ -245,7 +252,10 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
     println!();
     if profile::is_enabled() {
         println!("  span breakdown (timed decode window):");
-        println!("    {:<18} {:>10} {:>8} {:>12}", "span", "total/ms", "hits", "us/hit");
+        println!(
+            "    {:<18} {:>10} {:>8} {:>12}",
+            "span", "total/ms", "hits", "us/hit"
+        );
         for (name, total, hits) in &spans {
             let total_ms = total.as_secs_f64() * 1e3;
             let us_hit = if *hits == 0 {

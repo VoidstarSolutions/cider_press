@@ -30,7 +30,10 @@ fn accumulates_named_spans_with_hit_counts() {
     assert_eq!(beta.2, 1, "beta hit once");
 
     // drain cleared the accumulator.
-    assert!(profile::drain().is_empty(), "drain leaves the profiler empty");
+    assert!(
+        profile::drain().is_empty(),
+        "drain leaves the profiler empty"
+    );
 }
 
 #[test]
