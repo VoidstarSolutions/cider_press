@@ -75,7 +75,7 @@ mod imp {
     pub fn drain() -> Vec<(&'static str, Duration, u64)> {
         PROFILER.with(|p| {
             let mut out = std::mem::take(&mut *p.borrow_mut());
-            out.sort_by(|a, b| a.0.cmp(b.0));
+            out.sort_by_key(|e| e.0);
             out
         })
     }
@@ -92,10 +92,10 @@ mod imp {
     use std::time::Duration;
 
     /// Zero-sized no-op guard (feature off).
+    #[must_use = "binding the span to `_` drops it immediately, timing nothing"]
     pub struct Span;
 
     #[inline]
-    #[must_use]
     pub fn span(_name: &'static str) -> Span {
         Span
     }
