@@ -19,6 +19,11 @@ cider-press-models = { path = "../cider-press-models" }
 clap = { workspace = true }
 safetensors = { workspace = true }
 
+[features]
+# Compiles the profiling facility into the CLI so `bench` can report a
+# per-span breakdown. Forwards to both lower crates so their spans record.
+profiling = ["cider-press-models/profiling", "cider-press-runtime/profiling"]
+
 [lints]
 workspace = true
 

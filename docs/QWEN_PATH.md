@@ -94,7 +94,7 @@ that introduced them, instead of three branches later in some composition.
 | 12c | (done) `feat/models-qwen2` | `transpose: bool` flag on `Tensor::quantized_matmul` — `true` (existing orientation: `affine_qmv` / `affine_qmm_t`) or `false` (not yet wired; constructor rejects with `Unimplemented` until a non-tied consumer arrives; same rejection pattern as dtype/inner-dim checks). `TransformerBlock` in `qwen2::block` owns `RmsNormLayer × 2`, `Attention`, `Mlp`; `forward(hidden, mask, offset, cache)` mirrors `Attention::forward` and deliberately does NOT impl `Module`; pre-norm + residual: `hidden + attn(input_ln(hidden))` then `after_attn + mlp(post_ln(after_attn))`. `Qwen2Model` in `qwen2::model` owns the quantized `embed` weight, `Vec<TransformerBlock>` (length = `num_hidden_layers`), and the final `RmsNormLayer`; forward: `embed_tokens → N blocks → final norm → tied LM head` via `quantized_matmul(.., transpose=true)` (embed weight `[vocab, D]` already in the orientation the tied-head direction wants). Caller owns `&mut [KvCache]` slice so branch-14's decode loop persists state across calls. Gated `qwen2_logits` test exercises the complete wiring (ATOL=5e-2, RTOL=5e-2 combined np.allclose-style bound; explicit `[1, 1, T, T]` BF16 causal mask with `−1e4` upper-triangle, matched against `mlx_lm.Qwen2Model.__call__` on a fixed prompt prefill). | Gated `qwen2_logits` test on `CIDER_QWEN_CHECKPOINT_PATH`: logits parity vs `mlx_lm.Qwen2Model` at ATOL=5e-2/RTOL=5e-2 across the full vocab dimension; exercises every wiring path |
 | 13 | (done) `feat/tokenizer` | New `Tokenizer` type in `cider_press_models` wrapping HF's `tokenizers` crate (workspace dep `=0.23.1`, `default-features = false`, `fancy-regex` feature — pure-Rust regex backend, no `onig` C bindings). Surface: `from_file(path) -> Result<Self>`, `encode(text) -> Result<Vec<u32>>`, `decode(ids) -> Result<String>`; `add_special_tokens=false`, `skip_special_tokens=false`. Chat-template + BOS/EOS framing deferred to branch 14. New `Error::Tokenizer(#[from] tokenizers::Error)` variant on `crate::error::Error` — matches the existing `Safetensors`/`Json` thiserror pattern. `dev_dep: tempfile = "=3.19.1"` added at workspace level for the unit smoke. New `scripts/dump_tokenizer.py` PEP 723 harness that encodes a 6-string corpus via `transformers.AutoTokenizer` and writes the ids + per-entry metadata as u32 safetensors tensors. | Unit smoke: in-memory minimal BPE tokenizer built via `tokenizers::Tokenizer::save` into a tempdir + `from_file` + round-trip. Gated `tokenizer_parity_round_trip` (`tests/tokenizer_parity.rs`): exact-id equality against `transformers.AutoTokenizer` at the pinned `HF_REVISION` over a 6-string corpus (ASCII, multi-byte Unicode, leading whitespace, BPE-merge edge, numeric, empty) + decode round-trip on the Rust side. |
 | 14 | (done) `feat/cli + greedy decode` | New `cider-press-models::chat_template` (minijinja over `tokenizer_config.json`; renders `Message{system,user,assistant}` with `add_generation_prompt=true`; resolves `eos_token`/`eos_token_id` via `Tokenizer`) + `cider-press-models::generator` (`Generator { model, caches, eos_ids, context_window }`, concrete-on-`Qwen2Model`; `generate(ids, max_new_tokens) -> impl Iterator<Item=Result<u32>>` running prefill with `nn::causal_mask` then T=1 decode loop; CPU argmax over the last-position `[vocab]` BF16 slice). New `crates/cider-press/src/bin/cider-press.rs` clap-derive CLI composing the two with `Tokenizer::decode_stream` for streamed UTF-8-safe output. Workspace deps `clap=4.5.21` (derive) and `minijinja=2.5.0`. `nn::causal_mask` lifted out of `tests/qwen2_logits.rs`; `Error::ChatTemplate(minijinja::Error)` added with the `#[from]` pattern. | Unit smoke (`generator_smoke.rs`): synthetic 2-layer/vocab=128 Qwen2Model exercises iterator semantics on real Metal dispatches (max_new_tokens cap, EOS early-exit, context_window/eos_ids validation). Gated `generator_parity_greedy_qwen2` on `CIDER_QWEN_CHECKPOINT_PATH`: shells out to `scripts/dump_mlx_generate.py` and asserts exact id-sequence equality vs `mlx_lm.generate_step(temp=0.0)` for a fixed system+user prompt at `max_new_tokens=16`. |
-| 15 | `feat/perf-measurement` | Tokens/sec bench against MLX-LM; memory profile; identify hot spots | Numbers documented in `docs/QWEN_PERF.md` |
+| 15 | (done) `feat/perf-measurement` | General feature-gated `cider_press_runtime::profile` facility (RAII named spans → thread-local accumulator, compile-time no-op when off); `tensor.eval` / `kvcache.update` / `kvcache.memcpy` / `argmax` spans; `bench` CLI subcommand (chat/bench split) reusing the real load→generate path; in-process peak-RSS via mach `task_info` (`cider_press::sys`); `scripts/measure_qwen_mlx.py` mlx_lm companion. Optimizations deliberately out of scope. | Numbers documented in `docs/QWEN_PERF.md`: decode ~55 tok/s vs mlx_lm ~560 (~10×); breakdown shows ~89% in `tensor.eval` over ~49 synchronous `eval()` calls/token — dispatch-bound, as predicted. |
 
 ## Things deferred past first-token
 
@@ -119,24 +119,28 @@ for "it's fast and clean" but can wait until branch 15+:
 
 ## What to do next time we sit down
 
-Branches 12c (model), 13 (tokenizer), and 14 (CLI + greedy decode)
-are all done. The CLI runs end-to-end on Qwen2.5-0.5B-Instruct-4bit.
+The whole branch sequence (1–15) is done. The CLI runs end-to-end on
+Qwen2.5-0.5B-Instruct-4bit, and `docs/QWEN_PERF.md` has the measured
+numbers.
 
-**Before merging branch 14:** run the gated `generator_parity_greedy_qwen2`
-test locally with `CIDER_QWEN_CHECKPOINT_PATH` set. The exact-id bar
-is informative; if bf16 argmax-tie drift causes divergence, capture
-the diff before relaxing the assertion.
+**The headline from branch 15:** decode is **~10× slower than `mlx_lm`**
+(~55 vs ~560 tok/s), and the profiling breakdown pins ~89% of the decode
+step on `tensor.eval` spread over ~49 synchronous `commit + wait` cycles
+per token. The kernels are bit-exact; the gap is the dispatch boundary,
+exactly as the project hypothesis predicted (the spike's single-kernel
+1.5× compounding at full-model scale). The next work is performance, and
+the measurement now justifies the order:
 
-Branch 15 (`feat/perf-measurement`). Specifically:
-
-1. Bench tokens/sec end-to-end via the CLI on a fixed prompt at
-   fixed `--max-tokens`. Time the generate loop excluding load.
-2. Compare against `mlx_lm.generate` on the same prompt + greedy.
-3. Memory profile (peak RSS during decode).
-4. Identify hot spots — likely candidates remain: per-dispatch
-   commit/wait overhead (the spike's 1.5× gap), per-step bf16
-   round-trip for argmax, per-step KvCache memcpy.
-5. Document numbers in `docs/QWEN_PERF.md`.
+1. **Cross-eval command-buffer batching** — the dominant lever. Fold a
+   token's ~49 `eval()` calls into far fewer (ideally one) pipelined
+   command buffers; removes most of the ~16 ms/token dispatch tax.
+2. **Buffer pool / allocator** — peak RSS (~902 MiB) sits well above
+   post-load (~683 MiB) from per-`eval()` scratch churn.
+3. **KV-cache same-eval batching** — `kvcache.memcpy` is free (0.24%),
+   but `update` forcing two synchronous evals/layer feeds the dispatch
+   problem; fold the write into the forward's command buffer.
+4. **GPU argmax** (~2.7% of decode) and **`.metallib` precompile** (kills
+   the one-time ~43 s cold-start JIT) — after the big levers.
 
 Open carry-forward items:
 - **`LanguageModel` trait extraction**: `Generator` is concrete-on-`Qwen2Model`;
@@ -149,8 +153,10 @@ Open carry-forward items:
   `Unimplemented`; Qwen2.5 ties the LM head so this may never arrive.
 - **Generic non-aligned `affine_qmm`**: deferred to its first unaligned
   consumer.
-- **GPU argmax**: CPU scan over `[vocab]` is fine at sub-second
-  decode speeds; lift to GPU when measurement justifies it.
+- **GPU argmax**: CPU scan over `[vocab]` is ~2.7% of the decode step
+  (~500 µs/token) per branch-15 measurement; lift after the dispatch
+  levers above.
 
-Branches still ahead of perf measurement: 15 (perf). One branch
-between us and `docs/QWEN_PERF.md`.
+The roadmap is complete through branch 15. `docs/QWEN_PERF.md` holds the
+measured baseline; the deferred optimizations above are the backlog the
+numbers now justify.
