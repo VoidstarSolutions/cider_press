@@ -1,4 +1,4 @@
-//! Parity tests for the branch-12a [`Module`] wrappers — [`Linear`]
+//! Parity tests for the [`Module`] wrappers — [`Linear`]
 //! and [`RmsNormLayer`] — against MLX.
 //!
 //! Both wrappers are thin: `Linear::forward` is `quantized_matmul (+

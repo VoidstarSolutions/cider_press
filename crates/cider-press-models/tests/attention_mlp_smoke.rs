@@ -1,4 +1,4 @@
-//! Synthetic (no-checkpoint) tests for the branch-12b model layers:
+//! Synthetic (no-checkpoint) tests for the [`Attention`] and [`Mlp`] model layers:
 //! shape/dtype/lazy smoke coverage plus `Attention::forward`'s input
 //! rejection paths (the negative coverage carried over from the removed
 //! `projections_smoke.rs`).

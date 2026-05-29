@@ -1,7 +1,7 @@
 //! Parity test driving `Tensor::softmax` at Qwen2 attention-score
 //! shapes derived from the pinned `Qwen2Config`.
 //!
-//! Branch 10 doesn't add a models-crate softmax wrapper — softmax is
+//! There is no models-crate softmax wrapper — softmax is
 //! a primitive `Tensor::softmax(precise)` call and `mlx.nn` doesn't
 //! layer anything algorithmic on top of `mx.softmax`. The
 //! models-crate test exists for the integration seam: it parses

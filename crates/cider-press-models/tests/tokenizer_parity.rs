@@ -1,4 +1,4 @@
-//! Gated tokenizer parity test for branch 13.
+//! Gated tokenizer parity test.
 //!
 //! Loads `tokenizer.json` from the same checkpoint pointed at by
 //! `CIDER_QWEN_CHECKPOINT_PATH`, shells out to `dump_tokenizer.py` to

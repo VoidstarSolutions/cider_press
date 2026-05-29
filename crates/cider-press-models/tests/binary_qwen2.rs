@@ -150,7 +150,7 @@ fn real_checkpoint_layernorm_add_broadcast() {
 
     // input_layernorm is bf16, shape [hidden_size] — a natural
     // broadcast-add operand against a [1, S, hidden_size] hidden-states
-    // tensor. We don't actually run rmsnorm here (branch 5's job); we
+    // tensor. We don't actually run rmsnorm here; we
     // just use this weight as a known-good loaded bf16 vector.
     let gamma = &weights.layers[0].input_layernorm;
     assert_eq!(gamma.shape().dims(), &[config.hidden_size]);

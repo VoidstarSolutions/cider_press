@@ -15,7 +15,7 @@
 //! Bit-exact parity for these kernels lands in `reduce_parity.rs`
 //! once the dispatch wrappers arrive in commit 4 of this branch. The
 //! pipelines exercised here cover all four op families (Sum / Prod /
-//! Max / Min) since branch 5 wires the full reduce surface up front.
+//! Max / Min) since the full reduce surface is wired up front.
 
 #![cfg(target_os = "macos")]
 

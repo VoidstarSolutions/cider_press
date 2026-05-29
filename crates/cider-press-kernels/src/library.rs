@@ -68,8 +68,8 @@ const MATMUL_SOURCE: &str = include_str!("kernels/matmul.metal");
 /// `traditional` in rope, the activation flag in SDPA) as Metal
 /// function constants so each specialization compiles to its own
 /// branchless pipeline. We don't need a typed Rust constants surface
-/// yet — `bool` covers every consumer through branch 9 — so the enum
-/// is minimal. Extend with `U32` / `F32` when softmax / SDPA land.
+/// yet — `bool` covers all current consumers — so the enum is
+/// minimal. Extend with `U32` / `F32` when a consumer needs it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FunctionConstant {
     /// `constant bool x [[function_constant(index)]]` in MSL.
@@ -203,7 +203,7 @@ impl KernelLibrary {
 
     /// JIT-compile cider-press's own naive bf16 batched matmul kernel
     /// (`kernels/matmul.metal` next to this crate's source). Used by
-    /// branch-11 SDPA composition; not derived from MLX.
+    /// the SDPA composition; not derived from MLX.
     pub fn matmul(device: &Device) -> Result<Self> {
         Self::from_source(device, MATMUL_SOURCE)
     }

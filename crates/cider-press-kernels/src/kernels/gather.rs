@@ -13,7 +13,7 @@
 //! `indexing/*.h`) is prepended to a per-instantiation wrapper string
 //! produced from `GATHER_WRAPPER_TEMPLATE`, compiled, and dispatched.
 //!
-//! Scope for branch 7: one instantiation suitable for Qwen2's
+//! Scope: one instantiation suitable for Qwen2's
 //! embedding lookup — `T = bfloat16_t`, `IdxT = uint`, `NIDX = 1`,
 //! `IDX_NDIM = 1`, `LocT = int`, `axis = 0`, source rank 2. The
 //! [`make_source`] helper is generic over the instantiation tuple so

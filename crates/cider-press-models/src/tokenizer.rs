@@ -3,7 +3,7 @@
 //! Loads a `tokenizer.json` (the file shape HF / mlx-community
 //! checkpoints ship next to `config.json`) and exposes bare
 //! `encode` / `decode`. Special-token handling and chat-template
-//! rendering belong to the caller (branch 14's CLI / decode loop).
+//! rendering belong to the caller (the CLI / decode loop).
 
 use std::path::Path;
 

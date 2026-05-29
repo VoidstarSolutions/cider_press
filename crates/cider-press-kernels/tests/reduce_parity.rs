@@ -1,4 +1,4 @@
-//! Parity test for `reduce.metal` last-axis Sum dispatch (branch 5).
+//! Parity test for `reduce.metal` last-axis Sum dispatch.
 //!
 //! Generates fixtures via `uv run scripts/dump_mlx_op.py row_sum`
 //! and asserts bit-exact equality vs MLX for bf16 at `[1, 8, 896]`

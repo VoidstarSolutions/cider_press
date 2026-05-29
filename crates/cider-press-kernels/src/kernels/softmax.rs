@@ -4,7 +4,7 @@
 
 //! Last-axis softmax dispatch over MLX's `softmax.metal`.
 //!
-//! Exposes the two `bf16` entry points that branch-10 needs:
+//! Exposes two `bf16` entry points:
 //!
 //! - [`dispatch_block_softmax_bf16`] — `block_softmax_bfloat16`,
 //!   `AccT = bf16`. Matches `mx.softmax(x, precise=False)`.
@@ -17,9 +17,9 @@
 //! Scope cuts (defer until consumer justifies):
 //!
 //! - The `looped_softmax_*` family (axis > 4096) — Qwen2 attention
-//!   scores stay ≤ 4096 in the shapes we drive through this branch.
+//!   scores stay ≤ 4096 in the shapes we target.
 //! - `f32` / `f16` dtypes — bf16 is the only inference dtype that
-//!   reaches softmax in branch 10.
+//!   reaches softmax in the current dispatch.
 //! - Non-last-axis softmax — softmax is overwhelmingly last-axis;
 //!   non-last consumers permute first.
 //!
@@ -53,7 +53,7 @@ const SIMD_SIZE: usize = 32;
 /// correct variant. From MLX's
 /// `constexpr int SOFTMAX_LOOPED_LIMIT = 4096` in
 /// `backend/metal/softmax.cpp`. Above this, `looped_softmax_*` is
-/// required — not wired in branch 10.
+/// required — not yet wired.
 pub const BLOCK_AXIS_LIMIT: usize = 4096;
 
 /// `block_softmax_bfloat16`: numerically-stable softmax along the

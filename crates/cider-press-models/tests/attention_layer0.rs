@@ -1,6 +1,6 @@
 //! Layer-0 attention real-checkpoint integration test.
 //!
-//! Closes the deferred integration test from branch 11. Loads
+//! Loads
 //! Qwen2.5-0.5B layer 0 (gated on `CIDER_QWEN_CHECKPOINT_PATH`), drives
 //! the full attention pipeline via [`Attention::forward`]
 //! (project Q/K/V → rope → `KvCache` → sdpa → output projection), and
@@ -42,8 +42,8 @@ use safetensors::SafeTensors;
 /// permute + rope + sdpa (itself ~3 ops: `qk_matmul`, softmax, `av_matmul`).
 /// Decode (T=1) goes through the bit-exact qmv path and matches MLX to
 /// `5e-2` comfortably; prefill (T=8) goes through `qmm_t` whose ~1 ULP
-/// drift vs MLX (per branch 11b) gets amplified ~50–100× by the composed
-/// bf16 SDPA (no fused kernel — branch 15 will revisit). Empirically the
+/// drift vs MLX gets amplified ~50–100× by the composed
+/// bf16 SDPA (no fused kernel yet). Empirically the
 /// worst-element drift at layer-0 prefill is ~0.085 abs, so `1e-1` abs
 /// / `5e-2` rel passes while still failing fast on real bugs. Tighten
 /// when the fused SDPA kernel lands.

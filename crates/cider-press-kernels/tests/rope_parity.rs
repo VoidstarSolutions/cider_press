@@ -1,4 +1,4 @@
-//! Parity test for `rope.metal` `rope_bfloat16` dispatch (branch 9).
+//! Parity test for `rope.metal` `rope_bfloat16` dispatch.
 //!
 //! Generates a fixture at test time via `uv run scripts/dump_mlx_op.py
 //! rope` and compares against MLX for the Qwen2-shape input. The

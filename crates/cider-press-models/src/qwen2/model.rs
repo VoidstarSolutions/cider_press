@@ -19,7 +19,7 @@ use crate::nn::{Module, RmsNormLayer, embed_tokens};
 /// configuration.
 ///
 /// `forward` takes caller-owned `&mut [KvCache]` (one per layer) so a
-/// decode loop in branch 14 can persist them across calls.
+/// decode loop can persist them across calls.
 #[derive(Debug)]
 pub struct Qwen2Model {
     embed: QuantizedWeight,

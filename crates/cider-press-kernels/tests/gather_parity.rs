@@ -1,4 +1,4 @@
-//! Parity test for the JIT-assembled `gather` dispatch (branch 7).
+//! Parity test for the JIT-assembled `gather` dispatch.
 //!
 //! Drives the kernels-crate `gather::dispatch` against a fixture
 //! produced by `uv run scripts/dump_mlx_op.py gather` (which calls

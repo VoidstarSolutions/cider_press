@@ -22,10 +22,9 @@
 //! memory host pointer before returning. Apple Silicon's shared
 //! storage makes this a single host write — no Metal dispatch, no
 //! `did_modify_range`. The trade-off vs. issuing a `Copy` kernel into
-//! the slab is documented in `docs/QWEN_PATH.md`'s branch-8 entry:
-//! same-eval batching (folding the cache write into the SDPA command
-//! buffer) is deferred until branch 11 if perf measurement demands
-//! it.
+//! the slab is documented in `docs/QWEN_PATH.md`: same-eval batching
+//! (folding the cache write into the SDPA command buffer) is deferred
+//! as a future optimization if perf measurement demands it.
 //!
 //! ## Aliasing contract
 //!
