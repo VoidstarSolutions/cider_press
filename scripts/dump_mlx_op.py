@@ -710,6 +710,36 @@ def run_qwen2_logits(args: argparse.Namespace) -> dict[str, mx.array]:
     return {"input_ids": input_ids, "logits": logits.astype(mx.bfloat16)}
 
 
+# ---------------------------------------------------------------------------
+# slice_update: in-place row write of src into a slab at a row offset.
+# out = slab.copy(); out[offset:offset+src_rows] = src. Pure data mover
+# so the result is bit-exact vs the runtime's SliceUpdate dispatch.
+# Writes `slab`, `src`, `out`.
+# ---------------------------------------------------------------------------
+
+
+def add_slice_update_parser(subparsers: argparse._SubParsersAction) -> None:
+    p = subparsers.add_parser(
+        "slice_update",
+        help="In-place row write of src into a slab at a row offset",
+    )
+    p.add_argument("--slab-shape", required=True, help="comma-separated rows,n_kv_heads,head_dim")
+    p.add_argument("--src-rows", type=int, required=True, help="number of rows in src")
+    p.add_argument("--offset", type=int, required=True, help="row offset to write at")
+    p.add_argument("--dtype", default="bf16", help="one of f32, f16, bf16")
+
+
+def run_slice_update(args: argparse.Namespace) -> dict[str, mx.array]:
+    dtype = _float_dtype(args.dtype)
+    rows, n_kv, head_dim = _parse_shape(args.slab_shape)
+    slab = mx.random.normal((rows, n_kv, head_dim)).astype(dtype)
+    src = mx.random.normal((args.src_rows, n_kv, head_dim)).astype(dtype)
+    out = mx.array(slab)
+    out[args.offset : args.offset + args.src_rows] = src
+    mx.eval(slab, src, out)
+    return {"slab": slab, "src": src, "out": out}
+
+
 def add_softmax_parser(subparsers: argparse._SubParsersAction) -> None:
     p = subparsers.add_parser(
         "softmax",
@@ -759,6 +789,7 @@ OPS: dict[str, tuple[ParserBuilder, Runner]] = {
     "dequantize": (add_dequantize_parser, run_dequantize),
     "embed_tokens": (add_embed_tokens_parser, run_embed_tokens),
     "rope": (add_rope_parser, run_rope),
+    "slice_update": (add_slice_update_parser, run_slice_update),
     "softmax": (add_softmax_parser, run_softmax),
     "matmul": (add_matmul_parser, run_matmul),
     "sdpa": (add_sdpa_parser, run_sdpa),
