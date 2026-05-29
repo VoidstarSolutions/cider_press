@@ -1,6 +1,6 @@
 //! Identity-copy coverage for the dtypes wired beyond the original
-//! Stage-2 spike: `bf16`, `i32`, `u32`. (The `f32` / `f16` paths live
-//! in `stage2_copy.rs` and stay there as the spike-era canary.)
+//! copy kernel: `bf16`, `i32`, `u32`. (The `f32` / `f16` paths live
+//! in `copy_kernel.rs` and stay there as the canonical dispatch canary.)
 //!
 //! Each test uploads a sentinel buffer, runs `v_copy<dtype>`, and
 //! asserts byte-for-byte identity.

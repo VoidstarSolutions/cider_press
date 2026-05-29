@@ -1,13 +1,14 @@
-//! Stage 3 of the development spike — see `CLAUDE.md`.
+//! Copy-kernel MLX parity test.
 //!
-//! Reference parity harness. Loads pre-generated input/expected-output
-//! safetensors (produced by `scripts/gen_stage3_fixtures.py`), runs the
-//! MLX `v_copy` kernel via cider-press, and compares against the MLX
-//! reference with dtype-appropriate tolerance.
+//! Loads pre-generated input/expected-output safetensors (produced by
+//! `scripts/gen_copy_fixture.py`), runs the MLX `v_copy` kernel via
+//! cider-press, and compares against the MLX reference with
+//! dtype-appropriate tolerance.
 //!
-//! The harness exercised here is the rig Stage 4 uses to validate
-//! `qmv` against MLX's `quantized_matmul`. For copy the reference
-//! equals the input, so this stage mostly smoke-tests the rig itself.
+//! The harness exercised here is the same rig the qmv parity test uses
+//! to validate `qmv` against MLX's `quantized_matmul`. For copy the
+//! reference equals the input, so this test mostly smoke-tests the rig
+//! itself.
 
 #![cfg(target_os = "macos")]
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
@@ -23,7 +24,7 @@ fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
-        .join("stage3_copy.safetensors")
+        .join("copy.safetensors")
 }
 
 #[test]
@@ -31,7 +32,7 @@ fn parity_v_copy_f32() {
     let path = fixture_path();
     if !path.exists() {
         eprintln!(
-            "skipping: fixture missing at {}; run `uv run scripts/gen_stage3_fixtures.py`",
+            "skipping: fixture missing at {}; run `uv run scripts/gen_copy_fixture.py`",
             path.display(),
         );
         return;
@@ -68,7 +69,7 @@ fn parity_v_copy_f16() {
     let path = fixture_path();
     if !path.exists() {
         eprintln!(
-            "skipping: fixture missing at {}; run `uv run scripts/gen_stage3_fixtures.py`",
+            "skipping: fixture missing at {}; run `uv run scripts/gen_copy_fixture.py`",
             path.display(),
         );
         return;

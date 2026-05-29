@@ -1,14 +1,13 @@
-//! Stage 1 of the development spike — see `CLAUDE.md`.
+//! Smoke test of the inline-kernel dispatch loop.
 //!
 //! Compiles a trivial inline Metal kernel at runtime, dispatches it on 1024
 //! `f32` elements via shared-memory `MTLBuffer`s, and verifies the result.
+//! A single dispatch round-trip (after JIT warm-up) must complete in well
+//! under 5 ms.
 //!
-//! Acceptance: passes under `cargo test --release`, and a single dispatch
-//! round-trip (after JIT warm-up) completes in well under 5 ms.
-//!
-//! Post-spike: uses `Device` + `Buffer` + `KernelLibrary` from the crate.
-//! The dispatch path itself still lives inline pending the `Commands`
-//! handle and `kernels::` modules in upcoming commits.
+//! Uses `Device` + `Buffer` + `KernelLibrary` from the crate.
+//! The dispatch path itself still lives inline here as a direct exercise
+//! of the low-level dispatch primitives.
 
 #![cfg(target_os = "macos")]
 #![allow(

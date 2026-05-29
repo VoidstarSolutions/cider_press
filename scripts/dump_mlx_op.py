@@ -579,7 +579,7 @@ def add_qmm_parser(subparsers: argparse._SubParsersAction) -> None:
 
 def run_qmm(args: argparse.Namespace) -> dict[str, mx.array]:
     dtype = _float_dtype(args.dtype)
-    # Uniform [-0.5, 0.5) matches gen_qmm_fixture.py / gen_stage4_fixtures.py:
+    # Uniform [-0.5, 0.5) matches gen_qmm_fixture.py / gen_qmv_fixture.py:
     # at K=896, normal-distributed inputs produce output magnitudes large
     # enough that bf16 LSB precision exceeds the M>1 tolerance bar.
     w = (mx.random.uniform(shape=(args.n, args.k)) - 0.5).astype(dtype)

@@ -77,7 +77,7 @@ fn parity_affine_qmm_t_bf16_gs64_b4() {
     // SAFETY: commit_and_wait blocked until the GPU finished writing y_buf.
     let y_out: Vec<bf16> = unsafe { y_buf.as_mut_slice() }.to_vec();
 
-    // Per-element parity at bf16 precision. Tolerances match stage4_qmv:
+    // Per-element parity at bf16 precision. Tolerances match the qmv parity test:
     // the kernel is bit-exact on identical hardware, but 1–2 ULP drift
     // occurs across Apple Silicon generations (M1 CI vs M3/M4 dev machines)
     // because bf16 reduction order can differ between GPU families.

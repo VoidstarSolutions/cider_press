@@ -1,4 +1,4 @@
-//! Stage 4 of the development spike — see `CLAUDE.md`.
+//! qmv kernel parity vs MLX.
 //!
 //! Dispatches MLX's `affine_qmv_fast` (bf16 / int4 / `group_size=64`) via
 //! [`kernels::qmv::affine_qmv_bf16`] and compares against MLX's own
@@ -21,7 +21,7 @@ use cider_press_test_utils::{read_bf16, read_u32};
 use half::bf16;
 use safetensors::SafeTensors;
 
-// Test dims — must match scripts/gen_stage4_fixtures.py.
+// Test dims — must match scripts/gen_qmv_fixture.py.
 const K: usize = 512;
 const N: usize = 512;
 const GROUP_SIZE: u32 = 64;
@@ -31,7 +31,7 @@ fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
-        .join("stage4_qmv.safetensors")
+        .join("qmv.safetensors")
 }
 
 #[test]
@@ -39,7 +39,7 @@ fn parity_affine_qmv_fast_bf16_gs64_b4() {
     let path = fixture_path();
     if !path.exists() {
         eprintln!(
-            "skipping: fixture missing at {}; run `uv run scripts/gen_stage4_fixtures.py`",
+            "skipping: fixture missing at {}; run `uv run scripts/gen_qmv_fixture.py`",
             path.display(),
         );
         return;

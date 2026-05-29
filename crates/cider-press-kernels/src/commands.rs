@@ -6,8 +6,8 @@
 //! on their own. The caller controls when the batch flushes to the GPU
 //! via [`Commands::commit_and_wait`].
 //!
-//! This is the design lever that the spike's perf measurement
-//! (`stage5_perf`) identified: the ~1.5× latency gap vs. MLX comes from
+//! This is the design lever that the qmv dispatch-latency benchmark
+//! identified: the ~1.5× latency gap vs. MLX comes from
 //! committing+waiting per dispatch. The runtime layer will batch many
 //! dispatches into one `Commands` to close that gap. The kernel layer
 //! merely needs to make that batching trivial.

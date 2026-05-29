@@ -1,13 +1,13 @@
 //! Runtime-level parity test for `Tensor::quantized_matmul` (M=1 decode path)
 //! against MLX's `mx.quantized_matmul`.
 //!
-//! Reuses the Stage-4 fixture from the kernels crate
-//! (`crates/cider-press-kernels/tests/fixtures/stage4_qmv.safetensors`)
+//! Reuses the qmv fixture from the kernels crate
+//! (`crates/cider-press-kernels/tests/fixtures/qmv.safetensors`)
 //! but drives the dispatch through the runtime API: build a
 //! `QuantizedWeight`, build an activation tensor, schedule
 //! `quantized_matmul`, `eval()`, and read the result back.
 //!
-//! The kernels-level test [crates/cider-press-kernels/tests/stage4_qmv.rs]
+//! The kernels-level test [crates/cider-press-kernels/tests/qmv_parity.rs]
 //! has a relaxed bf16 tolerance to absorb GPU-family differences when
 //! run on multiple machines. The same kernel is being called here, so
 //! the comparison passes at the same tolerance.
@@ -35,7 +35,7 @@ fn fixture_path() -> PathBuf {
         .join("cider-press-kernels")
         .join("tests")
         .join("fixtures")
-        .join("stage4_qmv.safetensors")
+        .join("qmv.safetensors")
 }
 
 #[test]
@@ -43,7 +43,7 @@ fn qmv_through_runtime_matches_mlx() {
     let path = fixture_path();
     assert!(
         path.exists(),
-        "missing parity fixture at {}; run `uv run scripts/gen_stage4_fixtures.py` \
+        "missing parity fixture at {}; run `uv run scripts/gen_qmv_fixture.py` \
          from the workspace root to regenerate it",
         path.display(),
     );

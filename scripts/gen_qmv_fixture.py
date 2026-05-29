@@ -6,21 +6,22 @@
 #   "numpy>=1.26",
 # ]
 # ///
-"""Generate parity fixtures for the Stage 4 qmv test.
+"""Generate the qmv parity fixture.
 
-Produces tests/fixtures/stage4_qmv.safetensors containing:
+Produces tests/fixtures/qmv.safetensors containing:
   - w_q     : packed int4 weight matrix, uint32 [N, K * bits / 32]
   - scales  : per-group scales,           bf16   [N, K / group_size]
   - biases  : per-group biases,           bf16   [N, K / group_size]
   - x       : input vector,               bf16   [K]
   - y_ref   : MLX reference output,       bf16   [N]
 
+# Test dims
 Dimensions are kept small (K = N = 512) so the fixture stays ~150 KB and
 can be committed. The fast variant of the kernel still applies because
 K % 512 == 0 and N % 8 == 0 — those are the conditions MLX uses to
 select `affine_qmv_fast` over the general `affine_qmv`.
 
-Run: `uv run scripts/gen_stage4_fixtures.py`
+Run: `uv run scripts/gen_qmv_fixture.py`
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ from pathlib import Path
 
 import mlx.core as mx
 
-OUT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "stage4_qmv.safetensors"
+OUT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "qmv.safetensors"
 
 K = 512
 N = 512

@@ -1,11 +1,9 @@
-//! Stage 2 of the development spike — see `CLAUDE.md`.
+//! Loads and dispatches MLX's `copy.metal`.
 //!
 //! Loads MLX's `copy.metal` (vendored under `kernels-mlx/`, flattened by
 //! `build.rs`), compiles it at runtime, and dispatches the simplest
 //! vector-copy instantiation against 1D `f32` and `f16` inputs. Asserts
 //! the output is bit-identical to the input — the kernel is identity.
-//!
-//! Acceptance: passes under `cargo test --release` for both dtypes.
 
 #![cfg(target_os = "macos")]
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
