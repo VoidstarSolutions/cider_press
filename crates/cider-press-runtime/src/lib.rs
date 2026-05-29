@@ -41,6 +41,7 @@ mod error;
 mod eval;
 mod kv_cache;
 mod layout;
+pub mod profile;
 mod quantization;
 mod quantized;
 mod shape;

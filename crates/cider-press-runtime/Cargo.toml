@@ -12,6 +12,12 @@ categories.workspace = true
 
 [lib]
 
+[features]
+# General perf-instrumentation. Off by default; when off, the `profile`
+# span API compiles to a zero-sized no-op (no branch, no timer). Turn on
+# to make `profile::span` accumulate into a thread-local profiler.
+profiling = []
+
 [dependencies]
 cider-press-kernels = { path = "../cider-press-kernels" }
 half = { workspace = true }
