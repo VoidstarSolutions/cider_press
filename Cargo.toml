@@ -16,18 +16,20 @@ categories = ["science"]
 # Pinned exact for spike reproducibility; the objc2-* ecosystem moves
 # fast. Default features on objc2-metal 0.3.x activate 60+ items and
 # cover everything we need; minimization is post-spike work.
+approx = "=0.5.1"
+clap = { version = "=4.5.21", features = ["derive"] }
 half = "=2.7.1"
+minijinja = { version = "=2.5.0", features = ["loader"] }
 objc2 = "=0.6.4"
 objc2-foundation = "=0.3.2"
 objc2-metal = "=0.3.2"
-thiserror = "=2.0.18"
-approx = "=0.5.1"
 safetensors = "=0.7.0"
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.145"
+tempfile = "=3.19.1"
+thiserror = "=2.0.18"
 # default features pull in onig (C bindings), progressbar, esaxx_fast; fancy-regex is the pure-Rust regex backend
 tokenizers = { version = "=0.23.1", default-features = false, features = ["fancy-regex"] }
-tempfile = "=3.19.1"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

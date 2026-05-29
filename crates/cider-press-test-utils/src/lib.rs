@@ -13,6 +13,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use half::bf16;
 use safetensors::SafeTensors;
@@ -33,16 +34,18 @@ pub fn workspace_root() -> PathBuf {
 
 /// Per-invocation tempdir under `std::env::temp_dir()`. `tag` becomes
 /// part of the directory name so concurrent test suites stay clear of
-/// each other; pid + nanos suffix the path so parallel cargo runs
-/// don't collide.
+/// each other; pid keeps parallel cargo *processes* apart, and a
+/// process-wide atomic counter keeps concurrent calls *within* a
+/// process apart. The counter is load-bearing: cargo runs test
+/// functions on parallel threads, and a timestamp-only suffix collides
+/// whenever two of them land in the same clock tick — which silently
+/// shared one fixture directory between sibling parity tests.
 #[must_use]
 pub fn tempdir(tag: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("SystemTime")
-        .as_nanos();
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
-    let dir = std::env::temp_dir().join(format!("cider-press-{tag}-{pid}-{nanos}"));
+    let dir = std::env::temp_dir().join(format!("cider-press-{tag}-{pid}-{seq}"));
     std::fs::create_dir_all(&dir).expect("mktemp");
     dir
 }
@@ -106,4 +109,46 @@ pub fn dump_mlx_op(out: &Path, args: &[&str]) {
         ),
     };
     assert!(status.success(), "dump_mlx_op.py {args:?} exited {status}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tempdir;
+    use std::collections::HashSet;
+
+    /// Rapid same-tag calls must yield distinct directories. A
+    /// timestamp-only suffix collides whenever two calls land in the
+    /// same clock tick — which is exactly how concurrent parity tests
+    /// sharing a tag clobbered each other's fixtures on CI. A tight
+    /// loop reproduces the collision on a fast clock; concurrent
+    /// threads reproduce the original failure mode directly.
+    #[test]
+    fn tempdir_same_tag_is_unique_under_rapid_and_concurrent_calls() {
+        let mut paths = HashSet::new();
+        for _ in 0..1000 {
+            assert!(
+                paths.insert(tempdir("uniqueness")),
+                "tempdir returned a duplicate path under rapid sequential calls"
+            );
+        }
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    (0..200)
+                        .map(|_| tempdir("uniqueness-mt"))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut concurrent = HashSet::new();
+        for handle in handles {
+            for path in handle.join().expect("thread join") {
+                assert!(
+                    concurrent.insert(path),
+                    "tempdir returned a duplicate path under concurrent calls"
+                );
+            }
+        }
+    }
 }

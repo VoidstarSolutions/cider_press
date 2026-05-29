@@ -404,3 +404,25 @@ fn scalar_tensor(device: &Device, dtype: DType, value: f32) -> Result<Tensor> {
         ))),
     }
 }
+
+/// Build an additive causal attention mask of shape `[T, T]`, BF16.
+///
+/// `0.0` on/below the diagonal, `-1e4` above. The `-1e4` magnitude
+/// keeps the softmax accumulator inside bf16's representable range
+/// while still acting as a hard mask (softmax subtracts the max
+/// before exp).
+///
+/// Rank-2 because `sdpa`'s scores tensor is rank-3
+/// `[B*H_q, T, T_cache]`; the wired binary path is `g3_*`. Rank-4
+/// strided binary is deferred.
+pub fn causal_mask(device: &Device, t: usize) -> Result<Tensor> {
+    let neg = bf16::from_f32(-1.0e4);
+    let zero = bf16::ZERO;
+    let mut data = vec![zero; t * t];
+    for row in 0..t {
+        for col in (row + 1)..t {
+            data[row * t + col] = neg;
+        }
+    }
+    Ok(Tensor::from_slice(device, &data, [t, t])?)
+}

@@ -16,6 +16,12 @@ readme = "../../README.md"
 [dependencies]
 cider-press-runtime = { path = "../cider-press-runtime" }
 cider-press-models = { path = "../cider-press-models" }
+clap = { workspace = true }
+safetensors = { workspace = true }
 
 [lints]
 workspace = true
+
+[[bin]]
+name = "cider-press"
+path = "src/bin/cider-press.rs"

@@ -38,13 +38,35 @@ impl Tokenizer {
     pub fn decode(&self, ids: &[u32]) -> Result<String> {
         self.inner.decode(ids, false).map_err(Error::from)
     }
+
+    /// Construct an incremental decoder that buffers BPE tokens until
+    /// they form a UTF-8-valid suffix. Push ids with `.step(id)`;
+    /// returns `Some(String)` when a printable chunk is ready, `None`
+    /// while buffering mid-codepoint.
+    ///
+    /// Thin pass-through to `tokenizers::Tokenizer::decode_stream`.
+    /// `skip_special_tokens=true` suppresses tokens like `<|im_end|>`
+    /// from human-visible output.
+    pub fn decode_stream(
+        &self,
+        skip_special_tokens: bool,
+    ) -> tokenizers::DecodeStream<
+        '_,
+        tokenizers::models::ModelWrapper,
+        tokenizers::normalizers::NormalizerWrapper,
+        tokenizers::pre_tokenizers::PreTokenizerWrapper,
+        tokenizers::processors::PostProcessorWrapper,
+        tokenizers::decoders::DecoderWrapper,
+    > {
+        self.inner.decode_stream(skip_special_tokens)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
-    use tokenizers::models::bpe::BPE;
     use tokenizers::Tokenizer as HfTokenizer;
+    use tokenizers::models::bpe::BPE;
 
     use super::*;
 
@@ -68,6 +90,25 @@ mod tests {
         let path = dir.join("tokenizer.json");
         tok.save(&path, false).expect("save tokenizer.json");
         path
+    }
+
+    #[test]
+    fn decode_stream_emits_text() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = write_minimal_tokenizer(tmp.path());
+        let tok = Tokenizer::from_file(&path).expect("from_file");
+        let ids = tok.encode("hi").expect("encode");
+        let mut stream = tok.decode_stream(false);
+        let mut out = String::new();
+        for id in &ids {
+            if let Some(chunk) = stream.step(*id).expect("step") {
+                out.push_str(&chunk);
+            }
+        }
+        assert!(
+            out.contains('h') && out.contains('i'),
+            "decode_stream should round-trip both characters; got {out:?}"
+        );
     }
 
     #[test]

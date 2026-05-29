@@ -41,6 +41,9 @@ pub enum Error {
     /// Failed to load or run a tokenizer.
     #[error("tokenizer: {0}")]
     Tokenizer(#[from] tokenizers::Error),
+    /// A chat template (minijinja) failed to load, compile, or render.
+    #[error("chat template: {0}")]
+    ChatTemplate(#[from] minijinja::Error),
     /// Runtime-layer error (allocation, upload, …) bubbling up
     /// through the loader path.
     #[error("runtime: {0}")]
