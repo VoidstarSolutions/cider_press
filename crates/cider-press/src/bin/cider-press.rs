@@ -200,7 +200,16 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
     let mut produced = 0usize;
     let mut timed = 0usize;
     let mut decode_dur = std::time::Duration::ZERO;
-    let mut decode_timer: Option<Instant> = None;
+    // With `--warmup 0` the in-loop `produced == args.warmup` check never
+    // fires (produced is incremented to >= 1 before it), so start timing
+    // before the first token in that case. Otherwise the timer starts when
+    // the warmup-th token is produced.
+    let mut decode_timer: Option<Instant> = if args.warmup == 0 {
+        profile::reset();
+        Some(Instant::now())
+    } else {
+        None
+    };
     for id_result in iter {
         let _ = id_result?;
         produced += 1;
