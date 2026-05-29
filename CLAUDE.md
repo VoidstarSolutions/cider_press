@@ -70,7 +70,7 @@ crate re-exports from runtime + models. Workspace-level
 version pins in one place; each member uses `lints.workspace = true`
 and `dep.workspace = true`.
 
-## Current state: quantized matmul + layer-0 attention integration test landed
+## Current state: roadmap complete through branch 15 (perf measured); next work is performance
 
 The development spike (Stages 0–5 below) passed every acceptance bar,
 including bit-exact `qmv` parity with MLX's own `quantized_matmul`.
@@ -435,13 +435,25 @@ we'd need — both now landed (Views in branch 2; `KvCache` in branch 8).
   locally with `CIDER_QWEN_CHECKPOINT_PATH` before merge (the
   KV-view transpose fix is only exercised numerically there).**
 
-**Next concrete step: branch 12c of the roadmap — `feat/models-qwen2`.**
-Build `TransformerBlock` (residual connections wrapping
-`input_layernorm → Attention` and `post_attention_layernorm → Mlp`)
-and `Qwen2Model` (embed → N blocks → final norm), plus the tied LM
-head via a `transpose` flag on `Tensor::quantized_matmul` (deferred
-from branch 11b). Per-token logits parity vs MLX-LM on a fixed prompt
-prefill.
+**Roadmap status: complete through branch 15.** Branches 12c
+(`feat/models-qwen2`), 13 (`feat/tokenizer`), 14 (`feat/cli + greedy
+decode`), and 15 (`feat/perf-measurement`) all landed after the
+branch-by-branch detail below was last written — see `docs/QWEN_PATH.md`
+for their entries. The CLI runs Qwen2.5-0.5B-Instruct-4bit end-to-end.
+
+Branch 15 added a general feature-gated profiling facility
+(`cider_press_runtime::profile`: RAII named spans → thread-local
+accumulator, compile-time no-op when the `profiling` feature is off),
+spans at `tensor.eval` / `kvcache.update` / `kvcache.memcpy` / `argmax`,
+a `bench` CLI subcommand (chat/bench split), in-process peak-RSS via
+mach `task_info` (`cider_press::sys`), and `scripts/measure_qwen_mlx.py`.
+**Headline result (`docs/QWEN_PERF.md`):** decode ~55 tok/s vs `mlx_lm`
+~560 (**~10×**), with ~89% of the decode step in `tensor.eval` over ~49
+synchronous `commit + wait` cycles per token. Kernels are bit-exact;
+the gap is the dispatch boundary, as predicted. **Next work is
+performance**, measurement-justified order in `docs/QWEN_PATH.md`'s
+closing section: cross-eval command-buffer batching first, then buffer
+pool, KV-cache same-eval batching, GPU argmax, `.metallib` precompile.
 
 Quantized-embedding decision resolved in branch 7: neither
 quantized-row gather nor `gather → dequantize_row`. Instead,
