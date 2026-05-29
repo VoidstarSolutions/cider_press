@@ -51,25 +51,43 @@ HuggingFace / mlx-community 4-bit checkpoint.
 
 ## Performance backlog
 
-Decode is dispatch-bound (`QWEN_PERF.md`): ~89% of each step is in
-`Tensor::eval` over ~49 synchronous `commit + wait` cycles per token,
-~10× slower than `mlx_lm`. In measurement-justified priority:
+Decode is per-eval-cost-bound (`QWEN_PERF.md`): one `Tensor::eval` per
+token (~10 ms/token, ~90% of the step), ~6.2× slower than `mlx_lm`.
+The dispatch round-trip tax has been removed — see items #1 and #3 below.
+The remaining gap is kernel efficiency, CPU-side encode overhead, and
+per-eval scratch allocation. In measurement-justified priority:
 
-1. **Cross-eval command-buffer batching** — the dominant lever. Fold a
-   token's ~49 `eval()` calls into far fewer (ideally one) pipelined
-   command buffers with async commit. Removes most of the per-token
-   dispatch tax.
-2. **Buffer pool / allocator** — peak RSS sits well above post-load from
-   per-`eval()` scratch churn; a pool amortizes it.
-3. **KvCache same-eval batching** — the host `memcpy` is free, but
-   `update` forcing two synchronous evals per layer feeds the dispatch
-   problem; fold the cache write into the forward's command buffer.
-4. **GPU argmax** — ~2.7% of decode (the `[vocab]` cpu_to_vec + scan).
+1. **Cross-eval command-buffer batching — DONE (~1.6×).** The in-graph
+   KV write (SliceUpdate, `feat/command-buffer-batching`) collapsed the
+   token's ~49 synchronous `commit + wait` round-trips to **one command
+   buffer per token**. `kvcache.update` cost dropped from ~1874 ms to
+   0.56 ms over the 120-step timed window; decode improved ~55 → ~90
+   tok/s. Measured finding: the dispatch-collapse was worth ~1.6×; the
+   dominant remaining lever has shifted to per-eval cost (see below).
+   Numbers: `QWEN_PERF.md` and
+   `docs/superpowers/specs/2026-05-29-kv-slice-update-perf-design.md`
+   (spike results section).
+2. **Buffer pool / allocator** — peak RSS is now ~1192 MiB (+32% from
+   the one-eval-holds-all-intermediates regime); a pool recycles scratch
+   buffers across tokens and attacks per-eval setup time directly.
+3. **KvCache same-eval batching — DONE.** `KvCache::update` is now a
+   lazy SliceUpdate op; the forced `k.eval()` + `v.eval()` per layer is
+   gone. Metal hazard tracking serializes the slab write → SDPA read
+   within the single per-token command buffer.
+4. **Faster GEMM / kernel fusion** — the naive `gemm_bfloat16` dominates
+   kernel compute; steel-tiled matmul and fused attention close the ~6×
+   kernel efficiency gap vs `mlx_lm`.
+5. **Per-eval dispatch encoding overhead** — ~49 kernel dispatches are
+   encoded per token inside the single command buffer. Fused kernels,
+   fewer ops, or Approach-C lower-level plumbing (thread `Commands`
+   through the forward) reduce the CPU-side encode portion of per-eval
+   cost.
+6. **GPU argmax** — ~4.5% of decode (the `[vocab]` cpu_to_vec + scan).
    After the big levers.
-5. **`.metallib` precompilation** — removes the one-time cold-start JIT
+7. **`.metallib` precompilation** — removes the one-time cold-start JIT
    (~tens of seconds) from first-token latency in a shipped binary.
-6. **Top-k / top-p / temperature sampling** — greedy-only today.
-7. **Strided-aware kernels** (MLX's `g_copy` family) — we materialize
+8. **Top-k / top-p / temperature sampling** — greedy-only today.
+9. **Strided-aware kernels** (MLX's `g_copy` family) — we materialize
    strided views via `Copy`; strided kernels are a perf-only improvement.
 
 ## Carry-forward items
