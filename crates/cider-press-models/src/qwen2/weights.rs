@@ -107,7 +107,7 @@ pub struct Qwen2MlpWeights {
 /// against `config`'s predictions; mismatches return
 /// [`Error::ShapeMismatch`] or [`Error::InvalidArgument`] with the
 /// offending key. This is the "loaded bytes == safetensors bytes"
-/// contract from the `QWEN_PATH` doc: anything that passes here is
+/// contract from the `ARCHITECTURE` doc: anything that passes here is
 /// observably identical (byte-for-byte) to what's in the archive.
 pub fn load_qwen2_weights(
     archive: &SafeTensors<'_>,

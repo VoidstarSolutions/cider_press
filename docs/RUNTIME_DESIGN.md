@@ -25,10 +25,10 @@ fit. Code lands in follow-up commits.
    commits, and waits. After `eval()`, every reachable node is a
    materialized leaf.
 4. **First op coverage.** Enough ops to demonstrate the pattern
-   end-to-end. Concretely: `copy` (already validated in spike) and
-   one quantized matmul (`qmv`, validated bit-exact in Stage 4).
-   That's two ops with very different dispatch shapes — enough to
-   stress-test the abstraction without over-extending it.
+   end-to-end. Concretely: `copy` (the identity mover) and one
+   quantized matmul (`qmv`, bit-exact vs MLX). That's two ops with
+   very different dispatch shapes — enough to stress-test the
+   abstraction without over-extending it.
 
 ## Decided up-front: sync public API
 
@@ -48,7 +48,7 @@ The reasoning, briefly:
   above the inference engine, not inside it. vLLM, llama.cpp, and
   MLX-LM all structure things this way: sync per-request engine,
   async scheduler on top. The runtime crate is the engine.
-- The 1.5× perf gap to MLX (Stage 5) lives in *internal* dispatch
+- The 1.5× per-dispatch perf gap to MLX lives in *internal* dispatch
   pipelining, not in the public API shape — MLX's `mx.eval` is
   itself sync. Closing the gap is an implementation concern; see
   "What pipelining needs" below.
@@ -65,7 +65,7 @@ this hardware and workload.
   the public API.
 - **Cross-buffer command-buffer batching / internal pipelining.**
   First cut: one `Commands` per `eval()`, synchronous commit +
-  wait. The 1.5× perf gap to MLX (Stage 5) lives here — but
+  wait. The 1.5× per-dispatch perf gap to MLX lives here — but
   closing it is a follow-up, not a prerequisite. The graph shape
   we pick here is what *enables* batching later (see
   `Source::Pending` below); we don't need to land the scheduling
@@ -447,11 +447,11 @@ both example ops are wired through the runtime).
 
 ## After this slice: framework gaps for inference
 
-The target use case for the next several branches is **Qwen2.5-0.5B-Instruct**
-running end-to-end (see `docs/QWEN_PATH.md` for the branch-by-branch
-roadmap). It's the smallest published dense Qwen — same architecture
-family as the eventual MoE target minus the router and expert
-dispatch, so every op carries forward. Picking a concrete target now
+The target use case is **Qwen2.5-0.5B-Instruct** running end-to-end
+(see `docs/ARCHITECTURE.md` for the architecture map). It's the
+smallest published dense Qwen — same architecture family as the
+eventual MoE target minus the router and expert dispatch, so every
+op carries forward. Picking a concrete target now
 keeps the gap-fill work honest: each addition has a known consumer.
 
 Two framework primitives we know we'll need before the op flood:
@@ -540,9 +540,8 @@ no graph value to gain from laziness.
 
 ## After Qwen2.5-0.5B runs
 
-These are the perf and ergonomic follow-ups the spike already
-identified — landing them only matters once we have something
-running to measure:
+These are the perf and ergonomic follow-ups that only matter once
+there is something running to measure:
 
 - Buffer pool / allocator (reference: MLX's `allocator.cpp`).
 - Cross-`eval()` command-buffer batching — the lever that should

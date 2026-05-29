@@ -22,7 +22,7 @@ use crate::error::{Error, Result};
 ///
 /// Composed entirely from existing ops — no fused kernel. The
 /// roadmap defers `rms_norm.metal` until perf measurement on the
-/// composed path identifies a real bottleneck (`docs/QWEN_PATH.md`).
+/// composed path identifies a real bottleneck (`docs/ARCHITECTURE.md`).
 ///
 /// Preconditions:
 ///

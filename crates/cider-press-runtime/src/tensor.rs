@@ -283,7 +283,7 @@ pub enum OpKind {
     ///
     /// Dispatches to cider-press's own naive `gemm_bfloat16` kernel
     /// (not MLX-derived); steel-tiled GEMM is deferred (see
-    /// `docs/QWEN_PATH.md`). Non-contiguous inputs (transposed
+    /// `docs/ARCHITECTURE.md`). Non-contiguous inputs (transposed
     /// views) materialize via [`Tensor::copy`] first — same
     /// contract as `softmax` / `rope` / reductions.
     MatMul,
