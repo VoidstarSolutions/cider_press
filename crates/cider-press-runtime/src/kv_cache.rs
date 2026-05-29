@@ -26,26 +26,23 @@
 //! previous one (or the slab leaf on the first call); `keys_view` /
 //! `values_view` expose the populated prefix of the latest op.
 //!
-//! **Spike status:** this in-graph write is the perf spike described in
-//! `docs/superpowers/specs/2026-05-29-kv-slice-update-perf-design.md`;
-//! the bf16/rank-3-only `SliceUpdate` op is hardened in a later phase.
+//! ## Aliasing contract (append-only)
 //!
-//! ## Aliasing contract (spike: relaxed)
-//!
-//! The eager design rejected `update` while a `keys_view`/`values_view`
-//! tensor was still live, because it mutated the slab in place via a host
-//! `as_mut_slice()` write. The lazy rewrite removed that runtime guard:
-//! the write is now an ordinary graph op, and the slab leaf is
-//! permanently referenced by the `SliceUpdate` op-tensors, so the old
-//! `Arc::strong_count > 1` check would always trip. A correct
-//! graph-based aliasing contract is deferred to the clean build (see the
-//! design doc); for the spike, callers are trusted to `eval` a view
-//! before the next `update` overwrites the prefix it reads.
+//! `update` performs no host-side mutation: the write is an in-graph
+//! `SliceUpdate` GPU op, ordered against the SDPA read by Metal's hazard
+//! tracking within a command buffer and by `commit_and_wait` across
+//! buffers. The cache is **append-only** — `position` only grows and each
+//! `update` writes a fresh, disjoint row range — so a [`Tensor`] returned
+//! by [`KvCache::keys_view`]/[`KvCache::values_view`] reads a prefix that
+//! prior dispatches have fully written and remains valid until a later
+//! [`KvCache::update`] overwrites the rows it spans — the earliest such
+//! overwrite being the first `update` after a [`KvCache::reset`] rewinds
+//! `position`. (The eager design's `Arc::strong_count` guard, which
+//! prevented host-side overlapping `&[u8]`/`&mut [u8]` UB, is obsolete
+//! now that there is no host write.)
 
 use std::fmt;
 use std::sync::Arc;
-
-use cider_press_kernels::Buffer;
 
 use crate::Device;
 use crate::dtype::DType;
@@ -63,13 +60,10 @@ use crate::tensor::Tensor;
 /// and is exposed as zero-copy [`Tensor`] views.
 pub struct KvCache {
     device: Device,
-    _keys: Buffer<u8>,
-    _values: Buffer<u8>,
-    // Full-shape `[max_tokens, n_kv_heads, head_dim]` host_leaf
-    // tensors aliasing `_keys` / `_values` via refcount-bumped buffer
-    // handles. Views handed out by `keys_view` / `values_view` are
-    // slices of these, so the view's logical length matches its shape
-    // even when only a prefix is populated.
+    // Full-shape `[max_tokens, n_kv_heads, head_dim]` host_leaf tensors.
+    // Views handed out by `keys_view` / `values_view` are slices of these,
+    // so the view's logical length matches its shape even when only a prefix
+    // is populated.
     keys_slab: Tensor,
     values_slab: Tensor,
     dtype: DType,
@@ -77,10 +71,10 @@ pub struct KvCache {
     n_kv_heads: usize,
     head_dim: usize,
     position: usize,
-    // Spike: the most recent SliceUpdate op-tensor per slab. `update`
-    // builds these lazily (no host memcpy); `keys_view`/`values_view`
-    // slice them so SDPA's cache read is graph-downstream of the write.
-    // `None` before the first update (or after `reset`).
+    // Most recent SliceUpdate op-tensor per slab. `update` builds these
+    // lazily (no host memcpy); `keys_view`/`values_view` slice them so
+    // SDPA's cache read is graph-downstream of the write. `None` before
+    // the first update (or after `reset`).
     keys_latest: Option<Tensor>,
     values_latest: Option<Tensor>,
 }
@@ -150,16 +144,11 @@ impl KvCache {
             slab_layout,
             values.clone_handle(),
         );
-        // At construction each slab leaf is freshly built and unshared;
-        // assert that as a sanity check. (The eager update-time
-        // strong-count guard this once backed was removed in the lazy
-        // spike — see the module-level aliasing note.)
+        // Freshly built and unshared here — a construction tripwire only.
         debug_assert_eq!(Arc::strong_count(&keys_slab.inner), 1);
         debug_assert_eq!(Arc::strong_count(&values_slab.inner), 1);
         Ok(Self {
             device: device.clone(),
-            _keys: keys,
-            _values: values,
             keys_slab,
             values_slab,
             dtype,
@@ -184,11 +173,10 @@ impl KvCache {
     /// [`KvCache::values_view`].
     pub fn update(&mut self, k: &Tensor, v: &Tensor) -> Result<()> {
         let _span = crate::profile::span("kvcache.update");
-        // Spike: the eager strong-count aliasing guard is intentionally
-        // removed. The slab leaf is now permanently referenced by the
-        // SliceUpdate op-tensors, so the old `strong_count > 1` check
-        // would always trip. The clean build re-establishes a correct
-        // graph-based aliasing contract.
+        // No aliasing guard: `update` does no host write (the write is an
+        // in-graph SliceUpdate op), and the cache is append-only, so a
+        // live view reads a still-valid prefix. See the module-level
+        // append-only aliasing contract.
         let step_t = self.validate_update_input(k, "k")?;
         let step_t_v = self.validate_update_input(v, "v")?;
         if step_t != step_t_v {
@@ -312,12 +300,9 @@ impl KvCache {
     fn prefix_view(&self, slab: &Tensor) -> Tensor {
         // Slice the full-shape slab tensor along axis 0 down to the
         // populated prefix. The resulting view aliases the slab's
-        // MTLBuffer (zero-copy) and its logical length matches its
-        // shape, so vector-kernel dispatch sees a consistent
+        // MTLBuffer (zero-copy) and its logical length matches its shape,
+        // so vector-kernel dispatch sees a consistent
         // `buffer.len() == shape.elem_count() * dtype.size_bytes()`.
-        // Under the spike's relaxed aliasing contract (see module docs),
-        // the caller is trusted to `eval` this view before the next
-        // `update` overwrites the prefix.
         slab.slice(&[0..self.position, 0..self.n_kv_heads, 0..self.head_dim])
             .expect("prefix slice is in-bounds by construction")
     }
@@ -384,5 +369,31 @@ mod tests {
         let mut expected = k0.clone();
         expected.extend_from_slice(&k1);
         assert_eq!(kview.cpu_to_vec::<bf16>().expect("k bytes 2"), expected);
+    }
+
+    #[test]
+    fn view_stays_valid_across_later_append() {
+        let device = Device::shared().expect("device");
+        let mut cache = KvCache::new(&device, 4, 2, 3, DType::BF16).expect("cache");
+
+        let row = |base: i16| -> Vec<bf16> {
+            (0..6i16)
+                .map(|i| bf16::from_f32(f32::from(base + i)))
+                .collect()
+        };
+        let r0 = row(1);
+        let t0 = Tensor::from_slice(&device, &r0, [1usize, 2, 3]).expect("t0");
+        cache.update(&t0, &t0).expect("update 0");
+
+        // Capture a view of the row-0 prefix, then append row 1.
+        let kview0 = cache.keys_view();
+        let r1 = row(100);
+        let t1 = Tensor::from_slice(&device, &r1, [1usize, 2, 3]).expect("t1");
+        cache.update(&t1, &t1).expect("update 1");
+
+        // The earlier view still reads its (still-valid) prefix: append only
+        // wrote the disjoint row 1, so row 0's bytes are unchanged.
+        kview0.eval().expect("eval kview0");
+        assert_eq!(kview0.cpu_to_vec::<bf16>().expect("kview0"), r0);
     }
 }
