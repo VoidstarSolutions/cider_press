@@ -287,6 +287,20 @@ pub enum OpKind {
     /// views) materialize via [`Tensor::copy`] first — same
     /// contract as `softmax` / `rope` / reductions.
     MatMul,
+    /// **Spike op.** In-place write of `src`'s rows into a persistent,
+    /// caller-owned slab buffer at row `offset_rows`. Inputs (in
+    /// [`Tensor::op_inputs`] order) are `[slab, src]`. Unlike every
+    /// other op, `eval` does NOT allocate a fresh output — it binds the
+    /// slab buffer (resolved from `inputs[0]`) as the destination,
+    /// encodes a copy of `src` into `slab[offset_rows..]`, and caches
+    /// the slab buffer as this op's output. Output shape and dtype equal
+    /// the slab's; the output layout is dense (the spike's slab is dense).
+    /// bf16 / rank-3 slab only for the spike.
+    SliceUpdate {
+        /// Row index (along axis 0 of the slab) at which `src`'s first
+        /// row lands. Byte offset is `offset_rows * (n_kv_heads * head_dim) * 2`.
+        offset_rows: usize,
+    },
 }
 
 /// Element-wise binary operations supported by [`OpKind::Binary`].
@@ -620,6 +634,28 @@ impl Tensor {
             layout,
             OpKind::Copy,
             vec![self.clone()],
+        ))
+    }
+
+    /// **Spike:** schedule an in-place write of `src` into this slab
+    /// tensor at row `offset_rows`, returning an [`OpKind::SliceUpdate`]
+    /// op tensor whose logical shape equals the slab's.
+    ///
+    /// `self` must be a dense bf16 rank-3 slab
+    /// (`[max_rows, n_kv_heads, head_dim]`); `src` must be dense bf16
+    /// rank-3 with the same trailing two dims. Preconditions beyond
+    /// device-presence are checked at dispatch for the spike.
+    pub fn slice_update(&self, src: &Tensor, offset_rows: usize) -> Result<Self> {
+        let device = self.inner.device.as_ref().ok_or_else(|| {
+            Error::InvalidArgument("slice_update: slab is a placeholder (no device)".into())
+        })?;
+        Ok(Self::op_tensor(
+            device,
+            self.inner.shape.clone(),
+            self.inner.dtype,
+            dense_layout(&self.inner.shape),
+            OpKind::SliceUpdate { offset_rows },
+            vec![self.clone(), src.clone()],
         ))
     }
 
@@ -3737,5 +3773,37 @@ mod tests {
             msg.contains("transpose=false") && msg.contains("not implemented"),
             "expected Unimplemented for transpose=false; got: {msg}"
         );
+    }
+
+    #[test]
+    fn slice_update_writes_rows_at_offset_in_place() {
+        let device = Device::shared().expect("system default device");
+        // 4-row slab [max_tokens=4, n_kv_heads=2, head_dim=3], zero-filled.
+        let slab = Tensor::zeros(&device, [4usize, 2, 3], DType::BF16).expect("slab");
+        // One row of known values to write at row offset 2.
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "values 1..=6 fit exactly in f32"
+        )]
+        let src_vals: Vec<bf16> = (1..=6).map(|i| bf16::from_f32(i as f32)).collect();
+        let src = Tensor::from_slice(&device, &src_vals, [1usize, 2, 3]).expect("src");
+
+        let updated = slab.slice_update(&src, 2).expect("slice_update");
+        updated.eval().expect("eval");
+
+        let out = updated.cpu_to_vec::<bf16>().expect("out bytes");
+        assert_eq!(out.len(), 4 * 2 * 3);
+        // Row 2 (elements 12..18) holds src; all other rows stay zero.
+        let zero = bf16::from_f32(0.0);
+        for (i, &x) in out.iter().enumerate() {
+            if (12..18).contains(&i) {
+                assert_eq!(x, src_vals[i - 12], "row 2 element {i} should be written");
+            } else {
+                assert_eq!(
+                    x, zero,
+                    "element {i} outside the written row must stay zero"
+                );
+            }
+        }
     }
 }

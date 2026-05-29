@@ -60,8 +60,23 @@ pub(crate) fn eval(root: &Tensor) -> Result<()> {
     // exclusive `&mut dst` to the fresh local.
     let mut outputs: Vec<Buffer<u8>> = Vec::with_capacity(order.len());
     for inner in &order {
-        let byte_count = checked_byte_count(&inner.shape, inner.dtype)?;
-        let mut dst = device.kernels().alloc_buffer::<u8>(byte_count)?;
+        let op = inner
+            .op
+            .as_ref()
+            .expect("topo invariant: only op nodes are in `order`");
+        // SliceUpdate writes into a persistent caller-owned buffer
+        // (inputs[0], the slab) rather than a fresh output. Bind that
+        // buffer as `dst` so the encoded copy mutates it in place; its
+        // contents from earlier (already-committed) evals stay valid.
+        let mut dst = if let OpKind::SliceUpdate { .. } = op.kind {
+            let slab = op.inputs.first().ok_or_else(|| {
+                Error::InvalidArgument("SliceUpdate: missing slab input (inputs[0])".into())
+            })?;
+            dense_input_buffer(slab, &outputs, &index_of)?
+        } else {
+            let byte_count = checked_byte_count(&inner.shape, inner.dtype)?;
+            device.kernels().alloc_buffer::<u8>(byte_count)?
+        };
         dispatch(inner, &mut commands, &outputs, &mut dst, &index_of)?;
         outputs.push(dst);
     }
@@ -236,6 +251,9 @@ fn dispatch(
             dispatch_softmax(inner, op, commands, outputs, dst, index_of, precise)
         }
         OpKind::MatMul => dispatch_matmul(inner, op, commands, outputs, dst, index_of),
+        OpKind::SliceUpdate { offset_rows } => {
+            dispatch_slice_update(inner, op, commands, outputs, dst, index_of, offset_rows)
+        }
     }
 }
 
@@ -302,6 +320,70 @@ fn dispatch_copy(
         }
     }
 
+    Ok(())
+}
+
+/// Dispatch the spike `SliceUpdate`: write `src` (dense bf16 rank-3,
+/// contiguous) into the slab buffer bound as `dst` at byte offset
+/// `offset_rows * rows_stride`. Reuses MLX's `copy_gg` family via
+/// `copy_g_bf16`, which takes a destination byte offset. The slab's
+/// other rows are untouched (the kernel writes only `src.elem_count()`
+/// elements starting at the offset).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_slice_update(
+    inner: &Arc<TensorInner>,
+    op: &OpNode,
+    commands: &mut Commands<'_>,
+    outputs: &[Buffer<u8>],
+    dst: &mut Buffer<u8>,
+    index_of: &HashMap<*const TensorInner, usize>,
+    offset_rows: usize,
+) -> Result<()> {
+    let device = inner
+        .device
+        .as_ref()
+        .expect("op nodes are always constructed with a device");
+    if inner.dtype != DType::BF16 {
+        return Err(Error::InvalidArgument(format!(
+            "SliceUpdate: spike wires BF16 only (got {:?})",
+            inner.dtype
+        )));
+    }
+    let src = op.inputs.get(1).ok_or_else(|| {
+        Error::InvalidArgument("SliceUpdate: missing src input (inputs[1])".into())
+    })?;
+    let src_dims = src.shape().dims();
+    if src_dims.len() != 3 {
+        return Err(Error::InvalidArgument(format!(
+            "SliceUpdate: spike expects rank-3 src [step_t, n_kv_heads, head_dim] (got {src_dims:?})"
+        )));
+    }
+    let row_elems = src_dims[1] * src_dims[2];
+    let dst_byte_offset = offset_rows * row_elems * DType::BF16.size_bytes();
+
+    let src_bytes = dense_input_buffer(src, outputs, index_of)?;
+    // SAFETY: the dtype guard above pinned this op to BF16; the buffers
+    // were sized as `elem_count * size_bytes`, so the byte length divides
+    // evenly into the bf16 element count. dst is the slab buffer; the
+    // copy writes only src.elem_count() elements starting at the offset.
+    let src_typed = unsafe { src_bytes.reinterpret_as::<half::bf16>() };
+    let mut dst_typed = unsafe { dst.reinterpret_as::<half::bf16>() };
+
+    let shape_i32 = shape_to_i32(src_dims)?;
+    let strides = contiguous_strides_i64(&shape_i32);
+
+    let library = device.copy_library()?;
+    copy::copy_g_bf16(
+        commands,
+        library,
+        &src_typed,
+        0,
+        &strides,
+        &mut dst_typed,
+        dst_byte_offset,
+        &strides,
+        &shape_i32,
+    )?;
     Ok(())
 }
 
