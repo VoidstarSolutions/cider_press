@@ -416,7 +416,7 @@ Stage-by-stage, one logical concern per commit (per memory
    produces a leaf whose buffer reads back as `[1,2,3]`.
 4. **`Qmv` op + quantized leaf.** Add
    `Tensor::quantized_from_bytes`, `Tensor::qmv(&w, &x)`, and the
-   dispatcher in `ops/qmv.rs`. Reuse the Stage-4 fixture as the
+   dispatcher in `ops/qmv.rs`. Reuse the qmv parity fixture as the
    parity test, but now driven through the runtime API instead of
    raw kernels-crate code.
 
