@@ -18,10 +18,14 @@
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
+use objc2_metal::{
+    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+    MTLComputePassDescriptor,
+};
 
 use crate::device::Device;
 use crate::error::{Error, Result};
+use crate::gpu_sampler::{GpuSampler, GpuSegment};
 
 /// In-progress command-buffer session.
 ///
@@ -32,6 +36,12 @@ pub struct Commands<'d> {
     _device: &'d Device,
     cmd: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     encoder: Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>,
+    /// `Some` only in the profiling regime — one sampled encoder per
+    /// dispatch. `None` is the production single-encoder path.
+    sampler: Option<GpuSampler>,
+    /// When set, the next `encoder()` opens a sampled pass for this
+    /// (start, end) sample-index pair, then clears.
+    armed: Option<(usize, usize)>,
 }
 
 impl<'d> Commands<'d> {
@@ -49,7 +59,36 @@ impl<'d> Commands<'d> {
             _device: device,
             cmd,
             encoder: None,
+            sampler: None,
+            armed: None,
         })
+    }
+
+    /// Open a profiled session sized for `op_capacity` dispatches. Each
+    /// later `begin_profiled_op` opens a fresh sampled encoder.
+    pub fn new_profiled(device: &'d Device, op_capacity: usize) -> Result<Self> {
+        let mut commands = Self::new(device)?;
+        commands.sampler = Some(GpuSampler::new(device, op_capacity)?);
+        Ok(commands)
+    }
+
+    /// Close the current encoder (writing its end timestamp) and arm the
+    /// next `encoder()` to open a sampled pass for `label`. No-op when
+    /// not in the profiling regime.
+    pub fn begin_profiled_op(&mut self, label: &'static str) {
+        let Some(sampler) = self.sampler.as_mut() else {
+            return;
+        };
+        // Close any open encoder so its stage-end timestamp is written.
+        if let Some(enc) = self.encoder.take() {
+            enc.endEncoding();
+        }
+        match sampler.reserve(label) {
+            Ok(pair) => self.armed = Some(pair),
+            // Capacity exhausted: stop sampling further ops rather than
+            // erroring mid-eval. The report will show fewer segments.
+            Err(_) => self.armed = None,
+        }
     }
 
     /// Borrow the current compute encoder, opening one on first use.
@@ -60,9 +99,38 @@ impl<'d> Commands<'d> {
     /// [`Commands::commit_and_wait`] closes it.
     pub(crate) fn encoder(&mut self) -> Result<&ProtocolObject<dyn MTLComputeCommandEncoder>> {
         if self.encoder.is_none() {
-            let enc = self.cmd.computeCommandEncoder().ok_or(Error::AppleApi {
-                context: "MTLCommandBuffer::computeCommandEncoder",
-            })?;
+            let enc = if let Some((start, end)) = self.armed.take() {
+                let sampler = self
+                    .sampler
+                    .as_ref()
+                    .expect("armed implies a sampler is present");
+                let descriptor = MTLComputePassDescriptor::computePassDescriptor();
+                let attachment = {
+                    // SAFETY: index 0 is always valid on the attachment
+                    // array — it is allocated with at least one slot.
+                    unsafe {
+                        descriptor
+                            .sampleBufferAttachments()
+                            .objectAtIndexedSubscript(0)
+                    }
+                };
+                attachment.setSampleBuffer(Some(sampler.buffer()));
+                // SAFETY: start/end are reserved indices < the buffer's
+                // sampleCount (GpuSampler::reserve enforces the bound).
+                unsafe {
+                    attachment.setStartOfEncoderSampleIndex(start);
+                    attachment.setEndOfEncoderSampleIndex(end);
+                }
+                self.cmd
+                    .computeCommandEncoderWithDescriptor(&descriptor)
+                    .ok_or(Error::AppleApi {
+                        context: "MTLCommandBuffer::computeCommandEncoderWithDescriptor",
+                    })?
+            } else {
+                self.cmd.computeCommandEncoder().ok_or(Error::AppleApi {
+                    context: "MTLCommandBuffer::computeCommandEncoder",
+                })?
+            };
             self.encoder = Some(enc);
         }
         Ok(self.encoder.as_ref().expect("just inserted"))
@@ -78,6 +146,21 @@ impl<'d> Commands<'d> {
         self.cmd.commit();
         self.cmd.waitUntilCompleted();
         Ok(())
+    }
+
+    /// Profiling-only sibling of [`Commands::commit_and_wait`]: closes the
+    /// encoder, commits, waits, then resolves per-op GPU-tick segments.
+    /// Returns an empty vec if this session has no sampler.
+    pub fn commit_wait_resolve(mut self) -> Result<Vec<GpuSegment>> {
+        if let Some(enc) = self.encoder.take() {
+            enc.endEncoding();
+        }
+        self.cmd.commit();
+        self.cmd.waitUntilCompleted();
+        match self.sampler.as_ref() {
+            Some(sampler) => sampler.resolve(),
+            None => Ok(Vec::new()),
+        }
     }
 }
 
@@ -98,5 +181,12 @@ impl Device {
     /// Begin a new [`Commands`] session on this device's queue.
     pub fn commands(&self) -> Result<Commands<'_>> {
         Commands::new(self)
+    }
+
+    /// Begin a profiled [`Commands`] session sized for `op_capacity`
+    /// dispatches. Caller must ensure the device supports stage-boundary
+    /// sampling (see [`Device::supports_stage_boundary_sampling`]).
+    pub fn commands_profiled(&self, op_capacity: usize) -> Result<Commands<'_>> {
+        Commands::new_profiled(self, op_capacity)
     }
 }
