@@ -6,9 +6,9 @@
 //! library; pipeline-build cost is one-time per kernel name. Subsequent
 //! lookups for the same name hit the in-memory cache.
 //!
-//! The crate ships three pre-built libraries from vendored MLX sources:
-//! [`KernelLibrary::copy`], [`KernelLibrary::binary`], and
-//! [`KernelLibrary::quantized`]. All three wrap
+//! The crate ships pre-built libraries for the vendored kernel groups
+//! (copy, binary, unary, reduce, rope, softmax, quantized, matmul,
+//! `sdpa_vector`), each compiled on first use. All wrap
 //! [`KernelLibrary::from_source`], which is also public for callers
 //! that want to compile their own inline MSL (e.g. one-off kernels).
 //!
@@ -206,7 +206,10 @@ impl KernelLibrary {
     }
 
     /// Compile the vendored `sdpa_vector` kernels (single-pass vector
-    /// attention; decode path). See `KernelLibrary::copy` for caching
+    /// attention; decode path). All instantiations require
+    /// `[[function_constant]]` specialization — use
+    /// [`Self::pipeline_specialized`], not
+    /// [`Self::pipeline`]. See [`Self::copy`] for caching
     /// semantics at the runtime layer.
     pub fn sdpa_vector(device: &Device) -> Result<Self> {
         Self::from_source(device, SDPA_VECTOR_SOURCE)
