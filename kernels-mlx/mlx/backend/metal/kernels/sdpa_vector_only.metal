@@ -1,15 +1,11 @@
 // Copyright © 2024-25 Apple Inc.
 //
-// Single-pass sdpa_vector instantiations only (cider-press Plan A).
-// MLX's upstream scaled_dot_product_attention.metal also instantiates
-// the 2pass split-K variant; that lands later.
-
-#include <metal_stdlib>
+// Single-pass sdpa_vector instantiations only. The 2pass split-K variant
+// (sdpa_vector_2pass_{1,2}) is omitted here; it will be instantiated when
+// split-K dispatch lands. See docs/superpowers/plans/2026-05-30-fused-sdpa-A-vector.md.
 
 #include "mlx/backend/metal/kernels/utils.h"
 #include "mlx/backend/metal/kernels/sdpa_vector.h"
-
-using namespace metal;
 
 #define instantiate_sdpa_vector(type, qk_dim, value_dim)  \
   instantiate_kernel(                                      \
