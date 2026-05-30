@@ -43,6 +43,7 @@ pub(crate) fn op_kind_label(kind: &OpKind) -> &'static str {
         OpKind::Softmax { .. } => "softmax",
         OpKind::MatMul => "matmul",
         OpKind::SliceUpdate { .. } => "slice_update",
+        OpKind::Sdpa { .. } => "sdpa",
     }
 }
 
@@ -217,6 +218,7 @@ fn gpu_key(label: &'static str) -> &'static str {
         "softmax" => "gpu.softmax",
         "matmul" => "gpu.matmul",
         "slice_update" => "gpu.slice_update",
+        "sdpa" => "gpu.sdpa",
         _ => "gpu.other",
     }
 }
