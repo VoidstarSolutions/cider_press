@@ -62,9 +62,10 @@ impl GpuSampler {
         let descriptor = MTLCounterSampleBufferDescriptor::new();
         descriptor.setCounterSet(Some(&counter_set));
         descriptor.setStorageMode(MTLStorageMode::Shared);
-        // SAFETY: sample_count fits the device max (caller bounds it to
-        // one token; verified against maxCounterSampleBufferLength at
-        // call sites). Setting a count is always valid.
+        // SAFETY: `setSampleCount` is a plain ObjC setter; any usize is a
+        // valid argument. An out-of-range count is caught by the device
+        // below (newCounterSampleBufferWithDescriptor returns NSError),
+        // not by this call.
         unsafe { descriptor.setSampleCount(sample_count) };
 
         let buffer = device
@@ -127,7 +128,8 @@ impl GpuSampler {
             return Ok(Vec::new());
         }
         let range = NSRange::new(0, self.cursor);
-        // SAFETY: range covers only the indices we reserved (< capacity).
+        // SAFETY: `buffer` is a valid `Retained<>` ObjC object; the range
+        // [0, cursor) covers only indices we reserved (cursor <= capacity_samples).
         let data = unsafe { self.buffer.resolveCounterRange(range) }.ok_or(Error::AppleApi {
             context: "MTLCounterSampleBuffer::resolveCounterRange returned nil",
         })?;
