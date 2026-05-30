@@ -75,6 +75,32 @@ impl Generator {
         }
     }
 
+    /// Run one decode-step forward (`T = 1`, no mask, offset = the current
+    /// cache position) through the profiling-only [`Tensor::profiled_eval`],
+    /// recording per-OpKind GPU time into the `profile` GPU store.
+    ///
+    /// `last_id` is the most recently sampled token; the caches must hold
+    /// the full preceding context (call this *after* draining a
+    /// [`GenerateIter`]), so the graph is a realistic full-context decode
+    /// step rather than a cold `T = 1`. Note this advances the caches by one
+    /// row as a side effect — intended for one-shot profiling, not resumable
+    /// generation.
+    ///
+    /// # Errors
+    /// Tensor construction, forward, or `profiled_eval` failure.
+    #[doc(hidden)]
+    pub fn profiled_decode_step(&mut self, last_id: u32) -> Result<()> {
+        let device = Device::shared()?;
+        let pos = self.caches.first().map_or(0, KvCache::position);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let pos_i32 = pos as i32;
+        let ids = Tensor::from_slice(&device, &[last_id], [1, 1])?;
+        let offset = Tensor::from_slice(&device, &[pos_i32], [1])?;
+        let logits = self.model.forward(&ids, None, &offset, &mut self.caches)?;
+        logits.profiled_eval()?;
+        Ok(())
+    }
+
     /// Greedy-decode up to `max_new_tokens` ids from `input_ids`.
     ///
     /// Runs prefill (one forward at `T = input_ids.len()`, offset=0,

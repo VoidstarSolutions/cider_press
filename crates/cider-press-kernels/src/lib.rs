@@ -28,6 +28,7 @@ mod buffer;
 mod commands;
 mod device;
 mod error;
+mod gpu_sampler;
 pub mod kernels;
 mod library;
 
@@ -35,4 +36,5 @@ pub use buffer::Buffer;
 pub use commands::Commands;
 pub use device::Device;
 pub use error::{Error, Result};
+pub use gpu_sampler::{GpuSampler, GpuSegment};
 pub use library::{FunctionConstant, KernelLibrary, Pipeline};

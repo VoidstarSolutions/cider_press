@@ -89,3 +89,74 @@ fn eval_emits_encode_and_wait_spans() {
         eval.1,
     );
 }
+
+#[test]
+fn gpu_accumulator_sums_by_label_with_counts() {
+    profile::reset();
+    profile::record_gpu("gpu.qmv", 1000);
+    profile::record_gpu("gpu.qmv", 500);
+    profile::record_gpu("gpu.copy", 200);
+
+    let stats = profile::drain_gpu();
+    let qmv = stats.iter().find(|(n, _, _)| *n == "gpu.qmv").expect("qmv");
+    let copy = stats
+        .iter()
+        .find(|(n, _, _)| *n == "gpu.copy")
+        .expect("copy");
+    assert_eq!(qmv.1, 1500, "summed ns");
+    assert_eq!(qmv.2, 2, "two hits");
+    assert_eq!(copy.1, 200);
+    assert_eq!(copy.2, 1);
+    // drain clears
+    assert!(profile::drain_gpu().is_empty());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn profiled_eval_buckets_gpu_time_by_kind() {
+    use cider_press_runtime::{Device, Tensor};
+    use half::bf16;
+
+    let device = Device::system_default().expect("Metal device");
+    if !device.supports_stage_boundary_sampling() {
+        eprintln!("SKIP: no stage-boundary sampling");
+        return;
+    }
+    profile::reset();
+
+    let a = Tensor::from_slice(&device, &[bf16::ONE; 64], [1, 64]).expect("a");
+    let b = Tensor::from_slice(&device, &[bf16::ONE; 64], [1, 64]).expect("b");
+    let c = a.add(&b).expect("add");
+    let d = c.mul(&a).expect("mul");
+    d.profiled_eval().expect("profiled eval");
+
+    let gpu = profile::drain_gpu();
+    let binary = gpu
+        .iter()
+        .find(|(n, _, _)| *n == "gpu.binary")
+        .expect("binary segments recorded");
+    assert_eq!(binary.2, 2, "two binary dispatches");
+    assert!(binary.1 > 0, "nonzero gpu ns");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn profiled_eval_errors_clearly_without_sampling_support() {
+    use cider_press_runtime::{Device, Tensor};
+    use half::bf16;
+
+    let device = Device::system_default().expect("Metal device");
+    let a = Tensor::from_slice(&device, &[bf16::ONE; 16], [1, 16]).expect("a");
+    let g = a.add(&a).expect("add");
+
+    let result = g.profiled_eval();
+    if device.supports_stage_boundary_sampling() {
+        assert!(result.is_ok(), "supported device should profile cleanly");
+    } else {
+        let err = result.expect_err("unsupported device must error, not panic");
+        assert!(
+            format!("{err}").contains("stage-boundary"),
+            "error should name the missing capability: {err}"
+        );
+    }
+}

@@ -64,9 +64,41 @@ mod imp {
         }
     }
 
+    thread_local! {
+        static GPU_PROFILER: RefCell<Vec<(&'static str, u64, u64)>> =
+            const { RefCell::new(Vec::new()) };
+    }
+
+    /// Record `ns` of GPU time under `name`, accumulating with hit count.
+    /// Separate from the wall-clock span store: these are resolved GPU
+    /// counter intervals, not RAII span lifetimes.
+    pub fn record_gpu(name: &'static str, ns: u64) {
+        GPU_PROFILER.with(|p| {
+            let mut v = p.borrow_mut();
+            if let Some(entry) = v.iter_mut().find(|(n, _, _)| *n == name) {
+                entry.1 += ns;
+                entry.2 += 1;
+            } else {
+                v.push((name, ns, 1));
+            }
+        });
+    }
+
+    /// Take and clear accumulated GPU segments, sorted by name:
+    /// `(name, total_ns, hit_count)`.
+    #[must_use]
+    pub fn drain_gpu() -> Vec<(&'static str, u64, u64)> {
+        GPU_PROFILER.with(|p| {
+            let mut out = std::mem::take(&mut *p.borrow_mut());
+            out.sort_by_key(|e| e.0);
+            out
+        })
+    }
+
     /// Clear all accumulated spans on the current thread.
     pub fn reset() {
         PROFILER.with(|p| p.borrow_mut().clear());
+        GPU_PROFILER.with(|p| p.borrow_mut().clear());
     }
 
     /// Take and clear the accumulated spans, sorted by name:
@@ -109,6 +141,15 @@ mod imp {
         Vec::new()
     }
 
+    #[inline]
+    pub fn record_gpu(_name: &'static str, _ns: u64) {}
+
+    #[inline]
+    #[must_use]
+    pub fn drain_gpu() -> Vec<(&'static str, u64, u64)> {
+        Vec::new()
+    }
+
     /// Whether the `profiling` feature was compiled in.
     #[inline]
     #[must_use]
@@ -117,4 +158,4 @@ mod imp {
     }
 }
 
-pub use imp::{Span, drain, is_enabled, reset, span};
+pub use imp::{Span, drain, drain_gpu, is_enabled, record_gpu, reset, span};

@@ -94,6 +94,13 @@ struct BenchArgs {
     /// Skip `ChatTemplate` rendering; encode the bare --prompt.
     #[arg(long)]
     no_chat_template: bool,
+    /// Run one timed decode token through the profiled eval (one sampled
+    /// compute encoder per dispatch) to print a per-OpKind GPU-time
+    /// breakdown. Perturbs the encode regime; the production
+    /// encode/wait spans are still reported from the normal eval. No-op
+    /// without --features profiling.
+    #[arg(long)]
+    gpu_profile: bool,
 }
 
 /// Shared load result for both subcommands.
@@ -212,8 +219,9 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
     } else {
         None
     };
+    let mut last_id: Option<u32> = None;
     for id_result in iter {
-        let _ = id_result?;
+        last_id = Some(id_result?);
         produced += 1;
         if produced == args.warmup {
             profile::reset();
@@ -226,9 +234,22 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
         decode_dur = t.elapsed();
     }
 
+    // Capture the timed-window wall-clock spans BEFORE the optional profiled
+    // GPU-profile token runs. `gpu_profile_token` performs a real
+    // `model.forward`, whose KvCache updates emit `kvcache.update` spans that
+    // would otherwise contaminate this table. The GPU table is a separate
+    // store (`record_gpu`) drained later, so it is unaffected.
+    let spans = profile::drain();
+
+    if args.gpu_profile {
+        // generate() rejects max_tokens == 0, so last_id is always Some here.
+        if let Some(id) = last_id {
+            gpu_profile_token(&mut generator, id)?;
+        }
+    }
+
     let rss_post_decode = cider_press::sys::resident_bytes();
     let rss_peak = cider_press::sys::peak_resident_bytes();
-    let spans = profile::drain();
 
     // ---- report ----
     let prefill_tok_s = prompt_len as f64 / prefill_dur.as_secs_f64();
@@ -261,25 +282,84 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
     print_rss("  rss post-dec ", rss_post_decode);
     print_rss("  rss peak     ", rss_peak);
     println!();
+    print_span_breakdown(&spans);
+
     if profile::is_enabled() {
-        println!("  span breakdown (timed decode window):");
-        println!(
-            "    {:<18} {:>10} {:>8} {:>12}",
-            "span", "total/ms", "hits", "us/hit"
-        );
-        for (name, total, hits) in &spans {
-            let total_ms = total.as_secs_f64() * 1e3;
-            let us_hit = if *hits == 0 {
-                0.0
-            } else {
-                total.as_secs_f64() * 1e6 / *hits as f64
-            };
-            println!("    {name:<18} {total_ms:>10.3} {hits:>8} {us_hit:>12.2}");
-        }
-    } else {
-        println!("  (span breakdown unavailable; rebuild with --features profiling)");
+        print_gpu_breakdown(&profile::drain_gpu());
+    } else if args.gpu_profile {
+        println!("  (gpu breakdown unavailable; rebuild with --features profiling)");
     }
     Ok(())
+}
+
+/// After the timed window, run ONE more token through the profiled eval for a
+/// per-OpKind GPU breakdown. Outside the timed window so it doesn't skew
+/// tok/s; one token suffices (the counter sample buffer is sized per token).
+/// The generator's caches still hold the full generated context, so this is a
+/// realistic full-context decode step (T=1 at the current cache position), not
+/// a cold T=1.
+fn gpu_profile_token(generator: &mut Generator, last_id: u32) -> Result<(), BoxError> {
+    if !profile::is_enabled() {
+        eprintln!("  (--gpu-profile ignored; rebuild with --features profiling)");
+        return Ok(());
+    }
+    generator.profiled_decode_step(last_id)?;
+    Ok(())
+}
+
+/// Print the wall-clock span breakdown for the timed decode window. When
+/// profiling is disabled the spans are empty, so print the standard note.
+#[allow(clippy::cast_precision_loss)]
+fn print_span_breakdown(spans: &[(&'static str, std::time::Duration, u64)]) {
+    if !profile::is_enabled() {
+        println!("  (span breakdown unavailable; rebuild with --features profiling)");
+        return;
+    }
+    println!("  span breakdown (timed decode window):");
+    println!(
+        "    {:<18} {:>10} {:>8} {:>12}",
+        "span", "total/ms", "hits", "us/hit"
+    );
+    for (name, total, hits) in spans {
+        let total_ms = total.as_secs_f64() * 1e3;
+        let us_hit = if *hits == 0 {
+            0.0
+        } else {
+            total.as_secs_f64() * 1e6 / *hits as f64
+        };
+        println!("    {name:<18} {total_ms:>10.3} {hits:>8} {us_hit:>12.2}");
+    }
+}
+
+/// Print the per-OpKind GPU-time breakdown from `profiled_eval`. No-op when
+/// the slice is empty (no `--gpu-profile`, or feature off).
+#[allow(clippy::cast_precision_loss)]
+fn print_gpu_breakdown(gpu: &[(&'static str, u64, u64)]) {
+    if gpu.is_empty() {
+        return;
+    }
+    let grand_total: u64 = gpu.iter().map(|(_, ns, _)| *ns).sum();
+    println!();
+    println!("  GPU breakdown (counter-sampled, one token; perturbed regime —");
+    println!("  compare shares within, not against the production wait span):");
+    println!(
+        "    {:<20} {:>10} {:>11} {:>12} {:>8}",
+        "kind", "total/ms", "dispatches", "us/dispatch", "% gpu"
+    );
+    for (name, ns, count) in gpu {
+        let ms = *ns as f64 / 1e6;
+        let us_disp = if *count == 0 {
+            0.0
+        } else {
+            *ns as f64 / 1e3 / *count as f64
+        };
+        let pct = if grand_total == 0 {
+            0.0
+        } else {
+            *ns as f64 * 100.0 / grand_total as f64
+        };
+        println!("    {name:<20} {ms:>10.3} {count:>11} {us_disp:>12.2} {pct:>7.1}%");
+    }
 }
 
 #[allow(clippy::cast_precision_loss)]

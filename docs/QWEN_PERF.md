@@ -111,6 +111,58 @@ Reading it:
 - **`argmax` is ~4%** — the bf16 `cpu_to_vec` + scan over the ~151 k
   vocab, ~500 µs/token. Real but not the bottleneck.
 
+### GPU breakdown by op kind (counter-sampled)
+
+`bench --gpu-profile` (with `--features profiling`) runs one real decode
+token through per-dispatch stage-boundary counter sampling, attributing
+GPU time to each `OpKind`. This is a **perturbed regime**: Apple Silicon
+exposes only stage-boundary (not dispatch-boundary) counter sampling, so
+each sampled dispatch gets its own compute encoder — extra encoders, and
+the lost cross-dispatch overlap inflate absolute time. The shares below
+are therefore **within-table** (how the GPU's own work divides), **not**
+comparable to the production `tensor.eval.wait` total. Representative
+warm run (the first invocation pays the one-time Metal JIT compile;
+numbers are from the second):
+
+| kind             | total (ms) | dispatches | µs/dispatch | % gpu |
+|------------------|-----------:|-----------:|------------:|------:|
+| quantized_matmul |      1.968 |        169 |       11.64 | 29.9% |
+| copy             |      1.304 |        266 |        4.90 | 19.8% |
+| binary           |      1.217 |        388 |        3.14 | 18.5% |
+| matmul           |      1.075 |         48 |       22.40 | 16.4% |
+| unary            |      0.314 |        122 |        2.58 |  4.8% |
+| reduce           |      0.266 |         49 |        5.43 |  4.0% |
+| rope             |      0.198 |         48 |        4.12 |  3.0% |
+| slice_update     |      0.131 |         48 |        2.73 |  2.0% |
+| softmax          |      0.088 |         24 |        3.66 |  1.3% |
+| gather           |      0.013 |          3 |        4.19 |  0.2% |
+| dequantize       |      0.003 |          1 |        2.92 |  0.0% |
+
+Reading it:
+
+- **`quantized_matmul` (qmv) is the single largest bucket at ~30%** — the
+  4-bit weight matvecs (every projection and MLP linear at T=1). These are
+  the vendored MLX kernel and memory-bound, near the bandwidth roofline;
+  there is little headroom in the kernel itself.
+- **The attention copy/score-matmul chain is collectively comparable and
+  removable.** `copy` (~20%) is dominated by the ~11 materializing
+  `permute().copy()`s per layer that feed the contiguous-only matmul
+  kernel; `matmul` (~16%) is the two small SDPA score matmuls (`q@kᵀ`,
+  `probs@v`). Together they are **~36% of GPU time** — more than qmv — and
+  a flash-attention-style fused kernel that reads strided K/V in place
+  removes essentially all of it. This validates **"fused attention / fewer
+  copies" as the top GPU-side lever** (see below): qmv is at its floor,
+  but the copy/score-matmul chain is pure overhead. The `binary` bucket
+  (~19%, 388 dispatches) is the elementwise add/mul scatter across
+  residuals, RoPE, and SwiGLU — broadly distributed, not a single target.
+- **Total dispatch count is ~1166/token**, confirming the
+  ~1000-dispatch-per-token estimate cited above (the encode-side cost).
+
+These are perturbed-regime GPU-*internal* shares. The production
+decode-step split is still the ~62% GPU / ~38% CPU-encode from the
+encode/wait table above; this subsection only resolves how that GPU half
+divides across op kinds.
+
 ## Memory
 
 | mark        | cider-press RSS |

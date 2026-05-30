@@ -1962,6 +1962,16 @@ impl Tensor {
         crate::eval::eval(self)
     }
 
+    /// Profiling-only eval: like [`Tensor::eval`], but times each
+    /// dispatch's GPU execution via stage-boundary counter sampling and
+    /// records per-[`OpKind`] GPU totals into [`crate::profile`]. One
+    /// sampled encoder per dispatch perturbs the encode regime — read the
+    /// GPU breakdown alongside, not instead of, the production eval spans.
+    /// Errors on devices without stage-boundary counter sampling.
+    pub fn profiled_eval(&self) -> Result<()> {
+        crate::eval::profiled_eval(self)
+    }
+
     /// Logical shape of this tensor.
     #[must_use]
     pub fn shape(&self) -> &Shape {
