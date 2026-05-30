@@ -301,6 +301,22 @@ pub enum OpKind {
         /// row lands. Byte offset is `offset_rows * (n_kv_heads * head_dim) * 2`.
         offset_rows: usize,
     },
+    /// Fused scaled-dot-product attention. Inputs (in
+    /// [`Tensor::op_inputs`] order) are `[q, k, v]` plus an optional
+    /// `mask`. `q` is dense `[1, H_q, T_q, D]`; `k`/`v` are the
+    /// [`KvCache`](crate::KvCache) views `[1, H_kv, T_cache, D]`, read
+    /// strided in place. Output is dense `[1, H_q, T_q, D]`. The decode
+    /// (vector) kernel handles GQA via `gqa_factor`.
+    Sdpa {
+        /// Softmax scale (typically `1/sqrt(head_dim)`).
+        scale: f32,
+        /// Per-head dimension `D`.
+        head_dim: usize,
+        /// `H_q / H_kv` — query heads per kv head.
+        gqa_factor: usize,
+        /// Apply a causal mask (false for decode `T_q=1` full attention).
+        causal: bool,
+    },
 }
 
 /// Element-wise binary operations supported by [`OpKind::Binary`].
@@ -1649,6 +1665,78 @@ impl Tensor {
             layout,
             OpKind::MatMul,
             vec![self.clone(), other.clone()],
+        ))
+    }
+
+    /// Fused scaled-dot-product attention (lazy). `q` `[1, H_q, T_q, D]`,
+    /// `k`/`v` `[1, H_kv, T_cache, D]` (typically [`KvCache`](crate::KvCache)
+    /// views, read strided), optional additive `mask`. Returns
+    /// `[1, H_q, T_q, D]`.
+    ///
+    /// Validates `head_dim` ∈ {64, 96, 128, 256} (the vector kernel's
+    /// supported set), BF16 dtype, rank-4 shapes, and GQA divisibility at
+    /// construction.
+    pub fn sdpa(
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        mask: Option<&Tensor>,
+        scale: f32,
+        gqa_factor: usize,
+        causal: bool,
+    ) -> Result<Tensor> {
+        const SUPPORTED_HEAD_DIMS: [usize; 4] = [64, 96, 128, 256];
+        let qd = q.shape().dims();
+        let kd = k.shape().dims();
+        let vd = v.shape().dims();
+        if qd.len() != 4 || kd.len() != 4 || vd.len() != 4 {
+            return Err(Error::InvalidArgument(format!(
+                "sdpa: q/k/v must be rank-4 [1,H,T,D]; got {qd:?}, {kd:?}, {vd:?}"
+            )));
+        }
+        let head_dim = qd[3];
+        if !SUPPORTED_HEAD_DIMS.contains(&head_dim) {
+            return Err(Error::InvalidArgument(format!(
+                "sdpa: head_dim {head_dim} unsupported (vector kernel supports {SUPPORTED_HEAD_DIMS:?})"
+            )));
+        }
+        if kd[3] != head_dim || vd[3] != head_dim {
+            return Err(Error::InvalidArgument(format!(
+                "sdpa: k/v head_dim must equal q's ({head_dim}); got k={}, v={}",
+                kd[3], vd[3]
+            )));
+        }
+        if q.dtype() != DType::BF16 || k.dtype() != DType::BF16 || v.dtype() != DType::BF16 {
+            return Err(Error::InvalidArgument("sdpa: q/k/v must be BF16".into()));
+        }
+        if gqa_factor == 0 || qd[1] != kd[1] * gqa_factor {
+            return Err(Error::InvalidArgument(format!(
+                "sdpa: H_q ({}) must equal H_kv ({}) * gqa_factor ({gqa_factor})",
+                qd[1], kd[1]
+            )));
+        }
+        let device =
+            q.inner.device.as_ref().ok_or_else(|| {
+                Error::InvalidArgument("sdpa: q has no device (placeholder?)".into())
+            })?;
+        let out_shape = Shape::from(vec![qd[0], qd[1], qd[2], head_dim]);
+        let layout = dense_layout(&out_shape);
+        let mut inputs = vec![q.clone(), k.clone(), v.clone()];
+        if let Some(m) = mask {
+            inputs.push(m.clone());
+        }
+        Ok(Self::op_tensor(
+            device,
+            out_shape,
+            DType::BF16,
+            layout,
+            OpKind::Sdpa {
+                scale,
+                head_dim,
+                gqa_factor,
+                causal,
+            },
+            inputs,
         ))
     }
 

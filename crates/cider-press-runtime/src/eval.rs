@@ -377,6 +377,12 @@ fn dispatch(
         OpKind::SliceUpdate { offset_rows } => {
             dispatch_slice_update(inner, op, commands, outputs, dst, index_of, offset_rows)
         }
+        // TODO(Task 6): wire dispatch_sdpa_vector_bf16. Temporary error
+        // arm keeps the crate compiling; construction/validation does not
+        // eval, so the validation test passes without a real dispatch.
+        OpKind::Sdpa { .. } => Err(Error::InvalidArgument(
+            "sdpa: eval dispatch not wired yet (Task 6)".into(),
+        )),
     }
 }
 
