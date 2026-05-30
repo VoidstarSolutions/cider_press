@@ -96,8 +96,7 @@ impl GpuSampler {
     }
 
     /// The underlying sample buffer, for attaching to a compute pass
-    /// descriptor. Consumed by the profiled-eval path in a later task.
-    #[allow(dead_code)]
+    /// descriptor.
     pub(crate) fn buffer(&self) -> &ProtocolObject<dyn MTLCounterSampleBuffer> {
         &self.buffer
     }
@@ -105,8 +104,7 @@ impl GpuSampler {
     /// Reserve the next (start, end) index pair for an op labelled
     /// `label`, recording the segment. Returns `(start_idx, end_idx)` to
     /// bind into a compute pass descriptor. Errors if capacity is
-    /// exhausted. Consumed by the profiled-eval path in a later task.
-    #[allow(dead_code)]
+    /// exhausted.
     pub(crate) fn reserve(&mut self, label: &'static str) -> Result<(usize, usize)> {
         let start = self.cursor;
         let end = start + 1;
