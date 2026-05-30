@@ -89,3 +89,24 @@ fn eval_emits_encode_and_wait_spans() {
         eval.1,
     );
 }
+
+#[test]
+fn gpu_accumulator_sums_by_label_with_counts() {
+    profile::reset();
+    profile::record_gpu("gpu.qmv", 1000);
+    profile::record_gpu("gpu.qmv", 500);
+    profile::record_gpu("gpu.copy", 200);
+
+    let stats = profile::drain_gpu();
+    let qmv = stats.iter().find(|(n, _, _)| *n == "gpu.qmv").expect("qmv");
+    let copy = stats
+        .iter()
+        .find(|(n, _, _)| *n == "gpu.copy")
+        .expect("copy");
+    assert_eq!(qmv.1, 1500, "summed ns");
+    assert_eq!(qmv.2, 2, "two hits");
+    assert_eq!(copy.1, 200);
+    assert_eq!(copy.2, 1);
+    // drain clears
+    assert!(profile::drain_gpu().is_empty());
+}
