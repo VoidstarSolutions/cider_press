@@ -110,3 +110,31 @@ fn gpu_accumulator_sums_by_label_with_counts() {
     // drain clears
     assert!(profile::drain_gpu().is_empty());
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn profiled_eval_buckets_gpu_time_by_kind() {
+    use cider_press_runtime::{Device, Tensor};
+    use half::bf16;
+
+    let device = Device::system_default().expect("Metal device");
+    if !device.supports_stage_boundary_sampling() {
+        eprintln!("SKIP: no stage-boundary sampling");
+        return;
+    }
+    profile::reset();
+
+    let a = Tensor::from_slice(&device, &[bf16::ONE; 64], [1, 64]).expect("a");
+    let b = Tensor::from_slice(&device, &[bf16::ONE; 64], [1, 64]).expect("b");
+    let c = a.add(&b).expect("add");
+    let d = c.mul(&a).expect("mul");
+    d.profiled_eval().expect("profiled eval");
+
+    let gpu = profile::drain_gpu();
+    let binary = gpu
+        .iter()
+        .find(|(n, _, _)| *n == "gpu.binary")
+        .expect("binary segments recorded");
+    assert_eq!(binary.2, 2, "two binary dispatches");
+    assert!(binary.1 > 0, "nonzero gpu ns");
+}

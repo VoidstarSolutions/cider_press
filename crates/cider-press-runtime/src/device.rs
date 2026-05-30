@@ -152,6 +152,13 @@ impl Device {
         &self.inner.kernels
     }
 
+    /// Whether this device supports GPU stage-boundary counter sampling,
+    /// the prerequisite for [`Tensor::profiled_eval`](crate::Tensor::profiled_eval).
+    #[must_use]
+    pub fn supports_stage_boundary_sampling(&self) -> bool {
+        self.kernels().supports_stage_boundary_sampling()
+    }
+
     /// Lazily JIT-compile and cache MLX's `copy.metal` library.
     ///
     /// First call pays the JIT cost (sub-100 ms warm — Metal caches

@@ -134,6 +134,91 @@ pub(crate) fn eval(root: &Tensor) -> Result<()> {
     Ok(())
 }
 
+/// Profiling-only eval: one sampled compute encoder per dispatch, so GPU
+/// time can be attributed per [`OpKind`]. Perturbs the encode regime
+/// (extra encoders, lost cross-dispatch overlap) — read its GPU
+/// breakdown alongside the production `tensor.eval.encode`/`.wait` spans,
+/// never as a replacement. Errors if the device lacks stage-boundary
+/// counter sampling.
+pub(crate) fn profiled_eval(root: &Tensor) -> Result<()> {
+    let mut visited: HashSet<*const TensorInner> = HashSet::new();
+    let mut order: Vec<Arc<TensorInner>> = Vec::new();
+    visit(&root.inner, &mut visited, &mut order);
+    if order.is_empty() {
+        return Ok(());
+    }
+    let device =
+        root.inner.device.as_ref().ok_or_else(|| {
+            Error::InvalidArgument("profiled_eval: placeholder has no device".into())
+        })?;
+    if !device.kernels().supports_stage_boundary_sampling() {
+        return Err(Error::InvalidArgument(
+            "profiled_eval: device does not support stage-boundary counter sampling".into(),
+        ));
+    }
+    let mut commands = device.kernels().commands_profiled(order.len())?;
+    let mut index_of: HashMap<*const TensorInner, usize> = HashMap::new();
+    for (i, inner) in order.iter().enumerate() {
+        index_of.insert(Arc::as_ptr(inner), i);
+    }
+    let mut outputs: Vec<Buffer<u8>> = Vec::with_capacity(order.len());
+    for inner in &order {
+        let op = inner
+            .op
+            .as_ref()
+            .expect("topo invariant: only op nodes are in `order`");
+        commands.begin_profiled_op(op_kind_label(&op.kind));
+        let mut dst = if let OpKind::SliceUpdate { .. } = op.kind {
+            let slab = op.inputs.first().ok_or_else(|| {
+                Error::InvalidArgument("SliceUpdate: missing slab input (inputs[0])".into())
+            })?;
+            dense_input_buffer(slab, &outputs, &index_of)?
+        } else {
+            let byte_count = checked_byte_count(&inner.shape, inner.dtype)?;
+            device.kernels().alloc_buffer::<u8>(byte_count)?
+        };
+        dispatch(inner, &mut commands, &outputs, &mut dst, &index_of)?;
+        outputs.push(dst);
+    }
+
+    let segments = commands.commit_wait_resolve()?;
+    let period_ns = device.kernels().gpu_timestamp_period_ns();
+    for seg in &segments {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let ns = (seg.ticks() as f64 * period_ns) as u64;
+        crate::profile::record_gpu(gpu_key(seg.label), ns);
+    }
+
+    for (inner, buffer) in order.into_iter().zip(outputs) {
+        let _ = inner.cache.set(LeafStorage::Dense(buffer));
+    }
+
+    Ok(())
+}
+
+/// Map an op-kind label to its `gpu.<label>` profile key. Static strings
+/// so the profile accumulator keys stay `&'static str`.
+fn gpu_key(label: &'static str) -> &'static str {
+    match label {
+        "copy" => "gpu.copy",
+        "quantized_matmul" => "gpu.quantized_matmul",
+        "binary" => "gpu.binary",
+        "unary" => "gpu.unary",
+        "reduce" => "gpu.reduce",
+        "gather" => "gpu.gather",
+        "dequantize" => "gpu.dequantize",
+        "rope" => "gpu.rope",
+        "softmax" => "gpu.softmax",
+        "matmul" => "gpu.matmul",
+        "slice_update" => "gpu.slice_update",
+        _ => "gpu.other",
+    }
+}
+
 fn visit(
     inner: &Arc<TensorInner>,
     visited: &mut HashSet<*const TensorInner>,
