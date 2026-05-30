@@ -17,7 +17,7 @@ fn device_reports_stage_boundary_sampling_support() {
     }
     let period = device.gpu_timestamp_period_ns();
     assert!(
-        period > 0.0 && period.is_finite(),
-        "gpu timestamp period must be a positive finite ns/tick, got {period}"
+        (0.1..=10_000.0).contains(&period),
+        "gpu timestamp period ns/tick out of sane range, got {period}"
     );
 }

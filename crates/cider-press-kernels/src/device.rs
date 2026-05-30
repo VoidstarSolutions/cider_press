@@ -133,7 +133,7 @@ impl Device {
             .expect("commandBuffer for timestamp calibration");
         cmd.commit();
         cmd.waitUntilCompleted();
-        // SAFETY: as above.
+        // SAFETY: cpu1/gpu1 are live stack locals; same invariant as the first call.
         unsafe {
             self.device
                 .sampleTimestamps_gpuTimestamp(NonNull::from(&mut cpu1), NonNull::from(&mut gpu1));
@@ -145,7 +145,7 @@ impl Device {
         let cpu_delta = cpu1.saturating_sub(cpu0) as f64;
         #[allow(clippy::cast_precision_loss)]
         let gpu_ticks = gpu1.saturating_sub(gpu0) as f64;
-        if gpu_ticks <= 0.0 {
+        if cpu_delta <= 0.0 || gpu_ticks <= 0.0 {
             // Degenerate clock read; fall back to 1.0 (report raw ticks).
             return 1.0;
         }
