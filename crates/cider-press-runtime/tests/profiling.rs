@@ -138,3 +138,25 @@ fn profiled_eval_buckets_gpu_time_by_kind() {
     assert_eq!(binary.2, 2, "two binary dispatches");
     assert!(binary.1 > 0, "nonzero gpu ns");
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn profiled_eval_errors_clearly_without_sampling_support() {
+    use cider_press_runtime::{Device, Tensor};
+    use half::bf16;
+
+    let device = Device::system_default().expect("Metal device");
+    let a = Tensor::from_slice(&device, &[bf16::ONE; 16], [1, 16]).expect("a");
+    let g = a.add(&a).expect("add");
+
+    let result = g.profiled_eval();
+    if device.supports_stage_boundary_sampling() {
+        assert!(result.is_ok(), "supported device should profile cleanly");
+    } else {
+        let err = result.expect_err("unsupported device must error, not panic");
+        assert!(
+            format!("{err}").contains("stage-boundary"),
+            "error should name the missing capability: {err}"
+        );
+    }
+}
