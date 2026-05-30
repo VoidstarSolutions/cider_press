@@ -9,9 +9,14 @@
 //! allocation needs the underlying [`MTLDevice`]; keeping it on
 //! [`Device`] avoids leaking the raw handle for routine work.
 
+use std::ptr::NonNull;
+
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLResourceOptions};
+use objc2_metal::{
+    MTLCommandBuffer, MTLCommandQueue, MTLCounterSamplingPoint, MTLCreateSystemDefaultDevice,
+    MTLDevice, MTLResourceOptions, MTLTimestamp,
+};
 
 use crate::buffer::Buffer;
 use crate::error::{Error, Result};
@@ -89,5 +94,61 @@ impl Device {
     #[must_use]
     pub fn metal_queue(&self) -> &ProtocolObject<dyn MTLCommandQueue> {
         &self.queue
+    }
+
+    /// Whether this device can sample GPU counters at compute
+    /// stage (encoder) boundaries. Apple Silicon supports this and only
+    /// this — never `atDispatchBoundary` (TBDR architecture). The
+    /// profiled eval requires it; production eval does not.
+    #[must_use]
+    pub fn supports_stage_boundary_sampling(&self) -> bool {
+        self.device
+            .supportsCounterSampling(MTLCounterSamplingPoint::AtStageBoundary)
+    }
+
+    /// Nanoseconds per GPU timestamp tick, from a CPU/GPU correlation
+    /// sample. GPU counter timestamps are in GPU ticks; multiply a
+    /// tick delta by this to get nanoseconds. Sampled once per call —
+    /// the ratio is stable, so callers cache it per eval.
+    #[must_use]
+    pub fn gpu_timestamp_period_ns(&self) -> f64 {
+        // Two correlated CPU(ns)/GPU(tick) anchors a few ms apart give
+        // ns-per-tick = Δcpu_ns / Δgpu_tick. A single pair can't yield a
+        // ratio, so we take two and divide the deltas. CPU timestamps
+        // from this API are already in nanoseconds.
+        let mut cpu0: MTLTimestamp = 0;
+        let mut gpu0: MTLTimestamp = 0;
+        let mut cpu1: MTLTimestamp = 0;
+        let mut gpu1: MTLTimestamp = 0;
+        // SAFETY: all four are valid stack pointers to u64 (MTLTimestamp).
+        unsafe {
+            self.device
+                .sampleTimestamps_gpuTimestamp(NonNull::from(&mut cpu0), NonNull::from(&mut gpu0));
+        }
+        // Busy a touch so the second GPU tick differs from the first.
+        // A no-op command buffer commit gives a clean GPU-clock advance.
+        let cmd = self
+            .queue
+            .commandBuffer()
+            .expect("commandBuffer for timestamp calibration");
+        cmd.commit();
+        cmd.waitUntilCompleted();
+        // SAFETY: as above.
+        unsafe {
+            self.device
+                .sampleTimestamps_gpuTimestamp(NonNull::from(&mut cpu1), NonNull::from(&mut gpu1));
+        }
+        // u64 → f64: timestamps are monotonic wall-clock nanoseconds / GPU
+        // ticks; the values fit within f64's ~53-bit mantissa for any
+        // reasonable uptime, so the precision loss is acceptable.
+        #[allow(clippy::cast_precision_loss)]
+        let cpu_delta = cpu1.saturating_sub(cpu0) as f64;
+        #[allow(clippy::cast_precision_loss)]
+        let gpu_ticks = gpu1.saturating_sub(gpu0) as f64;
+        if gpu_ticks <= 0.0 {
+            // Degenerate clock read; fall back to 1.0 (report raw ticks).
+            return 1.0;
+        }
+        cpu_delta / gpu_ticks
     }
 }
