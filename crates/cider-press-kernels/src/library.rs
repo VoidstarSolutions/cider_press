@@ -55,6 +55,10 @@ const SOFTMAX_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/softmax_inl
 /// Pre-flattened MLX `quantized.metal`, produced by `build.rs`.
 const QUANTIZED_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/quantized_inlined.metal"));
 
+/// Pre-flattened MLX `sdpa_vector_only.metal`, produced by `build.rs`.
+const SDPA_VECTOR_SOURCE: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/sdpa_vector_inlined.metal"));
+
 /// Cider-press own bf16 batched matmul (not MLX-derived). Lives next
 /// to the dispatch routine in `kernels/matmul.metal`; included
 /// directly, no `build.rs` flattening needed since there are no MLX
@@ -199,6 +203,13 @@ impl KernelLibrary {
     /// `kernels-mlx/`).
     pub fn quantized(device: &Device) -> Result<Self> {
         Self::from_source(device, QUANTIZED_SOURCE)
+    }
+
+    /// Compile the vendored `sdpa_vector` kernels (single-pass vector
+    /// attention; decode path). See `KernelLibrary::copy` for caching
+    /// semantics at the runtime layer.
+    pub fn sdpa_vector(device: &Device) -> Result<Self> {
+        Self::from_source(device, SDPA_VECTOR_SOURCE)
     }
 
     /// JIT-compile cider-press's own naive bf16 batched matmul kernel
