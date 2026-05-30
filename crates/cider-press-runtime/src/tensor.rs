@@ -287,15 +287,15 @@ pub enum OpKind {
     /// views) materialize via [`Tensor::copy`] first — same
     /// contract as `softmax` / `rope` / reductions.
     MatMul,
-    /// **Spike op.** In-place write of `src`'s rows into a persistent,
+    /// In-place write of `src`'s rows into a persistent,
     /// caller-owned slab buffer at row `offset_rows`. Inputs (in
     /// [`Tensor::op_inputs`] order) are `[slab, src]`. Unlike every
     /// other op, `eval` does NOT allocate a fresh output — it binds the
     /// slab buffer (resolved from `inputs[0]`) as the destination,
     /// encodes a copy of `src` into `slab[offset_rows..]`, and caches
     /// the slab buffer as this op's output. Output shape and dtype equal
-    /// the slab's; the output layout is dense (the spike's slab is dense).
-    /// bf16 / rank-3 slab only for the spike.
+    /// the slab's; the output layout is dense (the slab is dense).
+    /// bf16 / rank-3 slab only (the KV cache is the only consumer; broaden when another arrives).
     SliceUpdate {
         /// Row index (along axis 0 of the slab) at which `src`'s first
         /// row lands. Byte offset is `offset_rows * (n_kv_heads * head_dim) * 2`.
@@ -637,7 +637,7 @@ impl Tensor {
         ))
     }
 
-    /// **Spike:** schedule an in-place write of `src` into this slab
+    /// Schedule an in-place write of `src` into this slab
     /// tensor at row `offset_rows`, returning an [`OpKind::SliceUpdate`]
     /// op tensor whose logical shape equals the slab's.
     ///
@@ -650,7 +650,7 @@ impl Tensor {
         let device = self.inner.device.as_ref().ok_or_else(|| {
             Error::InvalidArgument("slice_update: slab is a placeholder (no device)".into())
         })?;
-        // Spike scope: bf16 / rank-3 slab. The KV cache is the only
+        // Scope: bf16 / rank-3 slab. The KV cache is the only
         // consumer and is bf16; broaden when a second consumer needs it.
         if self.inner.dtype != DType::BF16 {
             return Err(Error::InvalidArgument(format!(
