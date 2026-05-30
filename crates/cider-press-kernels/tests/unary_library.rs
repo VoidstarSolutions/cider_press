@@ -28,9 +28,9 @@ fn unary_bf16_pipelines_resolve() {
     let device = Device::system_default().expect("Metal device");
     let library = KernelLibrary::unary(&device).expect("compile unary.metal");
 
-    // Contiguous fast path: this is the kernel branch 5's
-    // `Tensor::square`/`Tensor::rsqrt` will dispatch when the input is
-    // dense and contiguous (which the rmsnorm composition always is).
+    // Contiguous fast path: this is the kernel `Tensor::square` /
+    // `Tensor::rsqrt` dispatch when the input is dense and contiguous
+    // (which the rmsnorm composition always is).
     library
         .pipeline("v_Squarebfloat16bfloat16")
         .expect("v_Squarebfloat16bfloat16 pipeline");

@@ -1,16 +1,17 @@
-//! Stage 5 of the development spike — see `CLAUDE.md`.
+//! qmv dispatch-latency benchmark.
 //!
 //! Times 1000 dispatches of `kernels::qmv::affine_qmv_bf16` at two
 //! shapes (parity dim K=N=512, production dim K=N=4096) and reports
 //! per-dispatch latency. The companion script
-//! `scripts/measure_stage5_mlx.py` does the same against MLX Python;
-//! the ratio between the two is the spike's headline number.
+//! `scripts/measure_qmv_mlx.py` does the same against MLX Python;
+//! the ratio between the two measures the graph/dispatch overhead.
 //!
-//! Stage 4 already validated correctness; this test only measures, so
-//! buffers are left at whatever values `Device::alloc_buffer` produced
-//! (Metal does not zero shared-storage allocations). The qmv kernel is
-//! data-independent in its runtime cost, so the resulting outputs are
-//! garbage but the timings are still meaningful.
+//! The qmv parity test already validated correctness; this test only
+//! measures, so buffers are left at whatever values
+//! `Device::alloc_buffer` produced (Metal does not zero shared-storage
+//! allocations). The qmv kernel is data-independent in its runtime
+//! cost, so the resulting outputs are garbage but the timings are still
+//! meaningful.
 
 #![cfg(target_os = "macos")]
 #![allow(
@@ -38,7 +39,7 @@ fn perf_affine_qmv_fast_bf16_gs64_b4() {
 
     eprintln!();
     eprintln!(
-        "stage 5: affine_qmv_bf16 dispatch latency (gs={GROUP_SIZE}, bits={BITS}, \
+        "qmv dispatch-latency benchmark: affine_qmv_bf16 (gs={GROUP_SIZE}, bits={BITS}, \
          warmup={WARMUP}, timed={TIMED})",
     );
     eprintln!("  shape (K=N)   total          per-dispatch    rate");

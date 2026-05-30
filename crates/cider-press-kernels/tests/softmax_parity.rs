@@ -1,4 +1,4 @@
-//! Parity test for `softmax.metal` block dispatch (branch 10).
+//! Parity test for `softmax.metal` block dispatch.
 //!
 //! Drives both `block_softmax_bfloat16` (default accumulator) and
 //! `block_softmax_precise_bfloat16` (float accumulator) against

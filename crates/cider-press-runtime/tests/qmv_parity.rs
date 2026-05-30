@@ -1,13 +1,13 @@
 //! Runtime-level parity test for `Tensor::quantized_matmul` (M=1 decode path)
 //! against MLX's `mx.quantized_matmul`.
 //!
-//! Reuses the Stage-4 fixture from the kernels crate
-//! (`crates/cider-press-kernels/tests/fixtures/stage4_qmv.safetensors`)
+//! Reuses the qmv fixture from the kernels crate
+//! (`crates/cider-press-kernels/tests/fixtures/qmv.safetensors`)
 //! but drives the dispatch through the runtime API: build a
 //! `QuantizedWeight`, build an activation tensor, schedule
 //! `quantized_matmul`, `eval()`, and read the result back.
 //!
-//! The kernels-level test [crates/cider-press-kernels/tests/stage4_qmv.rs]
+//! The kernels-level test [crates/cider-press-kernels/tests/qmv_parity.rs]
 //! has a relaxed bf16 tolerance to absorb GPU-family differences when
 //! run on multiple machines. The same kernel is being called here, so
 //! the comparison passes at the same tolerance.
@@ -35,7 +35,7 @@ fn fixture_path() -> PathBuf {
         .join("cider-press-kernels")
         .join("tests")
         .join("fixtures")
-        .join("stage4_qmv.safetensors")
+        .join("qmv.safetensors")
 }
 
 #[test]
@@ -43,7 +43,7 @@ fn qmv_through_runtime_matches_mlx() {
     let path = fixture_path();
     assert!(
         path.exists(),
-        "missing parity fixture at {}; run `uv run scripts/gen_stage4_fixtures.py` \
+        "missing parity fixture at {}; run `uv run scripts/gen_qmv_fixture.py` \
          from the workspace root to regenerate it",
         path.display(),
     );
@@ -87,10 +87,10 @@ fn qmv_through_runtime_matches_mlx() {
     let y_out = y.cpu_slice::<bf16>().expect("cpu_slice bf16");
     assert_eq!(y_out.len(), N);
 
-    // Same kernel as Stage 4 ⇒ same per-element tolerance. The
-    // kernels-level test documents why this isn't bit-exact across
-    // all Apple Silicon families even though the spike measured
-    // max_relative=max_absolute=0 on the development machine.
+    // Same kernel ⇒ same per-element tolerance. The kernels-level test
+    // documents why this isn't bit-exact across all Apple Silicon families
+    // even though qmv parity measured max_relative=max_absolute=0 on the
+    // development machine.
     for (a, e) in y_out.iter().zip(y_ref.iter()) {
         let af = a.to_f32();
         let ef = e.to_f32();

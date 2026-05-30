@@ -5,15 +5,13 @@
 //! orderings of existing ones. Each function schedules an op tensor
 //! and returns it unevaluated; the caller chooses when to `eval()`.
 //!
-//! Status: branch 5 shipped [`rms_norm`]; branch 6 adds [`silu`] and
-//! [`gelu`] (exact, `erf`-based — matches `mlx.nn.gelu`); branch 7
-//! adds [`embed_tokens`] (gather + dequantize composition over a
-//! [`QuantizedWeight`] embedding table). Branch 12a adds the
-//! [`Module`] trait and the first stateful building blocks built on
-//! it — [`Linear`] (a quantized projection with optional dense bias)
-//! and [`RmsNormLayer`] (the composed [`rms_norm`] carrying its gamma
-//! weight). `SwiGLU`, `RoPE`, `SDPA`, and the rest of the Qwen2 layer
-//! building blocks land as their underlying ops do.
+//! Includes: [`rms_norm`]; [`silu`] and [`gelu`] (exact, `erf`-based
+//! — matches `mlx.nn.gelu`); [`embed_tokens`] (gather + dequantize
+//! composition over a [`QuantizedWeight`] embedding table); the
+//! [`Module`] trait and stateful building blocks — [`Linear`] (a
+//! quantized projection with optional dense bias) and [`RmsNormLayer`]
+//! (the composed [`rms_norm`] carrying its gamma weight). Additional
+//! building blocks land as their underlying ops are added.
 
 use cider_press_runtime::{DType, Device, QuantizedWeight, Tensor};
 use half::{bf16, f16};
@@ -24,7 +22,7 @@ use crate::error::{Error, Result};
 ///
 /// Composed entirely from existing ops — no fused kernel. The
 /// roadmap defers `rms_norm.metal` until perf measurement on the
-/// composed path identifies a real bottleneck (`docs/QWEN_PATH.md`).
+/// composed path identifies a real bottleneck (`docs/ARCHITECTURE.md`).
 ///
 /// Preconditions:
 ///
@@ -199,7 +197,7 @@ pub fn embed_tokens(input_ids: &Tensor, weight: &QuantizedWeight) -> Result<Tens
 /// the output tensor *unevaluated* — the caller decides when to
 /// `eval()`. This is the uniform shape that the stateful layers in
 /// this crate implement: [`Linear`] and [`RmsNormLayer`] here, then
-/// `Attention` / `Mlp` (branch 12b) and `TransformerBlock` (12c),
+/// `Attention`, `Mlp`, and `TransformerBlock`,
 /// so a model is "just" a composition of `Module::forward` calls.
 ///
 /// Single-input/single-output by design — it covers every Qwen2 layer.

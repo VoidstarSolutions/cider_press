@@ -135,7 +135,7 @@ pub fn affine_qmv_bf16(
     let encoder = commands.encoder()?;
     encoder.setComputePipelineState(pipeline.metal_pipeline_state());
     // SAFETY: bind slots and dtypes match the `affine_qmv*` MSL
-    // signatures verified bit-exactly against MLX in `stage4_qmv`.
+    // signatures verified bit-exactly against MLX in the qmv parity test.
     unsafe {
         encoder.setBuffer_offset_atIndex(Some(w_q.metal_buffer()), 0, 0);
         encoder.setBuffer_offset_atIndex(Some(scales.metal_buffer()), 0, 1);

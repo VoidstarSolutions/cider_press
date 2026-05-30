@@ -3,8 +3,8 @@
 //! This is the **first kernel that is not MLX-derived**: a naive
 //! one-thread-per-output GEMM, float accumulator, contiguous bf16
 //! inputs. The MLX kernels (`steel_gemm_*.metal`) are tiled and
-//! register-blocked; we deliberately skip that complexity until
-//! perf-branch 15. SDPA shapes (Q @ K^T and attn @ V at Qwen2.5-0.5B
+//! register-blocked; we deliberately skip that complexity for now (see
+//! `docs/ARCHITECTURE.md`). SDPA shapes (Q @ K^T and attn @ V at Qwen2.5-0.5B
 //! head sizes) keep this kernel inside the budget even unoptimized.
 //!
 //! Inputs: `A [Batch, M, K]`, `B [Batch, K, N]`, both contiguous bf16.
@@ -33,7 +33,7 @@ use crate::library::KernelLibrary;
 /// Threadgroup tile: one thread per output element. 8 × 8 is a safe
 /// default well under Apple Silicon's max-threads-per-threadgroup
 /// (1024 on every M-series we target) and aligns naturally to the
-/// 32-wide SIMD width. Tuning is a branch-15 concern.
+/// 32-wide SIMD width. Tuning is deferred (see `docs/ARCHITECTURE.md`).
 const TG_M: usize = 8;
 const TG_N: usize = 8;
 

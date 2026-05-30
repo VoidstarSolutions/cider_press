@@ -48,7 +48,7 @@ pub struct Quantization {
 
 impl Quantization {
     /// 4-bit, group size 64 — the dominant production config for
-    /// Llama / Qwen 4-bit quants and the layout the Stage 4 spike
+    /// Llama / Qwen 4-bit quants and the layout the qmv parity test
     /// validated bit-exactly against MLX.
     pub const Q4_GS64: Self = Self {
         bits: 4,

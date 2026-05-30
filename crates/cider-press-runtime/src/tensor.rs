@@ -282,8 +282,8 @@ pub enum OpKind {
     /// `[..., M, N]`.
     ///
     /// Dispatches to cider-press's own naive `gemm_bfloat16` kernel
-    /// (not MLX-derived); steel-tiled GEMM is deferred to branch 15
-    /// per `docs/QWEN_PATH.md`. Non-contiguous inputs (transposed
+    /// (not MLX-derived); steel-tiled GEMM is deferred (see
+    /// `docs/ARCHITECTURE.md`). Non-contiguous inputs (transposed
     /// views) materialize via [`Tensor::copy`] first — same
     /// contract as `softmax` / `rope` / reductions.
     MatMul,
@@ -300,11 +300,10 @@ pub enum BinaryOp {
 
 /// Element-wise unary operations supported by [`OpKind::Unary`].
 ///
-/// Branch 5 wired the two ops the `rms_norm` composition needs;
-/// branch 6 adds the two primitives MLX itself composes `silu` and
-/// `gelu` from in `mlx.nn`. MLX's `unary.metal` has many more
-/// (Exp / Sin / Tanh / …) that land the same way when their first
-/// consumer arrives.
+/// Includes the two ops the `rms_norm` composition needs and the two
+/// primitives MLX itself composes `silu` and `gelu` from in `mlx.nn`.
+/// MLX's `unary.metal` has many more (Exp / Sin / Tanh / …) that land
+/// the same way when their first consumer arrives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnaryOp {
     /// `out = x * x`.
@@ -1493,8 +1492,8 @@ impl Tensor {
     ///
     /// Transposed views (e.g. `K^T` in `Q @ K^T`) must be
     /// materialized via [`Tensor::copy`] before calling — the kernel
-    /// does not currently take strides. Branch 15 will revisit this
-    /// when migrating to MLX's tiled `steel_gemm` family.
+    /// does not currently take strides. This will be revisited when
+    /// migrating to MLX's tiled `steel_gemm` family.
     pub fn matmul(&self, other: &Tensor) -> Result<Self> {
         let device = self.inner.device.as_ref().ok_or_else(|| {
             Error::InvalidArgument("matmul: cannot apply an op to a placeholder (no device)".into())
@@ -1519,7 +1518,7 @@ impl Tensor {
             Layout::Quantized(_) => {
                 return Err(Error::InvalidArgument(
                     "matmul: quantized inputs are not supported (use Tensor::dequantize_affine \
-                     or the quantized-matmul path landing in branch 11b)"
+                     or `Tensor::quantized_matmul`)"
                         .into(),
                 ));
             }
@@ -2203,7 +2202,7 @@ fn host_scalar_tensor(device: &Device, dtype: DType, host_bytes: [u8; 4]) -> Res
 /// where `lead = lhs_dims.len() - 2` is the count of leading
 /// (batch) dims. Pulled out of [`Tensor::matmul`] to keep that
 /// constructor under the `too_many_lines` lint and so future
-/// matmul-shaped ops (qmm in branch 11b) can reuse the same
+/// matmul-shaped ops can reuse the same
 /// validation.
 fn matmul_shapes(lhs_dims: &[usize], rhs_dims: &[usize]) -> Result<(usize, usize, usize, usize)> {
     if lhs_dims.len() < 2 || rhs_dims.len() < 2 {

@@ -5,15 +5,18 @@
 #   "mlx>=0.18",
 # ]
 # ///
-"""Time MLX's own `mx.quantized_matmul` at the same shapes the Stage 5
-Rust test measures, so the two numbers can be compared apples-to-apples.
+"""qmv dispatch-latency comparison: MLX Python vs cider-press Rust.
+
+Times MLX's own `mx.quantized_matmul` at the same shapes the Rust
+`qmv_dispatch_bench` test measures, so the two numbers can be compared
+apples-to-apples.
 
 The Rust harness times raw kernel dispatch (commit + waitUntilCompleted).
 MLX's path includes its own graph/dispatch layer on top of the same
 Metal kernel, so the difference between the two is, by definition, the
 graph/dispatch overhead we're trying to characterize.
 
-Run: `uv run scripts/measure_stage5_mlx.py`
+Run: `uv run scripts/measure_qmv_mlx.py`
 """
 
 from __future__ import annotations
@@ -61,7 +64,7 @@ def bench(dim: int) -> None:
 
 
 def main() -> None:
-    print(f"stage 5 (MLX Python): mx.quantized_matmul, warmup={WARMUP}, timed={TIMED}")
+    print(f"qmv dispatch-latency (MLX Python): mx.quantized_matmul, warmup={WARMUP}, timed={TIMED}")
     print("  shape (K=N)   total          per-dispatch    rate")
     bench(512)
     bench(4096)

@@ -1,20 +1,19 @@
-//! Parity test for `binary.metal` Add dispatch (branch 4 commit 2).
+//! Parity test for `binary.metal` Add dispatch.
 //!
-//! Unlike the Stage-3/4 parity tests, the fixture is generated at test
+//! Unlike the copy/qmv parity tests, the fixture is generated at test
 //! time by shelling out to `uv run scripts/dump_mlx_op.py add ...`
-//! against MLX's own reference implementation. Branch 4 keeps fixture
-//! bytes out of the repo so the activation-dump harness stays the
-//! single source of truth for the op's reference output across both
-//! the kernels-crate parity test and the later models-crate parity
-//! test (commit 4).
+//! against MLX's own reference implementation. Fixture bytes are kept
+//! out of the repo so the activation-dump harness stays the single
+//! source of truth for the op's reference output across both the
+//! kernels-crate parity test and the later models-crate parity test.
 //!
 //! Two cases:
 //!
 //! - **vv** — same-shape `[1, S, H]` bf16 add, exercises `vv_Addbfloat16`.
 //! - **broadcast** — `[1, S, H] + [H]` bf16 add, exercises
 //!   `g3_Addbfloat16` with rhs strides `[0, 0, 1]`. This is the
-//!   per-channel-bias shape branch 5 (rmsnorm) and the Q/K/V/O Linear
-//!   biases will hit.
+//!   per-channel-bias shape that rmsnorm and the Q/K/V Linear
+//!   biases hit (O projection has no additive `.bias`).
 //!
 //! Bit-exact: bf16 add is a single rounded op, so MLX and us must
 //! agree on every byte. If this drifts to a tolerance check, something

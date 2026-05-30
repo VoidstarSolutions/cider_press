@@ -729,7 +729,7 @@ fn dispatch_binary_strided(
         // MLX's g_nd1/2/3 take no byte offset — they assume each input
         // buffer is bound at the broadcast view's element [0,..]. We'd
         // need to bind with `setBuffer:offset:` to support this, but
-        // none of branch 4's targets (residual + bias adds) produce
+        // none of the current consumers (residual + bias adds) produce
         // non-zero offsets, so surface the gap explicitly.
         return Err(Error::InvalidArgument(format!(
             "binary: non-zero view byte offset not yet supported in strided dispatch \

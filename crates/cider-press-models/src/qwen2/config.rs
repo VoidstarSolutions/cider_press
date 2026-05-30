@@ -32,7 +32,7 @@ pub const HF_REVISION: &str = "a5339a4131f135d0fdc6a5c8b5bbed2753bbe0f3";
 #[derive(Clone, Debug, Deserialize)]
 #[non_exhaustive]
 pub struct Qwen2Config {
-    /// Hidden / residual stream dimension (`D` in the `QWEN_PATH` doc).
+    /// Hidden / residual stream dimension (`D` in the `ARCHITECTURE` doc).
     pub hidden_size: usize,
     /// Number of transformer blocks.
     pub num_hidden_layers: usize,
@@ -164,7 +164,7 @@ mod tests {
     }
 
     #[test]
-    fn computed_dims_match_qwen_path_doc() {
+    fn computed_dims_match_architecture_doc() {
         let cfg = Qwen2Config::from_json_bytes(PINNED_CONFIG_JSON.as_bytes()).expect("parse");
         assert_eq!(cfg.head_dim().unwrap(), 64);
         assert_eq!(cfg.gqa_ratio().unwrap(), 7);

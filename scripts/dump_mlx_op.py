@@ -9,11 +9,10 @@
 # ///
 """Generic MLX activation-dump harness for per-op parity fixtures.
 
-Each `cider-press` op branch landing after branch 3 (`feat/weight-loading`)
-adds one case to this script: a small function that runs MLX's reference
-implementation of the op against deterministically-seeded inputs and
-writes both inputs and outputs to a safetensors file that the Rust-side
-parity test compares against.
+Each op added to the runtime adds one case to this script: a small function
+that runs MLX's reference implementation of the op against
+deterministically-seeded inputs and writes both inputs and outputs to a
+safetensors file that the Rust-side parity test compares against.
 
 Usage::
 
@@ -51,8 +50,7 @@ import mlx.nn as nn
 
 
 # ---------------------------------------------------------------------------
-# add: element-wise add with broadcasting (consumed by branch 4
-# `feat/elementwise-add`). Writes `lhs`, `rhs`, `out`.
+# add: element-wise add with broadcasting. Writes `lhs`, `rhs`, `out`.
 # ---------------------------------------------------------------------------
 
 
@@ -94,10 +92,9 @@ def run_add(args: argparse.Namespace) -> dict[str, mx.array]:
 
 
 # ---------------------------------------------------------------------------
-# square / rsqrt: element-wise unary ops (consumed by branch 5
-# `feat/rmsnorm`). Writes `lhs`, `out`. Use uniform-in-[0.1, 1.1]
-# inputs for rsqrt to avoid the rsqrt(0) trap; square accepts any
-# real input.
+# square / rsqrt: element-wise unary ops. Writes `lhs`, `out`.
+# Use uniform-in-[0.1, 1.1] inputs for rsqrt to avoid the rsqrt(0) trap;
+# square accepts any real input.
 # ---------------------------------------------------------------------------
 
 
@@ -136,9 +133,9 @@ def run_rsqrt(args: argparse.Namespace) -> dict[str, mx.array]:
 
 
 # ---------------------------------------------------------------------------
-# row_sum: sum-reduce along the last axis (consumed by branch 5
-# `feat/rmsnorm`). Writes `lhs`, `out`. Output shape drops the last
-# axis (i.e. caller picks keep_dim semantics at the runtime layer).
+# row_sum: sum-reduce along the last axis. Writes `lhs`, `out`.
+# Output shape drops the last axis (i.e. caller picks keep_dim semantics
+# at the runtime layer).
 # ---------------------------------------------------------------------------
 
 
@@ -158,9 +155,8 @@ def run_row_sum(args: argparse.Namespace) -> dict[str, mx.array]:
 
 
 # ---------------------------------------------------------------------------
-# rms_norm: composed RMSNorm against MLX's reference (consumed by
-# branch 5 `feat/rmsnorm`). Writes `x`, `gamma`, `out`. eps is bound
-# at the CLI; the runtime test side uses the same value.
+# rms_norm: composed RMSNorm against MLX's reference. Writes `x`, `gamma`,
+# `out`. eps is bound at the CLI; the runtime test side uses the same value.
 # ---------------------------------------------------------------------------
 
 
@@ -188,13 +184,12 @@ def run_rms_norm(args: argparse.Namespace) -> dict[str, mx.array]:
 
 
 # ---------------------------------------------------------------------------
-# sigmoid / erf: element-wise unary primitives (consumed by branch 6
-# `feat/silu-and-gelu`). MLX itself composes `silu = x * sigmoid(x)`
-# and exact `gelu = 0.5 * x * (1 + erf(x / sqrt(2)))` from these two,
-# so the kernels-crate parity bar is bit-exact against the MLX
-# primitive (not against `nn.silu` / `nn.gelu`). Writes `lhs`, `out`.
-# Inputs span [-0.5, 0.5] (zero-centred) so both ops see the
-# non-saturating regions of their respective curves.
+# sigmoid / erf: element-wise unary primitives. MLX itself composes
+# `silu = x * sigmoid(x)` and exact `gelu = 0.5 * x * (1 + erf(x / sqrt(2)))`
+# from these two, so the kernels-crate parity bar is bit-exact against the
+# MLX primitive (not against `nn.silu` / `nn.gelu`). Writes `lhs`, `out`.
+# Inputs span [-0.5, 0.5] (zero-centred) so both ops see the non-saturating
+# regions of their respective curves.
 # ---------------------------------------------------------------------------
 
 
@@ -229,13 +224,12 @@ def run_erf(args: argparse.Namespace) -> dict[str, mx.array]:
 
 
 # ---------------------------------------------------------------------------
-# silu / gelu: composed activations against MLX's mlx.nn references
-# (consumed by branch 6 `feat/silu-and-gelu`). silu = x * sigmoid(x);
-# gelu is the exact erf-based variant (mlx.nn.gelu, not the tanh
-# approx). Writes `lhs`, `out`. The composed-path tolerance on the
-# Rust side is bf16-compose (each intermediate rounds to bf16); under
-# f32 we expect bit-exact since both sides reduce to the same
-# arithmetic in the same order.
+# silu / gelu: composed activations against MLX's mlx.nn references.
+# silu = x * sigmoid(x); gelu is the exact erf-based variant
+# (mlx.nn.gelu, not the tanh approx). Writes `lhs`, `out`. The
+# composed-path tolerance on the Rust side is bf16-compose (each
+# intermediate rounds to bf16); under f32 we expect bit-exact since both
+# sides reduce to the same arithmetic in the same order.
 # ---------------------------------------------------------------------------
 
 
@@ -297,11 +291,10 @@ def run_mul(args: argparse.Namespace) -> dict[str, mx.array]:
 
 
 # ---------------------------------------------------------------------------
-# gather: axis-0 embedding-style lookup (consumed by branch 7
-# `feat/gather`). Writes `src`, `indices`, `out`. Indices are u32
-# uniformly drawn over `[0, vocab)`; src is bf16 uniform in [-0.5, 0.5).
-# The kernel is a pure data-mover so bit-exact equality holds for any
-# dtype.
+# gather: axis-0 embedding-style lookup. Writes `src`, `indices`, `out`.
+# Indices are u32 uniformly drawn over `[0, vocab)`; src is bf16 uniform
+# in [-0.5, 0.5). The kernel is a pure data-mover so bit-exact equality
+# holds for any dtype.
 # ---------------------------------------------------------------------------
 
 
@@ -344,11 +337,11 @@ def run_gather(args: argparse.Namespace) -> dict[str, mx.array]:
 
 # ---------------------------------------------------------------------------
 # dequantize: affine-dequantize a packed (w_q, scales, biases) triple
-# back to a dense bf16 tensor. Consumed by branch 7 (feat/gather) for
-# the embedding-table integration. Writes `w_q`, `scales`, `biases`,
-# `out`. Generates a random bf16 source, runs mx.quantize, then
-# mx.dequantize — the round-trip lets the Rust side compare against
-# the exact bytes MLX would produce given the same quantized triple.
+# back to a dense bf16 tensor. Used by the embedding-table integration.
+# Writes `w_q`, `scales`, `biases`, `out`. Generates a random bf16 source,
+# runs mx.quantize, then mx.dequantize — the round-trip lets the Rust side
+# compare against the exact bytes MLX would produce given the same
+# quantized triple.
 # ---------------------------------------------------------------------------
 
 
@@ -407,12 +400,12 @@ def run_embed_tokens(args: argparse.Namespace) -> dict[str, mx.array]:
 
 
 # ---------------------------------------------------------------------------
-# rope: rotary positional embedding (consumed by branch 9 `feat/rope`).
-# Writes `lhs`, `out`. Input shape is `[B, H, T, D]`; the rotated leading
-# `dims` slots are computed with Qwen2-style non-traditional layout
-# (`(x[:d/2], x[d/2:])`) by default. `offset` is the starting position
-# along the sequence axis (the MLX binding accepts a Python int and
-# materializes the device-side scalar internally).
+# rope: rotary positional embedding. Writes `lhs`, `out`. Input shape is
+# `[B, H, T, D]`; the rotated leading `dims` slots are computed with
+# Qwen2-style non-traditional layout (`(x[:d/2], x[d/2:])`) by default.
+# `offset` is the starting position along the sequence axis (the MLX
+# binding accepts a Python int and materializes the device-side scalar
+# internally).
 # ---------------------------------------------------------------------------
 
 
@@ -469,10 +462,10 @@ def run_rope(args: argparse.Namespace) -> dict[str, mx.array]:
 
 
 # ---------------------------------------------------------------------------
-# softmax: numerically-stable last-axis softmax (consumed by branch 10
-# `feat/softmax`). Writes `lhs`, `out`. Drives `mx.softmax(x, axis=-1,
-# precise=...)`. Inputs are uniform in [-3, 3] so the max-subtraction
-# produces a non-trivial exp range without overflowing bf16.
+# softmax: numerically-stable last-axis softmax. Writes `lhs`, `out`.
+# Drives `mx.softmax(x, axis=-1, precise=...)`. Inputs are uniform in
+# [-3, 3] so the max-subtraction produces a non-trivial exp range without
+# overflowing bf16.
 # ---------------------------------------------------------------------------
 
 
@@ -559,8 +552,7 @@ def run_matmul(args: argparse.Namespace) -> dict[str, mx.array]:
 
 # ---------------------------------------------------------------------------
 # qmm: quantized matmul — covers the qmv path (M=1 decode) and the
-# qmm_t path (M>1 prefill). Consumed by branch 11b `feat/quantized-matmul`.
-# Writes `x`, `w_q`, `scales`, `biases`, `y`.
+# qmm_t path (M>1 prefill). Writes `x`, `w_q`, `scales`, `biases`, `y`.
 # ---------------------------------------------------------------------------
 
 
@@ -579,7 +571,7 @@ def add_qmm_parser(subparsers: argparse._SubParsersAction) -> None:
 
 def run_qmm(args: argparse.Namespace) -> dict[str, mx.array]:
     dtype = _float_dtype(args.dtype)
-    # Uniform [-0.5, 0.5) matches gen_qmm_fixture.py / gen_stage4_fixtures.py:
+    # Uniform [-0.5, 0.5) matches gen_qmm_fixture.py / gen_qmv_fixture.py:
     # at K=896, normal-distributed inputs produce output magnitudes large
     # enough that bf16 LSB precision exceeds the M>1 tolerance bar.
     w = (mx.random.uniform(shape=(args.n, args.k)) - 0.5).astype(dtype)

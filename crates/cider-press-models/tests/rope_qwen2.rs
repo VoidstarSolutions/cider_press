@@ -1,7 +1,7 @@
 //! Parity test for `qwen2::attention::rope` against `mx.fast.rope`,
 //! exercising both Q (14 heads) and K (2 heads) projection shapes.
 //!
-//! Branch 9's models-layer surface is a thin config-binding wrapper
+//! The models-layer surface is a thin config-binding wrapper
 //! (`qwen2::attention::rope`); the algorithmic correctness was already
 //! pinned bit-exact at the kernels + runtime layers. This test makes
 //! sure the wrapper threads `rope_theta` and `head_dim` from
@@ -9,12 +9,10 @@
 //! config (`rope_theta = 1_000_000`, `head_dim = 64`) and checking
 //! both Q and K shapes simultaneously.
 //!
-//! Unlike branches 5 / 7, this branch has no "real-checkpoint" layer
-//! because rope applies to projection *outputs*, and the qmv-as-
-//! Tensor-op needed to produce those outputs in cider-press lands in
-//! branch 11b. The Qwen2-shape synthetic test is the right bar for
-//! now; the full layer-0 Q-projection → rope flow is a branch-11
-//! integration test.
+//! There is no "real-checkpoint" layer test because rope applies to
+//! projection *outputs*, and the full layer-0 Q-projection → rope
+//! flow is covered by the `attention_layer0` integration test.
+//! The Qwen2-shape synthetic test is the right bar here.
 
 #![cfg(target_os = "macos")]
 
@@ -85,7 +83,7 @@ fn parity_for(n_heads: usize, start_pos: i32) {
     } else {
         // metal::cos / metal::sin drift 1–2 bf16 ULPs across Apple
         // Silicon generations (M-series local vs macos-15 CI runners);
-        // same situation as sigmoid in branch 6.
+        // same situation as the sigmoid tolerance (hardware drift).
         assert_within_tolerance(
             &format!("qwen2::attention::rope (n_heads={n_heads}, offset={start_pos})"),
             &got,

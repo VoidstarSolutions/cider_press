@@ -16,7 +16,7 @@
 //! Like the kernels-crate parity test, fixtures are generated at test
 //! time via `uv run scripts/dump_mlx_op.py {add,mul}`; CI installs uv
 //! via astral-sh/setup-uv. See that file's module docstring for the
-//! rationale for not checking in fixture bytes for branch 4.
+//! rationale for not checking in fixture bytes.
 
 #![cfg(target_os = "macos")]
 

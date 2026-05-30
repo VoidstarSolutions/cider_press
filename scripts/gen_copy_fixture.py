@@ -7,15 +7,15 @@
 #   "safetensors>=0.4",
 # ]
 # ///
-"""Generate parity fixtures for the Stage 3 copy test.
+"""Generate the copy-kernel parity fixture.
 
 This is a one-shot fixture generator, not project infrastructure. It uses
-MLX as the reference oracle so the same harness extends to Stage 4 (qmv),
-where the reference is genuinely non-trivial. For copy itself the
+MLX as the reference oracle so the same harness extends to the qmv parity
+fixture, where the reference is genuinely non-trivial. For copy itself the
 expected output equals the input — we still round-trip through MLX so
 the harness exercises the same code path it will use later.
 
-Run with `uv run scripts/gen_stage3_fixtures.py` (no requirements.txt
+Run with `uv run scripts/gen_copy_fixture.py` (no requirements.txt
 needed; PEP 723 inline metadata above declares the deps).
 """
 
@@ -27,7 +27,7 @@ import mlx.core as mx
 import numpy as np
 from safetensors.numpy import save_file
 
-OUT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "stage3_copy.safetensors"
+OUT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "copy.safetensors"
 N = 1024
 
 
@@ -39,7 +39,7 @@ def main() -> None:
 
     # MLX as the reference oracle. For copy the expected output equals the
     # input, but we still pass it through `mx.array` -> `np.asarray` so
-    # this script stays representative of Stage 4's qmv flow.
+    # this script stays representative of the qmv parity flow.
     dst_f32 = np.asarray(mx.array(src_f32))
     dst_f16 = np.asarray(mx.array(src_f16))
 

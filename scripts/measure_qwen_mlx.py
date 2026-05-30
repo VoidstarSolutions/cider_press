@@ -11,7 +11,7 @@
 The cider-press `bench` subcommand reports prefill/decode tok/s and peak
 RSS on the same prompt + max-tokens; this script produces the comparable
 MLX numbers so docs/QWEN_PERF.md can table the ratio. Manual one-shot
-tool (Python is one-shot infra here), mirroring measure_stage5_mlx.py.
+tool (Python is one-shot infra here), mirroring measure_qmv_mlx.py.
 
 Uses `mlx_lm.stream_generate` (mlx_lm 0.20+ API) with no sampler
 argument for greedy/argmax decoding — matching dump_mlx_generate.py.

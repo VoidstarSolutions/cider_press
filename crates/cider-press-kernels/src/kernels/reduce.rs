@@ -19,15 +19,15 @@
 //! Mirrors the entry-point structure of MLX's
 //! `row_reduce_general_dispatch` (`backend/metal/reduce.cpp`).
 //!
-//! **Variant scope:** branch 5 wires the `row_reduce_looped`
-//! variant only. It's correct for every shape `RMSNorm` and softmax
-//! produce (small batch and large prefill alike); it's just less
-//! optimal than `row_reduce_simple` when `out_size ≥ 32` and the
-//! reduction axis is contiguous. The simple/small/large variants
-//! follow the same dispatch transcription pattern and land when
-//! perf measurement justifies the surface.
+//! **Variant scope:** only the `row_reduce_looped` variant is wired.
+//! It's correct for every shape `RMSNorm` and softmax produce (small
+//! batch and large prefill alike); it's just less optimal than
+//! `row_reduce_simple` when `out_size ≥ 32` and the reduction axis is
+//! contiguous. The simple/small/large variants follow the same
+//! dispatch transcription pattern and land when perf measurement
+//! justifies the surface.
 //!
-//! **Axis scope:** branch 5 only handles the last-axis case
+//! **Axis scope:** only the last-axis case is handled
 //! (`axis == src_shape.len() - 1`). Reducing along a non-last axis
 //! routes through `col_reduce.metal`, which is deferred. The runtime
 //! layer can permute first if a non-last reduction is needed.

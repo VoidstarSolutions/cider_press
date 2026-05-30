@@ -7,7 +7,7 @@
 #   "numpy>=1.26",
 # ]
 # ///
-"""Dump tokenizer parity fixtures for cider-press branch 13.
+"""Dump tokenizer parity fixtures for cider-press.
 
 Loads `transformers.AutoTokenizer.from_pretrained(<checkpoint>)` and
 encodes a fixed corpus of strings. Writes the corpus and the per-string
@@ -55,7 +55,7 @@ CORPUS: tuple[str, ...] = (
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Dump tokenizer parity fixtures for cider-press branch 13."
+        description="Dump tokenizer parity fixtures for cider-press."
     )
     parser.add_argument(
         "--checkpoint", required=True, help="path to HF/MLX checkpoint directory"

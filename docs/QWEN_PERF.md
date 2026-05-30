@@ -2,12 +2,11 @@
 
 End-to-end performance of Qwen2.5-0.5B-Instruct-4bit under `cider-press`,
 measured via `cider-press bench`, compared against `mlx_lm` on the same
-prompt and token budget. Methodology mirrors the spike's Stage 5 (warm
-up, then time a steady-state window); see `docs/QWEN_PATH.md` for the
-op-by-op road that got here.
+prompt and token budget. Methodology: warm up, then time a steady-state
+window; see `docs/ARCHITECTURE.md` for the architecture and forward backlog.
 
 The headline: decode runs **~10× slower than MLX** at the full-model
-scale, far wider than the spike's single-kernel 1.5× gap. The profiling
+scale, far wider than the single-kernel 1.5× baseline gap. The profiling
 breakdown shows why — and it's exactly where the project hypothesis
 predicted: the synchronous per-dispatch `commit + wait` boundary, paid
 ~49 times per token, not the kernels.
@@ -50,7 +49,7 @@ Metal JIT compilation of the quantized kernels — run 1's prefill measured
 **42.6 s** (0.9 tok/s) for this reason. Metal caches compiled libraries
 to disk cross-process, so runs 2+ prefill in ~130 ms. The 42.6 s is a
 one-time first-token-latency cost (a `.metallib` precompile would
-amortize it; deferred — see `docs/QWEN_PATH.md`), not representative of
+amortize it; deferred — see `docs/ARCHITECTURE.md`), not representative of
 prefill compute, and is excluded from the table above.
 
 ## Decode-step breakdown
@@ -108,7 +107,7 @@ allocation churn that a buffer pool would absorb.
 
 The decode step is **dispatch-bound, not compute-bound**. ~89% of it is
 `tensor.eval`, and the kernels themselves are known-good (bit-exact vs
-MLX since Stage 4). The ~10× decode gap to MLX is the synchronous
+MLX). The ~10× decode gap to MLX is the synchronous
 per-dispatch `commit + wait` boundary paid ~49× per token, versus MLX
 batching a whole forward into pipelined command buffers. In measurement-
 justified priority order:
@@ -116,7 +115,7 @@ justified priority order:
 - **Cross-eval command-buffer batching — the dominant lever.** Folding a
   token's ~49 `eval()` calls into far fewer command buffers (ideally one
   per forward) with async commit removes most of the ~16 ms/token
-  dispatch tax. This is the spike's predicted 1.5× gap compounding at
+  dispatch tax. This is the predicted per-dispatch gap compounding at
   full-model scale, and the single highest-value follow-up.
 - **Buffer pool / allocator.** Peak RSS (~902 MiB) well above post-load
   (~683 MiB) reflects per-`eval()` scratch allocation. A pool amortizes
@@ -131,8 +130,8 @@ justified priority order:
   removes the ~43 s cold-start JIT from first-token latency in a shipped
   binary.
 
-None of these are implemented here — branch 15 is measure-only. They are
-the starting backlog for the perf work the numbers now justify.
+None of these are implemented in this measurement pass. They are the
+starting backlog for the perf work the numbers now justify.
 
 ## Caveats on the comparison
 

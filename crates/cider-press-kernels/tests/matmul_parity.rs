@@ -1,5 +1,5 @@
 //! Parity test for the naive bf16 batched matmul kernel
-//! (`kernels/matmul.metal`, branch 11).
+//! (`kernels/matmul.metal`).
 //!
 //! Drives `gemm_bfloat16` against `mx.matmul`. The kernel uses a
 //! float accumulator (same as MLX's GEMMs) and processes each
@@ -8,7 +8,7 @@
 //! ordering inside the per-row dot product. At Qwen2.5-0.5B SDPA
 //! head sizes the bf16-cast at the final write dominates, and we
 //! land at a tight bf16-ULP tolerance — looser than bit-exact, same
-//! ballpark as branch-10 softmax (`precise`).
+//! ballpark as `block_softmax_precise_bfloat16`.
 //!
 //! Two shape regimes:
 //! - Small SDPA decode-ish shape `[14, 1, 64] × [14, 64, 4]` —

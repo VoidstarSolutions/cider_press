@@ -8,7 +8,7 @@
 #   "numpy>=1.26",
 # ]
 # ///
-"""Dump greedy-generated token ids from mlx_lm for cider-press branch 14.
+"""Dump greedy-generated token ids from mlx_lm for cider-press.
 
 Loads `mlx_lm.load(<checkpoint>)`, applies the HF chat template to the
 passed messages, runs `mlx_lm.generate` with greedy sampling

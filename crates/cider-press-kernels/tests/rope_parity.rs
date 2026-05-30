@@ -1,4 +1,4 @@
-//! Parity test for `rope.metal` `rope_bfloat16` dispatch (branch 9).
+//! Parity test for `rope.metal` `rope_bfloat16` dispatch.
 //!
 //! Generates a fixture at test time via `uv run scripts/dump_mlx_op.py
 //! rope` and compares against MLX for the Qwen2-shape input. The
@@ -10,7 +10,7 @@
 //! invokes `metal::cos` / `metal::sin`, which drift 1–2 bf16 ULPs
 //! across Apple Silicon generations (M-series local vs macos-15 CI
 //! runners), even though the kernel source matches MLX byte-for-byte.
-//! Same situation as sigmoid in [[branch6]] — see `unary_parity.rs`.
+//! Same situation as the sigmoid kernel — see `unary_parity.rs`.
 //!
 //! The single specialization exercised is the Qwen2-inference one:
 //! `forward=true, traditional=false, hs_transpose=false`,

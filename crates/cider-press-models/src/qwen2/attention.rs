@@ -1,14 +1,12 @@
 //! Qwen2 attention building blocks.
 //!
-//! Branch 9 landed [`rope`]. Branch 11 lands [`sdpa`], the three-op
-//! SDPA composition (`qk_matmul` → scale + mask + softmax →
-//! `attn_matmul`) with Qwen2-specific GQA broadcast of K/V to match
-//! Q's head count. Branch 12b lands [`Attention`], which folds the
-//! former `project_qkv` / `project_output` helpers into a single
-//! `forward` over the [`crate::nn::Linear`] projections plus [`rope`],
-//! the [`cider_press_runtime::KvCache`], and [`sdpa`]. `rope` and
-//! `sdpa` remain free helpers (reused by `Attention` and future
-//! models).
+//! Contains [`rope`], [`sdpa`] (the three-op SDPA composition:
+//! `qk_matmul` → scale + mask + softmax → `attn_matmul`) with
+//! Qwen2-specific GQA broadcast of K/V to match Q's head count, and
+//! [`Attention`], which folds the per-head projection, [`rope`], the
+//! [`cider_press_runtime::KvCache`], and [`sdpa`] into a single
+//! `forward`. `rope` and `sdpa` remain free helpers (reused by
+//! `Attention` and future models).
 //!
 //! Lives in the `qwen2` submodule rather than the generic [`crate::nn`]
 //! surface because the bind-config-to-op idiom is per-model: Qwen2.5
@@ -63,8 +61,8 @@ pub fn rope(x: &Tensor, offset: &Tensor, config: &Qwen2Config) -> Result<Tensor>
 }
 
 /// Scaled dot-product attention for Qwen2.5, composed from the
-/// runtime's primitive ops (no fused SDPA kernel yet — branch 15
-/// will revisit if perf demands).
+/// runtime's primitive ops (no fused SDPA kernel yet — a future
+/// optimization if perf demands).
 ///
 /// Composition:
 ///
@@ -93,8 +91,7 @@ pub fn rope(x: &Tensor, offset: &Tensor, config: &Qwen2Config) -> Result<Tensor>
 /// Mirrors `mlx-lm.models.qwen2.Attention.__call__`'s post-RoPE
 /// arithmetic, which itself delegates to
 /// `mx.fast.scaled_dot_product_attention`. We compose explicitly so
-/// each primitive carries its branch-by-branch parity story
-/// forward.
+/// each primitive's parity coverage is independent and verifiable.
 #[allow(clippy::many_single_char_names)]
 pub fn sdpa(
     q: &Tensor,
@@ -157,12 +154,11 @@ pub fn sdpa(
     let scores = q.matmul(&k_t)?; // [B, H_q, T, T_cache]
 
     // The scale / mask / softmax stretch broadcasts a `[1]` (or
-    // `[T, T_cache]` mask) into the score tensor. Branch 4 wired
-    // `g{1,2,3}_*` strided binary paths but not the rank-4 path, so
-    // we collapse `[B, H_q, T, T_cache]` to `[B*H_q, T, T_cache]`
-    // (rank 3) for the broadcast ops and reshape back. The reshape
-    // is zero-copy (matmul / softmax outputs are dense contiguous);
-    // the rank-4 strided binary lands in a future branch.
+    // `[T, T_cache]` mask) into the score tensor. The strided binary
+    // dispatch supports rank ≤ 3, so we collapse `[B, H_q, T, T_cache]`
+    // to `[B*H_q, T, T_cache]` (rank 3) for the broadcast ops and
+    // reshape back. The reshape is zero-copy (matmul / softmax outputs
+    // are dense contiguous); rank-4 strided binary is not yet wired.
     let device = q
         .device()
         .ok_or_else(|| Error::InvalidArgument("qwen2::attention::sdpa: Q has no device".into()))?;
@@ -185,8 +181,8 @@ pub fn sdpa(
     }
 
     // softmax(precise=true) is the standard choice for bf16 scores
-    // (branch-10 default for attention; the float accumulator
-    // absorbs simdgroup-sum drift before the bf16 write).
+    // (the float accumulator absorbs simdgroup-sum drift before the
+    // bf16 write).
     let probs_3d = pre_softmax.softmax(true)?;
     let probs = probs_3d.reshape([b, h_q, t, t_cache])?;
 
@@ -204,9 +200,8 @@ pub fn sdpa(
 /// Deliberately does **not** implement [`crate::nn::Module`]: its
 /// forward genuinely needs the attention mask, the `RoPE` offset, and a
 /// mutable [`KvCache`] — mirroring MLX's `Attention.__call__(x, mask,
-/// cache)`. Branch 12a kept `Module` single-input and documented that
-/// auxiliary state flows through a layer's own methods; this is that
-/// case.
+/// cache)`. [`crate::nn::Module`] is single-input by design; auxiliary
+/// state flows through a layer's own methods, and this is that case.
 #[derive(Clone, Debug)]
 pub struct Attention {
     q_proj: Linear,
