@@ -86,7 +86,9 @@ impl<'d> Commands<'d> {
         match sampler.reserve(label) {
             Ok(pair) => self.armed = Some(pair),
             // Capacity exhausted: stop sampling further ops rather than
-            // erroring mid-eval. The report will show fewer segments.
+            // erroring mid-eval (the report shows fewer segments). Calling
+            // this twice with no dispatch between also just opens and
+            // closes an empty sampled encoder — a harmless ~0-tick segment.
             Err(_) => self.armed = None,
         }
     }
@@ -184,8 +186,8 @@ impl Device {
     }
 
     /// Begin a profiled [`Commands`] session sized for `op_capacity`
-    /// dispatches. Caller must ensure the device supports stage-boundary
-    /// sampling (see [`Device::supports_stage_boundary_sampling`]).
+    /// dispatches. Returns [`Error::AppleApi`] if the device lacks a
+    /// timestamp counter set (see [`Device::supports_stage_boundary_sampling`]).
     pub fn commands_profiled(&self, op_capacity: usize) -> Result<Commands<'_>> {
         Commands::new_profiled(self, op_capacity)
     }

@@ -110,6 +110,7 @@ impl GpuSampler {
     pub(crate) fn reserve(&mut self, label: &'static str) -> Result<(usize, usize)> {
         let start = self.cursor;
         let end = start + 1;
+        // `end` is an index; `capacity_samples` is the exclusive bound.
         if end >= self.capacity_samples {
             return Err(Error::AppleApi {
                 context: "GpuSampler: sample capacity exhausted",
