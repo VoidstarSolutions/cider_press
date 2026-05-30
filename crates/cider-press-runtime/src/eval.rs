@@ -27,6 +27,15 @@ use crate::tensor::{
 
 pub(crate) fn eval(root: &Tensor) -> Result<()> {
     let _span = crate::profile::span("tensor.eval");
+    // `tensor.eval.encode` isolates the CPU-side cost of *building* the
+    // command buffer — the topo walk, per-op output allocation, and
+    // dispatch encoding (steps 1–4) — from `tensor.eval.wait`, which is
+    // the GPU execution time (the synchronous commit + wait, step 5).
+    // Their sum is the whole eval minus the cheap cache-population pass
+    // (step 6). Splitting them tells us whether decode is bound by
+    // CPU encode/alloc overhead or by GPU kernel time. See
+    // `docs/QWEN_PERF.md`.
+    let encode = crate::profile::span("tensor.eval.encode");
     // Step 1: topological order of unevaluated op nodes reachable from
     // `root`. Reverse-postorder DFS, deduped by `Arc` pointer identity.
     // Skips placeholders, already-materialized leaves, and op nodes
@@ -83,7 +92,12 @@ pub(crate) fn eval(root: &Tensor) -> Result<()> {
 
     // Step 5: synchronous commit + wait. After this returns, every
     // encoded dispatch has completed and the output bytes are valid.
+    // Close the encode span here so it excludes GPU time, and time the
+    // commit + wait under its own span.
+    drop(encode);
+    let wait = crate::profile::span("tensor.eval.wait");
     commands.commit_and_wait()?;
+    drop(wait);
 
     // Step 6: populate caches. Race-safe: if another thread also
     // evaluated this node (no concurrent-eval story yet, but the
