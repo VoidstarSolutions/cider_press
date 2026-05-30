@@ -167,7 +167,7 @@ impl KvCache {
     /// as this cache. After this call returns, `position()` advances
     /// by `step_t`.
     ///
-    /// Builds a lazy [`SliceUpdate`] op per slab (no eval, no host
+    /// Builds a lazy `SliceUpdate` op per slab (no eval, no host
     /// `memcpy`). The write lands in the same command buffer as the
     /// downstream SDPA read that consumes [`KvCache::keys_view`] /
     /// [`KvCache::values_view`].
