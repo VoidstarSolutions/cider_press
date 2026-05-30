@@ -300,7 +300,7 @@ impl Attention {
         // KvCache stores [step_t, n_kv_heads, head_dim]. K/V are
         // [1, H_kv, T, D_h]; permute (2,1,3,0) -> [T, H_kv, D_h, 1],
         // reshape to [T, H_kv, D_h] (safe: B==1). copy() lands the
-        // contiguous bytes update() memcpys from.
+        // contiguous bytes the lazy `SliceUpdate` write reads from.
         let k_upd = k
             .permute(&[2, 1, 3, 0])?
             .copy()?

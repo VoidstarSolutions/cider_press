@@ -81,6 +81,8 @@ fn roundtrip_appends_and_reads_back_populated_prefix() {
     assert_eq!(values_view.shape().dims(), &[total, N_KV_HEADS, HEAD_DIM]);
     assert_eq!(keys_view.dtype(), DType::BF16);
 
+    keys_view.eval().expect("eval keys_view");
+    values_view.eval().expect("eval values_view");
     let got_keys: Vec<bf16> = keys_view.cpu_to_vec().expect("keys view bf16 vec");
     let got_values: Vec<bf16> = values_view.cpu_to_vec().expect("values view bf16 vec");
     assert_eq!(got_keys, keys_expected);
@@ -114,7 +116,9 @@ fn reset_rewinds_position_and_subsequent_updates_overwrite() {
     cache.update(&second, &second).expect("second update");
     assert_eq!(cache.position(), 2);
 
-    let got: Vec<bf16> = cache.keys_view().cpu_to_vec().expect("keys after reset");
+    let kview = cache.keys_view();
+    kview.eval().expect("eval keys after reset");
+    let got: Vec<bf16> = kview.cpu_to_vec().expect("keys after reset");
     let expected: Vec<bf16> = (0..2)
         .flat_map(|row| {
             (0..N_KV_HEADS).flat_map(move |h| {
@@ -164,45 +168,41 @@ fn dtype_mismatch_is_rejected() {
 }
 
 #[test]
-fn update_rejects_outstanding_view() {
+fn update_with_outstanding_view_succeeds_under_lazy_contract() {
+    // Spike: the eager strong-count aliasing guard is removed. Updates
+    // now succeed even while a previously-returned view is still live,
+    // because there is no host memcpy and the data graph is correct by
+    // construction.
     let device = Device::system_default().expect("device");
     let mut cache =
         KvCache::new(&device, MAX_TOKENS, N_KV_HEADS, HEAD_DIM, DType::BF16).expect("alloc");
     let first = make_chunk_tensor(&device, 1, |_, _, _| 1.0);
     cache.update(&first, &first).expect("first update");
 
-    let view = cache.keys_view();
-    let err = cache.update(&first, &first).expect_err("must reject");
-    let msg = format!("{err}");
-    assert!(msg.contains("still live"), "unexpected error: {msg}");
-    assert_eq!(cache.position(), 1, "rejected update must not advance");
-
-    drop(view);
+    // Hold a view across a second update — no longer an error.
+    let _view = cache.keys_view();
     cache
         .update(&first, &first)
-        .expect("update succeeds after view dropped");
+        .expect("update with outstanding view is now allowed");
     assert_eq!(cache.position(), 2);
 }
 
 #[test]
-fn update_rejects_op_tensor_derived_from_view() {
+fn update_with_derived_op_tensor_succeeds_under_lazy_contract() {
+    // Spike: the eager strong-count aliasing guard is removed. An op
+    // tensor derived from a view no longer blocks a subsequent update.
     let device = Device::system_default().expect("device");
     let mut cache =
         KvCache::new(&device, MAX_TOKENS, N_KV_HEADS, HEAD_DIM, DType::BF16).expect("alloc");
     let first = make_chunk_tensor(&device, 1, |_, _, _| 1.0);
     cache.update(&first, &first).expect("first update");
 
-    // Op tensor descended from a view keeps the slab Arc bumped even
-    // after the original view is dropped, because the op holds its
-    // inputs in its OpNode.
     let other = make_chunk_tensor(&device, 1, |_, _, _| 2.0);
-    let derived = cache.keys_view().add(&other).expect("add");
-    let err = cache.update(&first, &first).expect_err("must reject");
-    assert!(format!("{err}").contains("still live"));
-    drop(derived);
+    let _derived = cache.keys_view().add(&other).expect("add");
     cache
         .update(&first, &first)
-        .expect("update succeeds after derived dropped");
+        .expect("update with derived op tensor is now allowed");
+    assert_eq!(cache.position(), 2);
 }
 
 #[test]

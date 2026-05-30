@@ -27,6 +27,15 @@ use crate::tensor::{
 
 pub(crate) fn eval(root: &Tensor) -> Result<()> {
     let _span = crate::profile::span("tensor.eval");
+    // `tensor.eval.encode` isolates the CPU-side cost of *building* the
+    // command buffer — the topo walk, per-op output allocation, and
+    // dispatch encoding (steps 1–4) — from `tensor.eval.wait`, which is
+    // the GPU execution time (the synchronous commit + wait, step 5).
+    // Their sum is the whole eval minus the cheap cache-population pass
+    // (step 6). Splitting them tells us whether decode is bound by
+    // CPU encode/alloc overhead or by GPU kernel time. See
+    // `docs/QWEN_PERF.md`.
+    let encode = crate::profile::span("tensor.eval.encode");
     // Step 1: topological order of unevaluated op nodes reachable from
     // `root`. Reverse-postorder DFS, deduped by `Arc` pointer identity.
     // Skips placeholders, already-materialized leaves, and op nodes
@@ -60,15 +69,35 @@ pub(crate) fn eval(root: &Tensor) -> Result<()> {
     // exclusive `&mut dst` to the fresh local.
     let mut outputs: Vec<Buffer<u8>> = Vec::with_capacity(order.len());
     for inner in &order {
-        let byte_count = checked_byte_count(&inner.shape, inner.dtype)?;
-        let mut dst = device.kernels().alloc_buffer::<u8>(byte_count)?;
+        let op = inner
+            .op
+            .as_ref()
+            .expect("topo invariant: only op nodes are in `order`");
+        // SliceUpdate writes into a persistent caller-owned buffer
+        // (inputs[0], the slab) rather than a fresh output. Bind that
+        // buffer as `dst` so the encoded copy mutates it in place; its
+        // contents from earlier (already-committed) evals stay valid.
+        let mut dst = if let OpKind::SliceUpdate { .. } = op.kind {
+            let slab = op.inputs.first().ok_or_else(|| {
+                Error::InvalidArgument("SliceUpdate: missing slab input (inputs[0])".into())
+            })?;
+            dense_input_buffer(slab, &outputs, &index_of)?
+        } else {
+            let byte_count = checked_byte_count(&inner.shape, inner.dtype)?;
+            device.kernels().alloc_buffer::<u8>(byte_count)?
+        };
         dispatch(inner, &mut commands, &outputs, &mut dst, &index_of)?;
         outputs.push(dst);
     }
 
     // Step 5: synchronous commit + wait. After this returns, every
     // encoded dispatch has completed and the output bytes are valid.
+    // Close the encode span here so it excludes GPU time, and time the
+    // commit + wait under its own span.
+    drop(encode);
+    let wait = crate::profile::span("tensor.eval.wait");
     commands.commit_and_wait()?;
+    drop(wait);
 
     // Step 6: populate caches. Race-safe: if another thread also
     // evaluated this node (no concurrent-eval story yet, but the
@@ -236,6 +265,9 @@ fn dispatch(
             dispatch_softmax(inner, op, commands, outputs, dst, index_of, precise)
         }
         OpKind::MatMul => dispatch_matmul(inner, op, commands, outputs, dst, index_of),
+        OpKind::SliceUpdate { offset_rows } => {
+            dispatch_slice_update(inner, op, commands, outputs, dst, index_of, offset_rows)
+        }
     }
 }
 
@@ -302,6 +334,73 @@ fn dispatch_copy(
         }
     }
 
+    Ok(())
+}
+
+/// Dispatch the spike `SliceUpdate`: write `src` (dense bf16 rank-3,
+/// contiguous) into the slab buffer bound as `dst` at byte offset
+/// `offset_rows * rows_stride`. Reuses MLX's `copy_gg` family via
+/// `copy_g_bf16`, which takes a destination byte offset. The slab's
+/// other rows are untouched (the kernel writes only `src.elem_count()`
+/// elements starting at the offset).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_slice_update(
+    inner: &Arc<TensorInner>,
+    op: &OpNode,
+    commands: &mut Commands<'_>,
+    outputs: &[Buffer<u8>],
+    dst: &mut Buffer<u8>,
+    index_of: &HashMap<*const TensorInner, usize>,
+    offset_rows: usize,
+) -> Result<()> {
+    let device = inner
+        .device
+        .as_ref()
+        .expect("op nodes are always constructed with a device");
+    // Preconditions (bf16, rank-3, matching row shape, in-bounds offset)
+    // are enforced by `Tensor::slice_update` at construction; re-assert
+    // the dtype in debug builds as a tripwire.
+    debug_assert_eq!(
+        inner.dtype,
+        DType::BF16,
+        "slice_update dispatch: non-bf16 reached eval"
+    );
+    let src = op.inputs.get(1).ok_or_else(|| {
+        Error::InvalidArgument("SliceUpdate: missing src input (inputs[1])".into())
+    })?;
+    let src_dims = src.shape().dims();
+    let row_elems = src_dims[1] * src_dims[2];
+    let dst_byte_offset = offset_rows * row_elems * DType::BF16.size_bytes();
+
+    // `src` is typically a contiguous reshape *view* of a copy op (the
+    // `k_upd`/`v_upd` produced by attention), so resolve through the view
+    // chain like the matmul path does — `dense_input_buffer` only handles
+    // direct op outputs / cached leaves and would reject a view. The
+    // contiguous-offset-0 assertion in `matmul_input_bytes` holds because
+    // the reshape just reinterprets a dense buffer's shape.
+    let src_bytes = matmul_input_bytes("slice_update", src, outputs, index_of)?;
+    // SAFETY: the dtype guard above pinned this op to BF16; the buffers
+    // were sized as `elem_count * size_bytes`, so the byte length divides
+    // evenly into the bf16 element count. dst is the slab buffer; the
+    // copy writes only src.elem_count() elements starting at the offset.
+    let src_typed = unsafe { src_bytes.reinterpret_as::<half::bf16>() };
+    let mut dst_typed = unsafe { dst.reinterpret_as::<half::bf16>() };
+
+    let shape_i32 = shape_to_i32(src_dims)?;
+    let strides = contiguous_strides_i64(&shape_i32);
+
+    let library = device.copy_library()?;
+    copy::copy_g_bf16(
+        commands,
+        library,
+        &src_typed,
+        0,
+        &strides,
+        &mut dst_typed,
+        dst_byte_offset,
+        &strides,
+        &shape_i32,
+    )?;
     Ok(())
 }
 
