@@ -234,13 +234,19 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
         decode_dur = t.elapsed();
     }
 
+    // Capture the timed-window wall-clock spans BEFORE the optional profiled
+    // GPU-profile token runs. `gpu_profile_token` performs a real
+    // `model.forward`, whose KvCache updates emit `kvcache.update` spans that
+    // would otherwise contaminate this table. The GPU table is a separate
+    // store (`record_gpu`) drained later, so it is unaffected.
+    let spans = profile::drain();
+
     if args.gpu_profile {
         gpu_profile_token(&mut generator, last_id)?;
     }
 
     let rss_post_decode = cider_press::sys::resident_bytes();
     let rss_peak = cider_press::sys::peak_resident_bytes();
-    let spans = profile::drain();
 
     // ---- report ----
     let prefill_tok_s = prompt_len as f64 / prefill_dur.as_secs_f64();
