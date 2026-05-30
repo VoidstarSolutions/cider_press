@@ -25,6 +25,28 @@ use crate::tensor::{
     checked_byte_count,
 };
 
+/// Static label for an [`OpKind`], used as the GPU-segment bucket key in
+/// the profiled eval. One label per kind; `QuantizedMatMul` is not split
+/// into qmv/qmm here because the kind carries no M — the dispatcher picks
+/// the kernel from the activation shape (at decode, M=1, so every segment
+/// is a qmv).
+#[allow(dead_code)]
+pub(crate) fn op_kind_label(kind: &OpKind) -> &'static str {
+    match kind {
+        OpKind::Copy => "copy",
+        OpKind::QuantizedMatMul { .. } => "quantized_matmul",
+        OpKind::Binary { .. } => "binary",
+        OpKind::Unary { .. } => "unary",
+        OpKind::Reduce { .. } => "reduce",
+        OpKind::Gather => "gather",
+        OpKind::Dequantize { .. } => "dequantize",
+        OpKind::Rope { .. } => "rope",
+        OpKind::Softmax { .. } => "softmax",
+        OpKind::MatMul => "matmul",
+        OpKind::SliceUpdate { .. } => "slice_update",
+    }
+}
+
 pub(crate) fn eval(root: &Tensor) -> Result<()> {
     let _span = crate::profile::span("tensor.eval");
     // `tensor.eval.encode` isolates the CPU-side cost of *building* the
@@ -1529,4 +1551,32 @@ fn element_strides(shape: &[usize]) -> Vec<i64> {
         strides[i] = strides[i + 1] * shape[i + 1] as i64;
     }
     strides
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::op_kind_label;
+    use crate::tensor::{BinaryOp, OpKind};
+
+    #[test]
+    fn labels_cover_each_kind() {
+        assert_eq!(op_kind_label(&OpKind::Copy), "copy");
+        assert_eq!(op_kind_label(&OpKind::MatMul), "matmul");
+        assert_eq!(
+            op_kind_label(&OpKind::Binary { op: BinaryOp::Add }),
+            "binary"
+        );
+        assert_eq!(
+            op_kind_label(&OpKind::QuantizedMatMul {
+                group_size: 64,
+                bits: 4,
+                transpose: true
+            }),
+            "quantized_matmul"
+        );
+        assert_eq!(
+            op_kind_label(&OpKind::SliceUpdate { offset_rows: 0 }),
+            "slice_update"
+        );
+    }
 }
