@@ -88,6 +88,7 @@ impl Generator {
     ///
     /// # Errors
     /// Tensor construction, forward, or `profiled_eval` failure.
+    #[doc(hidden)]
     pub fn profiled_decode_step(&mut self, last_id: u32) -> Result<()> {
         let device = Device::shared()?;
         let pos = self.caches.first().map_or(0, KvCache::position);
