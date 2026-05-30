@@ -30,7 +30,6 @@ use crate::tensor::{
 /// into qmv/qmm here because the kind carries no M — the dispatcher picks
 /// the kernel from the activation shape (at decode, M=1, so every segment
 /// is a qmv).
-#[allow(dead_code)]
 pub(crate) fn op_kind_label(kind: &OpKind) -> &'static str {
     match kind {
         OpKind::Copy => "copy",
@@ -200,6 +199,9 @@ pub(crate) fn profiled_eval(root: &Tensor) -> Result<()> {
     Ok(())
 }
 
+// Arms must match op_kind_label's output. A new OpKind variant compiles
+// without touching this (the compiler only enforces op_kind_label), so
+// it silently buckets to "gpu.other" until an arm is added here.
 /// Map an op-kind label to its `gpu.<label>` profile key. Static strings
 /// so the profile accumulator keys stay `&'static str`.
 fn gpu_key(label: &'static str) -> &'static str {
