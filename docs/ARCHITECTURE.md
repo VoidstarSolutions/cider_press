@@ -23,7 +23,7 @@ For *why* the runtime is shaped as it is (lazy eval, Views, KvCache), see
 Qwen2.5 is a Llama-family transformer with Qwen RoPE/norm choices. One
 forward pass:
 
-```
+```text
 tokens [B, T]
   → embed (gather quantized embed_tokens → dequantize)   [B, T, D]
   → for layer in 0..N:

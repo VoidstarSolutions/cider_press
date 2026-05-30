@@ -71,15 +71,15 @@ jobs:
             chore(mlx-sync): bump vendored kernels to ${{ env.MLX_SHA }}
 
             Synced from ml-explore/mlx@${{ env.MLX_SHA }} (${{ env.MLX_DATE }}).
-            CI's Stage 4 parity test is the canary; merge if green.
+            CI's qmv parity test is the canary; merge if green.
           body: |
             Automated MLX upstream sync.
 
             **Upstream:** [`${{ env.MLX_SHA }}`](https://github.com/ml-explore/mlx/commit/${{ env.MLX_SHA }}) (${{ env.MLX_DATE }})
 
             Files in `kernels-mlx/` have drifted from upstream. The
-            Stage 4 `qmv` bit-exact-parity test in
-            `crates/cider-press-kernels/tests/stage4_qmv.rs` is the
+            `qmv` bit-exact-parity test in
+            `crates/cider-press-kernels/tests/qmv_parity.rs` is the
             canary: green means MLX's changes did not break us.
 
             If CI is red, do **not** merge — triage what changed

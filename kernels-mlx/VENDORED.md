@@ -58,8 +58,8 @@ update the "Upstream commit" SHA above and run
 for MLX-side changes that break us.
 
 ```sh
-git clone https://github.com/ml-explore/mlx.git ~/src/mlx
-MLX_DIR=~/src/mlx ./scripts/sync_mlx_kernels.sh
+git clone https://github.com/ml-explore/mlx.git ../mlx
+MLX_DIR=../mlx ./scripts/sync_mlx_kernels.sh
 ```
 
 The `.github/workflows/mlx-sync.yml` GitHub Actions workflow runs this
