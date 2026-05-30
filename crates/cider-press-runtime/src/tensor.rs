@@ -310,8 +310,6 @@ pub enum OpKind {
     Sdpa {
         /// Softmax scale (typically `1/sqrt(head_dim)`).
         scale: f32,
-        /// Per-head dimension `D`.
-        head_dim: usize,
         /// `H_q / H_kv` — query heads per kv head.
         gqa_factor: usize,
         /// Apply a causal mask (false for decode `T_q=1` full attention).
@@ -1719,6 +1717,26 @@ impl Tensor {
             q.inner.device.as_ref().ok_or_else(|| {
                 Error::InvalidArgument("sdpa: q has no device (placeholder?)".into())
             })?;
+        for (name, t) in [("k", k), ("v", v)] {
+            let other = t.inner.device.as_ref().ok_or_else(|| {
+                Error::InvalidArgument(format!("sdpa: {name} has no device (placeholder?)"))
+            })?;
+            if !device.ptr_eq(other) {
+                return Err(Error::InvalidArgument(format!(
+                    "sdpa: {name} is on a different device than q"
+                )));
+            }
+        }
+        if let Some(m) = mask {
+            let md = m.inner.device.as_ref().ok_or_else(|| {
+                Error::InvalidArgument("sdpa: mask has no device (placeholder?)".into())
+            })?;
+            if !device.ptr_eq(md) {
+                return Err(Error::InvalidArgument(
+                    "sdpa: mask is on a different device than q".into(),
+                ));
+            }
+        }
         let out_shape = Shape::from(vec![qd[0], qd[1], qd[2], head_dim]);
         let layout = dense_layout(&out_shape);
         let mut inputs = vec![q.clone(), k.clone(), v.clone()];
@@ -1732,7 +1750,6 @@ impl Tensor {
             layout,
             OpKind::Sdpa {
                 scale,
-                head_dim,
                 gqa_factor,
                 causal,
             },
