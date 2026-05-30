@@ -379,12 +379,13 @@ fn dispatch(
         OpKind::SliceUpdate { offset_rows } => {
             dispatch_slice_update(inner, op, commands, outputs, dst, index_of, offset_rows)
         }
-        // TODO(Task 6): wire dispatch_sdpa_vector_bf16. Temporary error
-        // arm keeps the crate compiling; construction/validation does not
-        // eval, so the validation test passes without a real dispatch.
-        OpKind::Sdpa { .. } => Err(Error::InvalidArgument(
-            "sdpa: eval dispatch not wired yet (Task 6)".into(),
-        )),
+        OpKind::Sdpa {
+            scale,
+            gqa_factor,
+            causal,
+        } => dispatch_sdpa(
+            inner, op, commands, outputs, dst, index_of, scale, gqa_factor, causal,
+        ),
     }
 }
 
@@ -1633,6 +1634,86 @@ fn dispatch_matmul(
         m * k,
         k * n,
         m * n,
+    )?;
+    Ok(())
+}
+
+/// Dispatch the fused vector SDPA. Q is dense `[1,H_q,1,D]`; K/V are
+/// `[1,H_kv,T_cache,D]` (contiguous here; cache views in Task 7), read
+/// strided in place (no GQA-broadcast/transpose copy). Decode-only: no
+/// mask, causal=false (Plan B adds masked/causal).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_sdpa(
+    inner: &Arc<TensorInner>,
+    op: &OpNode,
+    commands: &mut Commands<'_>,
+    outputs: &[Buffer<u8>],
+    dst: &mut Buffer<u8>,
+    index_of: &HashMap<*const TensorInner, usize>,
+    scale: f32,
+    gqa_factor: usize,
+    causal: bool,
+) -> Result<()> {
+    debug_assert!(!causal, "Plan A vector SDPA is decode-only (no causal)");
+    let device = inner.device.as_ref().expect("op nodes carry a device");
+
+    let q = op
+        .inputs
+        .first()
+        .ok_or_else(|| Error::InvalidArgument("Sdpa: missing q (inputs[0])".into()))?;
+    let k = op
+        .inputs
+        .get(1)
+        .ok_or_else(|| Error::InvalidArgument("Sdpa: missing k (inputs[1])".into()))?;
+    let v = op
+        .inputs
+        .get(2)
+        .ok_or_else(|| Error::InvalidArgument("Sdpa: missing v (inputs[2])".into()))?;
+
+    let head_dim = *q.shape().dims().last().expect("sdpa q is rank-4");
+    let n_keys = k.shape().dims()[2];
+
+    let q_bytes = matmul_input_bytes("sdpa", q, outputs, index_of)?;
+    let (k_bytes, k_off) = resolve_view_storage(k, outputs, index_of)?;
+    let (v_bytes, v_off) = resolve_view_storage(v, outputs, index_of)?;
+    if k_off != 0 || v_off != 0 {
+        return Err(Error::InvalidArgument(format!(
+            "sdpa: non-zero K/V view byte offset (k={k_off}, v={v_off}) not yet supported"
+        )));
+    }
+
+    let k_strides = layout_strides(k)?; // &[isize], len 4: [s0, s_head, s_seq, s_d]
+    let v_strides = layout_strides(v)?;
+
+    // SAFETY: `Tensor::sdpa` pinned BF16 at construction, so every buffer
+    // here is bf16; each was sized as `elem_count * size_bytes`, so the
+    // typed reinterpret divides evenly and the strides describe valid
+    // in-bounds reads.
+    let q_typed = unsafe { q_bytes.reinterpret_as::<half::bf16>() };
+    let k_typed = unsafe { k_bytes.reinterpret_as::<half::bf16>() };
+    let v_typed = unsafe { v_bytes.reinterpret_as::<half::bf16>() };
+    let mut dst_typed = unsafe { dst.reinterpret_as::<half::bf16>() };
+
+    let library = device.sdpa_vector_library()?;
+    cider_press_kernels::kernels::sdpa::dispatch_sdpa_vector_bf16(
+        commands,
+        library,
+        &q_typed,
+        &k_typed,
+        &v_typed,
+        &mut dst_typed,
+        cider_press_kernels::kernels::sdpa::SdpaVectorArgs {
+            gqa_factor: i32::try_from(gqa_factor)
+                .map_err(|_| Error::InvalidArgument("sdpa: gqa_factor too large".into()))?,
+            n_keys: i32::try_from(n_keys)
+                .map_err(|_| Error::InvalidArgument("sdpa: n_keys too large".into()))?,
+            k_head_stride: u64::try_from(k_strides[1]).unwrap_or(0),
+            k_seq_stride: u64::try_from(k_strides[2]).unwrap_or(0),
+            v_head_stride: u64::try_from(v_strides[1]).unwrap_or(0),
+            v_seq_stride: u64::try_from(v_strides[2]).unwrap_or(0),
+            scale,
+            head_dim,
+        },
     )?;
     Ok(())
 }
