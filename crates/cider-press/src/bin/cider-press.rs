@@ -49,7 +49,8 @@ enum Command {
 struct ChatArgs {
     /// Checkpoint directory holding config.json, tokenizer.json,
     /// `tokenizer_config.json`, and a single-file model.safetensors.
-    #[arg(long)]
+    /// Falls back to `$CIDER_PRESS_CHECKPOINT` when the flag is omitted.
+    #[arg(long, env = "CIDER_PRESS_CHECKPOINT")]
     checkpoint: PathBuf,
     /// User message.
     #[arg(long)]
@@ -72,7 +73,8 @@ struct ChatArgs {
 #[derive(Args, Debug)]
 struct BenchArgs {
     /// Checkpoint directory (same layout as `chat`).
-    #[arg(long)]
+    /// Falls back to `$CIDER_PRESS_CHECKPOINT` when the flag is omitted.
+    #[arg(long, env = "CIDER_PRESS_CHECKPOINT")]
     checkpoint: PathBuf,
     /// Prompt to benchmark; defaults to a fixed paragraph request.
     #[arg(long, default_value_t = DEFAULT_BENCH_PROMPT.to_owned())]

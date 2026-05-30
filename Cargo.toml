@@ -17,7 +17,7 @@ categories = ["science"]
 # fast. Default features on objc2-metal 0.3.x activate 60+ items and
 # cover everything we need; minimization is post-spike work.
 approx = "=0.5.1"
-clap = { version = "=4.5.21", features = ["derive"] }
+clap = { version = "=4.5.21", features = ["derive", "env"] }
 half = "=2.7.1"
 minijinja = { version = "=2.5.0", features = ["loader"] }
 objc2 = "=0.6.4"
