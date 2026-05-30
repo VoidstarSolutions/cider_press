@@ -52,10 +52,11 @@ HuggingFace / mlx-community 4-bit checkpoint.
 ## Performance backlog
 
 Decode is per-eval-cost-bound (`QWEN_PERF.md`): one `Tensor::eval` per
-token (~10 ms/token, ~90% of the step), ~6.2× slower than `mlx_lm`.
+token (~10 ms/token, ~89% of the step), ~6.2× slower than `mlx_lm`.
 The dispatch round-trip tax has been removed — see items #1 and #3 below.
-The remaining gap is kernel efficiency, CPU-side encode overhead, and
-per-eval scratch allocation. In measurement-justified priority:
+The `tensor.eval` encode/wait split measures the remainder: **~62% GPU
+execution, ~38% serialized CPU encode**. Both halves individually exceed
+`mlx_lm`'s whole ~1.8 ms/token. In measurement-justified priority:
 
 1. **Cross-eval command-buffer batching — DONE (~1.6×).** The in-graph
    KV write (SliceUpdate, `feat/command-buffer-batching`) collapsed the
@@ -67,21 +68,27 @@ per-eval scratch allocation. In measurement-justified priority:
    Numbers: `QWEN_PERF.md` and
    `docs/superpowers/specs/2026-05-29-kv-slice-update-perf-design.md`
    (spike results section).
-2. **Buffer pool / allocator** — peak RSS is now ~1192 MiB (+32% from
-   the one-eval-holds-all-intermediates regime); a pool recycles scratch
-   buffers across tokens and attacks per-eval setup time directly.
+2. **Buffer pool / allocator** — ~1000 fresh `MTLBuffer` allocations per
+   token (one per op output, no pool); peak RSS is ~1192 MiB (+32% from
+   the one-eval-holds-all-intermediates regime). A pool recycles scratch
+   across tokens and lifts allocation out of the serial encode path.
 3. **KvCache same-eval batching — DONE.** `KvCache::update` is now a
    lazy SliceUpdate op; the forced `k.eval()` + `v.eval()` per layer is
    gone. Metal hazard tracking serializes the slab write → SDPA read
    within the single per-token command buffer.
-4. **Faster GEMM / kernel fusion** — the naive `gemm_bfloat16` dominates
-   kernel compute; steel-tiled matmul and fused attention close the ~6×
-   kernel efficiency gap vs `mlx_lm`.
-5. **Per-eval dispatch encoding overhead** — ~49 kernel dispatches are
-   encoded per token inside the single command buffer. Fused kernels,
-   fewer ops, or Approach-C lower-level plumbing (thread `Commands`
-   through the forward) reduce the CPU-side encode portion of per-eval
-   cost.
+4. **Fused attention / fewer copies (GPU, ~62%)** — the unfused SDPA
+   forces ~11 `permute().copy()`s per layer to feed the contiguous-only
+   matmul kernel; a flash-attention kernel reading strided K/V in place
+   removes them. The heavy compute is `qmv`, not `gemm_bfloat16` (which
+   runs only the small attention score matmuls), so audit `qmv`'s launch
+   config before assuming the kernel itself is the gap.
+5. **Pipelining / fewer dispatches (CPU encode, ~38%)** — ~1000 dispatches
+   are encoded per token (not the "~49" of an earlier draft — that was the
+   pre-SliceUpdate `commit + wait` count), and `commit_and_wait` is
+   synchronous, so that ~3.8 ms of CPU encode never overlaps the GPU.
+   Multiple command buffers in flight, fused kernels (fewer ops), or
+   Approach-C plumbing threading `Commands` through the forward hide or
+   shrink it; the buffer pool (item 2) attacks the allocation portion.
 6. **GPU argmax** — ~4.5% of decode (the `[vocab]` cpu_to_vec + scan).
    After the big levers.
 7. **`.metallib` precompilation** — removes the one-time cold-start JIT
