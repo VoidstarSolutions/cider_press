@@ -58,6 +58,7 @@ pub struct SdpaVectorArgs {
 /// elements. The number of query heads is derived as
 /// `out.len() / head_dim`. One threadgroup is dispatched per query head
 /// (MLX's `grid = (B*H_q, T_q, 1)` threadgroups, `T_q = 1` here).
+#[allow(clippy::too_many_lines)]
 pub fn dispatch_sdpa_vector_bf16(
     commands: &mut Commands<'_>,
     library: &KernelLibrary,
@@ -92,6 +93,18 @@ pub fn dispatch_sdpa_vector_bf16(
             q.len(),
         )));
     }
+    if args.n_keys <= 0 {
+        return Err(Error::InvalidArgument(format!(
+            "sdpa_vector: n_keys must be positive (got {})",
+            args.n_keys
+        )));
+    }
+    if args.gqa_factor <= 0 {
+        return Err(Error::InvalidArgument(format!(
+            "sdpa_vector: gqa_factor must be positive (got {})",
+            args.gqa_factor
+        )));
+    }
 
     let kname = format!("sdpa_vector_bfloat16_t_{}_{}", args.head_dim, args.head_dim);
     let pipeline = library.pipeline_specialized(
@@ -121,6 +134,8 @@ pub fn dispatch_sdpa_vector_bf16(
                 index: 25,
                 value: false,
             }, // has_sinks
+               // Index 26 (`blocks`, int) is the 2-pass split-K partition count —
+               // unused by the single-pass vector kernel, so it is left unbound.
         ],
     )?;
 
