@@ -60,11 +60,14 @@ pub fn rope(x: &Tensor, offset: &Tensor, config: &Qwen2Config) -> Result<Tensor>
     Ok(x.rope(offset, theta, 1.0, head_dim)?)
 }
 
-/// Scaled dot-product attention for Qwen2.5, composed from the
-/// runtime's primitive ops (no fused SDPA kernel yet — a future
-/// optimization if perf demands).
+/// Scaled dot-product attention for Qwen2.5.
 ///
-/// Composition:
+/// Decode (`T=1`, no mask) routes to the fused `Tensor::sdpa`
+/// (`sdpa_vector` kernel, GQA in-kernel, K/V read strided in place).
+/// Prefill (`T>1`) and masked calls use the composed chain via
+/// [`composed_sdpa`].
+///
+/// Composition (prefill / masked path):
 ///
 /// ```text
 /// K_g, V_g = broadcast K/V from H_kv to H_q (GQA fan-out)
@@ -92,6 +95,14 @@ pub fn rope(x: &Tensor, offset: &Tensor, config: &Qwen2Config) -> Result<Tensor>
 /// arithmetic, which itself delegates to
 /// `mx.fast.scaled_dot_product_attention`. We compose explicitly so
 /// each primitive's parity coverage is independent and verifiable.
+/// Decode fast-path predicate: single query step and no mask — the case
+/// the fused `sdpa_vector` kernel handles. Prefill / masked attention
+/// (`T>1` or a mask) uses the composed chain.
+#[inline]
+fn is_decode(t_q: usize, mask: Option<&Tensor>) -> bool {
+    t_q == 1 && mask.is_none()
+}
+
 #[allow(clippy::many_single_char_names)]
 pub fn sdpa(
     q: &Tensor,
@@ -115,7 +126,7 @@ pub fn sdpa(
     // `sdpa_vector` kernel, which reads K/V strided in place and handles
     // GQA in-kernel — no GQA-broadcast / Kᵀ / score-matmul / softmax
     // ops. Prefill (T>1) or any masked call keeps the composed chain.
-    if t_q == 1 && mask.is_none() {
+    if is_decode(t_q, mask) {
         let gqa_factor = h_q / h_kv;
         #[allow(clippy::cast_precision_loss)]
         let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -348,20 +359,13 @@ impl Attention {
 
         // Read the populated prefix. keys_view()/values_view() are
         // [T_cache, H_kv, D_h] (T-outer); sdpa wants [1, H_kv, T_cache,
-        // D_h]. Permute the T_cache/H_kv axes (1,0,2) -> [H_kv, T_cache,
-        // D_h], then add the leading batch axis.
+        // D_h]. Permute (1,0,2) → [H_kv, T_cache, D_h], then add the
+        // batch axis. Decode uses broadcast_to (stride-0, no copy);
+        // prefill copies to contiguous for the composed matmul path.
         let t_cache = cache.position();
         let k_view = cache.keys_view().permute(&[1, 0, 2])?;
         let v_view = cache.values_view().permute(&[1, 0, 2])?;
-
-        // Decode (T==1, no mask) routes through the fused `sdpa_vector`
-        // kernel, which reads K/V STRIDED IN PLACE: `broadcast_to`
-        // prepends the size-1 batch axis as a pure (stride-0) view, so the
-        // [1, H_kv, T_cache, D_h] K/V carry the slab's head/seq strides
-        // (head=D_h, seq=H_kv*D_h) with NO materializing copy. Prefill /
-        // masked attention keeps the composed matmul path, which needs
-        // contiguous K/V — copy() to land them.
-        let (k_sdpa, v_sdpa) = if t == 1 && mask.is_none() {
+        let (k_sdpa, v_sdpa) = if is_decode(t, mask) {
             (
                 k_view.broadcast_to([1usize, h_kv, t_cache, head_dim])?,
                 v_view.broadcast_to([1usize, h_kv, t_cache, head_dim])?,
