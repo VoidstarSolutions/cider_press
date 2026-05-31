@@ -43,6 +43,7 @@ pub(crate) fn op_kind_label(kind: &OpKind) -> &'static str {
         OpKind::Softmax { .. } => "softmax",
         OpKind::MatMul => "matmul",
         OpKind::SliceUpdate { .. } => "slice_update",
+        OpKind::Sdpa { .. } => "sdpa",
     }
 }
 
@@ -217,6 +218,7 @@ fn gpu_key(label: &'static str) -> &'static str {
         "softmax" => "gpu.softmax",
         "matmul" => "gpu.matmul",
         "slice_update" => "gpu.slice_update",
+        "sdpa" => "gpu.sdpa",
         _ => "gpu.other",
     }
 }
@@ -377,6 +379,13 @@ fn dispatch(
         OpKind::SliceUpdate { offset_rows } => {
             dispatch_slice_update(inner, op, commands, outputs, dst, index_of, offset_rows)
         }
+        OpKind::Sdpa {
+            scale,
+            gqa_factor,
+            causal,
+        } => dispatch_sdpa(
+            inner, op, commands, outputs, dst, index_of, scale, gqa_factor, causal,
+        ),
     }
 }
 
@@ -1625,6 +1634,125 @@ fn dispatch_matmul(
         m * k,
         k * n,
         m * n,
+    )?;
+    Ok(())
+}
+
+/// Dispatch the fused vector SDPA. Q is dense `[1,H_q,1,D]`; K/V are
+/// `[1,H_kv,T_cache,D]`, read strided in place via `layout_strides`
+/// (contiguous in Plan A's tests; real cache views in Task 7) — no
+/// GQA-broadcast/transpose copy. Decode-only: no mask, causal=false
+/// (Plan B adds masked/causal).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_sdpa(
+    inner: &Arc<TensorInner>,
+    op: &OpNode,
+    commands: &mut Commands<'_>,
+    outputs: &[Buffer<u8>],
+    dst: &mut Buffer<u8>,
+    index_of: &HashMap<*const TensorInner, usize>,
+    scale: f32,
+    gqa_factor: usize,
+    causal: bool,
+) -> Result<()> {
+    if causal {
+        return Err(Error::InvalidArgument(
+            "sdpa: causal=true not yet supported in the vector dispatch (Plan B)".into(),
+        ));
+    }
+    if op.inputs.len() > 3 {
+        return Err(Error::InvalidArgument(
+            "sdpa: mask not yet supported in the vector dispatch (Plan B)".into(),
+        ));
+    }
+    let device = inner.device.as_ref().expect("op nodes carry a device");
+
+    let q = op
+        .inputs
+        .first()
+        .ok_or_else(|| Error::InvalidArgument("Sdpa: missing q (inputs[0])".into()))?;
+    let k = op
+        .inputs
+        .get(1)
+        .ok_or_else(|| Error::InvalidArgument("Sdpa: missing k (inputs[1])".into()))?;
+    let v = op
+        .inputs
+        .get(2)
+        .ok_or_else(|| Error::InvalidArgument("Sdpa: missing v (inputs[2])".into()))?;
+
+    let head_dim = *q.shape().dims().last().expect("sdpa q is rank-4");
+    let n_keys = k.shape().dims()[2];
+
+    let q_bytes = matmul_input_bytes("sdpa", q, outputs, index_of)?;
+    let (k_bytes, k_off) = resolve_view_storage(k, outputs, index_of)?;
+    let (v_bytes, v_off) = resolve_view_storage(v, outputs, index_of)?;
+    if k_off != 0 || v_off != 0 {
+        return Err(Error::InvalidArgument(format!(
+            "sdpa: non-zero K/V view byte offset (k={k_off}, v={v_off}) not yet supported"
+        )));
+    }
+
+    let k_strides = layout_strides(k)?; // &[isize], len 4: [s0, s_head, s_seq, s_d]
+    let v_strides = layout_strides(v)?;
+    // The kernel reads the head dimension with contiguous pointer indexing
+    // (`keys[j]`/`values[j]`), so only the head/seq strides are passed; a
+    // non-unit trailing (D) stride would silently attend over wrong elements.
+    if k_strides[3] != 1 || v_strides[3] != 1 {
+        return Err(Error::InvalidArgument(format!(
+            "sdpa: K/V head dimension must be contiguous (D stride 1); got k={}, v={}",
+            k_strides[3], v_strides[3]
+        )));
+    }
+
+    // SAFETY: `Tensor::sdpa` pinned BF16 at construction, so every buffer
+    // here is bf16; each was sized as `elem_count * size_bytes`, so the
+    // typed reinterpret divides evenly and the strides describe valid
+    // in-bounds reads.
+    let q_typed = unsafe { q_bytes.reinterpret_as::<half::bf16>() };
+    let k_typed = unsafe { k_bytes.reinterpret_as::<half::bf16>() };
+    let v_typed = unsafe { v_bytes.reinterpret_as::<half::bf16>() };
+    let mut dst_typed = unsafe { dst.reinterpret_as::<half::bf16>() };
+
+    let library = device.sdpa_vector_library()?;
+    cider_press_kernels::kernels::sdpa::dispatch_sdpa_vector_bf16(
+        commands,
+        library,
+        &q_typed,
+        &k_typed,
+        &v_typed,
+        &mut dst_typed,
+        cider_press_kernels::kernels::sdpa::SdpaVectorArgs {
+            gqa_factor: i32::try_from(gqa_factor)
+                .map_err(|_| Error::InvalidArgument("sdpa: gqa_factor too large".into()))?,
+            n_keys: i32::try_from(n_keys)
+                .map_err(|_| Error::InvalidArgument("sdpa: n_keys too large".into()))?,
+            k_head_stride: u64::try_from(k_strides[1]).map_err(|_| {
+                Error::InvalidArgument(format!(
+                    "sdpa: k_head_stride {} is negative or overflows u64",
+                    k_strides[1]
+                ))
+            })?,
+            k_seq_stride: u64::try_from(k_strides[2]).map_err(|_| {
+                Error::InvalidArgument(format!(
+                    "sdpa: k_seq_stride {} is negative or overflows u64",
+                    k_strides[2]
+                ))
+            })?,
+            v_head_stride: u64::try_from(v_strides[1]).map_err(|_| {
+                Error::InvalidArgument(format!(
+                    "sdpa: v_head_stride {} is negative or overflows u64",
+                    v_strides[1]
+                ))
+            })?,
+            v_seq_stride: u64::try_from(v_strides[2]).map_err(|_| {
+                Error::InvalidArgument(format!(
+                    "sdpa: v_seq_stride {} is negative or overflows u64",
+                    v_strides[2]
+                ))
+            })?,
+            scale,
+            head_dim,
+        },
     )?;
     Ok(())
 }

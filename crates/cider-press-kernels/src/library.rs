@@ -6,9 +6,9 @@
 //! library; pipeline-build cost is one-time per kernel name. Subsequent
 //! lookups for the same name hit the in-memory cache.
 //!
-//! The crate ships three pre-built libraries from vendored MLX sources:
-//! [`KernelLibrary::copy`], [`KernelLibrary::binary`], and
-//! [`KernelLibrary::quantized`]. All three wrap
+//! The crate ships pre-built libraries for the vendored kernel groups
+//! (copy, binary, unary, reduce, rope, softmax, quantized, matmul,
+//! `sdpa_vector`), each compiled on first use. All wrap
 //! [`KernelLibrary::from_source`], which is also public for callers
 //! that want to compile their own inline MSL (e.g. one-off kernels).
 //!
@@ -54,6 +54,10 @@ const SOFTMAX_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/softmax_inl
 
 /// Pre-flattened MLX `quantized.metal`, produced by `build.rs`.
 const QUANTIZED_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/quantized_inlined.metal"));
+
+/// Pre-flattened MLX `sdpa_vector_only.metal`, produced by `build.rs`.
+const SDPA_VECTOR_SOURCE: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/sdpa_vector_inlined.metal"));
 
 /// Cider-press own bf16 batched matmul (not MLX-derived). Lives next
 /// to the dispatch routine in `kernels/matmul.metal`; included
@@ -199,6 +203,16 @@ impl KernelLibrary {
     /// `kernels-mlx/`).
     pub fn quantized(device: &Device) -> Result<Self> {
         Self::from_source(device, QUANTIZED_SOURCE)
+    }
+
+    /// Compile the vendored `sdpa_vector` kernels (single-pass vector
+    /// attention; decode path). All instantiations require
+    /// `[[function_constant]]` specialization — use
+    /// [`Self::pipeline_specialized`], not
+    /// [`Self::pipeline`]. See [`Self::copy`] for caching
+    /// semantics at the runtime layer.
+    pub fn sdpa_vector(device: &Device) -> Result<Self> {
+        Self::from_source(device, SDPA_VECTOR_SOURCE)
     }
 
     /// JIT-compile cider-press's own naive bf16 batched matmul kernel

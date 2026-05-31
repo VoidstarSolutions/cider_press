@@ -5,12 +5,17 @@ measured via `cider-press bench`, compared against `mlx_lm` on the same
 prompt and token budget. Methodology: warm up, then time a steady-state
 window; see `docs/ARCHITECTURE.md` for the architecture and forward backlog.
 
-The headline: decode runs **~6.2× slower than MLX** at the full-model
-scale. The in-graph KV write (SliceUpdate) collapsed each decode step from
-~49 synchronous `commit + wait` round-trips to **one command buffer per
-token**, delivering ~1.6×. The remaining gap is per-eval cost, and the
-`tensor.eval` encode/wait split now measures it: **~62% GPU execution,
-~38% CPU-side command-buffer construction** (topo walk, per-op buffer
+The headline: decode runs **~4.7× slower than MLX** at the full-model
+scale. Two changes drove it there. First, the in-graph KV write
+(SliceUpdate) collapsed each decode step from ~49 synchronous
+`commit + wait` round-trips to **one command buffer per token** (~1.6×).
+Second, the decode attention path is now a fused `sdpa_vector` kernel that
+reads K/V strided in place — no GQA-broadcast copy, no Kᵀ copy, no
+score-matmul/softmax/attn-matmul chain — which lifted decode from ~90 to
+**~120 tok/s** (~1.33×) and collapsed the ~36% copy+score-matmul attention
+share into a small `gpu.sdpa` bucket. The remaining gap is per-eval cost:
+the `tensor.eval` encode/wait split measures **~62% GPU execution, ~38%
+CPU-side command-buffer construction** (topo walk, per-op buffer
 allocation, dispatch encoding) — the latter serialized, because
 `commit_and_wait` is synchronous. It is not dispatch round-trips.
 
@@ -36,18 +41,23 @@ allocation, dispatch encoding) — the latter serialized, because
 | phase   | cider-press | mlx_lm  | ratio (mlx ÷ cp) |
 |---------|------------:|--------:|-----------------:|
 | prefill | ~290 tok/s  | ~1346 tok/s | ~4.6× |
-| decode  | ~90 tok/s   | ~560 tok/s  | ~6.2× |
+| decode  | ~120 tok/s  | ~560 tok/s  | ~4.7× |
 
 - **Prefill** processes the 39-token prompt in one forward. cider-press
-  ranged 263–319 tok/s across warm runs (~290 median); `mlx_lm` 1195–1369
+  ranged 263–358 tok/s across warm runs (~290 median); `mlx_lm` 1195–1369
   (~1346). The gap is narrower here because a single 39-token forward
-  amortizes the per-dispatch overhead over more compute.
-- **Decode** is the per-token steady state (the perf-dominant path).
-  The in-graph KV write (SliceUpdate) collapsed each decode step to one
-  command buffer per token (was ~49 synchronous `commit + wait` round-trips),
-  improving decode from ~55 tok/s to ~90 tok/s (~1.6×). The **remaining
-  ~6.2× gap** to `mlx_lm` is per-eval cost — kernel efficiency, CPU-side
-  dispatch encoding, and per-eval scratch allocation.
+  amortizes the per-dispatch overhead over more compute. Prefill still
+  runs the **composed** attention path (the fused vector kernel is the
+  decode/T=1 path; prefill fusion is deferred — see `docs/ARCHITECTURE.md`).
+- **Decode** is the per-token steady state (the perf-dominant path). Two
+  changes lifted it. The in-graph KV write (SliceUpdate) collapsed each
+  decode step to one command buffer per token (was ~49 synchronous
+  `commit + wait` round-trips), taking decode ~55 → ~90 tok/s (~1.6×).
+  Fusing the decode attention into the `sdpa_vector` kernel — which reads
+  K/V strided in place, dropping the per-layer GQA-broadcast/Kᵀ copies and
+  the q@kᵀ/softmax/probs@v chain — then took decode ~90 → **~120 tok/s**
+  (~1.33×). The **remaining ~4.7× gap** to `mlx_lm` is per-eval cost —
+  CPU-side dispatch encoding and per-eval scratch allocation.
 - Load time (excluded from tok/s): ~0.17 s.
 
 **Cold-start note:** the very first forward of a fresh process triggers
@@ -89,21 +99,20 @@ Reading it:
 - **`tensor.eval.encode` (~3.8 ms/token, ~38% of eval) is CPU-side.**
   Building one command buffer means a topological walk, a fresh
   `MTLBuffer` allocation per op output (no buffer pool — see Memory), and
-  encoding every dispatch. The decode forward is **~45 dispatches per
-  layer** (per-head qmv projections + bias, RoPE, the KV-write copies,
-  the unfused-SDPA copy/matmul/softmax chain, the MLP), so **on the order
-  of ~1000 dispatches per token** across 24 layers plus embedding and the
-  tied head — not the "~49" an earlier draft cited (that was the
-  pre-SliceUpdate `commit + wait` count, ~2 per layer). Because
+  encoding every dispatch. With decode attention fused into `sdpa_vector`,
+  the forward is **~38 dispatches per layer** (per-head qmv projections +
+  bias, RoPE, the KV slab write, one fused `sdpa_vector`, the MLP), so
+  **on the order of ~974 dispatches per token** across 24 layers plus
+  embedding and the tied head (see the GPU-breakdown table) — down from ~1166 before fusion. Because
   `commit_and_wait` is synchronous, this CPU time is fully serialized
   ahead of the GPU.
 - **`tensor.eval.wait` (~6.2 ms/token, ~62% of eval) is GPU execution.**
   The heavy compute is the 4-bit `qmv` weight matvecs — every projection
-  and MLP linear at T=1 — plus the **~11 materializing `permute().copy()`s
-  per layer** that the contiguous-only matmul kernel forces in the
-  unfused attention path. `gemm_bfloat16` runs only the two small
-  attention score matmuls (`q@kᵀ`, `probs@v`); it is **not** the dominant
-  decode kernel, contrary to an earlier draft.
+  and MLP linear at T=1. The attention score matmuls and softmax that
+  previously ran here (`q@kᵀ`, `probs@v`, the two `gemm_bfloat16` calls
+  plus softmax) and the materializing `permute().copy()`s (copy bucket
+  dropped 266→146 dispatches, ~5/layer removed) are gone: the fused
+  `sdpa_vector` kernel subsumes them, reading strided K/V in place.
 - **`kvcache.update` is ~0%** — the forced `k.eval()` + `v.eval()` per
   layer (formerly ~1874 ms, ~86% of decode) is gone. The SliceUpdate op
   is built lazily; Metal's hazard tracking serializes the slab write →
@@ -124,39 +133,46 @@ comparable to the production `tensor.eval.wait` total. Representative
 warm run (the first invocation pays the one-time Metal JIT compile;
 numbers are from the second):
 
+Post-fusion (decode attention through `sdpa_vector`):
+
 | kind             | total (ms) | dispatches | µs/dispatch | % gpu |
 |------------------|-----------:|-----------:|------------:|------:|
-| quantized_matmul |      1.968 |        169 |       11.64 | 29.9% |
-| copy             |      1.304 |        266 |        4.90 | 19.8% |
-| binary           |      1.217 |        388 |        3.14 | 18.5% |
-| matmul           |      1.075 |         48 |       22.40 | 16.4% |
-| unary            |      0.314 |        122 |        2.58 |  4.8% |
-| reduce           |      0.266 |         49 |        5.43 |  4.0% |
-| rope             |      0.198 |         48 |        4.12 |  3.0% |
-| slice_update     |      0.131 |         48 |        2.73 |  2.0% |
-| softmax          |      0.088 |         24 |        3.66 |  1.3% |
-| gather           |      0.013 |          3 |        4.19 |  0.2% |
-| dequantize       |      0.003 |          1 |        2.92 |  0.0% |
+| quantized_matmul |      2.301 |        169 |       13.61 | 41.4% |
+| binary           |      1.334 |        364 |        3.67 | 24.0% |
+| copy             |      0.623 |        146 |        4.27 | 11.2% |
+| unary            |      0.373 |        122 |        3.06 |  6.7% |
+| reduce           |      0.305 |         49 |        6.22 |  5.5% |
+| rope             |      0.233 |         48 |        4.86 |  4.2% |
+| sdpa             |      0.213 |         24 |        8.88 |  3.8% |
+| slice_update     |      0.155 |         48 |        3.22 |  2.8% |
+| gather           |      0.012 |          3 |        4.03 |  0.2% |
+| dequantize       |      0.003 |          1 |        2.79 |  0.1% |
 
 Reading it:
 
-- **`quantized_matmul` (qmv) is the single largest bucket at ~30%** — the
-  4-bit weight matvecs (every projection and MLP linear at T=1). These are
-  the vendored MLX kernel and memory-bound, near the bandwidth roofline;
-  there is little headroom in the kernel itself.
-- **The attention copy/score-matmul chain is collectively comparable and
-  removable.** `copy` (~20%) is dominated by the ~11 materializing
-  `permute().copy()`s per layer that feed the contiguous-only matmul
-  kernel; `matmul` (~16%) is the two small SDPA score matmuls (`q@kᵀ`,
-  `probs@v`). Together they are **~36% of GPU time** — more than qmv — and
-  a flash-attention-style fused kernel that reads strided K/V in place
-  removes essentially all of it. This validates **"fused attention / fewer
-  copies" as the top GPU-side lever** (see below): qmv is at its floor,
-  but the copy/score-matmul chain is pure overhead. The `binary` bucket
-  (~19%, 388 dispatches) is the elementwise add/mul scatter across
-  residuals, RoPE, and SwiGLU — broadly distributed, not a single target.
-- **Total dispatch count is ~1166/token**, confirming the
-  ~1000-dispatch-per-token estimate cited above (the encode-side cost).
+- **The attention copy/score-matmul chain has collapsed into `gpu.sdpa`.**
+  The old `matmul` (~16%) and `softmax` (~1.3%) buckets are gone entirely:
+  the two SDPA score matmuls (`q@kᵀ`, `probs@v`) and the softmax now run
+  inside the fused `sdpa_vector` kernel (24 dispatches, one per layer; the
+  whole bucket is ~3.8%). `copy` dropped from ~20% to ~11% — the ~11
+  materializing `permute().copy()`s that fed the contiguous-only matmul
+  kernel are gone (copy bucket: 266→146 dispatches, ~120 total / ~5 per
+  layer): the GQA-broadcast, Kᵀ-transpose, and the two K/V SDPA-read
+  copies per layer, because `sdpa_vector` reads K/V strided in place. The ~36% copy+score-matmul attention
+  share has been replaced by a single ~3.8% `sdpa` bucket plus the residual
+  copies that remain. Total dispatches/token dropped to ~974 (from ~1166; see table).
+- **`quantized_matmul` (qmv) is now the dominant bucket at ~41%** — the
+  4-bit weight matvecs (every projection and MLP linear at T=1). Its
+  absolute time is unchanged; its *share* rose because the attention
+  overhead it competed with is gone. These are the vendored MLX kernel and
+  memory-bound, near the bandwidth roofline; little headroom in the kernel
+  itself.
+- **`binary` (~24%, 364 dispatches)** is the elementwise add/mul scatter
+  across residuals, RoPE, and SwiGLU — broadly distributed, not a single
+  target. Note this is the **vector/decode path**; prefill still runs the
+  composed attention (copy + gemm + softmax), so a prefill `--gpu-profile`
+  would still show the old buckets until Plan B fuses the steel/nax
+  prefill path.
 
 These are perturbed-regime GPU-*internal* shares. The production
 decode-step split is still the ~62% GPU / ~38% CPU-encode from the
@@ -196,13 +212,15 @@ it is **~62% GPU execution / ~38% serialized CPU encode**. Both halves
 individually exceed `mlx_lm`'s entire ~1.8 ms/token, so no single lever
 closes the gap. In measurement-justified priority:
 
-- **Fused attention / fewer materializing copies (GPU, ~62%)** — the
-  unfused SDPA forces ~11 `permute().copy()`s per layer to feed the
-  contiguous-only matmul kernel. A flash-attention-style kernel that
-  reads strided K/V in place removes those copies — both the GPU
-  bandwidth they burn and the encode/alloc they add. The heavy compute is
-  `qmv`, not `gemm`; `qmv` is the vendored MLX kernel, so audit its launch
-  config before assuming the kernel itself is the gap.
+- **Fused decode attention — done.** The decode path now runs through the
+  `sdpa_vector` kernel, which reads strided K/V in place and removes the
+  ~120 materializing `permute().copy()`s (266→146; ~5/layer) plus the
+  q@kᵀ/softmax/probs@v chain.
+  This took decode ~90 → ~120 tok/s and collapsed the ~36% copy+matmul
+  attention share into a ~3.8% `gpu.sdpa` bucket. **Remaining:** prefill
+  still uses the composed path; fusing it (steel/nax `sdpa_full`, Plan B)
+  is the next attention lever. The heavy decode compute is now `qmv`, not
+  `gemm`; `qmv` is the vendored MLX kernel and near its bandwidth floor.
 - **Buffer pool / allocator (CPU encode, part of ~38%)** — ~1000 fresh
   `MTLBuffer` allocations per token (one per op output, no pool); peak RSS
   (+32% to ~1192 MiB) is the same root cause. A pool recycles scratch

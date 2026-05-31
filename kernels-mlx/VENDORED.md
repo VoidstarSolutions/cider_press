@@ -29,11 +29,12 @@ Entry points (compiled to JITed `MTLLibrary`s by cider-press-kernels):
 - `mlx/backend/metal/kernels/rope.metal`
 - `mlx/backend/metal/kernels/softmax.metal`
 - `mlx/backend/metal/kernels/quantized.metal`
+- `mlx/backend/metal/kernels/sdpa_vector_only.metal` (cider-press entry point; upstream uses `scaled_dot_product_attention.metal`)
 
 Transitive headers reached from those entry points (kept in sync by the
 sync workflow below):
 
-- `mlx/backend/metal/kernels/{copy,binary,binary_ops,unary,unary_ops,reduce,reduce_utils,quantized,quantized_utils,softmax,utils,bf16,bf16_math,complex,defines,logging,atomic,cexpf,erf,expm1f,fp8}.h`
+- `mlx/backend/metal/kernels/{copy,binary,binary_ops,unary,unary_ops,reduce,reduce_utils,quantized,quantized_utils,sdpa_vector,softmax,utils,bf16,bf16_math,complex,defines,logging,atomic,cexpf,erf,expm1f,fp8}.h`
 - `mlx/backend/metal/kernels/reduction/{ops,reduce_all,reduce_col,reduce_init,reduce_row}.h`
 - `mlx/backend/metal/kernels/steel/{defines,utils}.h`
 - `mlx/backend/metal/kernels/steel/gemm/{gemm,loader,mma,params,transforms}.h`

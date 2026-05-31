@@ -71,6 +71,10 @@ struct DeviceInner {
     /// MLX-derived — see `crates/cider-press-kernels/src/kernels/matmul.metal`).
     /// Populated on first [`crate::Tensor::matmul`] eval.
     matmul_library: OnceLock<kernels::KernelLibrary>,
+    /// JIT'd MLX `sdpa_vector` library. Populated on first
+    /// [`crate::Tensor::sdpa`] eval; subsequent decodes reuse the
+    /// cached library and its per-`head_dim` pipeline-state cache.
+    sdpa_vector_library: OnceLock<kernels::KernelLibrary>,
 }
 
 /// Refcounted handle to the system's default Metal device.
@@ -101,6 +105,7 @@ impl Device {
                 softmax_library: OnceLock::new(),
                 gather_libraries: Mutex::new(HashMap::new()),
                 matmul_library: OnceLock::new(),
+                sdpa_vector_library: OnceLock::new(),
             }),
         })
     }
@@ -131,6 +136,7 @@ impl Device {
             softmax_library: OnceLock::new(),
             gather_libraries: Mutex::new(HashMap::new()),
             matmul_library: OnceLock::new(),
+            sdpa_vector_library: OnceLock::new(),
         });
         let stored = SHARED.get_or_init(|| fresh);
         Ok(Self {
@@ -280,6 +286,16 @@ impl Device {
         }
         let lib = kernels::KernelLibrary::matmul(&self.inner.kernels)?;
         Ok(self.inner.matmul_library.get_or_init(|| lib))
+    }
+
+    /// Lazily JIT-compile and cache MLX's `sdpa_vector` library. See
+    /// [`Device::copy_library`] for cache semantics.
+    pub(crate) fn sdpa_vector_library(&self) -> Result<&kernels::KernelLibrary> {
+        if let Some(lib) = self.inner.sdpa_vector_library.get() {
+            return Ok(lib);
+        }
+        let lib = kernels::KernelLibrary::sdpa_vector(&self.inner.kernels)?;
+        Ok(self.inner.sdpa_vector_library.get_or_init(|| lib))
     }
 }
 

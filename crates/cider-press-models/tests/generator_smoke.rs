@@ -17,12 +17,14 @@ use cider_press_models::qwen2::{
 use cider_press_runtime::{Device, Quantization, QuantizedWeight, Tensor};
 use half::bf16;
 
-const HIDDEN: usize = 64;
+const HIDDEN: usize = 128;
 const VOCAB: usize = 128;
 const LAYERS: usize = 2;
 const HEADS: usize = 2;
 const KV_HEADS: usize = 1;
-const HEAD_DIM: usize = 32;
+// 64 is the smallest head_dim the fused decode SDPA vector kernel
+// supports ({64, 96, 128, 256}); HIDDEN = HEADS * HEAD_DIM.
+const HEAD_DIM: usize = 64;
 const INTERMEDIATE: usize = 128;
 const GROUP_SIZE: usize = 64;
 const BITS: usize = 4;

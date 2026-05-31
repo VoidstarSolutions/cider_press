@@ -33,6 +33,10 @@ const ENTRY_POINTS: &[(&str, &str)] = &[
     ("mlx/backend/metal/kernels/rope.metal", "rope"),
     ("mlx/backend/metal/kernels/softmax.metal", "softmax"),
     ("mlx/backend/metal/kernels/quantized.metal", "quantized"),
+    (
+        "mlx/backend/metal/kernels/sdpa_vector_only.metal",
+        "sdpa_vector",
+    ),
 ];
 
 /// Header-only bundles for JIT-assembled kernels.

@@ -51,6 +51,7 @@ FILES=(
     mlx/backend/metal/kernels/quantized.h
     mlx/backend/metal/kernels/quantized_utils.h
     mlx/backend/metal/kernels/utils.h
+    mlx/backend/metal/kernels/sdpa_vector.h
     mlx/backend/metal/kernels/bf16.h
     mlx/backend/metal/kernels/bf16_math.h
     mlx/backend/metal/kernels/complex.h

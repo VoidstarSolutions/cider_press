@@ -18,5 +18,6 @@ pub mod qmm;
 pub mod qmv;
 pub mod reduce;
 pub mod rope;
+pub mod sdpa;
 pub mod softmax;
 pub mod unary;
