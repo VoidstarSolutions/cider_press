@@ -78,7 +78,6 @@ fn qmv_gpu_ns(
     Some(total_ns / segments.len() as f64)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn bench(device: &Device, library: &KernelLibrary, k: usize, n: usize) {
     let w: Buffer<u32> = device
         .alloc_buffer(n * (k * BITS as usize / 32))
@@ -112,6 +111,7 @@ fn bench(device: &Device, library: &KernelLibrary, k: usize, n: usize) {
     let variant = if fast { "fast" } else { "gen " };
     let bytes = qmv_bytes(k, n, GROUP_SIZE as usize, BITS as usize);
 
+    // 256 dispatches share one command buffer (the decode regime); enough to average out, few enough to bound counter-segment overhead.
     match qmv_gpu_ns(device, library, &w, &s, &b, &x, &mut y, GROUP_SIZE, BITS, 256) {
         Some(gpu_ns) => {
             let eff_gbps = bytes as f64 / (gpu_ns / 1e9) / 1e9;
