@@ -22,9 +22,11 @@
 //! current row offset) and returns without evaluating. No host `memcpy`
 //! and no forced `eval` — the write lands in the same command buffer as
 //! the SDPA read that consumes it, which is what collapses a decode step
-//! to a single GPU submission. Each `update` chains its op off the
-//! previous one (or the slab leaf on the first call); `keys_view` /
-//! `values_view` expose the populated prefix of the latest op.
+//! to a single GPU submission. Each `update` builds its op directly on the
+//! slab leaf (not chained off the prior update), so per-step graphs are not
+//! retained across decode steps and the buffer pool can recycle per-step
+//! scratch; `keys_view` / `values_view` expose the populated prefix of the
+//! latest op.
 //!
 //! ## Aliasing contract (append-only)
 //!
@@ -71,10 +73,11 @@ pub struct KvCache {
     n_kv_heads: usize,
     head_dim: usize,
     position: usize,
-    // Most recent SliceUpdate op-tensor per slab. `update` builds these
-    // lazily (no host memcpy); `keys_view`/`values_view` slice them so
-    // SDPA's cache read is graph-downstream of the write. `None` before
-    // the first update (or after `reset`).
+    // Most recent SliceUpdate op-tensor per slab, built directly on the
+    // slab leaf (not chained off the prior update, so per-step graphs free
+    // for the buffer pool). `keys_view`/`values_view` slice them so SDPA's
+    // cache read is graph-downstream of the write. `None` before the first
+    // update (or after `reset`).
     keys_latest: Option<Tensor>,
     values_latest: Option<Tensor>,
 }
@@ -171,6 +174,13 @@ impl KvCache {
     /// `memcpy`). The write lands in the same command buffer as the
     /// downstream SDPA read that consumes [`KvCache::keys_view`] /
     /// [`KvCache::values_view`].
+    ///
+    /// Successive `update`s on the same cache must be separated by an
+    /// `eval` of the populated prefix (`keys_view`/`values_view`): each
+    /// `update` keeps only the latest `slice_update` op, so an
+    /// un-evaluated prior write would be dropped. Returns
+    /// `Error::InvalidArgument` if called again before the previous update
+    /// is evaluated. (Decode evals each token; prefill is a single update.)
     pub fn update(&mut self, k: &Tensor, v: &Tensor) -> Result<()> {
         let _span = crate::profile::span("kvcache.update");
         // No aliasing guard: `update` does no host write (the write is an
@@ -192,15 +202,40 @@ impl KvCache {
             )));
         }
 
-        // Lazy in-graph write: chain each SliceUpdate off the previous
-        // op-tensor (or the slab leaf on first use) so that successive
-        // writes compose in graph order. No eval, no host memcpy — the
-        // writes land in the same command buffer as the SDPA read that
-        // follows.
-        let k_base = self.keys_latest.as_ref().unwrap_or(&self.keys_slab);
-        let v_base = self.values_latest.as_ref().unwrap_or(&self.values_slab);
-        self.keys_latest = Some(k_base.slice_update(k, self.position)?);
-        self.values_latest = Some(v_base.slice_update(v, self.position)?);
+        // Eager slab-base contract: each `update` retains only the latest
+        // SliceUpdate op; the next one bases on the raw slab. If a prior
+        // update has not been evaluated, basing on the slab would drop its
+        // (unreferenced, never-executed) write. Fail loud rather than
+        // silently lose it — callers must `eval` between successive updates
+        // (decode evals each token; prefill is a single update + eval).
+        if self
+            .keys_latest
+            .as_ref()
+            .is_some_and(|t| !t.is_materialized())
+            || self
+                .values_latest
+                .as_ref()
+                .is_some_and(|t| !t.is_materialized())
+        {
+            return Err(Error::InvalidArgument(
+                "KvCache::update: the previous update has not been evaluated; \
+                 successive updates must be separated by an eval (the slab-based \
+                 slice_update would otherwise drop the prior, unevaluated write)"
+                    .into(),
+            ));
+        }
+
+        // Lazy in-graph write: build each SliceUpdate directly on the slab
+        // leaf (not chained off the previous op-tensor). The slab already
+        // holds the prior committed rows, and this step's disjoint row
+        // write is ordered before the SDPA read by Metal's hazard tracking
+        // on the shared (default-tracked) slab buffer. Basing on the slab
+        // — rather than retaining the prior `keys_latest`/`values_latest`
+        // op — means each step's projection graph frees once the next
+        // `update` reassigns these fields, so the buffer pool can recycle
+        // per-step scratch. No eval, no host memcpy.
+        self.keys_latest = Some(self.keys_slab.slice_update(k, self.position)?);
+        self.values_latest = Some(self.values_slab.slice_update(v, self.position)?);
         self.position += step_t;
         Ok(())
     }
@@ -385,8 +420,14 @@ mod tests {
         let t0 = Tensor::from_slice(&device, &r0, [1usize, 2, 3]).expect("t0");
         cache.update(&t0, &t0).expect("update 0");
 
-        // Capture a view of the row-0 prefix, then append row 1.
+        // Capture a view of the row-0 prefix; eval it (satisfying the
+        // between-update eval contract), then append row 1.
         let kview0 = cache.keys_view();
+        kview0.eval().expect("eval kview0 before update 1");
+        cache
+            .values_view()
+            .eval()
+            .expect("eval vview0 before update 1");
         let r1 = row(100);
         let t1 = Tensor::from_slice(&device, &r1, [1usize, 2, 3]).expect("t1");
         cache.update(&t1, &t1).expect("update 1");
@@ -395,5 +436,68 @@ mod tests {
         // wrote the disjoint row 1, so row 0's bytes are unchanged.
         kview0.eval().expect("eval kview0");
         assert_eq!(kview0.cpu_to_vec::<bf16>().expect("kview0"), r0);
+    }
+
+    /// Regression guard for the buffer-pool retention bug: `update` must
+    /// not pin each step's projection graph across the whole decode. We
+    /// drive a decode-like loop where the K/V inputs are pooled op
+    /// outputs (`leaf.add`), and assert the pool registers reuse hits —
+    /// which only happens if per-step graphs free between steps. With the
+    /// old chaining `update` (base = previous op-tensor) every step's
+    /// `add` output stays pinned by `keys_latest`/`values_latest` for the
+    /// whole loop, so hits stay at 0 and this fails.
+    #[test]
+    fn update_does_not_retain_per_step_graphs() {
+        let device = Device::system_default().expect("device");
+        let mut cache = KvCache::new(&device, 16, 2, 3, DType::BF16).expect("cache");
+
+        let row: Vec<bf16> = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]
+            .iter()
+            .map(|&x| bf16::from_f32(x))
+            .collect();
+
+        for _ in 0..8 {
+            let leaf = Tensor::from_slice(&device, &row, [1usize, 2, 3]).expect("leaf");
+            let k = leaf.add(&leaf).expect("k");
+            let v = leaf.add(&leaf).expect("v");
+            cache.update(&k, &v).expect("update");
+            cache.keys_view().eval().expect("eval keys");
+            cache.values_view().eval().expect("eval values");
+        }
+
+        assert!(
+            device.pool_stats().hits > 0,
+            "per-step buffers must free and recycle (pool hits {} == 0 means \
+             update is retaining each step's graph)",
+            device.pool_stats().hits
+        );
+    }
+
+    /// Two updates without an intervening eval must fail loud (the eager
+    /// slab-base form would otherwise silently drop the first write).
+    #[test]
+    fn update_without_intervening_eval_errors() {
+        let device = Device::system_default().expect("device");
+        let mut cache = KvCache::new(&device, 4, 2, 3, DType::BF16).expect("cache");
+
+        let row: Vec<bf16> = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]
+            .iter()
+            .map(|&x| bf16::from_f32(x))
+            .collect();
+        let k = Tensor::from_slice(&device, &row, [1usize, 2, 3]).expect("k");
+        let v = Tensor::from_slice(&device, &row, [1usize, 2, 3]).expect("v");
+
+        cache.update(&k, &v).expect("first update ok");
+        // No eval here → second update must error rather than lose row 0.
+        let err = cache.update(&k, &v).unwrap_err();
+        assert!(
+            format!("{err}").contains("must be separated by an eval"),
+            "expected eval-between-updates error, got: {err}"
+        );
+
+        // After evaluating, a further update is accepted again.
+        cache.keys_view().eval().expect("eval keys");
+        cache.values_view().eval().expect("eval values");
+        cache.update(&k, &v).expect("update after eval ok");
     }
 }

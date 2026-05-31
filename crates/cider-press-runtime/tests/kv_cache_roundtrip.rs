@@ -33,6 +33,12 @@ fn roundtrip_appends_and_reads_back_populated_prefix() {
 
     // Append in three chunks (2 + 3 + 1 = 6 rows) so we exercise
     // multi-row `update` and a non-trivial running offset.
+    //
+    // KvCache's append-only contract requires that prior rows are committed
+    // (via `eval`) before the next `update` — `update` bases its
+    // `slice_update` op directly on the slab leaf, so unevaluated writes
+    // from a prior step are not in the graph for the next step's base. Each
+    // iteration evaluates the current prefix before appending the next chunk.
     let chunks: [usize; 3] = [2, 3, 1];
     let mut keys_expected: Vec<bf16> = Vec::new();
     let mut values_expected: Vec<bf16> = Vec::new();
@@ -47,6 +53,9 @@ fn roundtrip_appends_and_reads_back_populated_prefix() {
             value(next_value, chunks_pos + row, h, d, 100.0)
         });
         cache.update(&k, &v).expect("update");
+        // Commit prior rows into the slab before the next update builds on it.
+        cache.keys_view().eval().expect("eval keys after chunk");
+        cache.values_view().eval().expect("eval values after chunk");
         // Mirror the per-element values into the expected vec.
         for row in 0..step_t {
             for h in 0..N_KV_HEADS {
@@ -169,28 +178,34 @@ fn dtype_mismatch_is_rejected() {
 
 #[test]
 fn update_with_outstanding_view_succeeds_under_lazy_contract() {
-    // Spike: the eager strong-count aliasing guard is removed. Updates
-    // now succeed even while a previously-returned view is still live,
-    // because there is no host memcpy and the data graph is correct by
-    // construction.
+    // A previously-returned view that is still live must not block a
+    // subsequent update: there is no host memcpy (the write is an in-graph
+    // GPU op) and the cache is append-only, so a live view reads a still-
+    // valid prefix. The prefix is evaluated between the two updates to
+    // satisfy the slab-base eval-between-updates contract; the held view
+    // is what stays outstanding across the second update.
     let device = Device::system_default().expect("device");
     let mut cache =
         KvCache::new(&device, MAX_TOKENS, N_KV_HEADS, HEAD_DIM, DType::BF16).expect("alloc");
     let first = make_chunk_tensor(&device, 1, |_, _, _| 1.0);
     cache.update(&first, &first).expect("first update");
 
-    // Hold a view across a second update — no longer an error.
+    // Hold a view across the second update; commit the first write first.
     let _view = cache.keys_view();
+    cache.keys_view().eval().expect("eval keys");
+    cache.values_view().eval().expect("eval values");
     cache
         .update(&first, &first)
-        .expect("update with outstanding view is now allowed");
+        .expect("update with outstanding view is allowed");
     assert_eq!(cache.position(), 2);
 }
 
 #[test]
 fn update_with_derived_op_tensor_succeeds_under_lazy_contract() {
-    // Spike: the eager strong-count aliasing guard is removed. An op
-    // tensor derived from a view no longer blocks a subsequent update.
+    // An (unevaluated) op tensor derived from a view must not block a
+    // subsequent update — the held derived op stays outstanding across the
+    // second update. The prefix is evaluated between updates to satisfy the
+    // slab-base eval-between-updates contract.
     let device = Device::system_default().expect("device");
     let mut cache =
         KvCache::new(&device, MAX_TOKENS, N_KV_HEADS, HEAD_DIM, DType::BF16).expect("alloc");
@@ -199,9 +214,11 @@ fn update_with_derived_op_tensor_succeeds_under_lazy_contract() {
 
     let other = make_chunk_tensor(&device, 1, |_, _, _| 2.0);
     let _derived = cache.keys_view().add(&other).expect("add");
+    cache.keys_view().eval().expect("eval keys");
+    cache.values_view().eval().expect("eval values");
     cache
         .update(&first, &first)
-        .expect("update with derived op tensor is now allowed");
+        .expect("update with derived op tensor is allowed");
     assert_eq!(cache.position(), 2);
 }
 
