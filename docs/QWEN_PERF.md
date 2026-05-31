@@ -320,3 +320,78 @@ uv run scripts/measure_qwen_mlx.py \
 
 Run the cider-press bench at least twice; the first invocation of a fresh
 process pays the one-time Metal JIT compile in prefill.
+
+## qmv audit
+
+This audits backlog item #4 (the decode 4-bit `qmv` matvecs). It runs two
+microbenches at the five Qwen2.5-0.5B decode shapes plus a forced-fast
+control: cider-press `affine_qmv_bf16` (`crates/cider-press-kernels/tests/qmv_dispatch_bench.rs`)
+and MLX `mx.quantized_matmul` (`scripts/measure_qmv_mlx.py`), gs=64, bits=4.
+
+Read the columns carefully — the two harnesses measure different things:
+
+- **Per-dispatch wall µs is the only apples-to-apples cider-vs-MLX
+  comparator.** Both harnesses do one submit + one wait per dispatch
+  (cider: `commit_and_wait`; MLX: `mx.eval`), so both are
+  **dispatch-latency-bound** — the ~90–360 µs is dominated by the
+  submit+wait floor, not the matvec.
+- **cider's GPU-counter `eff BW` is the kernel-only truth** — pure GPU
+  execution from stage-boundary counters, excluding submit/wait. This is
+  the kernel-internal signal. (Small-shape GPU-counter readings vary
+  run-to-run from thermal/scheduling perturbation; the floor — lowest ns
+  over several runs — is the representative kernel time and is reported
+  below.)
+- MLX's wall-derived BW is **overhead-bound** (the ~100 µs eval floor
+  dominates small shapes), so it is **not** comparable to cider's
+  GPU-counter BW — see the note under the table.
+
+| shape (K×N) | linear       | variant | cider GPU-counter eff BW | cider wall µs | MLX wall µs |
+|-------------|--------------|---------|-------------------------:|--------------:|------------:|
+| 896×896     | q/o_proj     | gen     |  85 GB/s |  ~93 | ~98  |
+| 896×128     | k/v_proj     | gen     |  13 GB/s |  ~92 | ~97  |
+| 896×4864    | gate/up_proj | gen     | 306 GB/s | ~100 | ~106 |
+| 4864×896    | down_proj    | gen     | 272 GB/s | ~105 | ~109 |
+| 896×151936  | lm_head      | gen     | 464 GB/s | ~257 | ~268 |
+| 1024×1024   | forced-fast  | fast    | 151 GB/s |  ~92 | ~99  |
+
+(MLX wall-clock BW, overhead-bound, for context only — not comparable to
+cider's GPU-counter column: q/o ~5, k/v ~1, gate/up ~23, down ~23, lm_head
+~287, fast ~6 GB/s. The ~100 µs `mx.eval` floor swamps every shape but
+lm_head, which is why these are tiny.)
+
+Findings:
+
+1. **The qmv dispatch path is not where cider-press loses to mlx_lm.** On
+   the only comparable axis — per-dispatch wall µs — cider-press is at or
+   slightly ahead of MLX at every shape (~92 vs ~98 µs at q/o_proj, ~257 vs
+   ~268 at lm_head). Both are latency-bound on the submit+wait floor; the
+   matvec itself is a small fraction of that wall time.
+2. **Kernel-internal bandwidth (cider GPU-counter) scales with N (output
+   dim).** Small-N projections are badly under-utilized — k/v_proj (N=128)
+   at ~13 GB/s, q/o_proj (N=896) at ~85 — while large-N linears saturate:
+   gate/up (N=4864) ~306, down ~272, lm_head (N=151936) ~464 GB/s. The
+   generic qmv grid is `(1, ceil(N/8), 1)` threadgroups, so small N
+   launches too few threadgroups to fill the GPU. This is **occupancy
+   starvation (lever b)**.
+3. **The forced-fast control adds a second lever.** At a comparable size,
+   the fast path (1024×1024, ~151 GB/s) runs ~1.7× the generic q/o_proj
+   (896×896, ~85 GB/s). Since every Qwen2.5-0.5B decode shape has
+   `K ∈ {896, 4864}` (neither a 512-multiple), the fast path is never
+   selected — **fast-path absence (lever a)** also contributes.
+4. **The empirical kernel ceiling is ~464 GB/s** (lm_head GPU-counter),
+   approaching the M4 Max ~410–546 GB/s spec roofline — not the bogus
+   ~125 GB/s `copy_v_bf16` probe (which several qmv shapes exceed, so it is
+   not bandwidth-saturating; see the plan's execution amendment). So the
+   large-N linears are essentially roofline-bound, and the headroom is
+   concentrated in the small-N projections.
+5. **This microbench cannot arbitrate the decode gap** — it is
+   latency-bound (one submit+wait per call), whereas decode runs many ops
+   in one command buffer with no per-op wait. The decode-gap arbiter is
+   Approach B (next): a steady-state attribution of a real decode token,
+   comparing Σ(per-shape qmv GPU time) against the `tensor.eval.wait`
+   bucket. That determines whether the residual is kernel/config (levers
+   a/b) or inter-dispatch serialization (lever c).
+
+Reproduce: `cargo test -p cider-press-kernels --release --test
+qmv_dispatch_bench -- --ignored --nocapture` and `uv run
+scripts/measure_qmv_mlx.py`.
