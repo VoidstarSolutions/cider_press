@@ -108,6 +108,41 @@ pub fn sdpa(
             "qwen2::attention::sdpa: invalid GQA config (H_q={h_q}, H_kv={h_kv})",
         )));
     }
+    let t_q = q.shape().dims().get(2).copied().ok_or_else(|| {
+        Error::InvalidArgument("qwen2::attention::sdpa: Q must be rank-4 [B, H, T, D_h]".into())
+    })?;
+    // Decode (single Q row, full attention): route to the fused
+    // `sdpa_vector` kernel, which reads K/V strided in place and handles
+    // GQA in-kernel — no GQA-broadcast / Kᵀ / score-matmul / softmax
+    // ops. Prefill (T>1) or any masked call keeps the composed chain.
+    if t_q == 1 && mask.is_none() {
+        let gqa_factor = h_q / h_kv;
+        #[allow(clippy::cast_precision_loss)]
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        return Ok(Tensor::sdpa(q, k, v, None, scale, gqa_factor, false)?);
+    }
+    composed_sdpa(q, k, v, mask, config)
+}
+
+/// The composed SDPA chain (GQA broadcast → `Q @ Kᵀ` → scale/mask/softmax
+/// → `@ V`), used for prefill (`T>1`) and masked attention. The fused
+/// [`Tensor::sdpa`] path in [`sdpa`] covers decode (`T=1`, no mask).
+#[allow(clippy::many_single_char_names)]
+fn composed_sdpa(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    config: &Qwen2Config,
+) -> Result<Tensor> {
+    let head_dim = config.head_dim()?;
+    let h_q = config.num_attention_heads;
+    let h_kv = config.num_key_value_heads;
+    if h_kv == 0 || h_q % h_kv != 0 {
+        return Err(Error::InvalidArgument(format!(
+            "qwen2::attention::sdpa: invalid GQA config (H_q={h_q}, H_kv={h_kv})",
+        )));
+    }
     let ratio = h_q / h_kv;
 
     let q_dims = q.shape().dims();
@@ -312,21 +347,31 @@ impl Attention {
         cache.update(&k_upd, &v_upd)?;
 
         // Read the populated prefix. keys_view()/values_view() are
-        // [T_cache, H_kv, D_h] (T-outer). sdpa wants [1, H_kv, T_cache,
-        // D_h], so permute the T_cache/H_kv axes (1,0,2) then add the
-        // leading batch axis. A plain reshape here would transpose the
-        // data incorrectly when H_kv>1 and T_cache>1.
+        // [T_cache, H_kv, D_h] (T-outer); sdpa wants [1, H_kv, T_cache,
+        // D_h]. Permute the T_cache/H_kv axes (1,0,2) -> [H_kv, T_cache,
+        // D_h], then add the leading batch axis.
         let t_cache = cache.position();
-        let k_sdpa = cache
-            .keys_view()
-            .permute(&[1, 0, 2])?
-            .copy()?
-            .reshape([1usize, h_kv, t_cache, head_dim])?;
-        let v_sdpa = cache
-            .values_view()
-            .permute(&[1, 0, 2])?
-            .copy()?
-            .reshape([1usize, h_kv, t_cache, head_dim])?;
+        let k_view = cache.keys_view().permute(&[1, 0, 2])?;
+        let v_view = cache.values_view().permute(&[1, 0, 2])?;
+
+        // Decode (T==1, no mask) routes through the fused `sdpa_vector`
+        // kernel, which reads K/V STRIDED IN PLACE: `broadcast_to`
+        // prepends the size-1 batch axis as a pure (stride-0) view, so the
+        // [1, H_kv, T_cache, D_h] K/V carry the slab's head/seq strides
+        // (head=D_h, seq=H_kv*D_h) with NO materializing copy. Prefill /
+        // masked attention keeps the composed matmul path, which needs
+        // contiguous K/V — copy() to land them.
+        let (k_sdpa, v_sdpa) = if t == 1 && mask.is_none() {
+            (
+                k_view.broadcast_to([1usize, h_kv, t_cache, head_dim])?,
+                v_view.broadcast_to([1usize, h_kv, t_cache, head_dim])?,
+            )
+        } else {
+            (
+                k_view.copy()?.reshape([1usize, h_kv, t_cache, head_dim])?,
+                v_view.copy()?.reshape([1usize, h_kv, t_cache, head_dim])?,
+            )
+        };
 
         let attn = sdpa(&q, &k_sdpa, &v_sdpa, mask, config)?; // [1, H_q, T, D_h]
 
