@@ -112,7 +112,9 @@ fn bench(device: &Device, library: &KernelLibrary, k: usize, n: usize) {
     let bytes = qmv_bytes(k, n, GROUP_SIZE as usize, BITS as usize);
 
     // 256 dispatches share one command buffer (the decode regime); enough to average out, few enough to bound counter-segment overhead.
-    match qmv_gpu_ns(device, library, &w, &s, &b, &x, &mut y, GROUP_SIZE, BITS, 256) {
+    match qmv_gpu_ns(
+        device, library, &w, &s, &b, &x, &mut y, GROUP_SIZE, BITS, 256,
+    ) {
         Some(gpu_ns) => {
             let eff_gbps = bytes as f64 / (gpu_ns / 1e9) / 1e9;
             eprintln!(
@@ -121,9 +123,7 @@ fn bench(device: &Device, library: &KernelLibrary, k: usize, n: usize) {
             );
         }
         None => {
-            eprintln!(
-                "  {k:>5}x{n:<6} {variant}  wall {wall_us:>7.2}us  gpu  (no counters)",
-            );
+            eprintln!("  {k:>5}x{n:<6} {variant}  wall {wall_us:>7.2}us  gpu  (no counters)",);
         }
     }
 }
