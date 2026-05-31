@@ -113,7 +113,7 @@ pub(crate) enum LeafStorage {
     /// Byte-erased dense buffer. The dtype tag on
     /// [`TensorInner::dtype`] is the source of truth for what's in
     /// the bytes; op dispatch sites reinterpret at call time.
-    Dense(Buffer<u8>),
+    Dense(crate::buffer_pool::PooledBuffer),
     /// Three-buffer storage for affine-quantized weights. Layout
     /// matches what `cider_press_kernels::kernels::qmv` expects.
     Quantized {
@@ -492,7 +492,13 @@ impl Tensor {
         layout: Layout,
         buffer: Buffer<u8>,
     ) -> Self {
-        Self::host_leaf_storage(device, shape, dtype, layout, LeafStorage::Dense(buffer))
+        Self::host_leaf_storage(
+            device,
+            shape,
+            dtype,
+            layout,
+            LeafStorage::Dense(crate::buffer_pool::PooledBuffer::unpooled(buffer)),
+        )
     }
 
     /// Crate-private constructor for quantized leaves (used by

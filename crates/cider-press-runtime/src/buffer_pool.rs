@@ -28,8 +28,6 @@ pub(crate) const DEFAULT_POOL_CAP_BYTES: usize = 384 << 20;
 /// for), not the page-rounded allocation size: a recycled buffer of the
 /// same requested length has an identical rounded allocation, so exact
 /// keying makes reuse a drop-in replacement.
-// Not yet wired into eval; the next commit threads these through LeafStorage.
-#[allow(dead_code)]
 pub(crate) struct BufferPool {
     free: HashMap<usize, Vec<Buffer<u8>>>,
     pooled_bytes: usize,
@@ -112,8 +110,6 @@ impl BufferPool {
 /// (`pool: None`) and therefore never return — they are not pool-owned
 /// (the slab is co-owned by the [`KvCache`]; recycling it would corrupt
 /// cached K/V).
-// Not yet wired into eval; the next commit threads these through LeafStorage.
-#[allow(dead_code)]
 pub(crate) struct PooledBuffer {
     /// `Some` until `Drop` takes it. `Deref` unwraps it.
     buffer: Option<Buffer<u8>>,
@@ -123,7 +119,6 @@ pub(crate) struct PooledBuffer {
     pool: Option<Weak<Mutex<BufferPool>>>,
 }
 
-#[allow(dead_code)]
 impl PooledBuffer {
     /// A pool-minted buffer that returns to `pool` on drop.
     pub(crate) fn pooled(buffer: Buffer<u8>, bytes: usize, pool: Weak<Mutex<BufferPool>>) -> Self {

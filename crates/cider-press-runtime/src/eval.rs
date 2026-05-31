@@ -90,26 +90,26 @@ pub(crate) fn eval(root: &Tensor) -> Result<()> {
     // for input lookup on subsequent iterations while we hold an
     // exclusive `&mut dst` to the fresh local.
     let mut outputs: Vec<Buffer<u8>> = Vec::with_capacity(order.len());
+    // Per-output pool tag: `Some(bytes)` ⇒ pool-minted, return to pool on
+    // drop; `None` ⇒ SliceUpdate slab clone (caller-owned), never pooled.
+    let mut tags: Vec<Option<usize>> = Vec::with_capacity(order.len());
     for inner in &order {
         let op = inner
             .op
             .as_ref()
             .expect("topo invariant: only op nodes are in `order`");
-        // SliceUpdate writes into a persistent caller-owned buffer
-        // (inputs[0], the slab) rather than a fresh output. Bind that
-        // buffer as `dst` so the encoded copy mutates it in place; its
-        // contents from earlier (already-committed) evals stay valid.
-        let mut dst = if let OpKind::SliceUpdate { .. } = op.kind {
+        let (mut dst, tag) = if let OpKind::SliceUpdate { .. } = op.kind {
             let slab = op.inputs.first().ok_or_else(|| {
                 Error::InvalidArgument("SliceUpdate: missing slab input (inputs[0])".into())
             })?;
-            dense_input_buffer(slab, &outputs, &index_of)?
+            (dense_input_buffer(slab, &outputs, &index_of)?, None)
         } else {
             let byte_count = checked_byte_count(&inner.shape, inner.dtype)?;
-            device.kernels().alloc_buffer::<u8>(byte_count)?
+            (device.alloc_pooled(byte_count)?, Some(byte_count))
         };
         dispatch(inner, &mut commands, &outputs, &mut dst, &index_of)?;
         outputs.push(dst);
+        tags.push(tag);
     }
 
     // Step 5: synchronous commit + wait. After this returns, every
@@ -127,8 +127,12 @@ pub(crate) fn eval(root: &Tensor) -> Result<()> {
     // buffer is dropped. Op outputs are always dense — no op
     // currently produces a quantized tensor (no `mx.quantize`
     // analogue yet).
-    for (inner, buffer) in order.into_iter().zip(outputs) {
-        let _ = inner.cache.set(LeafStorage::Dense(buffer));
+    for ((inner, buffer), tag) in order.into_iter().zip(outputs).zip(tags) {
+        let storage = match tag {
+            Some(bytes) => LeafStorage::Dense(device.pooled(buffer, bytes)),
+            None => LeafStorage::Dense(crate::buffer_pool::PooledBuffer::unpooled(buffer)),
+        };
+        let _ = inner.cache.set(storage);
     }
 
     Ok(())
@@ -162,23 +166,27 @@ pub(crate) fn profiled_eval(root: &Tensor) -> Result<()> {
         index_of.insert(Arc::as_ptr(inner), i);
     }
     let mut outputs: Vec<Buffer<u8>> = Vec::with_capacity(order.len());
+    // Per-output pool tag: `Some(bytes)` ⇒ pool-minted, return to pool on
+    // drop; `None` ⇒ SliceUpdate slab clone (caller-owned), never pooled.
+    let mut tags: Vec<Option<usize>> = Vec::with_capacity(order.len());
     for inner in &order {
         let op = inner
             .op
             .as_ref()
             .expect("topo invariant: only op nodes are in `order`");
         commands.begin_profiled_op(op_kind_label(&op.kind));
-        let mut dst = if let OpKind::SliceUpdate { .. } = op.kind {
+        let (mut dst, tag) = if let OpKind::SliceUpdate { .. } = op.kind {
             let slab = op.inputs.first().ok_or_else(|| {
                 Error::InvalidArgument("SliceUpdate: missing slab input (inputs[0])".into())
             })?;
-            dense_input_buffer(slab, &outputs, &index_of)?
+            (dense_input_buffer(slab, &outputs, &index_of)?, None)
         } else {
             let byte_count = checked_byte_count(&inner.shape, inner.dtype)?;
-            device.kernels().alloc_buffer::<u8>(byte_count)?
+            (device.alloc_pooled(byte_count)?, Some(byte_count))
         };
         dispatch(inner, &mut commands, &outputs, &mut dst, &index_of)?;
         outputs.push(dst);
+        tags.push(tag);
     }
 
     let segments = commands.commit_wait_resolve()?;
@@ -193,8 +201,12 @@ pub(crate) fn profiled_eval(root: &Tensor) -> Result<()> {
         crate::profile::record_gpu(gpu_key(seg.label), ns);
     }
 
-    for (inner, buffer) in order.into_iter().zip(outputs) {
-        let _ = inner.cache.set(LeafStorage::Dense(buffer));
+    for ((inner, buffer), tag) in order.into_iter().zip(outputs).zip(tags) {
+        let storage = match tag {
+            Some(bytes) => LeafStorage::Dense(device.pooled(buffer, bytes)),
+            None => LeafStorage::Dense(crate::buffer_pool::PooledBuffer::unpooled(buffer)),
+        };
+        let _ = inner.cache.set(storage);
     }
 
     Ok(())
@@ -1766,6 +1778,41 @@ fn element_strides(shape: &[usize]) -> Vec<i64> {
         strides[i] = strides[i + 1] * shape[i + 1] as i64;
     }
     strides
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use crate::{Device, Tensor};
+
+    /// A second eval of the same-shaped graph on a fresh device reuses
+    /// the first eval's freed op-output buffer: the pool registers a hit.
+    #[test]
+    fn second_eval_reuses_freed_output_buffer() {
+        let device = Device::system_default().expect("device");
+
+        {
+            let a = Tensor::from_slice(&device, &[1.0f32, 2.0, 3.0, 4.0], [4]).unwrap();
+            let b = Tensor::from_slice(&device, &[10.0f32, 20.0, 30.0, 40.0], [4]).unwrap();
+            let r = a.add(&b).unwrap();
+            r.eval().unwrap();
+            assert_eq!(r.cpu_slice::<f32>().unwrap(), &[11.0, 22.0, 33.0, 44.0]);
+        } // r drops here → its output buffer returns to the pool.
+
+        let before = device.pool_stats().hits;
+
+        {
+            let a = Tensor::from_slice(&device, &[5.0f32, 6.0, 7.0, 8.0], [4]).unwrap();
+            let b = Tensor::from_slice(&device, &[1.0f32, 1.0, 1.0, 1.0], [4]).unwrap();
+            let r = a.add(&b).unwrap();
+            r.eval().unwrap();
+            assert_eq!(r.cpu_slice::<f32>().unwrap(), &[6.0, 7.0, 8.0, 9.0]);
+        }
+
+        assert!(
+            device.pool_stats().hits > before,
+            "second eval should reuse the freed output buffer"
+        );
+    }
 }
 
 #[cfg(test)]

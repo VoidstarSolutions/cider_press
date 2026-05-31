@@ -170,8 +170,6 @@ impl Device {
     /// Allocate a scratch buffer of `bytes`, drawing from the recycling
     /// pool when a freed buffer of the same requested size is available
     /// and falling back to a fresh Metal allocation otherwise.
-    // Not yet wired into eval; the next commit threads this through LeafStorage.
-    #[allow(dead_code)]
     pub(crate) fn alloc_pooled(&self, bytes: usize) -> Result<Buffer<u8>> {
         if let Some(buf) = self
             .inner
@@ -188,8 +186,6 @@ impl Device {
     /// Wrap an op-output buffer as a pool-owned [`PooledBuffer`] that
     /// returns to this device's pool on drop. `bytes` is the requested
     /// length it was allocated at (its free-list key).
-    // Not yet wired into eval; the next commit threads this through LeafStorage.
-    #[allow(dead_code)]
     pub(crate) fn pooled(
         &self,
         buffer: Buffer<u8>,
