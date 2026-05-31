@@ -121,7 +121,10 @@ fn reset_rewinds_position_and_subsequent_updates_overwrite() {
     // reset() requires the last update to be evaluated (so no outstanding
     // view can replay a stale write into the reused slab).
     cache.keys_view().eval().expect("eval keys before reset");
-    cache.values_view().eval().expect("eval values before reset");
+    cache
+        .values_view()
+        .eval()
+        .expect("eval values before reset");
     cache.reset().expect("reset after eval");
     assert_eq!(cache.position(), 0);
 
