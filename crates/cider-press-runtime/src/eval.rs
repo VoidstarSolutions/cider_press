@@ -1639,9 +1639,10 @@ fn dispatch_matmul(
 }
 
 /// Dispatch the fused vector SDPA. Q is dense `[1,H_q,1,D]`; K/V are
-/// `[1,H_kv,T_cache,D]` (contiguous here; cache views in Task 7), read
-/// strided in place (no GQA-broadcast/transpose copy). Decode-only: no
-/// mask, causal=false (Plan B adds masked/causal).
+/// `[1,H_kv,T_cache,D]`, read strided in place via `layout_strides`
+/// (contiguous in Plan A's tests; real cache views in Task 7) — no
+/// GQA-broadcast/transpose copy. Decode-only: no mask, causal=false
+/// (Plan B adds masked/causal).
 #[allow(clippy::too_many_arguments)]
 fn dispatch_sdpa(
     inner: &Arc<TensorInner>,
@@ -1654,7 +1655,11 @@ fn dispatch_sdpa(
     gqa_factor: usize,
     causal: bool,
 ) -> Result<()> {
-    debug_assert!(!causal, "Plan A vector SDPA is decode-only (no causal)");
+    if causal {
+        return Err(Error::InvalidArgument(
+            "sdpa: causal=true not yet supported in the vector dispatch (Plan B)".into(),
+        ));
+    }
     let device = inner.device.as_ref().expect("op nodes carry a device");
 
     let q = op
@@ -1707,10 +1712,30 @@ fn dispatch_sdpa(
                 .map_err(|_| Error::InvalidArgument("sdpa: gqa_factor too large".into()))?,
             n_keys: i32::try_from(n_keys)
                 .map_err(|_| Error::InvalidArgument("sdpa: n_keys too large".into()))?,
-            k_head_stride: u64::try_from(k_strides[1]).unwrap_or(0),
-            k_seq_stride: u64::try_from(k_strides[2]).unwrap_or(0),
-            v_head_stride: u64::try_from(v_strides[1]).unwrap_or(0),
-            v_seq_stride: u64::try_from(v_strides[2]).unwrap_or(0),
+            k_head_stride: u64::try_from(k_strides[1]).map_err(|_| {
+                Error::InvalidArgument(format!(
+                    "sdpa: k_head_stride {} is negative or overflows u64",
+                    k_strides[1]
+                ))
+            })?,
+            k_seq_stride: u64::try_from(k_strides[2]).map_err(|_| {
+                Error::InvalidArgument(format!(
+                    "sdpa: k_seq_stride {} is negative or overflows u64",
+                    k_strides[2]
+                ))
+            })?,
+            v_head_stride: u64::try_from(v_strides[1]).map_err(|_| {
+                Error::InvalidArgument(format!(
+                    "sdpa: v_head_stride {} is negative or overflows u64",
+                    v_strides[1]
+                ))
+            })?,
+            v_seq_stride: u64::try_from(v_strides[2]).map_err(|_| {
+                Error::InvalidArgument(format!(
+                    "sdpa: v_seq_stride {} is negative or overflows u64",
+                    v_strides[2]
+                ))
+            })?,
             scale,
             head_dim,
         },
