@@ -113,7 +113,7 @@ pub(crate) enum LeafStorage {
     /// Byte-erased dense buffer. The dtype tag on
     /// [`TensorInner::dtype`] is the source of truth for what's in
     /// the bytes; op dispatch sites reinterpret at call time.
-    Dense(Buffer<u8>),
+    Dense(crate::buffer_pool::PooledBuffer),
     /// Three-buffer storage for affine-quantized weights. Layout
     /// matches what `cider_press_kernels::kernels::qmv` expects.
     Quantized {
@@ -492,7 +492,13 @@ impl Tensor {
         layout: Layout,
         buffer: Buffer<u8>,
     ) -> Self {
-        Self::host_leaf_storage(device, shape, dtype, layout, LeafStorage::Dense(buffer))
+        Self::host_leaf_storage(
+            device,
+            shape,
+            dtype,
+            layout,
+            LeafStorage::Dense(crate::buffer_pool::PooledBuffer::unpooled(buffer)),
+        )
     }
 
     /// Crate-private constructor for quantized leaves (used by
@@ -664,6 +670,19 @@ impl Tensor {
         let device = self.inner.device.as_ref().ok_or_else(|| {
             Error::InvalidArgument("slice_update: slab is a placeholder (no device)".into())
         })?;
+        // The slab must be a caller-owned dense leaf. `eval` writes in
+        // place through a refcount-bumped handle to the slab's buffer and
+        // caches the SliceUpdate output as *unpooled* — so a pool-minted op
+        // output as the slab would let the pool reclaim that buffer while
+        // this unpooled alias is still live (corruption), and a view never
+        // resolves to a dense buffer in `dense_input_buffer`. Only the slab
+        // input is constrained; `src` may be an op or view (the dispatcher
+        // chases its chain).
+        if self.inner.op.is_some() || self.inner.view.is_some() {
+            return Err(Error::InvalidArgument(
+                "slice_update: slab must be a dense leaf, not an op output or a view".into(),
+            ));
+        }
         // Scope: bf16 / rank-3 slab. The KV cache is the only
         // consumer and is bf16; broaden when a second consumer needs it.
         if self.inner.dtype != DType::BF16 {
@@ -4065,6 +4084,41 @@ mod tests {
         assert!(
             format!("{err}").contains("BF16"),
             "expected a BF16-only error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn slice_update_rejects_op_or_view_slab() {
+        // The slab must be a dense leaf: an op-output slab would be
+        // pool-minted, so writing in place and caching the result as
+        // unpooled would alias a buffer the pool can reclaim; a view slab
+        // never resolves to a dense buffer. `src` is fine as either.
+        let device = Device::shared().expect("device");
+        let src = Tensor::zeros(&device, [1usize, 2, 3], DType::BF16).expect("src");
+
+        let op_slab = {
+            let leaf = Tensor::zeros(&device, [4usize, 2, 3], DType::BF16).expect("leaf");
+            leaf.add(&leaf).expect("op slab")
+        };
+        assert!(op_slab.inner.op.is_some(), "op_slab must be an op node");
+        let err = op_slab.slice_update(&src, 0).unwrap_err();
+        assert!(
+            format!("{err}").contains("dense leaf"),
+            "expected a dense-leaf error for an op slab, got: {err}"
+        );
+
+        let view_slab = Tensor::zeros(&device, [4usize, 2, 3], DType::BF16)
+            .expect("leaf")
+            .reshape([2usize, 4, 3])
+            .expect("view slab");
+        assert!(
+            view_slab.inner.view.is_some(),
+            "view_slab must be a view node"
+        );
+        let err = view_slab.slice_update(&src, 0).unwrap_err();
+        assert!(
+            format!("{err}").contains("dense leaf"),
+            "expected a dense-leaf error for a view slab, got: {err}"
         );
     }
 }

@@ -69,10 +69,16 @@ impl Generator {
 
     /// Reset all `KvCache`s to position 0. Called automatically at the
     /// start of [`Self::generate`].
-    pub fn reset(&mut self) {
+    ///
+    /// # Errors
+    /// Propagates [`KvCache::reset`] if a cache's last update has not been
+    /// evaluated (it must be, to keep outstanding K/V views from replaying
+    /// stale writes into the reused slab).
+    pub fn reset(&mut self) -> Result<()> {
         for cache in &mut self.caches {
-            cache.reset();
+            cache.reset()?;
         }
+        Ok(())
     }
 
     /// Run one decode-step forward (`T = 1`, no mask, offset = the current
@@ -151,7 +157,7 @@ impl Generator {
                 self.context_window,
             )));
         }
-        self.reset();
+        self.reset()?;
         let device = Device::shared()?;
         let prefill_len = input_ids.len();
 
