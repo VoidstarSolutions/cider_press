@@ -57,12 +57,42 @@ Picking an async runtime (tokio / smol / executor-agnostic
 futures) would be a heavy API tax that doesn't pay for itself on
 this hardware and workload.
 
+## Buffer pool / allocator (implemented)
+
+A cross-token recycling pool now lives in `buffer_pool.rs` (the
+runtime layer — the kernels `Device` doc places the allocator here).
+`BufferPool` is a size-keyed, byte-capped free-list of `Buffer<u8>`;
+`PooledBuffer` wraps an op-output buffer plus a `Weak` pool ref and,
+on `Drop`, returns its `MTLBuffer` to the free-list instead of
+releasing it. `LeafStorage::Dense` holds a `PooledBuffer`; `eval`
+draws each op output from the pool and tags it pooled.
+
+The load-bearing rule is **only pool-minted buffers return**: the
+`SliceUpdate` slab (co-owned by `KvCache`) and host/constant leaves
+are minted `unpooled` (`pool: None`) and never recycled, or they would
+corrupt cached data. Reclaim rides Rust ownership — a `PooledBuffer`
+is the sole long-lived owner of its `MTLBuffer`, and transient
+`reinterpret_as` views are dropped during dispatch encoding (before
+the node drops, after `commit_and_wait`), so the buffer is unaliased
+when it returns. Reuse is **cross-token**: a token's whole graph stays
+live for its single command buffer, freeing only as the next token
+starts — so the pool recycles per-token scratch but does not do MLX's
+within-eval reuse. See `QWEN_PERF.md` for the measured effect (98%
+decode hit, peak RSS ~1192 → ~900 MiB) and the design specs under
+`docs/superpowers/specs/`.
+
+Contrast with MLX (`allocator.cpp` / `buffer_cache.h`), the reference:
+MLX uses best-fit keying (`lower_bound` within 2×) with LRU
+pressure-eviction and frees intermediates *during* eval; ours is
+exact-size keyed, refuse-on-over-cap, and frees cross-token. MLX also
+allocates hazard-*untracked* buffers and orders work itself, whereas
+cider-press relies on Metal's automatic hazard tracking on default-
+tracked buffers (which the `KvCache` slab-base write→read ordering
+leans on) — a future divergence if cider-press adopts untracked
+buffers.
+
 ## Non-goals (deferred)
 
-- **Buffer pool / allocator.** Use raw `Device::new_buffer` per
-  allocation. The MLX `allocator.cpp` design is the reference for
-  later, but pooling is an optimization, not a design constraint on
-  the public API.
 - **Cross-buffer command-buffer batching / internal pipelining.**
   First cut: one `Commands` per `eval()`, synchronous commit +
   wait. The 1.5× per-dispatch perf gap to MLX lives here — but
