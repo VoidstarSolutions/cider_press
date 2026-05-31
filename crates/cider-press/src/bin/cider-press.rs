@@ -250,6 +250,7 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
 
     let rss_post_decode = cider_press::sys::resident_bytes();
     let rss_peak = cider_press::sys::peak_resident_bytes();
+    let pool = device.pool_stats();
 
     // ---- report ----
     let prefill_tok_s = prompt_len as f64 / prefill_dur.as_secs_f64();
@@ -281,6 +282,8 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
     print_rss("  rss post-load", rss_post_load);
     print_rss("  rss post-dec ", rss_post_decode);
     print_rss("  rss peak     ", rss_peak);
+    println!();
+    print_pool_stats(&pool);
     println!();
     print_span_breakdown(&spans);
 
@@ -360,6 +363,29 @@ fn print_gpu_breakdown(gpu: &[(&'static str, u64, u64)]) {
         };
         println!("    {name:<20} {ms:>10.3} {count:>11} {us_disp:>12.2} {pct:>7.1}%");
     }
+}
+
+/// Print the buffer-pool counters. Cumulative over the whole run
+/// (prefill + warmup + timed decode), so the hit-rate is pessimistic
+/// versus warm steady state; `high water` (max bytes simultaneously
+/// held in the free-list) is the cap-sizing figure and is windowing-
+/// independent.
+#[allow(clippy::cast_precision_loss)]
+fn print_pool_stats(pool: &cider_press_runtime::PoolStats) {
+    let total = pool.hits + pool.misses;
+    let hit_rate = if total == 0 {
+        0.0
+    } else {
+        pool.hits as f64 * 100.0 / total as f64
+    };
+    let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
+    println!("  buffer pool (cumulative):");
+    println!(
+        "    hits {} / misses {}  ({hit_rate:.1}% hit)   high water {:>8.1} MiB",
+        pool.hits,
+        pool.misses,
+        mib(pool.high_water_bytes),
+    );
 }
 
 #[allow(clippy::cast_precision_loss)]
