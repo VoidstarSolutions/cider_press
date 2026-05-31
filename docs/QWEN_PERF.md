@@ -102,17 +102,17 @@ Reading it:
   encoding every dispatch. With decode attention fused into `sdpa_vector`,
   the forward is **~38 dispatches per layer** (per-head qmv projections +
   bias, RoPE, the KV slab write, one fused `sdpa_vector`, the MLP), so
-  **on the order of ~900 dispatches per token** across 24 layers plus
-  embedding and the tied head — down from ~1000 before fusion. Because
+  **on the order of ~974 dispatches per token** across 24 layers plus
+  embedding and the tied head (see the GPU-breakdown table) — down from ~1166 before fusion. Because
   `commit_and_wait` is synchronous, this CPU time is fully serialized
   ahead of the GPU.
 - **`tensor.eval.wait` (~6.2 ms/token, ~62% of eval) is GPU execution.**
   The heavy compute is the 4-bit `qmv` weight matvecs — every projection
   and MLP linear at T=1. The attention score matmuls and softmax that
   previously ran here (`q@kᵀ`, `probs@v`, the two `gemm_bfloat16` calls
-  plus softmax) and the ~11 materializing `permute().copy()`s per layer
-  are gone: the fused `sdpa_vector` kernel subsumes them, reading strided
-  K/V in place.
+  plus softmax) and the materializing `permute().copy()`s (copy bucket
+  dropped 266→146 dispatches, ~5/layer removed) are gone: the fused
+  `sdpa_vector` kernel subsumes them, reading strided K/V in place.
 - **`kvcache.update` is ~0%** — the forced `k.eval()` + `v.eval()` per
   layer (formerly ~1874 ms, ~86% of decode) is gone. The SliceUpdate op
   is built lazily; Metal's hazard tracking serializes the slab write →
@@ -155,11 +155,12 @@ Reading it:
   the two SDPA score matmuls (`q@kᵀ`, `probs@v`) and the softmax now run
   inside the fused `sdpa_vector` kernel (24 dispatches, one per layer; the
   whole bucket is ~3.8%). `copy` dropped from ~20% to ~11% — the ~11
-  materializing `permute().copy()`s per layer that fed the contiguous-only
-  matmul kernel are gone, because `sdpa_vector` reads K/V strided in place
-  with no GQA-broadcast or Kᵀ copy. The ~36% copy+score-matmul attention
+  materializing `permute().copy()`s that fed the contiguous-only matmul
+  kernel are gone (copy bucket: 266→146 dispatches, ~120 total / ~5 per
+  layer): the GQA-broadcast, Kᵀ-transpose, and the two K/V SDPA-read
+  copies per layer, because `sdpa_vector` reads K/V strided in place. The ~36% copy+score-matmul attention
   share has been replaced by a single ~3.8% `sdpa` bucket plus the residual
-  copies that remain. Total dispatches/token dropped to ~924 (from ~1166).
+  copies that remain. Total dispatches/token dropped to ~974 (from ~1166; see table).
 - **`quantized_matmul` (qmv) is now the dominant bucket at ~41%** — the
   4-bit weight matvecs (every projection and MLP linear at T=1). Its
   absolute time is unchanged; its *share* rose because the attention
@@ -213,7 +214,8 @@ closes the gap. In measurement-justified priority:
 
 - **Fused decode attention — done.** The decode path now runs through the
   `sdpa_vector` kernel, which reads strided K/V in place and removes the
-  ~11 `permute().copy()`s per layer plus the q@kᵀ/softmax/probs@v chain.
+  ~120 materializing `permute().copy()`s (266→146; ~5/layer) plus the
+  q@kᵀ/softmax/probs@v chain.
   This took decode ~90 → ~120 tok/s and collapsed the ~36% copy+matmul
   attention share into a ~3.8% `gpu.sdpa` bucket. **Remaining:** prefill
   still uses the composed path; fusing it (steel/nax `sdpa_full`, Plan B)
