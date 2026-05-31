@@ -2,7 +2,8 @@
 //
 // Single-pass sdpa_vector instantiations only. The 2pass split-K variant
 // (sdpa_vector_2pass_{1,2}) is omitted here; it will be instantiated when
-// split-K dispatch lands. See docs/superpowers/plans/2026-05-30-fused-sdpa-A-vector.md.
+// split-K dispatch lands (the long-context decode follow-up tracked in
+// docs/QWEN_PERF.md).
 
 #include "mlx/backend/metal/kernels/utils.h"
 #include "mlx/backend/metal/kernels/sdpa_vector.h"
