@@ -105,6 +105,47 @@ pub fn dispatch_sdpa_vector_bf16(
             args.gqa_factor
         )));
     }
+    // GQA maps each query head to `q_head / gqa_factor`; an uneven split
+    // would index a KV head past the cache. The strided K/V reads run
+    // `keys[(n_kv_heads-1)*head_stride + (n_keys-1)*seq_stride + d]`, so
+    // bound both buffers against that maximum element before dispatching —
+    // a short K/V (or oversized strides) would otherwise read OOB on-GPU.
+    let gqa = usize::try_from(args.gqa_factor).expect("gqa_factor > 0 checked above");
+    if n_q_heads % gqa != 0 {
+        return Err(Error::InvalidArgument(format!(
+            "sdpa_vector: n_q_heads ({n_q_heads}) must be divisible by gqa_factor ({gqa})"
+        )));
+    }
+    let n_kv_heads = n_q_heads / gqa;
+    let n_keys = usize::try_from(args.n_keys).expect("n_keys > 0 checked above");
+    let khs = usize::try_from(args.k_head_stride)
+        .map_err(|_| Error::InvalidArgument("sdpa_vector: k_head_stride too large".into()))?;
+    let kss = usize::try_from(args.k_seq_stride)
+        .map_err(|_| Error::InvalidArgument("sdpa_vector: k_seq_stride too large".into()))?;
+    let vhs = usize::try_from(args.v_head_stride)
+        .map_err(|_| Error::InvalidArgument("sdpa_vector: v_head_stride too large".into()))?;
+    let vss = usize::try_from(args.v_seq_stride)
+        .map_err(|_| Error::InvalidArgument("sdpa_vector: v_seq_stride too large".into()))?;
+    let max_index = |head_stride: usize, seq_stride: usize| {
+        (n_kv_heads - 1)
+            .saturating_mul(head_stride)
+            .saturating_add((n_keys - 1).saturating_mul(seq_stride))
+            .saturating_add(args.head_dim)
+    };
+    let required_k = max_index(khs, kss);
+    if k.len() < required_k {
+        return Err(Error::InvalidArgument(format!(
+            "sdpa_vector: k too small (need {required_k}, got {})",
+            k.len()
+        )));
+    }
+    let required_v = max_index(vhs, vss);
+    if v.len() < required_v {
+        return Err(Error::InvalidArgument(format!(
+            "sdpa_vector: v too small (need {required_v}, got {})",
+            v.len()
+        )));
+    }
 
     let kname = format!("sdpa_vector_bfloat16_t_{}_{}", args.head_dim, args.head_dim);
     let pipeline = library.pipeline_specialized(
