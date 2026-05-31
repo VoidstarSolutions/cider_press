@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use cider_press_kernels as kernels;
+use cider_press_kernels::Buffer;
 
 use crate::error::Result;
 
@@ -75,6 +76,8 @@ struct DeviceInner {
     /// [`crate::Tensor::sdpa`] eval; subsequent decodes reuse the
     /// cached library and its per-`head_dim` pipeline-state cache.
     sdpa_vector_library: OnceLock<kernels::KernelLibrary>,
+    /// Cross-token scratch recycling. See [`crate::buffer_pool`].
+    pool: Arc<Mutex<crate::buffer_pool::BufferPool>>,
 }
 
 /// Refcounted handle to the system's default Metal device.
@@ -106,6 +109,9 @@ impl Device {
                 gather_libraries: Mutex::new(HashMap::new()),
                 matmul_library: OnceLock::new(),
                 sdpa_vector_library: OnceLock::new(),
+                pool: Arc::new(Mutex::new(crate::buffer_pool::BufferPool::new(
+                    crate::buffer_pool::DEFAULT_POOL_CAP_BYTES,
+                ))),
             }),
         })
     }
@@ -137,6 +143,9 @@ impl Device {
             gather_libraries: Mutex::new(HashMap::new()),
             matmul_library: OnceLock::new(),
             sdpa_vector_library: OnceLock::new(),
+            pool: Arc::new(Mutex::new(crate::buffer_pool::BufferPool::new(
+                crate::buffer_pool::DEFAULT_POOL_CAP_BYTES,
+            ))),
         });
         let stored = SHARED.get_or_init(|| fresh);
         Ok(Self {
@@ -155,6 +164,63 @@ impl Device {
     /// runtime uses this to thread allocation and dispatch through;
     /// callers outside the crate should stay at the [`Device`] level.
     pub(crate) fn kernels(&self) -> &kernels::Device {
+        &self.inner.kernels
+    }
+
+    /// Allocate a scratch buffer of `bytes`, drawing from the recycling
+    /// pool when a freed buffer of the same requested size is available
+    /// and falling back to a fresh Metal allocation otherwise.
+    // Not yet wired into eval; the next commit threads this through LeafStorage.
+    #[allow(dead_code)]
+    pub(crate) fn alloc_pooled(&self, bytes: usize) -> Result<Buffer<u8>> {
+        if let Some(buf) = self
+            .inner
+            .pool
+            .lock()
+            .expect("buffer pool mutex poisoned")
+            .take(bytes)
+        {
+            return Ok(buf);
+        }
+        Ok(self.inner.kernels.alloc_buffer::<u8>(bytes)?)
+    }
+
+    /// Wrap an op-output buffer as a pool-owned [`PooledBuffer`] that
+    /// returns to this device's pool on drop. `bytes` is the requested
+    /// length it was allocated at (its free-list key).
+    // Not yet wired into eval; the next commit threads this through LeafStorage.
+    #[allow(dead_code)]
+    pub(crate) fn pooled(
+        &self,
+        buffer: Buffer<u8>,
+        bytes: usize,
+    ) -> crate::buffer_pool::PooledBuffer {
+        crate::buffer_pool::PooledBuffer::pooled(buffer, bytes, Arc::downgrade(&self.inner.pool))
+    }
+
+    /// Snapshot of the pool's hit/miss/byte counters.
+    #[must_use]
+    pub fn pool_stats(&self) -> crate::buffer_pool::PoolStats {
+        self.inner
+            .pool
+            .lock()
+            .expect("buffer pool mutex poisoned")
+            .stats()
+    }
+
+    /// Override the pool's retained-byte ceiling.
+    pub fn set_pool_cap(&self, cap_bytes: usize) {
+        self.inner
+            .pool
+            .lock()
+            .expect("buffer pool mutex poisoned")
+            .set_cap(cap_bytes);
+    }
+
+    /// Test-only accessor for the underlying kernels device (so
+    /// `buffer_pool` unit tests can allocate raw buffers).
+    #[cfg(test)]
+    pub(crate) fn kernels_for_test(&self) -> &kernels::Device {
         &self.inner.kernels
     }
 
