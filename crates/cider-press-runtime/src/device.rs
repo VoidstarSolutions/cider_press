@@ -204,7 +204,9 @@ impl Device {
             .stats()
     }
 
-    /// Override the pool's retained-byte ceiling.
+    /// Override the pool's retained-byte ceiling. Lowering it below the
+    /// currently-pooled bytes evicts free-list entries until the pool is
+    /// back under the new ceiling, so a shrink frees memory immediately.
     pub fn set_pool_cap(&self, cap_bytes: usize) {
         self.inner
             .pool

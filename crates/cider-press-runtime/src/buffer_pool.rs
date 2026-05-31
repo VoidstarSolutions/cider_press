@@ -86,8 +86,24 @@ impl BufferPool {
         self.high_water_bytes = self.high_water_bytes.max(self.pooled_bytes);
     }
 
+    /// Set the retained-byte ceiling. Lowering it below the bytes already
+    /// held evicts free-list entries (dropping their `MTLBuffer`s) until
+    /// `pooled_bytes <= cap_bytes`, so a shrink actually bounds retained
+    /// memory rather than only gating future [`give`](Self::give)s.
+    /// `high_water_bytes` is left as the historical peak.
     pub(crate) fn set_cap(&mut self, cap_bytes: usize) {
         self.cap_bytes = cap_bytes;
+        if self.pooled_bytes <= cap_bytes {
+            return;
+        }
+        'evict: for (&bytes, slot) in &mut self.free {
+            while slot.pop().is_some() {
+                self.pooled_bytes -= bytes;
+                if self.pooled_bytes <= cap_bytes {
+                    break 'evict;
+                }
+            }
+        }
     }
 
     pub(crate) fn stats(&self) -> PoolStats {
@@ -243,6 +259,35 @@ mod tests {
         pool.give(buf(&device, 1024), 1024);
         assert_eq!(pool.stats().pooled_bytes, 1024);
         assert_eq!(pool.stats().high_water_bytes, 1024);
+    }
+
+    #[test]
+    fn set_cap_shrink_evicts_to_new_ceiling() {
+        let device = Device::system_default().expect("device");
+        let mut pool = BufferPool::new(DEFAULT_POOL_CAP_BYTES);
+        for _ in 0..3 {
+            pool.give(buf(&device, 1024), 1024);
+        }
+        assert_eq!(pool.stats().pooled_bytes, 3072);
+        pool.set_cap(1024);
+        assert!(
+            pool.stats().pooled_bytes <= 1024,
+            "shrinking the cap must evict down to the ceiling (held {} > 1024)",
+            pool.stats().pooled_bytes
+        );
+        // High-water records the peak, not the post-eviction level.
+        assert_eq!(pool.stats().high_water_bytes, 3072);
+    }
+
+    #[test]
+    fn set_cap_no_eviction_when_already_under_ceiling() {
+        let device = Device::system_default().expect("device");
+        let mut pool = BufferPool::new(DEFAULT_POOL_CAP_BYTES);
+        pool.give(buf(&device, 1024), 1024);
+        pool.set_cap(4096); // raise: nothing to evict
+        assert_eq!(pool.stats().pooled_bytes, 1024);
+        pool.set_cap(1024); // shrink to exactly the held bytes: still nothing
+        assert_eq!(pool.stats().pooled_bytes, 1024);
     }
 
     #[test]
