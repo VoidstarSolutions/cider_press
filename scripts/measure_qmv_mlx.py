@@ -5,16 +5,12 @@
 #   "mlx>=0.18",
 # ]
 # ///
-"""qmv dispatch-latency comparison: MLX Python vs cider-press Rust.
+"""MLX qmv effective-bandwidth comparison over Qwen2.5-0.5B production shapes.
 
-Times MLX's own `mx.quantized_matmul` at the same shapes the Rust
-`qmv_dispatch_bench` test measures, so the two numbers can be compared
-apples-to-apples.
-
-The Rust harness times raw kernel dispatch (commit + waitUntilCompleted).
-MLX's path includes its own graph/dispatch layer on top of the same
-Metal kernel, so the difference between the two is, by definition, the
-graph/dispatch overhead we're trying to characterize.
+Times MLX's `mx.quantized_matmul` at the five Qwen2.5-0.5B decode shapes
+plus a forced-fast control, reporting per-dispatch latency and effective
+GB/s. Mirrors the shapes in `crates/cider-press-kernels/tests/qmv_dispatch_bench.rs`
+so cider-press and MLX numbers can be compared column-for-column.
 
 Run: `uv run scripts/measure_qmv_mlx.py`
 """
@@ -31,11 +27,14 @@ WARMUP = 50
 TIMED = 1000
 
 
-def bench(dim: int) -> None:
-    k = dim
-    n = dim
-    mx.random.seed(0)
+def qmv_bytes(k: int, n: int) -> int:
+    weights = n * k * BITS // 8
+    scales_biases = 2 * (n * (k // GROUP_SIZE)) * 2  # bf16 scales + biases
+    return weights + scales_biases + k * 2 + n * 2
 
+
+def bench(k: int, n: int, label: str) -> None:
+    mx.random.seed(0)
     w = (mx.random.uniform(shape=(n, k)) - 0.5).astype(mx.bfloat16)
     x = (mx.random.uniform(shape=(k,)) - 0.5).astype(mx.bfloat16)
     w_q, scales, biases = mx.quantize(w, group_size=GROUP_SIZE, bits=BITS)
@@ -48,26 +47,30 @@ def bench(dim: int) -> None:
         )
 
     for _ in range(WARMUP):
-        y = one()
-        mx.eval(y)
+        mx.eval(one())
 
     t0 = time.perf_counter()
     for _ in range(TIMED):
-        y = one()
-        mx.eval(y)
-    t1 = time.perf_counter()
+        mx.eval(one())
+    elapsed = time.perf_counter() - t0
 
-    elapsed = t1 - t0
     per_us = (elapsed / TIMED) * 1e6
-    rate = TIMED / elapsed
-    print(f"  {k:>5}x{n:<5}   {elapsed * 1000:>8.2f} ms   {per_us:>9.2f} us   {rate:>9.0f} disp/s")
+    eff_gbps = qmv_bytes(k, n) / (elapsed / TIMED) / 1e9
+    print(f"  {k:>5}x{n:<6} {label:<20} {per_us:>9.2f} us   {eff_gbps:>6.0f} GB/s")
 
 
 def main() -> None:
-    print(f"qmv dispatch-latency (MLX Python): mx.quantized_matmul, warmup={WARMUP}, timed={TIMED}")
-    print("  shape (K=N)   total          per-dispatch    rate")
-    bench(512)
-    bench(4096)
+    print(f"qmv (MLX Python): mx.quantized_matmul, warmup={WARMUP}, timed={TIMED}")
+    print("  shape        label                per-dispatch    eff BW")
+    for k, n, label in [
+        (896, 896, "q/o_proj"),
+        (896, 128, "k/v_proj"),
+        (896, 4864, "gate/up_proj"),
+        (4864, 896, "down_proj"),
+        (896, 151936, "lm_head"),
+        (1024, 1024, "forced-fast control"),
+    ]:
+        bench(k, n, label)
 
 
 if __name__ == "__main__":
