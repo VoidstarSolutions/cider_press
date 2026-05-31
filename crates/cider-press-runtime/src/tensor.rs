@@ -1666,13 +1666,15 @@ impl Tensor {
         ))
     }
 
-    /// Fused scaled-dot-product attention (lazy). `q` `[1, H_q, T_q, D]`,
+    /// Fused scaled-dot-product attention (lazy). `q` `[1, H_q, 1, D]`,
     /// `k`/`v` `[1, H_kv, T_cache, D]` (typically [`KvCache`](crate::KvCache)
     /// views, read strided), optional additive `mask`. Returns
-    /// `[1, H_q, T_q, D]`.
+    /// `[1, H_q, 1, D]`.
     ///
-    /// Validates `head_dim` ∈ {64, 96, 128, 256} (the vector kernel's
-    /// supported set), BF16 dtype, rank-4 shapes, and GQA divisibility at
+    /// Decode-only: the vector dispatch handles a single query position
+    /// (`T_q = 1`) and batch 1. Validates `head_dim` ∈ {64, 96, 128, 256}
+    /// (the vector kernel's supported set), BF16 dtype, rank-4 shapes,
+    /// `T_q`/batch, K/V cache-axis agreement, and GQA divisibility at
     /// construction.
     pub fn sdpa(
         q: &Tensor,
@@ -1711,6 +1713,23 @@ impl Tensor {
             return Err(Error::InvalidArgument(format!(
                 "sdpa: H_q ({}) must equal H_kv ({}) * gqa_factor ({gqa_factor})",
                 qd[1], kd[1]
+            )));
+        }
+        if qd[0] != 1 || kd[0] != 1 || vd[0] != 1 {
+            return Err(Error::InvalidArgument(format!(
+                "sdpa: batch must be 1 in the vector dispatch; got q/k/v = {}/{}/{}",
+                qd[0], kd[0], vd[0]
+            )));
+        }
+        if qd[2] != 1 {
+            return Err(Error::InvalidArgument(format!(
+                "sdpa: only decode T_q=1 is supported in the vector dispatch (got T_q={})",
+                qd[2]
+            )));
+        }
+        if kd[1] != vd[1] || kd[2] != vd[2] {
+            return Err(Error::InvalidArgument(format!(
+                "sdpa: k and v must agree on [H_kv, T_cache]; got k={kd:?}, v={vd:?}"
             )));
         }
         let device =

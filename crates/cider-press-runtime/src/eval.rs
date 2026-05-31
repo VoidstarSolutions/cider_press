@@ -1694,6 +1694,15 @@ fn dispatch_sdpa(
 
     let k_strides = layout_strides(k)?; // &[isize], len 4: [s0, s_head, s_seq, s_d]
     let v_strides = layout_strides(v)?;
+    // The kernel reads the head dimension with contiguous pointer indexing
+    // (`keys[j]`/`values[j]`), so only the head/seq strides are passed; a
+    // non-unit trailing (D) stride would silently attend over wrong elements.
+    if k_strides[3] != 1 || v_strides[3] != 1 {
+        return Err(Error::InvalidArgument(format!(
+            "sdpa: K/V head dimension must be contiguous (D stride 1); got k={}, v={}",
+            k_strides[3], v_strides[3]
+        )));
+    }
 
     // SAFETY: `Tensor::sdpa` pinned BF16 at construction, so every buffer
     // here is bf16; each was sized as `elem_count * size_bytes`, so the

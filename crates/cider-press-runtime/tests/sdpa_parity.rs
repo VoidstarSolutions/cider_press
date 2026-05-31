@@ -35,6 +35,29 @@ fn sdpa_rejects_gqa_mismatch() {
 }
 
 #[test]
+fn sdpa_rejects_multi_query() {
+    let device = Device::system_default().expect("Metal device");
+    // T_q = 2 is not a decode shape; the vector dispatch is single-query.
+    let q = Tensor::from_slice(&device, &[bf16::ONE; 16 * 2 * 64], [1, 16, 2, 64]).expect("q");
+    let k = Tensor::from_slice(&device, &[bf16::ONE; 2 * 16 * 64], [1, 2, 16, 64]).expect("k");
+    let v = Tensor::from_slice(&device, &[bf16::ONE; 2 * 16 * 64], [1, 2, 16, 64]).expect("v");
+    let err = Tensor::sdpa(&q, &k, &v, None, 0.125, 8, false).expect_err("T_q>1 must error");
+    assert!(format!("{err}").contains("T_q"), "{err}");
+}
+
+#[test]
+fn sdpa_rejects_kv_cache_mismatch() {
+    let device = Device::system_default().expect("Metal device");
+    let q = Tensor::from_slice(&device, &[bf16::ONE; 16 * 64], [1, 16, 1, 64]).expect("q");
+    let k = Tensor::from_slice(&device, &[bf16::ONE; 2 * 16 * 64], [1, 2, 16, 64]).expect("k");
+    // v has a shorter cache axis than k (8 vs 16) — n_keys from k would
+    // overrun v.
+    let v = Tensor::from_slice(&device, &[bf16::ONE; 2 * 8 * 64], [1, 2, 8, 64]).expect("v");
+    let err = Tensor::sdpa(&q, &k, &v, None, 0.125, 8, false).expect_err("k/v mismatch must error");
+    assert!(format!("{err}").contains("k and v must agree"), "{err}");
+}
+
+#[test]
 fn sdpa_through_op_matches_mlx() {
     const H_Q: usize = 14;
     const H_KV: usize = 2;
@@ -77,6 +100,13 @@ fn sdpa_through_op_matches_mlx() {
     let o = Tensor::sdpa(&qt, &kt, &vt, None, scale, H_Q / H_KV, false).expect("sdpa");
     o.eval().expect("eval");
     let out: Vec<bf16> = o.cpu_to_vec().expect("dense out");
+    assert_eq!(
+        out.len(),
+        out_ref.len(),
+        "output length mismatch: got {}, expected {}",
+        out.len(),
+        out_ref.len()
+    );
 
     let (atol, rtol) = (0.01f32, 0.02f32);
     for (i, (&a, &b)) in out.iter().zip(out_ref.iter()).enumerate() {
