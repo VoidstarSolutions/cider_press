@@ -42,6 +42,13 @@
 //! `position`. (The eager design's `Arc::strong_count` guard, which
 //! prevented host-side overlapping `&[u8]`/`&mut [u8]` UB, is obsolete
 //! now that there is no host write.)
+//!
+//! Because both [`KvCache::update`] and [`KvCache::reset`] reuse the slab,
+//! each fails loud (`Error::InvalidArgument`) if the previous `update` has
+//! not been evaluated: that guarantees every `SliceUpdate` the cache ever
+//! produced is materialized, so any outstanding view short-circuits on
+//! `eval` (a materialized node is never re-dispatched) and cannot replay a
+//! stale write into the reused slab.
 
 use std::fmt;
 use std::sync::Arc;
@@ -208,15 +215,7 @@ impl KvCache {
         // (unreferenced, never-executed) write. Fail loud rather than
         // silently lose it — callers must `eval` between successive updates
         // (decode evals each token; prefill is a single update + eval).
-        if self
-            .keys_latest
-            .as_ref()
-            .is_some_and(|t| !t.is_materialized())
-            || self
-                .values_latest
-                .as_ref()
-                .is_some_and(|t| !t.is_materialized())
-        {
+        if !self.prior_update_evaluated() {
             return Err(Error::InvalidArgument(
                 "KvCache::update: the previous update has not been evaluated; \
                  successive updates must be separated by an eval (the slab-based \
@@ -297,10 +296,43 @@ impl KvCache {
     /// for restarting a decode loop on a new prompt with the same
     /// cache instance. The slab bytes are left untouched (no
     /// zero-fill); the next [`KvCache::update`] writes over them.
-    pub fn reset(&mut self) {
+    ///
+    /// Requires the last update to have been evaluated, for the same
+    /// reason as [`KvCache::update`]: clearing `keys_latest`/`values_latest`
+    /// here drops the cache's only strong ref to the latest `SliceUpdate`,
+    /// so an *un-evaluated* one outstanding via [`KvCache::keys_view`] could
+    /// later replay its stale write into the (now reused) slab. With the
+    /// last update evaluated, every `SliceUpdate` the cache produced is
+    /// materialized (the update guard covers superseded ones), so any
+    /// outstanding view short-circuits on `eval` and cannot replay. Returns
+    /// `Error::InvalidArgument` otherwise.
+    pub fn reset(&mut self) -> Result<()> {
+        if !self.prior_update_evaluated() {
+            return Err(Error::InvalidArgument(
+                "KvCache::reset: the last update has not been evaluated; resetting now \
+                 would let an outstanding, un-evaluated K/V view replay its stale write \
+                 into the reused slab (eval the view before reset)"
+                    .into(),
+            ));
+        }
         self.position = 0;
         self.keys_latest = None;
         self.values_latest = None;
+        Ok(())
+    }
+
+    /// Whether the latest K/V `SliceUpdate` (if any) has been evaluated.
+    /// `true` when there is no pending update (both `None`). Shared by
+    /// [`KvCache::update`] and [`KvCache::reset`], which both reuse the
+    /// slab and so must not strand an un-evaluated prior write.
+    fn prior_update_evaluated(&self) -> bool {
+        self.keys_latest
+            .as_ref()
+            .is_none_or(Tensor::is_materialized)
+            && self
+                .values_latest
+                .as_ref()
+                .is_none_or(Tensor::is_materialized)
     }
 
     fn validate_update_input(&self, t: &Tensor, name: &str) -> Result<usize> {
@@ -499,5 +531,42 @@ mod tests {
         cache.keys_view().eval().expect("eval keys");
         cache.values_view().eval().expect("eval values");
         cache.update(&k, &v).expect("update after eval ok");
+    }
+
+    /// `reset` reuses the slab, so an un-evaluated last update must fail
+    /// loud — otherwise an outstanding view could replay a stale write.
+    #[test]
+    fn reset_without_intervening_eval_errors() {
+        let device = Device::system_default().expect("device");
+        let mut cache = KvCache::new(&device, 4, 2, 3, DType::BF16).expect("cache");
+
+        let row: Vec<bf16> = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]
+            .iter()
+            .map(|&x| bf16::from_f32(x))
+            .collect();
+        let k = Tensor::from_slice(&device, &row, [1usize, 2, 3]).expect("k");
+        let v = Tensor::from_slice(&device, &row, [1usize, 2, 3]).expect("v");
+
+        cache.update(&k, &v).expect("update ok");
+        let err = cache.reset().unwrap_err();
+        assert!(
+            format!("{err}").contains("has not been evaluated"),
+            "expected an eval-before-reset error, got: {err}"
+        );
+
+        // After evaluating the last update, reset is accepted.
+        cache.keys_view().eval().expect("eval keys");
+        cache.values_view().eval().expect("eval values");
+        cache.reset().expect("reset after eval ok");
+        assert_eq!(cache.position(), 0);
+    }
+
+    /// A fresh cache has no pending update, so `reset` is a no-op success.
+    #[test]
+    fn reset_on_empty_cache_is_ok() {
+        let device = Device::system_default().expect("device");
+        let mut cache = KvCache::new(&device, 4, 2, 3, DType::BF16).expect("cache");
+        cache.reset().expect("reset on empty cache ok");
+        assert_eq!(cache.position(), 0);
     }
 }

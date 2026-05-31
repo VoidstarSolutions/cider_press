@@ -118,7 +118,11 @@ fn reset_rewinds_position_and_subsequent_updates_overwrite() {
     cache.update(&first, &first).expect("first update");
     assert_eq!(cache.position(), 3);
 
-    cache.reset();
+    // reset() requires the last update to be evaluated (so no outstanding
+    // view can replay a stale write into the reused slab).
+    cache.keys_view().eval().expect("eval keys before reset");
+    cache.values_view().eval().expect("eval values before reset");
+    cache.reset().expect("reset after eval");
     assert_eq!(cache.position(), 0);
 
     let second = make_chunk_tensor(&device, 2, |row, h, d| -((row * 7 + h * 3 + d + 1) as f32));
