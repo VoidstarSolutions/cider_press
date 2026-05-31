@@ -15,12 +15,15 @@ use std::sync::{Mutex, Weak};
 
 use cider_press_kernels::Buffer;
 
-/// Default ceiling on bytes held in the free-list. Sized to hold roughly
-/// one decode token's simultaneously-live scratch (the +32% peak-RSS
-/// regression added ~290 MiB) with headroom. Tunable via
-/// [`crate::Device::set_pool_cap`]; refined by measurement (see plan
-/// Task 6).
-pub(crate) const DEFAULT_POOL_CAP_BYTES: usize = 384 << 20;
+/// Default ceiling on bytes held in the free-list. A safety ceiling, not
+/// a target: `cider-press bench` on Qwen2.5-0.5B-4bit measures a
+/// warm-decode high-water of ~94 MiB held in the pool, so 256 MiB is
+/// ~2.7× the measured working set — comfortably clear of the hit-rate
+/// cliff while bounding runaway growth (e.g. if varying shapes ever
+/// proliferate size keys). It is non-binding in steady-state decode, so
+/// it does not drive peak RSS (the freed-graph reclaim does). Tunable via
+/// [`crate::Device::set_pool_cap`].
+pub(crate) const DEFAULT_POOL_CAP_BYTES: usize = 256 << 20;
 
 /// Size-keyed free-list of reusable shared-storage buffers.
 ///
