@@ -87,3 +87,26 @@ fn sdpa_through_op_matches_mlx() {
         );
     }
 }
+
+#[test]
+fn sdpa_rejects_mask_at_eval() {
+    const H_Q: usize = 8;
+    const H_KV: usize = 1;
+    const T: usize = 16;
+    const D: usize = 64;
+
+    let device = Device::system_default().expect("Metal device");
+    let q = Tensor::from_slice(&device, &[bf16::ONE; H_Q * D], [1, H_Q, 1, D]).expect("q");
+    let k = Tensor::from_slice(&device, &[bf16::ONE; H_KV * T * D], [1, H_KV, T, D]).expect("k");
+    let v = Tensor::from_slice(&device, &[bf16::ONE; H_KV * T * D], [1, H_KV, T, D]).expect("v");
+    let mask = Tensor::from_slice(&device, &[bf16::ZERO; T], [1, 1, 1, T]).expect("mask");
+
+    let scale = 1.0f32 / (D as f32).sqrt();
+    let o = Tensor::sdpa(&q, &k, &v, Some(&mask), scale, H_Q / H_KV, false)
+        .expect("construction must succeed");
+    let err = o.eval().expect_err("mask must be rejected at eval");
+    assert!(
+        format!("{err}").contains("mask not yet supported"),
+        "error must mention mask: {err}"
+    );
+}

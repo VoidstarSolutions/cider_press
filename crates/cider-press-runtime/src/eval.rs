@@ -1660,6 +1660,11 @@ fn dispatch_sdpa(
             "sdpa: causal=true not yet supported in the vector dispatch (Plan B)".into(),
         ));
     }
+    if op.inputs.len() > 3 {
+        return Err(Error::InvalidArgument(
+            "sdpa: mask not yet supported in the vector dispatch (Plan B)".into(),
+        ));
+    }
     let device = inner.device.as_ref().expect("op nodes carry a device");
 
     let q = op
