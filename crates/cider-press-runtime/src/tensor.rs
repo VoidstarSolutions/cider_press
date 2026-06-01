@@ -315,6 +315,16 @@ pub enum OpKind {
         /// Apply a causal mask (false for decode `T_q=1` full attention).
         causal: bool,
     },
+    /// Index of the maximum (or minimum) element along `axis`. Input
+    /// must be a dense, contiguous BF16 tensor. Output dtype is
+    /// [`DType::U32`] with `axis` dropped. Only last-axis reductions
+    /// are wired (same constraint as [`OpKind::Reduce`]).
+    ArgReduce {
+        /// Which index reduction to perform.
+        kind: ArgReduceKind,
+        /// The axis being reduced (resolved, non-negative).
+        axis: usize,
+    },
 }
 
 /// Element-wise binary operations supported by [`OpKind::Binary`].
@@ -358,6 +368,13 @@ pub enum ReduceKind {
     Min,
     /// Maximum element.
     Max,
+}
+
+/// Index-reduction kinds for [`OpKind::ArgReduce`]. Only `ArgMax` is
+/// wired (greedy decode); `ArgMin` lands with its first consumer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArgReduceKind {
+    ArgMax,
 }
 
 /// User-facing lazy tensor handle.
@@ -1028,6 +1045,56 @@ impl Tensor {
             self.inner.dtype,
             layout,
             OpKind::Reduce { kind, keep_dim },
+            vec![self.clone()],
+        ))
+    }
+
+    /// Index of the maximum along `axis` (must be the last axis), as a
+    /// `U32` tensor with `axis` dropped. Input must be a dense,
+    /// contiguous BF16 tensor (the only wired kernel instantiation).
+    pub fn argmax(&self, axis: i64) -> Result<Self> {
+        let device = self.inner.device.as_ref().ok_or_else(|| {
+            Error::InvalidArgument("argmax: cannot apply an op to a placeholder (no device)".into())
+        })?;
+        if self.inner.dtype != DType::BF16 {
+            return Err(Error::InvalidArgument(format!(
+                "argmax: only BF16 input is wired (got {:?})",
+                self.inner.dtype,
+            )));
+        }
+        if self.inner.view.is_some() {
+            return Err(Error::InvalidArgument(
+                "argmax: view inputs are not supported; copy() first".into(),
+            ));
+        }
+        let strides = match self.layout() {
+            Layout::Dense { strides } => strides,
+            Layout::Quantized(_) => {
+                return Err(Error::InvalidArgument("argmax: quantized not supported".into()));
+            }
+        };
+        if !strides.is_contiguous(self.shape()) {
+            return Err(Error::InvalidArgument(
+                "argmax: input must be contiguous; copy() first".into(),
+            ));
+        }
+        let rank = self.shape().rank();
+        let axis_resolved = resolve_axis(rank, axis)?;
+        if axis_resolved != rank - 1 {
+            return Err(Error::InvalidArgument(format!(
+                "argmax: only last-axis is wired (got axis {axis_resolved} of rank {rank})",
+            )));
+        }
+        let mut out_dims: Vec<usize> = self.shape().dims().to_vec();
+        out_dims.remove(axis_resolved);
+        let out_shape = Shape::from(out_dims);
+        let layout = dense_layout(&out_shape);
+        Ok(Self::op_tensor(
+            device,
+            out_shape,
+            DType::U32,
+            layout,
+            OpKind::ArgReduce { kind: ArgReduceKind::ArgMax, axis: axis_resolved },
             vec![self.clone()],
         ))
     }
@@ -4120,5 +4187,28 @@ mod tests {
             format!("{err}").contains("dense leaf"),
             "expected a dense-leaf error for a view slab, got: {err}"
         );
+    }
+
+    #[test]
+    fn argmax_returns_u32_index_dropping_last_axis() {
+        let device = Device::shared().expect("device");
+        let vals: Vec<bf16> = [0.1f32, 0.5, 0.9, 0.2]
+            .iter()
+            .map(|&x| bf16::from_f32(x))
+            .collect();
+        let t = Tensor::from_slice(&device, &vals, [1usize, 4]).expect("leaf");
+        let idx = t.argmax(1).expect("argmax");
+        assert_eq!(idx.shape().dims(), &[1]);
+        assert_eq!(idx.dtype(), DType::U32);
+        idx.eval().expect("eval");
+        assert_eq!(idx.cpu_slice::<u32>().expect("u32 slice"), &[2]);
+    }
+
+    #[test]
+    fn argmax_rejects_non_bf16() {
+        let device = Device::shared().expect("device");
+        let t = Tensor::zeros(&device, [1usize, 4], DType::F32).expect("leaf");
+        let err = t.argmax(1).unwrap_err();
+        assert!(format!("{err}").contains("BF16"), "got: {err}");
     }
 }

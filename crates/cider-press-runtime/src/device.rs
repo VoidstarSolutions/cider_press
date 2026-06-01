@@ -76,6 +76,10 @@ struct DeviceInner {
     /// [`crate::Tensor::sdpa`] eval; subsequent decodes reuse the
     /// cached library and its per-`head_dim` pipeline-state cache.
     sdpa_vector_library: OnceLock<kernels::KernelLibrary>,
+    /// JIT'd MLX `arg_reduce.metal` library. Populated on first
+    /// [`crate::Tensor::argmax`] eval; subsequent calls reuse the
+    /// cached library.
+    arg_reduce_library: OnceLock<kernels::KernelLibrary>,
     /// Cross-token scratch recycling. See [`crate::buffer_pool`].
     pool: Arc<Mutex<crate::buffer_pool::BufferPool>>,
 }
@@ -109,6 +113,7 @@ impl Device {
                 gather_libraries: Mutex::new(HashMap::new()),
                 matmul_library: OnceLock::new(),
                 sdpa_vector_library: OnceLock::new(),
+                arg_reduce_library: OnceLock::new(),
                 pool: Arc::new(Mutex::new(crate::buffer_pool::BufferPool::new(
                     crate::buffer_pool::DEFAULT_POOL_CAP_BYTES,
                 ))),
@@ -143,6 +148,7 @@ impl Device {
             gather_libraries: Mutex::new(HashMap::new()),
             matmul_library: OnceLock::new(),
             sdpa_vector_library: OnceLock::new(),
+            arg_reduce_library: OnceLock::new(),
             pool: Arc::new(Mutex::new(crate::buffer_pool::BufferPool::new(
                 crate::buffer_pool::DEFAULT_POOL_CAP_BYTES,
             ))),
@@ -360,6 +366,16 @@ impl Device {
         }
         let lib = kernels::KernelLibrary::sdpa_vector(&self.inner.kernels)?;
         Ok(self.inner.sdpa_vector_library.get_or_init(|| lib))
+    }
+
+    /// Lazily JIT-compile and cache MLX's `arg_reduce.metal` library.
+    /// See [`Device::copy_library`] for cache semantics.
+    pub(crate) fn arg_reduce_library(&self) -> Result<&kernels::KernelLibrary> {
+        if let Some(lib) = self.inner.arg_reduce_library.get() {
+            return Ok(lib);
+        }
+        let lib = kernels::KernelLibrary::arg_reduce(&self.inner.kernels)?;
+        Ok(self.inner.arg_reduce_library.get_or_init(|| lib))
     }
 }
 

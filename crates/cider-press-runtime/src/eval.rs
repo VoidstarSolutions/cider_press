@@ -14,15 +14,15 @@ use std::sync::Arc;
 
 use cider_press_kernels::{
     Buffer, Commands, KernelLibrary,
-    kernels::{binary, copy, qmm, qmv, reduce, unary},
+    kernels::{arg_reduce, binary, copy, qmm, qmv, reduce, unary},
 };
 
 use crate::dtype::DType;
 use crate::error::{Error, Result};
 use crate::layout::Layout;
 use crate::tensor::{
-    BinaryOp, LeafStorage, OpKind, OpNode, ReduceKind, Tensor, TensorInner, UnaryOp,
-    checked_byte_count,
+    ArgReduceKind, BinaryOp, LeafStorage, OpKind, OpNode, ReduceKind, Tensor, TensorInner,
+    UnaryOp, checked_byte_count,
 };
 
 /// Static label for an [`OpKind`], used as the GPU-segment bucket key in
@@ -44,6 +44,7 @@ pub(crate) fn op_kind_label(kind: &OpKind) -> &'static str {
         OpKind::MatMul => "matmul",
         OpKind::SliceUpdate { .. } => "slice_update",
         OpKind::Sdpa { .. } => "sdpa",
+        OpKind::ArgReduce { .. } => "argmax",
     }
 }
 
@@ -231,6 +232,7 @@ fn gpu_key(label: &'static str) -> &'static str {
         "matmul" => "gpu.matmul",
         "slice_update" => "gpu.slice_update",
         "sdpa" => "gpu.sdpa",
+        "argmax" => "gpu.argmax",
         _ => "gpu.other",
     }
 }
@@ -398,6 +400,9 @@ fn dispatch(
         } => dispatch_sdpa(
             inner, op, commands, outputs, dst, index_of, scale, gqa_factor, causal,
         ),
+        OpKind::ArgReduce { kind, axis } => {
+            dispatch_arg_reduce(inner, op, commands, outputs, dst, index_of, kind, axis)
+        }
     }
 }
 
@@ -1264,6 +1269,38 @@ fn dispatch_reduce(
                 "reduce: dtype {dtype:?} not wired for Sum/Prod/Min/Max yet \
                  (only float dtypes are wired at the kernels layer)",
             )));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_arg_reduce(
+    inner: &Arc<TensorInner>,
+    op: &OpNode,
+    commands: &mut Commands<'_>,
+    outputs: &[Buffer<u8>],
+    dst: &mut Buffer<u8>,
+    index_of: &HashMap<*const TensorInner, usize>,
+    kind: ArgReduceKind,
+    axis: usize,
+) -> Result<()> {
+    let device = inner.device.as_ref().expect("op nodes carry a device");
+    let input = op
+        .inputs
+        .first()
+        .ok_or_else(|| Error::InvalidArgument("ArgReduce: missing input (inputs[0])".into()))?;
+    let axis_size = input.shape().dims()[axis];
+    let library = device.arg_reduce_library()?;
+    let src = dense_input_buffer(input, outputs, index_of)?;
+    // SAFETY: src is bf16 (validated at Tensor::argmax); dst is the
+    // op's U32 output buffer (sized by checked_byte_count from the op
+    // dtype). u8 reinterprets preserve byte length.
+    let s = unsafe { src.reinterpret_as::<half::bf16>() };
+    let mut d = unsafe { dst.reinterpret_as::<u32>() };
+    match kind {
+        ArgReduceKind::ArgMax => {
+            arg_reduce::argmax_bf16(commands, library, &s, &mut d, axis_size)?;
         }
     }
     Ok(())
