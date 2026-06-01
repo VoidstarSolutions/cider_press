@@ -243,16 +243,22 @@ fn id_is_terminal(id: u32, eos_ids: &HashSet<u32>) -> bool {
 
 /// Argmax over the last position of a `[1, T, vocab]` BF16 logits tensor.
 fn argmax_last_position(logits: &Tensor, vocab: usize) -> Result<u32> {
-    // logits is [1, T, vocab]; select the last position's row, argmax
-    // over the vocab axis on the GPU (same command buffer as lm_head),
-    // and read back the single index.
     let t = logits.shape().dims()[1];
-    let last = logits.slice(&[0..1, t - 1..t, 0..vocab])?.copy()?; // [1, 1, vocab] dense
-    let idx = last.argmax(2)?; // [1, 1] U32
+    // Decode (T=1): logits is already [1,1,vocab] and dense — argmax it
+    // directly. Prefill (T>1): copy out the last row first (argmax needs
+    // a dense, non-view input).
+    let last = if t == 1 {
+        logits.clone()
+    } else {
+        logits.slice(&[0..1, t - 1..t, 0..vocab])?.copy()?
+    };
+    let idx = last.argmax(2)?;
     idx.eval()?;
     let _span = cider_press_runtime::profile::span("argmax");
-    let ids = idx
-        .cpu_slice::<u32>()
-        .ok_or_else(|| Error::InvalidArgument("argmax: cpu_slice::<u32> returned None".into()))?;
+    let ids = idx.cpu_slice::<u32>().ok_or_else(|| {
+        Error::InvalidArgument(
+            "argmax: result not materialised or wrong dtype (expected U32)".into(),
+        )
+    })?;
     Ok(ids[0])
 }
