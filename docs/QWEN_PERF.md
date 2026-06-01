@@ -5,24 +5,27 @@ measured via `cider-press bench`, compared against `mlx_lm` on the same
 prompt and token budget. Methodology: warm up, then time a steady-state
 window; see `docs/ARCHITECTURE.md` for the architecture and forward backlog.
 
-The headline: decode runs **~2.7× slower than MLX** at the full-model
-scale (~210 vs ~560 tok/s), down from ~4.7× before the buffer pool. Two
+The headline: decode runs **~2.3× slower than MLX** at the full-model
+scale (~243 vs ~560 tok/s), down from ~4.7× before the buffer pool. Three
 prior changes set the stage — the in-graph KV write (SliceUpdate)
-collapsed each step to **one command buffer per token** (~1.6×), and the
+collapsed each step to **one command buffer per token** (~1.6×), the
 fused `sdpa_vector` decode-attention kernel lifted decode to ~120 tok/s
-(~1.33×). This pass then attacked the per-eval CPU cost with a
-**cross-token buffer pool** that recycles op-output scratch instead of
-allocating ~1000 fresh `MTLBuffer`s per token. The pool was inert on its
-own (3% hit) until the enabling fix: **`KvCache::update` no longer chains
-each `SliceUpdate` off the prior op-tensor** (it bases on the slab leaf),
-which stopped the cache from pinning every step's projection graph for the
-whole decode. Together they took decode **~120 → ~210 tok/s** (~1.75×) at
-**98% pool hit-rate**, cut the `tensor.eval` CPU-encode share from ~38% to
-**~11%**, and resolved the +32% peak-RSS regression (**~1192 → ~900
-MiB**). The remaining ~2.7× gap is now GPU-execution-bound: `tensor.eval`
-is ~83% of the decode step and ~89% of *that* is the synchronous GPU
+(~1.33×), and a **cross-token buffer pool** (recycling op-output scratch
+instead of allocating ~1000 fresh `MTLBuffer`s per token) took decode to
+~210 tok/s. The pool was inert on its own (3% hit) until the enabling fix:
+**`KvCache::update` no longer chains each `SliceUpdate` off the prior
+op-tensor** (it bases on the slab leaf), which stopped the cache from
+pinning every step's projection graph for the whole decode — together they
+hit **98% pool hit-rate**, cut the `tensor.eval` CPU-encode share from ~38%
+to ~11%, and resolved the +32% peak-RSS regression (**~1192 → ~900 MiB**).
+This pass then moved **next-token selection on-GPU** (in-graph `ArgReduce`):
+the ~444 µs/token CPU `cpu_to_vec` + 151 k-wide scan and the 302 kB logits
+readback are gone, replaced by a sub-µs GPU reduction folded into the decode
+command buffer + a 4-byte index readback, lifting decode **~210 → ~243
+tok/s**. The remaining ~2.3× gap is GPU-execution-bound: `tensor.eval` is
+~90% of the decode step and ~85% of *that* is the synchronous GPU
 `commit_and_wait` (the 4-bit `qmv` weight matvecs), with the CPU encode
-down to ~9% of the step.
+~12% of the step.
 
 ## Environment
 
@@ -46,7 +49,7 @@ down to ~9% of the step.
 | phase   | cider-press | mlx_lm  | ratio (mlx ÷ cp) |
 |---------|------------:|--------:|-----------------:|
 | prefill | ~376 tok/s  | ~1346 tok/s | ~3.6× |
-| decode  | ~210 tok/s  | ~560 tok/s  | ~2.7× |
+| decode  | ~243 tok/s  | ~560 tok/s  | ~2.3× |
 
 - **Prefill** processes the 39-token prompt in one forward. cider-press
   ranged 346–391 tok/s across warm runs (~376 median); `mlx_lm` ~1346.
@@ -64,9 +67,11 @@ down to ~9% of the step.
   lifting the ~1000-allocations-per-token cost out of the serialized
   command-buffer encode. The pool only paid off once `KvCache::update`
   stopped chaining `SliceUpdate`s (which had pinned every step's graph for
-  the whole decode — see Decode-step breakdown). The **remaining ~2.7×
-  gap** to `mlx_lm` is now dominated by GPU execution (the 4-bit `qmv`
-  matvecs in `tensor.eval.wait`), not CPU encode.
+  the whole decode — see Decode-step breakdown). The **GPU argmax** then
+  lifted decode **~210 → ~243 tok/s** (range 238–246) by removing the
+  ~444 µs/token CPU vocab scan + 302 kB logits readback (see **GPU argmax**).
+  The **remaining ~2.3× gap** to `mlx_lm` is now dominated by GPU execution
+  (the 4-bit `qmv` matvecs in `tensor.eval.wait`), not CPU encode.
 - Load time (excluded from tok/s): ~0.17 s.
 
 **Cold-start note:** the very first forward of a fresh process triggers
@@ -81,36 +86,38 @@ prefill compute, and is excluded from the table above.
 
 Per-span totals over the timed decode window (~109 timed steps; the
 profiler is reset after warmup, so the spans below show 108 hits).
-Representative warm run, decode wall ≈ 502 ms / 217 tok/s. `tensor.eval` is split into two **nested,
+Representative warm run, decode wall ≈ 446 ms / 243 tok/s. `tensor.eval` is split into two **nested,
 non-overlapping** sub-spans: `tensor.eval.encode` (CPU-side command-buffer
 construction) and `tensor.eval.wait` (the synchronous GPU
 `commit_and_wait`); their sum is `tensor.eval` minus the cheap
-cache-population pass. `argmax` is the post-eval CPU `cpu_to_vec` + scan;
-`kvcache.update` is the lazy slab-based SliceUpdate op-build (24 hits/token,
-no forced eval).
+cache-population pass. `argmax` now times only the **4-byte index
+readback** after `eval()` — the GPU `ArgMax` reduction itself is folded
+into `tensor.eval.wait` (see **GPU argmax** below); `kvcache.update` is
+the lazy slab-based SliceUpdate op-build (24 hits/token, no forced eval).
 
 | span                 | total (ms) | hits | µs/hit | share of decode |
 |----------------------|-----------:|-----:|-------:|----------------:|
-| tensor.eval          |  420 |  108 |  3886 | ~83% |
-| → tensor.eval.encode |   46 |  108 |   426 | ~9% |
-| → tensor.eval.wait   |  371 |  108 |  3434 | ~74% |
-| argmax               |   48 |  108 |   444 | ~9.5% |
-| kvcache.update       | 14.7 | 2592 |   5.7 | ~3% (lazy op build) |
+| tensor.eval          |  401 |  108 |  3709 | ~90% |
+| → tensor.eval.encode |   55 |  108 |   512 | ~12% |
+| → tensor.eval.wait   |  342 |  108 |  3166 | ~77% |
+| argmax               | 0.08 |  108 |  0.78 | ~0.02% (4-byte readback) |
+| kvcache.update       | 15.9 | 2592 |   6.1 | ~4% (lazy op build) |
 
 Reading it:
 
-- **`tensor.eval` is ~83% of the decode step, one `eval()` per token,**
-  and is now **GPU-bound**: the encode/wait split is **~11% CPU encode,
-  ~89% GPU wait** (was ~38%/62% before the buffer pool). The pool moved the
-  decode bottleneck off the CPU encode path.
-- **`tensor.eval.encode` (~0.43 ms/token, ~9% of the step) is CPU-side**
+- **`tensor.eval` is ~90% of the decode step, one `eval()` per token,**
+  and is now **GPU-bound**: the encode/wait split is **~14% CPU encode,
+  ~86% GPU wait** (was ~38%/62% before the buffer pool). The pool moved the
+  decode bottleneck off the CPU encode path; the GPU argmax then removed the
+  post-eval CPU scan, so `tensor.eval`'s *share* of the (smaller) step rose.
+- **`tensor.eval.encode` (~0.51 ms/token, ~12% of the step) is CPU-side**
   and now small. Building one command buffer still means a topo walk and
   encoding every dispatch (~974 dispatches/token across 24 layers plus
-  embedding and the tied head), but the per-op `MTLBuffer` allocation —
-  formerly ~1000 fresh `newBufferWithLength:` calls per token — is now a
-  **buffer-pool hit ~98% of the time** (see Memory), so allocation is no
-  longer the dominant encode cost.
-- **`tensor.eval.wait` (~3.4 ms/token, ~74% of the step) is GPU execution**
+  embedding and the tied head, now plus the one `ArgReduce`), but the per-op
+  `MTLBuffer` allocation — formerly ~1000 fresh `newBufferWithLength:` calls
+  per token — is now a **buffer-pool hit ~98% of the time** (see Memory), so
+  allocation is no longer the dominant encode cost.
+- **`tensor.eval.wait` (~3.2 ms/token, ~77% of the step) is GPU execution**
   and is the bottleneck. The heavy compute is the 4-bit `qmv` weight
   matvecs — every projection and MLP linear at T=1 — which are the vendored
   MLX kernel, memory-bound near the bandwidth roofline.
@@ -123,9 +130,12 @@ Reading it:
   build is marginally costlier per call (~5.7 vs ~0.3 µs) but still ~3% of
   the step. Successive `update`s must now be separated by an `eval`
   (decode evals each token; a fail-loud guard enforces it).
-- **`argmax` is ~9.5%** — the bf16 `cpu_to_vec` + scan over the ~151 k
-  vocab, ~440 µs/token. Its *share* rose (the step got faster around it);
-  a GPU argmax is the next small lever.
+- **`argmax` is now ~0.02% (~0.8 µs/token)** — next-token selection moved
+  on-GPU (in-graph `ArgReduce`). The span now times only the 4-byte index
+  readback; the actual reduction over the ~151 k vocab is folded into
+  `tensor.eval.wait` (sub-µs, memory-bound), and the old 302 kB logits
+  readback + bf16 `cpu_to_vec` + 151 k-wide CPU scan (~444 µs/token) are
+  gone. See **GPU argmax** below.
 
 ### GPU breakdown by op kind (counter-sampled)
 
@@ -182,11 +192,40 @@ Reading it:
   prefill path.
 
 These are perturbed-regime GPU-*internal* shares. The production
-decode-step split is now ~89% GPU wait / ~11% CPU-encode (the buffer pool
+decode-step split is now ~86% GPU wait / ~14% CPU-encode (the buffer pool
 moved allocation off the encode path); this subsection only resolves how
 that GPU half divides across op kinds. The op-kind breakdown itself is
 unchanged by the buffer pool and the KvCache slab-base collapse — both act
 on CPU-side allocation/retention, not the GPU dispatches.
+
+### GPU argmax
+
+Next-token selection moved on-GPU. Greedy decode previously did
+`logits.eval()` → a 302 kB `cpu_to_vec` of the `[vocab]` row → a 151 k-wide
+CPU `fold` to find the max index — ~444 µs of serial CPU work per token
+(~9.5% of the decode step). That is replaced by an in-graph `ArgReduce`
+(MLX's `argmax_bfloat16` from `arg_reduce.metal`) that evaluates in the
+**same command buffer as the lm_head**: the GPU reduces the vocab row to a
+single `u32` index, and only that 4-byte index is read back.
+
+Effect on the spans:
+
+- The `argmax` profile span now sits *after* `eval()` and times only the
+  4-byte readback — it dropped from **~444 µs/token to ~0.8 µs/token**
+  (~0.73–0.94 µs across warm runs).
+- The GPU reduction is a tiny, memory-bound pass over one vocab row, folded
+  into `tensor.eval.wait` (sub-µs; not separately visible against the ~3.2 ms
+  qmv-dominated wait).
+- The 302 kB per-token logits readback is gone.
+
+Decode throughput moved **~217 → ~243 tok/s** (warm runs measured
+238–245.5 tok/s; representative ~243). The gain is close to the old argmax
+share — removing ~444 µs of serial CPU work from a ~4.6 ms step — and lands
+where predicted. Greedy output is unchanged: the kernel is MLX's own, so it
+matches `mlx_lm` by construction (`generator_parity_greedy_qwen2` passes).
+This also removes the logits-readback dependency, which is the **enabler**
+for keeping the next-token id on-GPU into the following embedding gather
+(eliminating the per-token CPU↔GPU sync entirely — future work, backlog #5).
 
 ## Memory
 
@@ -222,9 +261,9 @@ lever.
 The decode step is now **GPU-execution-bound**. The CPU-side taxes are
 gone — the SliceUpdate collapsed the dispatch round-trips, and the buffer
 pool moved per-op allocation off the serial encode path (encode is down to
-~9% of the step). What remains is `tensor.eval.wait` (~74% of decode), the
-synchronous GPU run of the 4-bit `qmv` matvecs. In measurement-justified
-priority:
+~12% of the step), and the GPU argmax removed the post-eval vocab scan.
+What remains is `tensor.eval.wait` (~77% of decode), the synchronous GPU
+run of the 4-bit `qmv` matvecs. In measurement-justified priority:
 
 - **Buffer pool / allocator — done (~1.75× with the KvCache fix).** A
   cross-token free-list recycles op-output scratch (98% decode hit), and
@@ -235,8 +274,8 @@ priority:
   graph live); **within-eval reuse** (mid-eval freeing, as MLX does) is the
   next RSS lever toward `mlx_lm`'s ~329 MiB.
 - **GPU execution (`qmv`) — the dominant remaining cost.** `tensor.eval.wait`
-  is ~74% of decode and is the vendored 4-bit `qmv` weight matvecs, which
-  are memory-bound near the bandwidth roofline. Closing more of the ~2.7×
+  is ~77% of decode and is the vendored 4-bit `qmv` weight matvecs, which
+  are memory-bound near the bandwidth roofline. Closing more of the ~2.3×
   gap means either faster matvecs or hiding the wait (pipelining, below).
 - **Pipelining (overlap CPU encode with GPU)** — `commit_and_wait` is
   synchronous, so the (now small) CPU encode never overlaps the GPU.
@@ -245,9 +284,13 @@ priority:
   encode is ~9% of the step.
 - **Fused prefill attention** — prefill still uses the composed path;
   fusing it (steel/nax `sdpa_full`, Plan B) is the prefill attention lever.
-- **GPU argmax** — ~9.5% of decode (the `[vocab]` cpu_to_vec + scan,
-  ~440 µs/token). Its share rose as the step got faster; a worthwhile small
-  lever now.
+- **GPU argmax — done (~217 → ~243 tok/s).** Next-token selection moved
+  on-GPU (in-graph `ArgReduce`): the ~444 µs/token CPU `cpu_to_vec` + 151 k
+  scan and the 302 kB logits readback are gone, replaced by a sub-µs GPU
+  reduction folded into `tensor.eval.wait` + a 4-byte index readback (the
+  `argmax` span fell to ~0.8 µs/token). This also clears the logits-readback
+  dependency, the enabler for keeping the id on-GPU into the next embedding
+  gather (per-token sync removal — future work).
 - **`.metallib` precompilation** — doesn't touch steady-state tok/s, but
   removes the ~43 s cold-start JIT from first-token latency in a shipped
   binary.
@@ -259,7 +302,7 @@ priority:
   the 117 generated for this prompt); `mlx_lm`'s `generation_tps` averages
   over all generated tokens (its `--warmup` flag is accepted only for CLI
   symmetry and is informational). On a pipelined backend the skew is small
-  and, if anything, flatters cider-press — so the ~2.7× gap is not an
+  and, if anything, flatters cider-press — so the ~2.3× gap is not an
   artifact of windowing.
 - **Run-to-run variance** on cider-press decode is larger than MLX's
   because the synchronous per-eval path is more exposed to OS scheduling

@@ -52,12 +52,12 @@ HuggingFace / mlx-community 4-bit checkpoint.
 ## Performance backlog
 
 Decode is now **GPU-execution-bound** (`QWEN_PERF.md`): one `Tensor::eval`
-per token (~3.9 ms/token, ~83% of the step), ~2.7× slower than `mlx_lm`.
-The dispatch round-trip tax (items #1, #3) and the CPU-side allocation tax
-(item #2) have been removed; the `tensor.eval` encode/wait split is now
-**~89% GPU execution, ~11% CPU encode**. The remaining cost is the 4-bit
-`qmv` matvecs in the synchronous GPU wait. In measurement-justified
-priority:
+per token (~3.7 ms/token, ~90% of the step), ~2.3× slower than `mlx_lm`.
+The dispatch round-trip tax (items #1, #3), the CPU-side allocation tax
+(item #2), and the post-eval CPU vocab scan (item #6, GPU argmax) have been
+removed; the `tensor.eval` encode/wait split is now **~86% GPU execution,
+~14% CPU encode**. The remaining cost is the 4-bit `qmv` matvecs in the
+synchronous GPU wait. In measurement-justified priority:
 
 1. **Cross-eval command-buffer batching — DONE (~1.6×).** The in-graph
    KV write (SliceUpdate, `feat/command-buffer-batching`) collapsed the
@@ -90,21 +90,36 @@ priority:
    `k.eval()` + `v.eval()` per layer is gone. Metal hazard tracking
    serializes the slab write → SDPA read within the single per-token
    command buffer.
-4. **Decode `qmv` matvecs (GPU, ~74% of the step)** — `tensor.eval.wait`
+4. **Decode `qmv` matvecs (GPU, ~77% of the step)** — `tensor.eval.wait`
    is now the dominant cost: the 4-bit `qmv` weight matvecs (every
    projection and MLP linear at T=1), the vendored MLX kernel, memory-bound
    near the bandwidth roofline. Decode attention is already fused
    (`sdpa_vector`); the score-matmul/softmax/copy chain is gone. Audit
    `qmv`'s launch config before assuming the kernel itself is the gap.
-5. **Pipelining (CPU encode, now ~11%)** — `commit_and_wait` is
-   synchronous, so the (now ~0.4 ms) CPU encode never overlaps the GPU.
-   Multiple command buffers in flight or Approach-C plumbing threading
-   `Commands` through the forward would hide it. Lower priority now that
-   the buffer pool (item 2) removed the allocation portion and encode is
-   ~11% of the step. **Within-eval buffer reuse** (mid-eval freeing) is the
-   related RSS lever toward `mlx_lm`'s ~329 MiB peak.
-6. **GPU argmax** — ~9.5% of decode (the `[vocab]` cpu_to_vec + scan); its
-   share rose as the step got faster. A worthwhile small lever now.
+5. **Pipelining / per-token sync removal (CPU encode, now ~12%)** —
+   `commit_and_wait` is synchronous, so the (now ~0.5 ms) CPU encode never
+   overlaps the GPU, and each token still round-trips the next-token id
+   through the CPU. Multiple command buffers in flight, or Approach-C
+   plumbing threading `Commands` through the forward and chaining the GPU
+   argmax id (item 6) straight into the next embedding gather, would hide
+   it and eliminate the per-token sync. Lower priority now that the buffer
+   pool (item 2) removed the allocation portion and encode is ~12% of the
+   step. **Within-eval buffer reuse** (mid-eval freeing) is the related RSS
+   lever toward `mlx_lm`'s ~329 MiB peak.
+6. **GPU argmax — DONE (~210 → ~243 tok/s).** Next-token selection moved
+   on-GPU: an in-graph `OpKind::ArgReduce` (MLX's `argmax_bfloat16` from
+   `arg_reduce.metal`) reduces the last logits row to a `u32` index inside
+   the same per-token command buffer as the lm_head. The ~444 µs/token CPU
+   `cpu_to_vec` + 151 k-wide scan and the 302 kB logits readback are gone,
+   replaced by a sub-µs GPU reduction folded into `tensor.eval.wait` + a
+   4-byte index readback (the `argmax` span fell ~444 → ~0.8 µs/token).
+   Greedy output is unchanged (MLX's own kernel ⇒ matches `mlx_lm` by
+   construction; `generator_parity_greedy_qwen2` passes). Design:
+   `docs/superpowers/specs/2026-05-31-gpu-argmax-design.md`. This is the
+   **enabler** for eliminating the per-token CPU↔GPU sync (item 5): with
+   the logits readback gone, the next-token id can stay on-GPU and feed the
+   following embedding gather directly (command-buffer chaining) — that
+   remains future work.
 7. **`.metallib` precompilation** — removes the one-time cold-start JIT
    (~tens of seconds) from first-token latency in a shipped binary.
 8. **Top-k / top-p / temperature sampling** — greedy-only today.
