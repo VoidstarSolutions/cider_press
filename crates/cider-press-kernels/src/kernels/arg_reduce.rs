@@ -13,7 +13,7 @@ use std::ptr::NonNull;
 
 use crate::buffer::Buffer;
 use crate::commands::Commands;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::library::KernelLibrary;
 
 /// Argmax over a contiguous `[axis_size]` bf16 vector → `u32` index in
@@ -26,18 +26,37 @@ pub fn argmax_bf16(
     dst: &mut Buffer<u32>,
     axis_size: usize,
 ) -> Result<()> {
+    if axis_size == 0 {
+        return Err(Error::InvalidArgument(
+            "argmax_bf16: axis_size must be positive".to_owned(),
+        ));
+    }
+    if src.len() != axis_size {
+        return Err(Error::InvalidArgument(format!(
+            "argmax_bf16: src.len() ({}) != axis_size ({})",
+            src.len(),
+            axis_size
+        )));
+    }
+    if dst.len() != 1 {
+        return Err(Error::InvalidArgument(format!(
+            "argmax_bf16: dst.len() must be 1, got {}",
+            dst.len()
+        )));
+    }
     let pipeline = library.pipeline("argmax_bfloat16")?;
     let encoder = commands.encoder()?;
     encoder.setComputePipelineState(pipeline.metal_pipeline_state());
 
     // ndim == 0 (flat scalar reduction): shape/strides slots take a
-    // single placeholder element; the kernel does not dereference them.
+    // single placeholder element. For the flat ndim==0 case the kernel
+    // does not dereference shape/in_strides/out_strides, so single zero
+    // placeholders suffice (matching MLX's set_bytes(0, 2/3/4)).
     let shape: [i32; 1] = [0];
     let in_strides: [i64; 1] = [0];
     let out_strides: [i64; 1] = [0];
     let ndim: usize = 0;
     let axis_stride: i64 = 1;
-    let axis_sz: usize = axis_size;
 
     // SAFETY: bind slots/dtypes match the `arg_reduce_general` MSL
     // signature (in@0, out u32@1, shape@2, in_strides@3, out_strides@4,
@@ -71,7 +90,7 @@ pub fn argmax_bf16(
             6,
         );
         encoder.setBytes_length_atIndex(
-            NonNull::from(&axis_sz).cast::<c_void>(),
+            NonNull::from(&axis_size).cast::<c_void>(),
             std::mem::size_of::<usize>(),
             7,
         );
@@ -83,7 +102,6 @@ pub fn argmax_bf16(
     // larger axes). Mirrors MLX primitives.cpp::ArgReduce::eval_gpu.
     let want = axis_size.div_ceil(4);
     let tg = want.min(1024).div_ceil(32) * 32;
-    let tg = tg.max(32);
     let grid = MTLSize { width: tg, height: 1, depth: 1 };
     let threadgroup = MTLSize { width: tg, height: 1, depth: 1 };
     encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
