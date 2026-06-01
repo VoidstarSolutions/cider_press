@@ -46,6 +46,10 @@ const UNARY_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/unary_inlined
 /// Pre-flattened MLX `reduce.metal`, produced by `build.rs`.
 const REDUCE_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/reduce_inlined.metal"));
 
+/// Pre-flattened MLX `arg_reduce.metal`, produced by `build.rs`.
+const ARG_REDUCE_SOURCE: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/arg_reduce_inlined.metal"));
+
 /// Pre-flattened MLX `rope.metal`, produced by `build.rs`.
 const ROPE_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/rope_inlined.metal"));
 
@@ -176,6 +180,11 @@ impl KernelLibrary {
     /// `column` reductions.
     pub fn reduce(device: &Device) -> Result<Self> {
         Self::from_source(device, REDUCE_SOURCE)
+    }
+
+    /// JIT-compile MLX's `arg_reduce.metal` (argmax/argmin index kernels).
+    pub fn arg_reduce(device: &Device) -> Result<Self> {
+        Self::from_source(device, ARG_REDUCE_SOURCE)
     }
 
     /// JIT-compile MLX's `rope.metal` (vendored under `kernels-mlx/`).

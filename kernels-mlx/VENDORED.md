@@ -26,6 +26,7 @@ Entry points (compiled to JITed `MTLLibrary`s by cider-press-kernels):
 - `mlx/backend/metal/kernels/binary.metal`
 - `mlx/backend/metal/kernels/unary.metal`
 - `mlx/backend/metal/kernels/reduce.metal`
+- `mlx/backend/metal/kernels/arg_reduce.metal`
 - `mlx/backend/metal/kernels/rope.metal`
 - `mlx/backend/metal/kernels/softmax.metal`
 - `mlx/backend/metal/kernels/quantized.metal`
