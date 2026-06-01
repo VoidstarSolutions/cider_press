@@ -9,6 +9,7 @@
 //! transcription pattern is validated by the qmv parity test, so the
 //! per-kernel work is mostly mechanical.
 
+pub mod arg_reduce;
 pub mod binary;
 pub mod copy;
 pub mod dequantize;
