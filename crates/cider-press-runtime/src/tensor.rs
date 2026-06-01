@@ -4213,6 +4213,21 @@ mod tests {
     }
 
     #[test]
+    fn argmax_decode_shape_1_1_vocab() {
+        let device = Device::shared().expect("device");
+        // [1, 1, 5] — the decode logits shape; max at vocab index 3.
+        let vals: Vec<bf16> = [0.1f32, 0.4, 0.2, 0.9, 0.3]
+            .iter()
+            .map(|&x| bf16::from_f32(x))
+            .collect();
+        let logits = Tensor::from_slice(&device, &vals, [1usize, 1, 5]).expect("leaf");
+        let idx = logits.argmax(2).expect("argmax");
+        assert_eq!(idx.shape().dims(), &[1, 1]);
+        idx.eval().expect("eval");
+        assert_eq!(idx.cpu_slice::<u32>().expect("u32"), &[3]);
+    }
+
+    #[test]
     fn argmax_rejects_non_bf16() {
         let device = Device::shared().expect("device");
         let t = Tensor::zeros(&device, [1usize, 4], DType::F32).expect("leaf");

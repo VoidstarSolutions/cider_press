@@ -21,9 +21,9 @@ to ~11%, and resolved the +32% peak-RSS regression (**~1192 → ~900 MiB**).
 This pass then moved **next-token selection on-GPU** (in-graph `ArgReduce`):
 the ~444 µs/token CPU `cpu_to_vec` + 151 k-wide scan and the 302 kB logits
 readback are gone, replaced by a sub-µs GPU reduction folded into the decode
-command buffer + a 4-byte index readback, lifting decode **~210 → ~243
+command buffer + a 4-byte index readback, lifting decode **~217 → ~243
 tok/s**. The remaining ~2.3× gap is GPU-execution-bound: `tensor.eval` is
-~90% of the decode step and ~85% of *that* is the synchronous GPU
+~90% of the decode step and ~86% of *that* is the synchronous GPU
 `commit_and_wait` (the 4-bit `qmv` weight matvecs), with the CPU encode
 ~12% of the step.
 
@@ -68,7 +68,7 @@ tok/s**. The remaining ~2.3× gap is GPU-execution-bound: `tensor.eval` is
   command-buffer encode. The pool only paid off once `KvCache::update`
   stopped chaining `SliceUpdate`s (which had pinned every step's graph for
   the whole decode — see Decode-step breakdown). The **GPU argmax** then
-  lifted decode **~210 → ~243 tok/s** (range 238–246) by removing the
+  lifted decode **~217 → ~243 tok/s** (range 238–246) by removing the
   ~444 µs/token CPU vocab scan + 302 kB logits readback (see **GPU argmax**).
   The **remaining ~2.3× gap** to `mlx_lm` is now dominated by GPU execution
   (the 4-bit `qmv` matvecs in `tensor.eval.wait`), not CPU encode.
@@ -281,7 +281,7 @@ run of the 4-bit `qmv` matvecs. In measurement-justified priority:
   synchronous, so the (now small) CPU encode never overlaps the GPU.
   Multiple command buffers in flight (or Approach-C plumbing threading
   `Commands` through the forward) would hide it. Lower priority now that
-  encode is ~9% of the step.
+  encode is ~12% of the step.
 - **Fused prefill attention** — prefill still uses the composed path;
   fusing it (steel/nax `sdpa_full`, Plan B) is the prefill attention lever.
 - **GPU argmax — done (~217 → ~243 tok/s).** Next-token selection moved
