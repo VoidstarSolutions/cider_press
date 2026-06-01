@@ -44,7 +44,7 @@ pub(crate) fn op_kind_label(kind: &OpKind) -> &'static str {
         OpKind::MatMul => "matmul",
         OpKind::SliceUpdate { .. } => "slice_update",
         OpKind::Sdpa { .. } => "sdpa",
-        OpKind::ArgReduce { .. } => "argmax",
+        OpKind::ArgReduce { .. } => "arg_reduce",
     }
 }
 
@@ -232,7 +232,7 @@ fn gpu_key(label: &'static str) -> &'static str {
         "matmul" => "gpu.matmul",
         "slice_update" => "gpu.slice_update",
         "sdpa" => "gpu.sdpa",
-        "argmax" => "gpu.argmax",
+        "arg_reduce" => "gpu.arg_reduce",
         _ => "gpu.other",
     }
 }

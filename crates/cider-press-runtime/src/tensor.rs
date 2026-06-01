@@ -315,7 +315,7 @@ pub enum OpKind {
         /// Apply a causal mask (false for decode `T_q=1` full attention).
         causal: bool,
     },
-    /// Index of the maximum (or minimum) element along `axis`. Input
+    /// Index of the maximum element along `axis`. Input
     /// must be a dense, contiguous BF16 tensor. Output dtype is
     /// [`DType::U32`] with `axis` dropped. Only last-axis reductions
     /// are wired (same constraint as [`OpKind::Reduce`]).
@@ -371,7 +371,7 @@ pub enum ReduceKind {
 }
 
 /// Index-reduction kinds for [`OpKind::ArgReduce`]. Only `ArgMax` is
-/// wired (greedy decode); `ArgMin` lands with its first consumer.
+/// wired (greedy decode).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArgReduceKind {
     ArgMax,
@@ -1062,21 +1062,29 @@ impl Tensor {
                 self.inner.dtype,
             )));
         }
-        if self.inner.view.is_some() {
-            return Err(Error::InvalidArgument(
-                "argmax: view inputs are not supported; copy() first".into(),
-            ));
-        }
         let strides = match self.layout() {
             Layout::Dense { strides } => strides,
             Layout::Quantized(_) => {
-                return Err(Error::InvalidArgument("argmax: quantized not supported".into()));
+                return Err(Error::InvalidArgument(
+                    "argmax: quantized tensors are not supported".into(),
+                ));
             }
         };
-        if !strides.is_contiguous(self.shape()) {
+        if self.inner.view.is_some() {
             return Err(Error::InvalidArgument(
-                "argmax: input must be contiguous; copy() first".into(),
+                "argmax: view inputs are not supported; copy() first to materialise \
+                 a dense version (eval-side dispatch reads inputs as dense leaves \
+                 and does not resolve view chains)"
+                    .into(),
             ));
+        }
+        if !strides.is_contiguous(self.shape()) {
+            return Err(Error::InvalidArgument(format!(
+                "argmax: input must be contiguous (got shape {:?} strides {:?}); \
+                 copy() first to materialise a dense version",
+                self.shape().dims(),
+                strides.as_slice(),
+            )));
         }
         let rank = self.shape().rank();
         let axis_resolved = resolve_axis(rank, axis)?;

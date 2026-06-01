@@ -369,7 +369,6 @@ impl Device {
     }
 
     /// Lazily JIT-compile and cache MLX's `arg_reduce.metal` library.
-    /// See [`Device::copy_library`] for cache semantics.
     pub(crate) fn arg_reduce_library(&self) -> Result<&kernels::KernelLibrary> {
         if let Some(lib) = self.inner.arg_reduce_library.get() {
             return Ok(lib);
