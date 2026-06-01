@@ -8,7 +8,6 @@
 use std::collections::HashSet;
 
 use cider_press_runtime::{DType, Device, KvCache, Tensor};
-use half::bf16;
 
 use crate::error::{Error, Result};
 use crate::nn::causal_mask;
@@ -244,38 +243,16 @@ fn id_is_terminal(id: u32, eos_ids: &HashSet<u32>) -> bool {
 
 /// Argmax over the last position of a `[1, T, vocab]` BF16 logits tensor.
 fn argmax_last_position(logits: &Tensor, vocab: usize) -> Result<u32> {
-    logits.eval()?;
+    // logits is [1, T, vocab]; select the last position's row, argmax
+    // over the vocab axis on the GPU (same command buffer as lm_head),
+    // and read back the single index.
+    let t = logits.shape().dims()[1];
+    let last = logits.slice(&[0..1, t - 1..t, 0..vocab])?.copy()?; // [1, 1, vocab] dense
+    let idx = last.argmax(2)?; // [1, 1] U32
+    idx.eval()?;
     let _span = cider_press_runtime::profile::span("argmax");
-    let elements: Vec<bf16> = logits.cpu_to_vec().ok_or_else(|| {
-        Error::InvalidArgument(
-            "argmax_last_position: cpu_to_vec returned None \
-             (logits not materialised or dtype mismatch)"
-                .into(),
-        )
-    })?;
-    debug_assert_eq!(
-        elements.len() % vocab,
-        0,
-        "argmax_last_position: logits length {} is not a multiple of vocab={vocab}",
-        elements.len(),
-    );
-    if elements.len() < vocab {
-        return Err(Error::InvalidArgument(format!(
-            "argmax_last_position: logits has {} elements; need at least vocab={vocab}",
-            elements.len(),
-        )));
-    }
-    let start = elements.len() - vocab;
-    let (best_i, _) = elements[start..]
-        .iter()
-        .enumerate()
-        .map(|(i, x)| {
-            #[allow(clippy::cast_possible_truncation)]
-            let idx = i as u32;
-            (idx, x.to_f32())
-        })
-        .fold((0u32, f32::NEG_INFINITY), |(bi, bv), (i, v)| {
-            if v > bv { (i, v) } else { (bi, bv) }
-        });
-    Ok(best_i)
+    let ids = idx
+        .cpu_slice::<u32>()
+        .ok_or_else(|| Error::InvalidArgument("argmax: cpu_slice::<u32> returned None".into()))?;
+    Ok(ids[0])
 }
