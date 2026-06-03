@@ -92,9 +92,12 @@ pub struct KvCache {
 impl KvCache {
     /// Allocate a fresh cache with capacity for `max_tokens` rows.
     ///
-    /// The two slabs are allocated uninitialized — no zero-fill,
-    /// because the `keys_view` / `values_view` shapes only ever
-    /// expose the populated prefix `[0..position]`.
+    /// The two slabs are zero-filled at construction. `keys_view` /
+    /// `values_view` only ever expose the populated prefix `[0..position]`,
+    /// so under serial dispatch the fill is invisible — but concurrent
+    /// dispatch loses the automatic write-before-read ordering, and a
+    /// zeroed slab keeps a premature read of an unwritten row benign rather
+    /// than garbage (see the module-level aliasing-contract note).
     ///
     /// `dtype` must be a float type (`f32`, `f16`, or `bf16`);
     /// quantized K/V caches are out of scope.
@@ -134,8 +137,21 @@ impl KvCache {
                  (elem_count={elem_count}, dtype={dtype})"
             ))
         })?;
-        let keys = device.kernels().alloc_buffer::<u8>(byte_count)?;
-        let values = device.kernels().alloc_buffer::<u8>(byte_count)?;
+        let mut keys = device.kernels().alloc_buffer::<u8>(byte_count)?;
+        let mut values = device.kernels().alloc_buffer::<u8>(byte_count)?;
+        // Zero the full slabs. Reads only ever target the populated prefix
+        // `[0..position]` *under serial dispatch*, where Metal's automatic
+        // hazard tracking orders each `SliceUpdate` write before the SDPA
+        // read. Under concurrent dispatch that ordering is no longer
+        // automatic, so an unwritten row can be read before its write lands;
+        // a deterministically-zero slab makes that read benign instead of
+        // garbage. Cheap (one host memset at construction; shared storage).
+        // SAFETY: freshly allocated; no dispatch has referenced these
+        // buffers yet, so the host pointer is exclusively ours to write.
+        unsafe {
+            keys.as_mut_slice().fill(0);
+            values.as_mut_slice().fill(0);
+        }
         let slab_shape = Shape::new([max_tokens, n_kv_heads, head_dim]);
         let slab_layout = Layout::Dense {
             strides: Strides::contiguous(&slab_shape),
@@ -394,6 +410,28 @@ mod tests {
     use super::*;
     use crate::Device;
     use crate::dtype::DType;
+
+    #[test]
+    fn new_cache_zeroes_full_slabs() {
+        let device = Device::shared().expect("device");
+        let cache = KvCache::new(&device, 4, 2, 3, DType::BF16).expect("cache");
+
+        // Read the *full* slab memory — every row, not just the populated
+        // prefix `keys_view` exposes. Under concurrent dispatch an unwritten
+        // row can be read before its `SliceUpdate` lands, so the slab must be
+        // deterministically zero, never left uninitialized.
+        for (name, slab) in [("keys", &cache.keys_slab), ("values", &cache.values_slab)] {
+            let bytes = match slab.inner.cache.get() {
+                Some(crate::tensor::LeafStorage::Dense(buf)) => unsafe { buf.as_slice() },
+                _ => panic!("{name} slab is not a dense leaf"),
+            };
+            assert!(
+                bytes.iter().all(|&b| b == 0),
+                "{name} slab not zero-initialized: first nonzero byte at {:?}",
+                bytes.iter().position(|&b| b != 0),
+            );
+        }
+    }
 
     #[test]
     fn lazy_update_then_view_reads_written_rows() {
