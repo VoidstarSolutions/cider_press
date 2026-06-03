@@ -49,53 +49,32 @@ pub(crate) fn op_kind_label(kind: &OpKind) -> &'static str {
     }
 }
 
-pub(crate) fn eval(root: &Tensor) -> Result<()> {
-    let _span = crate::profile::span("tensor.eval");
-    // `tensor.eval.encode` isolates the CPU-side cost of *building* the
-    // command buffer — the topo walk, per-op output allocation, and
-    // dispatch encoding (steps 1–4) — from `tensor.eval.wait`, which is
-    // the GPU execution time (the synchronous commit + wait, step 5).
-    // Their sum is the whole eval minus the cheap cache-population pass
-    // (step 6). Splitting them tells us whether decode is bound by
-    // CPU encode/alloc overhead or by GPU kernel time. See
-    // `docs/QWEN_PERF.md`.
-    let encode = crate::profile::span("tensor.eval.encode");
-    // Step 1: topological order of unevaluated op nodes reachable from
-    // `root`. Reverse-postorder DFS, deduped by `Arc` pointer identity.
-    // Skips placeholders, already-materialized leaves, and op nodes
-    // whose cache is already populated.
+/// Step 1: reverse-postorder topo walk of unevaluated op nodes reachable
+/// from `root`, deduped by `Arc` pointer identity.
+fn build_order(root: &Tensor) -> Vec<Arc<TensorInner>> {
     let mut visited: HashSet<*const TensorInner> = HashSet::new();
     let mut order: Vec<Arc<TensorInner>> = Vec::new();
     visit(&root.inner, &mut visited, &mut order);
+    order
+}
 
-    if order.is_empty() {
-        return Ok(()); // every reachable node is already terminal.
-    }
-
-    // Step 2: open one `Commands` for the whole batch.
-    let device = root.inner.device.as_ref().ok_or_else(|| {
-        Error::InvalidArgument("eval: placeholder has no device to dispatch on".into())
-    })?;
-    let mut commands = device.kernels().commands()?;
-
-    // Step 3: index every node we're about to dispatch, so a later
-    // node's dispatcher can look up an earlier node's just-allocated
-    // output without the cache being populated yet (cache writes are
-    // deferred until step 5 — bytes aren't valid until commit + wait).
+/// Steps 3–4: index the nodes, then allocate each op's output and encode
+/// its dispatch into `commands`. Returns the per-node output buffers and
+/// their pool tags (`Some(bytes)` ⇒ pool-minted; `None` ⇒ `SliceUpdate` slab
+/// clone, never pooled).
+#[allow(clippy::type_complexity)]
+fn encode_ops(
+    order: &[Arc<TensorInner>],
+    device: &crate::Device,
+    commands: &mut Commands<'_>,
+) -> Result<(Vec<Buffer<u8>>, Vec<Option<usize>>)> {
     let mut index_of: HashMap<*const TensorInner, usize> = HashMap::new();
     for (i, inner) in order.iter().enumerate() {
         index_of.insert(Arc::as_ptr(inner), i);
     }
-
-    // Step 4: for each op in topo order, allocate output and encode.
-    // `outputs` grows as we go; `&outputs` is a valid shared-borrow
-    // for input lookup on subsequent iterations while we hold an
-    // exclusive `&mut dst` to the fresh local.
     let mut outputs: Vec<Buffer<u8>> = Vec::with_capacity(order.len());
-    // Per-output pool tag: `Some(bytes)` ⇒ pool-minted, return to pool on
-    // drop; `None` ⇒ SliceUpdate slab clone (caller-owned), never pooled.
     let mut tags: Vec<Option<usize>> = Vec::with_capacity(order.len());
-    for inner in &order {
+    for inner in order {
         let op = inner
             .op
             .as_ref()
@@ -109,34 +88,52 @@ pub(crate) fn eval(root: &Tensor) -> Result<()> {
             let byte_count = checked_byte_count(&inner.shape, inner.dtype)?;
             (device.alloc_pooled(byte_count)?, Some(byte_count))
         };
-        dispatch(inner, &mut commands, &outputs, &mut dst, &index_of)?;
+        dispatch(inner, commands, &outputs, &mut dst, &index_of)?;
         outputs.push(dst);
         tags.push(tag);
     }
+    Ok((outputs, tags))
+}
 
-    // Step 5: synchronous commit + wait. After this returns, every
-    // encoded dispatch has completed and the output bytes are valid.
-    // Close the encode span here so it excludes GPU time, and time the
-    // commit + wait under its own span.
-    drop(encode);
-    let wait = crate::profile::span("tensor.eval.wait");
-    commands.commit_and_wait()?;
-    drop(wait);
-
-    // Step 6: populate caches. Race-safe: if another thread also
-    // evaluated this node (no concurrent-eval story yet, but the
-    // structure already supports it), one set wins and the other's
-    // buffer is dropped. Op outputs are always dense — no op
-    // currently produces a quantized tensor (no `mx.quantize`
-    // analogue yet).
-    for ((inner, buffer), tag) in order.into_iter().zip(outputs).zip(tags) {
+/// Step 6: populate each node's result cache from its output buffer.
+/// The buffer handle is valid immediately after allocation; its bytes are only
+/// valid after `commit_and_wait` (or equivalent GPU completion), so a caller
+/// must order this so any host read of the cached bytes happens after the GPU
+/// finishes.
+fn populate_caches(
+    order: &[Arc<TensorInner>],
+    outputs: Vec<Buffer<u8>>,
+    tags: Vec<Option<usize>>,
+    device: &crate::Device,
+) {
+    for ((inner, buffer), tag) in order.iter().zip(outputs).zip(tags) {
         let storage = match tag {
             Some(bytes) => LeafStorage::Dense(device.pooled(buffer, bytes)),
             None => LeafStorage::Dense(crate::buffer_pool::PooledBuffer::unpooled(buffer)),
         };
         let _ = inner.cache.set(storage);
     }
+}
 
+pub(crate) fn eval(root: &Tensor) -> Result<()> {
+    let _span = crate::profile::span("tensor.eval");
+    let encode = crate::profile::span("tensor.eval.encode");
+    let order = build_order(root);
+    if order.is_empty() {
+        return Ok(()); // every reachable node is already terminal.
+    }
+    let device = root.inner.device.as_ref().ok_or_else(|| {
+        Error::InvalidArgument("eval: placeholder has no device to dispatch on".into())
+    })?;
+    let mut commands = device.kernels().commands()?;
+    let (outputs, tags) = encode_ops(&order, device, &mut commands)?;
+    drop(encode);
+
+    let wait = crate::profile::span("tensor.eval.wait");
+    commands.commit_and_wait()?;
+    drop(wait);
+
+    populate_caches(&order, outputs, tags, device);
     Ok(())
 }
 
@@ -147,9 +144,7 @@ pub(crate) fn eval(root: &Tensor) -> Result<()> {
 /// never as a replacement. Errors if the device lacks stage-boundary
 /// counter sampling.
 pub(crate) fn profiled_eval(root: &Tensor) -> Result<()> {
-    let mut visited: HashSet<*const TensorInner> = HashSet::new();
-    let mut order: Vec<Arc<TensorInner>> = Vec::new();
-    visit(&root.inner, &mut visited, &mut order);
+    let order = build_order(root);
     if order.is_empty() {
         return Ok(());
     }
@@ -203,14 +198,7 @@ pub(crate) fn profiled_eval(root: &Tensor) -> Result<()> {
         crate::profile::record_gpu(gpu_key(seg.label), ns);
     }
 
-    for ((inner, buffer), tag) in order.into_iter().zip(outputs).zip(tags) {
-        let storage = match tag {
-            Some(bytes) => LeafStorage::Dense(device.pooled(buffer, bytes)),
-            None => LeafStorage::Dense(crate::buffer_pool::PooledBuffer::unpooled(buffer)),
-        };
-        let _ = inner.cache.set(storage);
-    }
-
+    populate_caches(&order, outputs, tags, device);
     Ok(())
 }
 
