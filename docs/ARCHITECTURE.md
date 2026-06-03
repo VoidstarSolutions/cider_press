@@ -52,8 +52,8 @@ HuggingFace / mlx-community 4-bit checkpoint.
 ## Performance backlog
 
 Decode is **critical-path-bound** (`QWEN_PERF.md`): one `Tensor::eval` per
-token (~90% of the step), ~1.85× slower than `mlx_lm` (~302 vs ~560 tok/s,
-down from ~2.3× before the fused `RMSNorm`). The
+token (~90% of the step), ~1.35× slower than `mlx_lm` (~420 vs ~566 tok/s,
+down from ~2.3× before the fused `RMSNorm` + async pipelining). The
 dispatch round-trip tax (items #1, #3), the CPU-side allocation tax (item
 #2), and the post-eval CPU vocab scan (item #6, GPU argmax) have been
 removed; the `tensor.eval` encode/wait split is now **~86% GPU execution,
@@ -135,8 +135,9 @@ priority:
    `## Concurrent-encoder spike`. A defensive prerequisite did land — the KV
    slabs are now zero-filled (`KvCache::new`) so any future reordering reads
    deterministic zero, not garbage.
-5. **Pipelining / per-token sync removal — DONE (~1.40×, ~243 → ~341
-   tok/s).** `Tensor::eval_async` commits a token's command buffer without
+5. **Pipelining / per-token sync removal — DONE (~1.33× on the post-`RMSNorm`
+   base: depth-0 ~317 → depth-1 ~420 tok/s; ~1.40× when first measured on the
+   pre-fusion ~243 baseline).** `Tensor::eval_async` commits a token's command buffer without
    waiting (returning a `PendingEval` waited later), and the GPU argmax id
    (item 6) is chained **on-GPU** into the next embedding gather — so token
    N+1's CPU graph-build + encode overlaps token N's GPU execution and the

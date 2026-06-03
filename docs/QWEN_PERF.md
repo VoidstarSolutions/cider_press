@@ -5,9 +5,10 @@ measured via `cider-press bench`, compared against `mlx_lm` on the same
 prompt and token budget. Methodology: warm up, then time a steady-state
 window; see `docs/ARCHITECTURE.md` for the architecture and forward backlog.
 
-The headline: decode runs **~1.85× slower than MLX** at the full-model
-scale (~302 vs ~560 tok/s), down from ~2.3× before the fused `RMSNorm`
-(which replaced a six-dispatch composition with one kernel, ~1.26×). Three
+The headline: decode runs **~1.35× slower than MLX** at the full-model
+scale (~420 vs ~566 tok/s), down from ~2.3× two branches ago — the fused
+`RMSNorm` and **async decode pipelining** stack to **~1.73×** over the
+pre-fusion ~243 baseline. Three
 prior changes set the stage — the in-graph KV write (SliceUpdate)
 collapsed each step to **one command buffer per token** (~1.6×), the
 fused `sdpa_vector` decode-attention kernel lifted decode to ~120 tok/s
@@ -26,12 +27,12 @@ command buffer + a 4-byte index readback, lifting decode **~217 → ~243
 tok/s**, and the fused `RMSNorm` then **~243 → ~302** (~1.26×, first fusion
 landed). **Async decode pipelining** then committed the next token's command
 buffer without waiting and chained the argmax id on-GPU, so token N+1's CPU
-graph-build + encode overlaps token N's GPU execution — an independent
-**~1.40× (~243 → ~341 tok/s)**, measured on the pre-`RMSNorm` baseline. Both
-optimizations land stacked in this branch but were measured separately; the
-combined steady-state is **pending a re-measure** (the ~302 / ~1.85× headline
-and the throughput table below predate pipelining). See **Async decode
-pipelining** below.
+graph-build + encode overlaps token N's GPU execution. Re-measured on this
+branch with both stacked: decode is **~420 tok/s** at the production depth-1
+vs **~317 tok/s** synchronous (depth-0) on the same post-`RMSNorm` base — a
+**~1.33×** pipelining overlap (down from the ~1.40× measured on the pre-fusion
+~243 baseline: `RMSNorm` already shortened the GPU critical path, so there is
+less CPU encode left to hide). See **Async decode pipelining** below.
 
 The remaining gap is **critical-path-bound**: `tensor.eval` is ~90% of the
 decode step, and its GPU wait is a deep chain of **dependent dispatches** —
@@ -64,7 +65,7 @@ faster kernels, and pipelining (now landed) — not the dispatch model.
 | phase   | cider-press | mlx_lm  | ratio (mlx ÷ cp) |
 |---------|------------:|--------:|-----------------:|
 | prefill | ~376 tok/s  | ~1346 tok/s | ~3.6× |
-| decode  | ~302 tok/s  | ~560 tok/s  | ~1.85× |
+| decode  | ~420 tok/s  | ~566 tok/s  | ~1.35× |
 
 - **Prefill** processes the 39-token prompt in one forward. cider-press
   ranged 346–391 tok/s across warm runs (~376 median); `mlx_lm` ~1346.
@@ -87,9 +88,12 @@ faster kernels, and pipelining (now landed) — not the dispatch model.
   ~444 µs/token CPU vocab scan + 302 kB logits readback (see **GPU argmax**).
   The **fused `RMSNorm`** then lifted decode **~243 → ~302 tok/s** (~1.26×)
   by collapsing the 6-dispatch composition (×49 calls/token) to one
-  `rms_single_row` each (see **Hot spots & next levers**). The **remaining
-  ~1.85× gap** to `mlx_lm` is critical-path-bound — the chain of dependent
-  dispatches in `tensor.eval.wait`, not CPU encode.
+  `rms_single_row` each (see **Hot spots & next levers**). Finally **async
+  decode pipelining** lifted the production path to **~420 tok/s** (depth-1,
+  range 413–423; ~317 tok/s synchronous depth-0 on the same post-`RMSNorm`
+  base, a ~1.33× overlap). The **remaining ~1.35× gap** to `mlx_lm` (~566) is
+  critical-path-bound — the chain of dependent dispatches in
+  `tensor.eval.wait`, not CPU encode.
 - Load time (excluded from tok/s): ~0.17 s.
 
 **Cold-start note:** the very first forward of a fresh process triggers
@@ -147,15 +151,30 @@ measured no further gain. Design:
 `docs/superpowers/specs/2026-06-03-async-pipelining-design.md` and
 `…-eval-detach-design.md`.
 
+**Re-measured post-`RMSNorm`** (this branch rebased onto fused `RMSNorm`; M4
+Max warm, `--max-tokens 128 --warmup 8`, median of 5 — the A/B table above
+predates the fusion, which now lives in the base):
+
+| build | decode tok/s | pool hit |
+|-------|-------------:|---------:|
+| depth-0 (synchronous, detach) | ~317 (308–323) | 97.2% |
+| **depth-1 (pipelined, detach)** | **~420 (413–423)** | 97.2% |
+
+The pipelining overlap is now **~1.33×** (was ~1.40× pre-fusion): the fused
+`RMSNorm` shortened the GPU critical path, so there is less CPU encode left to
+hide under GPU execution. `mlx_lm` on the same prompt measured **~566 tok/s**
+(560–577, median of 5) — gap **~1.35×**.
+
 ## Decode-step breakdown
 
 Per-span totals over the timed decode window (~109 timed steps; the
 profiler is reset after warmup, so the spans below show 108 hits).
 Representative warm run, decode wall ≈ 446 ms / 243 tok/s — a
-**pre-fusion snapshot** (the headline ~302 tok/s reflects the fused
-`RMSNorm` that landed after this breakdown was captured; the span
-*shape* below is unchanged, RMSNorm fusion removed five dispatches from
-the `tensor.eval.encode` side). `tensor.eval` is split into two **nested,
+**pre-fusion, pre-pipelining snapshot** (the headline ~420 tok/s reflects
+the fused `RMSNorm` and async pipelining that landed after this breakdown
+was captured; the span *shape* below is from the synchronous path — RMSNorm
+fusion removed five dispatches from the `tensor.eval.encode` side, and
+pipelining moved the wait off the critical path). `tensor.eval` is split into two **nested,
 non-overlapping** sub-spans: `tensor.eval.encode` (CPU-side command-buffer
 construction) and `tensor.eval.wait` (the synchronous GPU
 `commit_and_wait`); their sum is `tensor.eval` minus the cheap
@@ -459,7 +478,7 @@ concurrent encoder itself is **shelved**.
   the 117 generated for this prompt); `mlx_lm`'s `generation_tps` averages
   over all generated tokens (its `--warmup` flag is accepted only for CLI
   symmetry and is informational). On a pipelined backend the skew is small
-  and, if anything, flatters cider-press — so the ~1.85× gap is not an
+  and, if anything, flatters cider-press — so the ~1.35× gap is not an
   artifact of windowing.
 - **Run-to-run variance** on cider-press decode is larger than MLX's
   because the synchronous per-eval path is more exposed to OS scheduling
