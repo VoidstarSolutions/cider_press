@@ -2291,6 +2291,15 @@ impl Tensor {
         crate::eval::eval(self)
     }
 
+    /// Commit this tensor's graph to the GPU **without waiting**, returning
+    /// a [`PendingEval`](crate::PendingEval) to block on later. Result
+    /// caches are populated at commit time so dependent graphs can chain off
+    /// this tensor immediately, but its bytes are not host-readable until the
+    /// returned handle is waited (see `PendingEval`'s contract).
+    pub fn eval_async(&self) -> Result<crate::PendingEval> {
+        crate::eval::eval_async(self)
+    }
+
     /// Profiling-only eval: like [`Tensor::eval`], but times each
     /// dispatch's GPU execution via stage-boundary counter sampling and
     /// records per-[`OpKind`] GPU totals into [`crate::profile`]. One

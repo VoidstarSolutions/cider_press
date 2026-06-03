@@ -115,6 +115,27 @@ fn populate_caches(
     }
 }
 
+/// Commit `root`'s graph without waiting. Populates result caches at commit
+/// time (buffer handles valid now; bytes valid after the returned handle is
+/// waited) and returns a [`PendingEval`](crate::PendingEval) owning the
+/// in-flight command buffer plus the topo order (pinning the in-flight
+/// pooled buffers). See `pending_eval` for the host-read contract.
+pub(crate) fn eval_async(root: &Tensor) -> Result<crate::PendingEval> {
+    let _span = crate::profile::span("tensor.eval_async");
+    let order = build_order(root);
+    if order.is_empty() {
+        return Ok(crate::PendingEval::empty());
+    }
+    let device = root.inner.device.as_ref().ok_or_else(|| {
+        Error::InvalidArgument("eval_async: placeholder has no device to dispatch on".into())
+    })?;
+    let mut commands = device.kernels().commands()?;
+    let (outputs, tags) = encode_ops(&order, device, &mut commands)?;
+    let in_flight = commands.commit()?;
+    populate_caches(&order, outputs, tags, device);
+    Ok(crate::PendingEval::new(in_flight, order))
+}
+
 pub(crate) fn eval(root: &Tensor) -> Result<()> {
     let _span = crate::profile::span("tensor.eval");
     let encode = crate::profile::span("tensor.eval.encode");
@@ -1922,5 +1943,117 @@ mod label_tests {
             op_kind_label(&OpKind::SliceUpdate { offset_rows: 0 }),
             "slice_update"
         );
+    }
+}
+
+#[cfg(test)]
+mod async_tests {
+    use half::bf16;
+
+    use crate::{Device, Tensor};
+
+    fn bf16_vec(xs: &[f32]) -> Vec<bf16> {
+        xs.iter().map(|&x| bf16::from_f32(x)).collect()
+    }
+
+    /// A committed-but-unwaited graph yields correct bytes after `wait()`.
+    #[test]
+    fn eval_async_then_wait_materializes() {
+        let device = Device::system_default().expect("device");
+        let a = Tensor::from_slice(&device, &bf16_vec(&[1.0, 2.0, 3.0, 4.0]), [4]).expect("a");
+        let b = a.add(&a).expect("b = a + a");
+        let pending = b.eval_async().expect("eval_async");
+        pending.wait().expect("wait");
+        assert_eq!(b.cpu_to_vec::<bf16>().expect("b bytes"), bf16_vec(&[2.0, 4.0, 6.0, 8.0]));
+    }
+
+    /// Two chained async evals — the second consumes the first's output —
+    /// equal two synchronous evals. Proves cross-command-buffer ordering.
+    #[test]
+    fn chained_async_evals_order_correctly() {
+        let device = Device::system_default().expect("device");
+        let a = Tensor::from_slice(&device, &bf16_vec(&[1.0, 2.0, 3.0, 4.0]), [4]).expect("a");
+        let b = a.add(&a).expect("b");
+        let p1 = b.eval_async().expect("p1"); // b committed, not waited
+        let c = b.add(&b).expect("c = b + b"); // reads b's in-flight buffer
+        let p2 = c.eval_async().expect("p2");
+        p1.wait().expect("wait p1");
+        p2.wait().expect("wait p2");
+        assert_eq!(c.cpu_to_vec::<bf16>().expect("c bytes"), bf16_vec(&[4.0, 8.0, 12.0, 16.0]));
+    }
+
+    /// Dropping a `PendingEval` without calling `wait()` must still block on GPU
+    /// completion (the in-flight handle's Drop), leaving valid bytes. Guards
+    /// the `in_flight`-before-`order` field drop ordering.
+    #[test]
+    fn dropping_pending_eval_blocks_until_complete() {
+        let device = Device::system_default().expect("device");
+        let a = Tensor::from_slice(&device, &bf16_vec(&[3.0, 4.0]), [2]).expect("a");
+        let b = a.add(&a).expect("b");
+        drop(b.eval_async().expect("eval_async")); // dropped, not waited
+        assert_eq!(b.cpu_to_vec::<bf16>().expect("b"), bf16_vec(&[6.0, 8.0]));
+    }
+
+    /// Holding many `PendingEval`s (never waiting until the end) keeps every
+    /// in-flight buffer pinned, so a long dependent chain stays correct.
+    ///
+    /// Pool-competition note: ideally we would assert that a same-sized
+    /// competing alloc (done while chain handles are held) recycles a freed
+    /// buffer and still produces the wrong result if pinning is broken. In
+    /// practice the chain holds *all* same-sized (2-byte bf16) free-list
+    /// slots while its handles are unwaited, so a competing alloc always
+    /// misses the pool — deterministic freelist-slot contention is not
+    /// achievable here without bypassing the pool's encapsulation. Instead,
+    /// we document the pool's miss count (which must equal 1 for the
+    /// competing eval, proving that all slots were in fact held), and assert
+    /// the chain result is still correct after waiting — the correctness
+    /// assertion is the primary guard; the pool-stats assertion documents
+    /// exactly what "pinning was exercised" means here.
+    #[test]
+    fn held_pending_evals_pin_buffers_through_a_chain() {
+        let device = Device::system_default().expect("device");
+        let mut t = Tensor::from_slice(&device, &bf16_vec(&[1.0]), [1]).expect("t0");
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            t = t.add(&t).expect("double");
+            handles.push(t.eval_async().expect("eval_async"));
+        }
+
+        // While all 16 chain PendingEvals are unwaited, run a competing
+        // same-sized (1-element bf16) synchronous eval. Because all
+        // same-sized free-list slots are pinned by the chain, the
+        // competitor must allocate fresh (miss). The miss count increasing
+        // documents that the freelist was fully occupied — i.e., buffers
+        // are not leaking back to the pool mid-flight.
+        let misses_before = device.pool_stats().misses;
+        let competitor = Tensor::from_slice(&device, &bf16_vec(&[1.0]), [1]).expect("comp");
+        let comp_r = competitor.add(&competitor).expect("comp_r");
+        comp_r.eval().expect("comp eval");
+        let misses_after = device.pool_stats().misses;
+        assert!(
+            misses_after > misses_before,
+            "competitor eval unexpectedly hit the pool while chain buffers should be pinned \
+             (misses before={misses_before}, after={misses_after}); this is surprising — \
+             check whether the chain is actually holding its handles"
+        );
+        assert_eq!(comp_r.cpu_to_vec::<bf16>().expect("comp"), bf16_vec(&[2.0]));
+
+        for h in handles {
+            h.wait().expect("wait");
+        }
+        // 1 doubled 16 times = 2^16 = 65536.
+        assert_eq!(t.cpu_to_vec::<bf16>().expect("final"), bf16_vec(&[65536.0]));
+    }
+
+    /// `eval_async` on an already-materialized tensor returns an empty
+    /// handle that waits trivially.
+    #[test]
+    fn eval_async_on_materialized_is_empty() {
+        let device = Device::system_default().expect("device");
+        let a = Tensor::from_slice(&device, &bf16_vec(&[5.0]), [1]).expect("a");
+        a.eval().expect("eval"); // materialize
+        let pending = a.eval_async().expect("eval_async on materialized");
+        pending.wait().expect("wait");
+        assert_eq!(a.cpu_to_vec::<bf16>().expect("a"), bf16_vec(&[5.0]));
     }
 }

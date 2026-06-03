@@ -41,6 +41,7 @@ mod dtype;
 mod error;
 mod eval;
 mod kv_cache;
+mod pending_eval;
 mod layout;
 pub mod profile;
 mod quantization;
@@ -51,6 +52,7 @@ mod tensor;
 
 pub use buffer_pool::PoolStats;
 pub use device::Device;
+pub use pending_eval::PendingEval;
 pub use dtype::{DType, Scalar};
 pub use error::{Error, Result};
 pub use kv_cache::KvCache;
