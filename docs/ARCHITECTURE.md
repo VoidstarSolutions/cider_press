@@ -51,13 +51,19 @@ HuggingFace / mlx-community 4-bit checkpoint.
 
 ## Performance backlog
 
-Decode is now **GPU-execution-bound** (`QWEN_PERF.md`): one `Tensor::eval`
-per token (~3.7 ms/token, ~90% of the step), ~2.3× slower than `mlx_lm`.
-The dispatch round-trip tax (items #1, #3), the CPU-side allocation tax
-(item #2), and the post-eval CPU vocab scan (item #6, GPU argmax) have been
+Decode is **critical-path-bound** (`QWEN_PERF.md`): one `Tensor::eval` per
+token (~90% of the step), ~1.85× slower than `mlx_lm` (~302 vs ~560 tok/s,
+down from ~2.3× before the fused `RMSNorm`). The
+dispatch round-trip tax (items #1, #3), the CPU-side allocation tax (item
+#2), and the post-eval CPU vocab scan (item #6, GPU argmax) have been
 removed; the `tensor.eval` encode/wait split is now **~86% GPU execution,
-~14% CPU encode**. The remaining cost is the 4-bit `qmv` matvecs in the
-synchronous GPU wait. In measurement-justified priority:
+~14% CPU encode**. The GPU wait is a deep chain of ~900 *dependent*
+dispatches/token (the 4-bit `qmv` matvecs plus the small ops gated behind
+them). A concurrent-encoder spike confirmed this is genuine
+dependency-latency, **not** removable serialization — correct concurrent
+dispatch is a net loss (item #4). So the levers shorten the chain (fusion)
+or speed each link (`qmv`), plus pipelining. In measurement-justified
+priority:
 
 1. **Cross-eval command-buffer batching — DONE (~1.6×).** The in-graph
    KV write (SliceUpdate, `feat/command-buffer-batching`) collapsed the
@@ -90,26 +96,45 @@ synchronous GPU wait. In measurement-justified priority:
    `k.eval()` + `v.eval()` per layer is gone. Metal hazard tracking
    serializes the slab write → SDPA read within the single per-token
    command buffer.
-4. **Decode `qmv` matvecs (GPU) — audited.**
-   `tensor.eval.wait` is the dominant cost: the 4-bit `qmv` weight matvecs
-   (every projection and MLP linear at T=1), the vendored MLX kernel. The
-   audit (`docs/QWEN_PERF.md` `## qmv audit`, Approaches A + B) answered the
-   open question — the per-shape attained bandwidth is **N-dependent**:
-   large-N linears (gate/up/down ~272–306 GB/s, lm_head ~464) are
-   roofline-bound near the M4 Max ~410–546 GB/s spec, but the small-N decode
-   projections (k/v_proj ~13 GB/s, q/o_proj ~85) are occupancy-starved by
-   the generic `(1, ceil(N/8), 1)` grid. Approach B confirmed the
-   per-token qmv GPU time (Σ ≈ 1.27 ms) matches the measured
-   `quantized_matmul` bucket (~1.67 ms) to within counter noise, so the
-   cost is kernel/config, **not** inter-dispatch serialization. Named lever:
-   **small-N occupancy starvation (lever b)**, compounded by fast-path
-   absence (lever a — no Qwen2.5-0.5B shape has a 512-multiple K).
-   Decode attention is already fused (`sdpa_vector`); the
-   score-matmul/softmax/copy chain is gone. **Promoted follow-up branch:** a
-   small-N qmv launch-config fix (split the output dim across more
-   threadgroups so small-N projections fill the GPU) plus, secondarily,
-   fast-path-via-padding (pad K to a 512-multiple) — both dispatch-side,
-   parity-preserving, no edits to vendored `quantized.metal`.
+4. **Decode GPU wait (the ~900-dependent-dispatch critical path).** This is
+   the dominant remaining cost. Three sub-levers, in priority:
+
+   *(a) Kernel fusion — leading lever, in progress.* The wait is a deep chain
+   of dependent dispatches; fewer ⇒ a shorter critical path ⇒ less
+   inter-dispatch latency. **`RMSNorm` fused (done):** the 6-dispatch
+   composition (×49 calls = ~294/token) is now one `rms_single_row` dispatch
+   each, dropping decode ~975 → ~730 dispatches/token and ~240 → ~302 tok/s
+   (~1.26×); it also realigned us with `mlx.nn.RMSNorm`'s own
+   `mx.fast.rms_norm`. Remaining dispatch-count headroom is mostly the ~146
+   materializing `copy`s (attention permute) — strided-aware kernels
+   (item #9). SwiGLU and RoPE are *not* targets (MLX composes SwiGLU; RoPE
+   and decode-SDPA are already fused). Parity-sensitive; highest-potential.
+
+   *(b) Faster `qmv` kernels — speeds each link.* The 4-bit `qmv` matvecs are
+   the heaviest dispatches. The audit (`docs/QWEN_PERF.md` `## qmv audit`,
+   Approaches A + B) found the attained bandwidth is **N-dependent**: large-N
+   linears (gate/up/down ~272–306 GB/s, lm_head ~464) are roofline-bound near
+   the M4 Max ~410–546 GB/s spec, but small-N decode projections (k/v_proj
+   ~13 GB/s, q/o_proj ~85) are occupancy-starved by the generic
+   `(1, ceil(N/8), 1)` grid — lever (b), compounded by fast-path absence
+   (lever a — no Qwen2.5-0.5B shape has a 512-multiple K). A small-N
+   launch-config fix (split the output dim across more threadgroups) plus
+   fast-path-via-padding are dispatch-side, parity-preserving, no edits to
+   vendored `quantized.metal`. Shortens each `qmv` link but not the dispatch
+   *count* (that is fusion).
+
+   *(c) Concurrent dispatch encoder — tested, REJECTED.* A spike
+   (`spike/concurrent-encoder`) flipped the serial encoder
+   (`computeCommandEncoder`) to concurrent dispatch with correct
+   buffer-level hazard barriers. Output is byte-identical to serial but
+   decode is ~13% *slower*: ~900/975 dispatches need a barrier (the graph is
+   ~92% a sequential chain), so almost nothing overlaps and the explicit
+   barriers add cost. The no-barrier "floor" (~510 tok/s) only computes wrong
+   answers (it ignores the dependencies). The serial encoder is **not** the
+   bottleneck; the dependency chain is. Full analysis: `QWEN_PERF.md`
+   `## Concurrent-encoder spike`. A defensive prerequisite did land — the KV
+   slabs are now zero-filled (`KvCache::new`) so any future reordering reads
+   deterministic zero, not garbage.
 5. **Pipelining / per-token sync removal (CPU encode, now ~12%)** —
    `commit_and_wait` is synchronous, so the (now ~0.5 ms) CPU encode never
    overlaps the GPU, and each token still round-trips the next-token id

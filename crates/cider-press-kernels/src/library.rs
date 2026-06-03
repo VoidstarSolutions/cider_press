@@ -52,6 +52,9 @@ const ARG_REDUCE_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/arg_redu
 /// Pre-flattened MLX `rope.metal`, produced by `build.rs`.
 const ROPE_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/rope_inlined.metal"));
 
+/// Pre-flattened MLX `rms_norm.metal`, produced by `build.rs`.
+const RMS_NORM_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/rms_norm_inlined.metal"));
+
 /// Pre-flattened MLX `softmax.metal`, produced by `build.rs`.
 const SOFTMAX_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/softmax_inlined.metal"));
 
@@ -193,6 +196,16 @@ impl KernelLibrary {
     /// rather than [`KernelLibrary::pipeline`] for these.
     pub fn rope(device: &Device) -> Result<Self> {
         Self::from_source(device, ROPE_SOURCE)
+    }
+
+    /// JIT-compile MLX's `rms_norm.metal` (vendored under `kernels-mlx/`).
+    /// Hosts the fused last-axis `RMSNorm`: `rms<dtype>` (single-threadgroup,
+    /// axis ≤ 4096) and `rms_looped<dtype>` (axis > 4096). The forward
+    /// kernels reference no `[[function_constant]]` slots (the `has_w`
+    /// constant is used only by the VJP variants), so plain
+    /// [`Self::pipeline`] suffices.
+    pub fn rms_norm(device: &Device) -> Result<Self> {
+        Self::from_source(device, RMS_NORM_SOURCE)
     }
 
     /// JIT-compile MLX's `softmax.metal` (vendored under

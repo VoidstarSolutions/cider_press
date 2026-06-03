@@ -28,6 +28,7 @@ Entry points (compiled to JITed `MTLLibrary`s by cider-press-kernels):
 - `mlx/backend/metal/kernels/reduce.metal`
 - `mlx/backend/metal/kernels/arg_reduce.metal`
 - `mlx/backend/metal/kernels/rope.metal`
+- `mlx/backend/metal/kernels/rms_norm.metal`
 - `mlx/backend/metal/kernels/softmax.metal`
 - `mlx/backend/metal/kernels/quantized.metal`
 - `mlx/backend/metal/kernels/sdpa_vector_only.metal` (cider-press entry point; upstream uses `scaled_dot_product_attention.metal`)

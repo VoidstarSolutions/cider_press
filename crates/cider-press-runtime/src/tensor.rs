@@ -260,6 +260,19 @@ pub enum OpKind {
         /// Equals `head_dim` for full-rotation models like Qwen2.
         rotary_dims: u32,
     },
+    /// Fused last-axis `RMSNorm`: `out = w * x * rsqrt(mean(x²) + eps)`,
+    /// reduced per row in fp32. Inputs (in [`Tensor::op_inputs`] order)
+    /// are `[x, w]` — `x` a dense, contiguous, [`DType::BF16`] tensor of
+    /// rank ≥ 1, `w` a rank-1 `[hidden]` weight matching `x`'s trailing
+    /// axis. Output has the same shape and dtype as `x`. Single-row
+    /// kernel only (trailing axis ≤ 4096). Replaces the composed
+    /// square→mean→rsqrt→mul→mul chain with one dispatch.
+    RmsNorm {
+        /// Variance-stabilising epsilon added before the `rsqrt`
+        /// (`1e-6` for Qwen2.5). Carried as `f32` — the reason this enum
+        /// is `PartialEq` but not `Eq`.
+        eps: f32,
+    },
     /// Numerically-stable softmax along the trailing axis. Inputs (in
     /// [`Tensor::op_inputs`] order) are `[input]` — a dense,
     /// contiguous, BF16 tensor with rank ≥ 1 whose trailing axis size
@@ -1462,6 +1475,101 @@ impl Tensor {
                 rotary_dims: rotary_dims_u32,
             },
             vec![self.clone(), offset.clone()],
+        ))
+    }
+
+    /// Schedule a fused last-axis `RMSNorm`:
+    /// `out = w * x * rsqrt(mean(x²) + eps)`, reduced per row in fp32.
+    ///
+    /// One dispatch of MLX's `rms_single_row`, replacing the composed
+    /// square→mean→rsqrt→mul→mul chain. Preconditions:
+    ///
+    /// - `self` (x) is dense, contiguous, [`DType::BF16`], rank ≥ 1.
+    /// - `weight` (w) is a dense, contiguous, rank-1 [`DType::BF16`]
+    ///   tensor sized to `self`'s trailing axis.
+    /// - The trailing axis is ≤ 4096 (the single-row kernel limit).
+    ///
+    /// Output has the same shape, dtype, and (dense) layout as `self`.
+    pub fn rms_norm(&self, weight: &Self, eps: f32) -> Result<Self> {
+        let device = self.inner.device.as_ref().ok_or_else(|| {
+            Error::InvalidArgument(
+                "rms_norm: cannot apply an op to a placeholder (no device)".into(),
+            )
+        })?;
+        let w_device = weight.inner.device.as_ref().ok_or_else(|| {
+            Error::InvalidArgument("rms_norm: cannot use a placeholder as the weight".into())
+        })?;
+        if !device.ptr_eq(w_device) {
+            return Err(Error::InvalidArgument(
+                "rms_norm: x and weight are on different devices".into(),
+            ));
+        }
+        if self.inner.view.is_some() || weight.inner.view.is_some() {
+            return Err(Error::InvalidArgument(
+                "rms_norm: view inputs are not supported; copy() first (eval reads inputs \
+                 as dense leaves and does not resolve view chains)"
+                    .into(),
+            ));
+        }
+        if self.inner.dtype != DType::BF16 || weight.inner.dtype != DType::BF16 {
+            return Err(Error::InvalidArgument(format!(
+                "rms_norm: only BF16 is wired (x={:?}, weight={:?})",
+                self.inner.dtype, weight.inner.dtype,
+            )));
+        }
+        if self.rank() == 0 {
+            return Err(Error::InvalidArgument(
+                "rms_norm: x must have rank ≥ 1 (hidden size is the last axis)".into(),
+            ));
+        }
+        let hidden = *self.shape().dims().last().expect("rank ≥ 1");
+        if hidden == 0 {
+            return Err(Error::InvalidArgument(
+                "rms_norm: trailing axis must be non-zero".into(),
+            ));
+        }
+        if weight.rank() != 1 || weight.shape().dims() != [hidden] {
+            return Err(Error::InvalidArgument(format!(
+                "rms_norm: weight must be rank-1 of size {hidden} (got rank {} shape {:?})",
+                weight.rank(),
+                weight.shape().dims(),
+            )));
+        }
+        if hidden > 4096 {
+            return Err(Error::InvalidArgument(format!(
+                "rms_norm: trailing axis {hidden} exceeds the single-row kernel limit (4096)"
+            )));
+        }
+        if !eps.is_finite() || eps < 0.0 {
+            return Err(Error::InvalidArgument(format!(
+                "rms_norm: eps must be finite and non-negative (got {eps})"
+            )));
+        }
+        for (label, t) in [("x", self), ("weight", weight)] {
+            match t.layout() {
+                Layout::Dense { strides } if strides.is_contiguous(t.shape()) => {}
+                Layout::Dense { .. } => {
+                    return Err(Error::InvalidArgument(format!(
+                        "rms_norm: {label} must be contiguous; copy() first"
+                    )));
+                }
+                Layout::Quantized(_) => {
+                    return Err(Error::InvalidArgument(format!(
+                        "rms_norm: quantized {label} is not supported"
+                    )));
+                }
+            }
+        }
+
+        let out_shape = self.shape().clone();
+        let layout = dense_layout(&out_shape);
+        Ok(Self::op_tensor(
+            device,
+            out_shape,
+            DType::BF16,
+            layout,
+            OpKind::RmsNorm { eps },
+            vec![self.clone(), weight.clone()],
         ))
     }
 
