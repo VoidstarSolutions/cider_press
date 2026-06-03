@@ -22,10 +22,15 @@ This pass then moved **next-token selection on-GPU** (in-graph `ArgReduce`):
 the ~444 µs/token CPU `cpu_to_vec` + 151 k-wide scan and the 302 kB logits
 readback are gone, replaced by a sub-µs GPU reduction folded into the decode
 command buffer + a 4-byte index readback, lifting decode **~217 → ~243
-tok/s**. The remaining ~2.3× gap is GPU-execution-bound: `tensor.eval` is
-~90% of the decode step and ~86% of *that* is the synchronous GPU
-`commit_and_wait` (the 4-bit `qmv` weight matvecs), with the CPU encode
-~12% of the step.
+tok/s**. The remaining ~2.3× gap is **critical-path-bound**: `tensor.eval`
+is ~90% of the decode step, and its GPU wait (~77%) is a deep chain of
+**~900 *dependent* dispatches** — the 4-bit `qmv` matvecs plus the many
+small ops gated behind them. A concurrent-encoder spike (see the
+**Concurrent-encoder spike** section) tested whether the serial Metal
+encoder was throttling this and found it is **not**: with correct hazard
+barriers, overlapping dispatch is a net loss. The levers are fusion (fewer
+dependent dispatches), faster kernels, and pipelining — not the dispatch
+model.
 
 ## Environment
 
@@ -267,13 +272,29 @@ lever.
 
 ## Hot spots & next levers
 
-The decode step is now **GPU-execution-bound**. The CPU-side taxes are
-gone — the SliceUpdate collapsed the dispatch round-trips, and the buffer
-pool moved per-op allocation off the serial encode path (encode is down to
-~12% of the step), and the GPU argmax removed the post-eval vocab scan.
-What remains is `tensor.eval.wait` (~77% of decode), the synchronous GPU
-run of the 4-bit `qmv` matvecs. In measurement-justified priority:
+The decode step is **critical-path-bound**. The CPU-side taxes are gone —
+the SliceUpdate collapsed the dispatch round-trips, the buffer pool moved
+per-op allocation off the serial encode path (encode ~12% of the step), and
+the GPU argmax removed the post-eval vocab scan. What remains is
+`tensor.eval.wait` (~77% of decode): a deep chain of ~900 *dependent*
+dispatches/token — the 4-bit `qmv` matvecs plus the small ops gated behind
+them — where each link pays GPU launch + inter-dispatch latency. The
+**Concurrent-encoder spike** confirmed this is not removable serialization:
+correct concurrent dispatch is a net loss. So the levers shorten or speed
+the critical path. In measurement-justified priority:
 
+- **Kernel fusion — the leading lever (untried).** Fewer dependent
+  dispatches in the chain: fuse RoPE into the projection epilogue, the
+  rms-norm reduction, SwiGLU's `silu*up`, and the residual adds. Each fused
+  op removes a critical-path link and its inter-dispatch latency. Decode is
+  ~975 dispatches/token (~900 of them dependent); MLX runs the same model
+  in far fewer, which is likely the bulk of its ~2.3× lead. Parity-sensitive
+  (kernel changes); the highest-potential, highest-effort lever.
+- **Concurrent dispatch encoder — tested, rejected.** Flipping serial →
+  concurrent dispatch and inserting correct hazard barriers is byte-identical
+  to serial but ~13% *slower* (~900/975 dispatches need a barrier; almost
+  nothing overlaps). The serial encoder is not the bottleneck. See
+  **Concurrent-encoder spike**.
 - **Buffer pool / allocator — done (~1.75× with the KvCache fix).** A
   cross-token free-list recycles op-output scratch (98% decode hit), and
   the enabling `KvCache::update` slab-base change stopped the cache
@@ -282,15 +303,16 @@ run of the 4-bit `qmv` matvecs. In measurement-justified priority:
   **cross-token** only (one command buffer per token keeps a token's whole
   graph live); **within-eval reuse** (mid-eval freeing, as MLX does) is the
   next RSS lever toward `mlx_lm`'s ~329 MiB.
-- **GPU execution (`qmv`) — the dominant remaining cost.** `tensor.eval.wait`
-  is ~77% of decode and is the vendored 4-bit `qmv` weight matvecs. The
+- **Faster `qmv` kernels — speeds each critical-path link.** The 4-bit
+  `qmv` weight matvecs are the heaviest dispatches in the chain. The
   `## qmv audit` localized the headroom: the large-N linears are
   roofline-bound (~464 GB/s, near the M4 Max spec), but the small-N decode
   projections (k/v_proj ~13 GB/s, q/o_proj ~85) are occupancy-starved by the
   generic launch grid — lever (b), with fast-path absence (lever a)
   compounding. A small-N qmv launch-config fix (and/or fast-path-via-padding)
-  is the promoted follow-up; closing the rest of the ~2.3× gap is faster
-  matvecs there plus hiding the wait (pipelining, below).
+  is dispatch-side and parity-preserving; it shortens each `qmv` link's
+  GPU time but does not reduce the *number* of dependent dispatches (that is
+  fusion, above).
 - **Pipelining (overlap CPU encode with GPU)** — `commit_and_wait` is
   synchronous, so the (now small) CPU encode never overlaps the GPU.
   Multiple command buffers in flight (or Approach-C plumbing threading
@@ -308,6 +330,57 @@ run of the 4-bit `qmv` matvecs. In measurement-justified priority:
 - **`.metallib` precompilation** — doesn't touch steady-state tok/s, but
   removes the ~43 s cold-start JIT from first-token latency in a shipped
   binary.
+
+## Concurrent-encoder spike (tested, rejected)
+
+A spike (branch `spike/concurrent-encoder`, 2026-06-02, M4 Max) asked
+whether the serial Metal compute encoder was throttling decode. The
+production encoder is opened serial (`computeCommandEncoder` =
+`MTLDispatchTypeSerial`), which inserts an implicit barrier between every
+dispatch; the hypothesis was that the ~975 decode dispatches/token were
+needlessly serialized, with MLX's concurrent encoder
+(`computeCommandEncoderWithDispatchType(Concurrent)`) overlapping them.
+**The hypothesis was wrong** — decode is critical-path-bound, so concurrent
+dispatch does not help.
+
+Three measurements settle it:
+
+| variant                                 | `tensor.eval.wait` | decode     | output                   |
+|-----------------------------------------|-------------------:|-----------:|--------------------------|
+| serial (baseline)                       |       ~3.29 ms/tok | ~240 tok/s | correct                  |
+| concurrent, **no** barriers             |       ~1.03 ms/tok | ~510 tok/s | **garbage**              |
+| concurrent, **correct** hazard barriers |       ~3.59 ms/tok | ~210 tok/s | byte-identical to serial |
+
+- The **no-barrier** run is fast only because it ignores data
+  dependencies — it computes wrong answers. Its ~1.03 ms is the throughput
+  floor *if the work had no dependencies*; it is **not** an achievable
+  target. (It misled an earlier draft of this doc into calling the serial
+  encoder the dominant lever — corrected here.)
+- With **correct** buffer-level hazard tracking (a barrier before any
+  dispatch that reads a buffer an earlier dispatch wrote, MLX's
+  `set_input_array`/`maybeInsertBarrier` model), the output is
+  byte-identical to serial — but **~900 of the ~975 dispatches/token need a
+  barrier**. The decode graph (the residual stream plus each layer's
+  q→rope→slice-update→sdpa→o-proj and rms→gate→silu→mul→down chains) is
+  ~92% a sequential dependency chain. Only ~7.7% of dispatches are
+  independent, and `memoryBarrierWithScope` is a *global* barrier that
+  over-serializes anyway. Net effect: concurrent dispatch is **~13% slower**
+  than serial (extra explicit-barrier + hazard-tracking cost, ~nothing
+  overlaps).
+
+**Conclusion: the serial encoder is not the bottleneck.** Decode is bound
+by the *critical path* through a deep chain of dependent dispatches — each
+link's GPU launch plus inter-dispatch latency, summed over ~900 ordered
+ops. The ~2 ms between the predicted pure-`qmv` compute (~1.27 ms, see
+`## qmv audit`) and the ~3.3 ms wait is that dependent-dispatch latency,
+**not** removable serialization. This re-points the remaining work at
+*shortening and speeding the critical path* (fusion, faster kernels,
+pipelining — see **Hot spots & next levers**), not the dispatch model.
+
+One defensive change landed from the spike regardless: the KV slabs are
+zero-filled at construction (`KvCache::new`), so any future dispatch
+reordering reads deterministic zero rather than uninitialized garbage. The
+concurrent encoder itself is **shelved**.
 
 ## Caveats on the comparison
 
