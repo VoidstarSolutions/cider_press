@@ -1601,12 +1601,11 @@ fn dispatch_rms_norm(
         .as_ref()
         .expect("op nodes are always constructed with a device");
 
-    let x = op
-        .inputs
+    let inputs = op.inputs();
+    let x = inputs
         .first()
         .ok_or_else(|| Error::InvalidArgument("RmsNorm: missing x (inputs[0])".into()))?;
-    let w = op
-        .inputs
+    let w = inputs
         .get(1)
         .ok_or_else(|| Error::InvalidArgument("RmsNorm: missing weight (inputs[1])".into()))?;
 
