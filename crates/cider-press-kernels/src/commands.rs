@@ -4,7 +4,8 @@
 //! encoder. Kernel dispatch functions (in [`crate::kernels`]) take a
 //! `&mut Commands`, encode their work, and return — they never commit
 //! on their own. The caller controls when the batch flushes to the GPU
-//! via [`Commands::commit_and_wait`].
+//! via [`Commands::commit_and_wait`] (blocking) or [`Commands::commit`]
+//! (non-blocking, returning a [`CommandsInFlight`] handle to wait on later).
 //!
 //! This is the design lever that the qmv dispatch-latency benchmark
 //! identified: the ~1.5× latency gap vs. MLX comes from
@@ -150,6 +151,24 @@ impl<'d> Commands<'d> {
         Ok(())
     }
 
+    /// Close any open encoder and commit the command buffer **without
+    /// waiting**. Returns a [`CommandsInFlight`] handle whose GPU work may
+    /// still be running; block on it via [`CommandsInFlight::wait`] (or by
+    /// dropping it). Consumes the handle so the same batch can't be
+    /// re-committed.
+    pub fn commit(mut self) -> Result<CommandsInFlight> {
+        if let Some(enc) = self.encoder.take() {
+            enc.endEncoding();
+        }
+        self.cmd.commit();
+        // Refcount bump: the `Commands` Drop runs at end of this fn (encoder
+        // already taken, so it is a no-op), while the handle keeps the
+        // command buffer alive independently.
+        Ok(CommandsInFlight {
+            cmd: self.cmd.clone(),
+        })
+    }
+
     /// Profiling-only sibling of [`Commands::commit_and_wait`]: closes the
     /// encoder, commits, waits, then resolves per-op GPU-tick segments.
     /// Returns an empty vec if this session has no sampler.
@@ -163,6 +182,33 @@ impl<'d> Commands<'d> {
             Some(sampler) => sampler.resolve(),
             None => Ok(Vec::new()),
         }
+    }
+}
+
+/// A committed command buffer whose GPU work may still be in flight.
+///
+/// Hold it to keep the submission alive; [`CommandsInFlight::wait`] blocks
+/// until the GPU finishes. `Drop` also blocks on completion, so dropping a
+/// handle without an explicit `wait` is safe — it never lets a caller reuse
+/// buffers the GPU is still reading or writing.
+pub struct CommandsInFlight {
+    cmd: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+}
+
+impl CommandsInFlight {
+    /// Block until the GPU finishes this batch. Consumes the handle.
+    pub fn wait(self) -> Result<()> {
+        self.cmd.waitUntilCompleted();
+        Ok(())
+    }
+}
+
+impl Drop for CommandsInFlight {
+    fn drop(&mut self) {
+        // `wait` consumes `self`, so `Drop` only fires when the caller
+        // discards the handle without an explicit wait. `waitUntilCompleted`
+        // on an already-completed buffer returns immediately.
+        self.cmd.waitUntilCompleted();
     }
 }
 
@@ -190,5 +236,53 @@ impl Device {
     /// timestamp counter set (see [`Device::supports_stage_boundary_sampling`]).
     pub fn commands_profiled(&self, op_capacity: usize) -> Result<Commands<'_>> {
         Commands::new_profiled(self, op_capacity)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use half::bf16;
+
+    use crate::kernels::arg_reduce::argmax_bf16;
+    use crate::{Buffer, Device, KernelLibrary};
+
+    /// `commit` (no wait) then waiting the returned handle must produce the
+    /// same result as `commit_and_wait` — the GPU work runs, we just defer
+    /// the block. Uses argmax as a trivial dispatch with a known answer.
+    #[test]
+    fn commit_then_wait_handle_completes_work() {
+        let device = Device::system_default().expect("device");
+        let library = KernelLibrary::arg_reduce(&device).expect("arg_reduce lib");
+        let host: Vec<bf16> = [0.1f32, 0.5, 0.3, 0.9, 0.2]
+            .iter()
+            .map(|&x| bf16::from_f32(x))
+            .collect();
+        let src: Buffer<bf16> = device.upload(&host).expect("upload");
+        let mut dst: Buffer<u32> = device.alloc_buffer(1).expect("alloc dst");
+
+        let mut cmds = device.commands().expect("commands");
+        argmax_bf16(&mut cmds, &library, &src, &mut dst, host.len()).expect("dispatch");
+        let inflight = cmds.commit().expect("commit without wait");
+        inflight.wait().expect("wait");
+
+        // SAFETY: dst is a [1] u32 buffer, valid after the handle is waited.
+        assert_eq!(unsafe { dst.as_slice()[0] }, 3);
+    }
+
+    /// Dropping the handle without calling `wait` must still block on
+    /// completion (RAII safety) — the result is valid after the drop.
+    #[test]
+    fn dropping_handle_blocks_until_complete() {
+        let device = Device::system_default().expect("device");
+        let library = KernelLibrary::arg_reduce(&device).expect("arg_reduce lib");
+        let host: Vec<bf16> = [0.1f32, 0.9, 0.3].iter().map(|&x| bf16::from_f32(x)).collect();
+        let src: Buffer<bf16> = device.upload(&host).expect("upload");
+        let mut dst: Buffer<u32> = device.alloc_buffer(1).expect("alloc dst");
+
+        let mut cmds = device.commands().expect("commands");
+        argmax_bf16(&mut cmds, &library, &src, &mut dst, host.len()).expect("dispatch");
+        drop(cmds.commit().expect("commit")); // Drop must waitUntilCompleted
+
+        assert_eq!(unsafe { dst.as_slice()[0] }, 1);
     }
 }
