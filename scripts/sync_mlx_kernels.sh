@@ -34,6 +34,7 @@ FILES=(
     mlx/backend/metal/kernels/reduce.metal
     mlx/backend/metal/kernels/arg_reduce.metal
     mlx/backend/metal/kernels/rope.metal
+    mlx/backend/metal/kernels/rms_norm.metal
     mlx/backend/metal/kernels/softmax.metal
     mlx/backend/metal/kernels/softmax.h
     mlx/backend/metal/kernels/reduce.h

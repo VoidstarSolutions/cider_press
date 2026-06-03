@@ -18,6 +18,7 @@ pub mod matmul;
 pub mod qmm;
 pub mod qmv;
 pub mod reduce;
+pub mod rms_norm;
 pub mod rope;
 pub mod sdpa;
 pub mod softmax;

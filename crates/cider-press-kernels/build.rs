@@ -32,6 +32,7 @@ const ENTRY_POINTS: &[(&str, &str)] = &[
     ("mlx/backend/metal/kernels/reduce.metal", "reduce"),
     ("mlx/backend/metal/kernels/arg_reduce.metal", "arg_reduce"),
     ("mlx/backend/metal/kernels/rope.metal", "rope"),
+    ("mlx/backend/metal/kernels/rms_norm.metal", "rms_norm"),
     ("mlx/backend/metal/kernels/softmax.metal", "softmax"),
     ("mlx/backend/metal/kernels/quantized.metal", "quantized"),
     (
