@@ -152,7 +152,6 @@ impl OpNode {
     /// Drop this node's references to its producers, breaking its retention
     /// of the upstream graph. Called after the node's cache is populated.
     /// Idempotent.
-    #[allow(dead_code)] // wired in the detach-on-eval task
     pub(crate) fn detach(&self) {
         self.inputs
             .lock()

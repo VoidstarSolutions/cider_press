@@ -116,6 +116,24 @@ fn populate_caches(
     }
 }
 
+/// Detach every just-evaluated node from its producers (MLX's
+/// detach-on-eval). Clears each op node's inputs so an evaluated tensor no
+/// longer retains its upstream graph; its own cache/buffer is untouched.
+/// Call only after the nodes' caches are populated.
+///
+/// In the async path (`eval_async`) this runs before GPU completion; in-flight
+/// buffer safety is handled by `PendingEval` pinning `order` and by Metal's
+/// serial-queue hazard tracking for cross-eval inputs (see `PooledBuffer` doc).
+fn detach_order(order: &[Arc<TensorInner>]) {
+    for inner in order {
+        let op = inner
+            .op
+            .as_ref()
+            .expect("topo invariant: only op nodes are in `order`");
+        op.detach();
+    }
+}
+
 /// Commit `root`'s graph without waiting. Populates result caches at commit
 /// time (buffer handles valid now; bytes valid after the returned handle is
 /// waited) and returns a [`PendingEval`](crate::PendingEval) owning the
@@ -134,6 +152,11 @@ pub(crate) fn eval_async(root: &Tensor) -> Result<crate::PendingEval> {
     let (outputs, tags) = encode_ops(&order, device, &mut commands)?;
     let in_flight = commands.commit()?;
     populate_caches(&order, outputs, tags, device);
+    // Detach before the GPU finishes. A cross-eval input whose last Arc drops
+    // here returns its buffer to the pool mid-flight; reuse by the next eval is
+    // safe via the serial queue's automatic hazard tracking. See the
+    // `PooledBuffer` doc for the full safety argument.
+    detach_order(&order);
     Ok(crate::PendingEval::new(in_flight, order))
 }
 
@@ -156,6 +179,7 @@ pub(crate) fn eval(root: &Tensor) -> Result<()> {
     drop(wait);
 
     populate_caches(&order, outputs, tags, device);
+    detach_order(&order);
     Ok(())
 }
 
@@ -222,6 +246,7 @@ pub(crate) fn profiled_eval(root: &Tensor) -> Result<()> {
     }
 
     populate_caches(&order, outputs, tags, device);
+    detach_order(&order);
     Ok(())
 }
 
@@ -2053,5 +2078,106 @@ mod async_tests {
         let pending = a.eval_async().expect("eval_async on materialized");
         pending.wait().expect("wait");
         assert_eq!(a.cpu_to_vec::<bf16>().expect("a"), bf16_vec(&[5.0]));
+    }
+}
+
+#[cfg(test)]
+mod detach_tests {
+    use half::bf16;
+
+    use crate::{Device, Tensor};
+
+    fn bf16_vec(xs: &[f32]) -> Vec<bf16> {
+        xs.iter().map(|&x| bf16::from_f32(x)).collect()
+    }
+
+    /// After eval, every evaluated node has dropped its inputs (detached),
+    /// while its value is still correct and materialized.
+    #[test]
+    fn eval_detaches_inputs() {
+        let device = Device::system_default().expect("device");
+        let a = Tensor::from_slice(&device, &bf16_vec(&[1.0, 2.0, 3.0, 4.0]), [4]).expect("a");
+        let b = a.add(&a).expect("b = a + a"); // intermediate, held
+        let c = b.add(&b).expect("c = b + b"); // root, held
+        c.eval().expect("eval");
+
+        assert!(
+            c.op_inputs().expect("c is an op").is_empty(),
+            "root must be detached after eval"
+        );
+        assert!(
+            b.op_inputs().expect("b is an op").is_empty(),
+            "intermediate must be detached after eval"
+        );
+        assert!(c.is_materialized() && b.is_materialized());
+        assert_eq!(c.cpu_to_vec::<bf16>().expect("c"), bf16_vec(&[4.0, 8.0, 12.0, 16.0]));
+    }
+
+    /// `eval_async` detaches at commit time (before wait), while the value is
+    /// still produced correctly once waited.
+    #[test]
+    fn eval_async_detaches_at_commit() {
+        let device = Device::system_default().expect("device");
+        let a = Tensor::from_slice(&device, &bf16_vec(&[1.0, 2.0]), [2]).expect("a");
+        let b = a.add(&a).expect("b");
+        let pending = b.eval_async().expect("eval_async");
+        assert!(
+            b.op_inputs().expect("b is an op").is_empty(),
+            "detach happens at commit, before wait"
+        );
+        pending.wait().expect("wait");
+        assert_eq!(b.cpu_to_vec::<bf16>().expect("b"), bf16_vec(&[2.0, 4.0]));
+    }
+
+    /// Detach is idempotent: a second eval (short-circuited by the cache)
+    /// does not panic and leaves inputs empty.
+    #[test]
+    fn detach_is_idempotent() {
+        let device = Device::system_default().expect("device");
+        let a = Tensor::from_slice(&device, &bf16_vec(&[5.0]), [1]).expect("a");
+        let b = a.add(&a).expect("b");
+        b.eval().expect("eval 1");
+        b.eval().expect("eval 2 (cached, no-op)");
+        assert!(b.op_inputs().expect("b is an op").is_empty());
+        assert_eq!(b.cpu_to_vec::<bf16>().expect("b"), bf16_vec(&[10.0]));
+    }
+
+    /// A view onto a detached node still resolves through its cache.
+    ///
+    /// `b` is already cached before `v` is created, so `v.eval()` short-circuits
+    /// immediately (the topo walk skips cached nodes). This test confirms that
+    /// detaching `b` does not break later view *resolution* through `b`'s cache;
+    /// it does not itself exercise the detach pass (that is covered by
+    /// `eval_detaches_inputs` and `eval_async_detaches_at_commit`).
+    #[test]
+    fn view_of_detached_node_still_resolves() {
+        let device = Device::system_default().expect("device");
+        let a = Tensor::from_slice(&device, &bf16_vec(&[1.0, 2.0, 3.0, 4.0]), [4]).expect("a");
+        let b = a.add(&a).expect("b"); // [2,4,6,8]
+        b.eval().expect("eval");
+        let v = b.reshape([2usize, 2]).expect("reshape view");
+        v.eval().expect("eval view");
+        assert_eq!(v.cpu_to_vec::<bf16>().expect("v"), bf16_vec(&[2.0, 4.0, 6.0, 8.0]));
+    }
+
+    /// The regression guard: chaining an evaluated op-tensor across
+    /// iterations must let the buffer pool recycle scratch. Without detach
+    /// the chain retains every iteration's graph and pool hits stay flat.
+    #[test]
+    fn chaining_evaluated_tensor_recycles_pool() {
+        let device = Device::system_default().expect("device");
+        let mut t = Tensor::from_slice(&device, &bf16_vec(&[1.0, 1.0, 1.0, 1.0]), [4]).expect("t0");
+        let before = device.pool_stats().hits;
+        for _ in 0..8 {
+            let next = t.add(&t).expect("double");
+            next.eval().expect("eval");
+            t = next; // hold the evaluated op-tensor as the next input
+        }
+        assert!(
+            device.pool_stats().hits > before,
+            "detach must free per-iteration scratch for pool reuse (hits {} did not grow from {})",
+            device.pool_stats().hits,
+            before
+        );
     }
 }
