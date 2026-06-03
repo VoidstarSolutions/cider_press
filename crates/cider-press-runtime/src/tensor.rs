@@ -32,7 +32,7 @@
 
 use std::marker::PhantomData;
 use std::ops::Range;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use cider_press_kernels::Buffer;
 
@@ -135,7 +135,30 @@ pub(crate) enum LeafStorage {
 /// same producer share an [`Arc<TensorInner>`].
 pub(crate) struct OpNode {
     pub(crate) kind: OpKind,
-    pub(crate) inputs: Vec<Tensor>,
+    pub(crate) inputs: Mutex<Vec<Tensor>>,
+}
+
+impl OpNode {
+    /// Snapshot the input handles (cheap `Arc`-clones). Returns empty once
+    /// the node has been detached after eval. Locking is uncontended —
+    /// eval is single-threaded — so this is just a clone of 1–4 handles.
+    pub(crate) fn inputs(&self) -> Vec<Tensor> {
+        self.inputs
+            .lock()
+            .expect("op inputs mutex poisoned")
+            .clone()
+    }
+
+    /// Drop this node's references to its producers, breaking its retention
+    /// of the upstream graph. Called after the node's cache is populated.
+    /// Idempotent.
+    #[allow(dead_code)] // wired in the detach-on-eval task
+    pub(crate) fn detach(&self) {
+        self.inputs
+            .lock()
+            .expect("op inputs mutex poisoned")
+            .clear();
+    }
 }
 
 /// Closed set of ops the runtime can dispatch.
@@ -648,7 +671,7 @@ impl Tensor {
                 dtype,
                 layout,
                 device: Some(device.clone()),
-                op: Some(OpNode { kind, inputs }),
+                op: Some(OpNode { kind, inputs: Mutex::new(inputs) }),
                 view: None,
                 cache: OnceLock::new(),
             }),
@@ -2380,12 +2403,14 @@ impl Tensor {
         self.inner.op.as_ref().map(|n| n.kind)
     }
 
-    /// Inputs to this tensor's op node, or `None` if it wasn't
-    /// produced by an op. The slice elements are `Tensor` clones
-    /// (refcount bumps); use [`Tensor::ptr_eq`] for identity.
+    /// Inputs to this tensor's op node, or `None` if it wasn't produced by
+    /// an op. Returns owned `Tensor` clones (refcount bumps); use
+    /// [`Tensor::ptr_eq`] for identity. (Once detach-on-eval is wired, an
+    /// evaluated node's inputs are cleared, so this returns an empty `Vec`
+    /// for a materialized op tensor.)
     #[must_use]
-    pub fn op_inputs(&self) -> Option<&[Tensor]> {
-        self.inner.op.as_ref().map(|n| n.inputs.as_slice())
+    pub fn op_inputs(&self) -> Option<Vec<Tensor>> {
+        self.inner.op.as_ref().map(OpNode::inputs)
     }
 
     /// Whether two `Tensor` handles point at the same underlying graph

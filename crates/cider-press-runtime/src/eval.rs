@@ -80,7 +80,8 @@ fn encode_ops(
             .as_ref()
             .expect("topo invariant: only op nodes are in `order`");
         let (mut dst, tag) = if let OpKind::SliceUpdate { .. } = op.kind {
-            let slab = op.inputs.first().ok_or_else(|| {
+            let op_inputs = op.inputs();
+            let slab = op_inputs.first().ok_or_else(|| {
                 Error::InvalidArgument("SliceUpdate: missing slab input (inputs[0])".into())
             })?;
             (dense_input_buffer(slab, &outputs, &index_of)?, None)
@@ -194,7 +195,8 @@ pub(crate) fn profiled_eval(root: &Tensor) -> Result<()> {
             .expect("topo invariant: only op nodes are in `order`");
         commands.begin_profiled_op(op_kind_label(&op.kind));
         let (mut dst, tag) = if let OpKind::SliceUpdate { .. } = op.kind {
-            let slab = op.inputs.first().ok_or_else(|| {
+            let op_inputs = op.inputs();
+            let slab = op_inputs.first().ok_or_else(|| {
                 Error::InvalidArgument("SliceUpdate: missing slab input (inputs[0])".into())
             })?;
             (dense_input_buffer(slab, &outputs, &index_of)?, None)
@@ -261,9 +263,11 @@ fn visit(
         return; // already materialized; skip the whole subtree below.
     }
     if let Some(op) = inner.op.as_ref() {
-        for input in &op.inputs {
+        let inputs = op.inputs.lock().expect("op inputs mutex poisoned");
+        for input in inputs.iter() {
             visit(&input.inner, visited, order);
         }
+        drop(inputs);
         order.push(inner.clone());
     } else if let Some(view) = inner.view.as_ref() {
         // Views own no storage; eval needs to chase the source so the
@@ -432,8 +436,8 @@ fn dispatch_copy(
         .device
         .as_ref()
         .expect("op nodes are always constructed with a device");
-    let input = op
-        .inputs
+    let inputs = op.inputs();
+    let input = inputs
         .first()
         .expect("Copy has exactly one input by construction");
     let library = device.copy_library()?;
@@ -514,7 +518,8 @@ fn dispatch_slice_update(
         DType::BF16,
         "slice_update dispatch: non-bf16 reached eval"
     );
-    let src = op.inputs.get(1).ok_or_else(|| {
+    let inputs = op.inputs();
+    let src = inputs.get(1).ok_or_else(|| {
         Error::InvalidArgument("SliceUpdate: missing src input (inputs[1])".into())
     })?;
     let src_dims = src.shape().dims();
@@ -768,10 +773,11 @@ fn dispatch_quantized_matmul(
         .device
         .as_ref()
         .expect("op nodes are always constructed with a device");
-    let weight = op.inputs.first().ok_or_else(|| {
+    let inputs = op.inputs();
+    let weight = inputs.first().ok_or_else(|| {
         Error::InvalidArgument("QuantizedMatMul: missing weight input (inputs[0])".into())
     })?;
-    let x_tensor = op.inputs.get(1).ok_or_else(|| {
+    let x_tensor = inputs.get(1).ok_or_else(|| {
         Error::InvalidArgument("QuantizedMatMul: missing activation input (inputs[1])".into())
     })?;
 
@@ -872,12 +878,11 @@ fn dispatch_binary(
         .device
         .as_ref()
         .expect("op nodes are always constructed with a device");
-    let lhs = op
-        .inputs
+    let inputs = op.inputs();
+    let lhs = inputs
         .first()
         .ok_or_else(|| Error::InvalidArgument("Binary: missing lhs input (inputs[0])".into()))?;
-    let rhs = op
-        .inputs
+    let rhs = inputs
         .get(1)
         .ok_or_else(|| Error::InvalidArgument("Binary: missing rhs input (inputs[1])".into()))?;
     let library = device.binary_library()?;
@@ -1132,8 +1137,8 @@ fn dispatch_unary(
         .device
         .as_ref()
         .expect("op nodes are always constructed with a device");
-    let input = op
-        .inputs
+    let inputs = op.inputs();
+    let input = inputs
         .first()
         .ok_or_else(|| Error::InvalidArgument("Unary: missing input (inputs[0])".into()))?;
     let library = device.unary_library()?;
@@ -1204,8 +1209,8 @@ fn dispatch_reduce(
         .device
         .as_ref()
         .expect("op nodes are always constructed with a device");
-    let input = op
-        .inputs
+    let inputs = op.inputs();
+    let input = inputs
         .first()
         .ok_or_else(|| Error::InvalidArgument("Reduce: missing input (inputs[0])".into()))?;
     let library = device.reduce_library()?;
@@ -1300,8 +1305,8 @@ fn dispatch_arg_reduce(
     axis: usize,
 ) -> Result<()> {
     let device = inner.device.as_ref().expect("op nodes carry a device");
-    let input = op
-        .inputs
+    let inputs = op.inputs();
+    let input = inputs
         .first()
         .ok_or_else(|| Error::InvalidArgument("ArgReduce: missing input (inputs[0])".into()))?;
     let axis_size = input.shape().dims()[axis];
@@ -1339,12 +1344,11 @@ fn dispatch_gather(
         .device
         .as_ref()
         .expect("op nodes are always constructed with a device");
-    let src_tensor = op
-        .inputs
+    let inputs = op.inputs();
+    let src_tensor = inputs
         .first()
         .ok_or_else(|| Error::InvalidArgument("Gather: missing src (inputs[0])".into()))?;
-    let idx_tensor = op
-        .inputs
+    let idx_tensor = inputs
         .get(1)
         .ok_or_else(|| Error::InvalidArgument("Gather: missing indices (inputs[1])".into()))?;
 
@@ -1450,16 +1454,14 @@ fn dispatch_dequantize(
              (got group_size={group_size}, bits={bits})",
         )));
     }
-    let w_q = op
-        .inputs
+    let inputs = op.inputs();
+    let w_q = inputs
         .first()
         .ok_or_else(|| Error::InvalidArgument("Dequantize: missing w_q (inputs[0])".into()))?;
-    let scales = op
-        .inputs
+    let scales = inputs
         .get(1)
         .ok_or_else(|| Error::InvalidArgument("Dequantize: missing scales (inputs[1])".into()))?;
-    let biases = op
-        .inputs
+    let biases = inputs
         .get(2)
         .ok_or_else(|| Error::InvalidArgument("Dequantize: missing biases (inputs[2])".into()))?;
 
@@ -1508,12 +1510,11 @@ fn dispatch_rope(
         .as_ref()
         .expect("op nodes are always constructed with a device");
 
-    let input = op
-        .inputs
+    let inputs = op.inputs();
+    let input = inputs
         .first()
         .ok_or_else(|| Error::InvalidArgument("Rope: missing input (inputs[0])".into()))?;
-    let offset = op
-        .inputs
+    let offset = inputs
         .get(1)
         .ok_or_else(|| Error::InvalidArgument("Rope: missing offset (inputs[1])".into()))?;
 
@@ -1630,8 +1631,8 @@ fn dispatch_softmax(
         .as_ref()
         .expect("op nodes are always constructed with a device");
 
-    let input = op
-        .inputs
+    let inputs = op.inputs();
+    let input = inputs
         .first()
         .ok_or_else(|| Error::InvalidArgument("Softmax: missing input (inputs[0])".into()))?;
     let in_bytes = dense_input_buffer(input, outputs, index_of)?;
@@ -1707,12 +1708,11 @@ fn dispatch_matmul(
         .as_ref()
         .expect("op nodes are always constructed with a device");
 
-    let lhs = op
-        .inputs
+    let inputs = op.inputs();
+    let lhs = inputs
         .first()
         .ok_or_else(|| Error::InvalidArgument("MatMul: missing LHS (inputs[0])".into()))?;
-    let rhs = op
-        .inputs
+    let rhs = inputs
         .get(1)
         .ok_or_else(|| Error::InvalidArgument("MatMul: missing RHS (inputs[1])".into()))?;
 
@@ -1775,23 +1775,21 @@ fn dispatch_sdpa(
             "sdpa: causal=true not yet supported in the vector dispatch (Plan B)".into(),
         ));
     }
-    if op.inputs.len() > 3 {
+    let inputs = op.inputs();
+    if inputs.len() > 3 {
         return Err(Error::InvalidArgument(
             "sdpa: mask not yet supported in the vector dispatch (Plan B)".into(),
         ));
     }
     let device = inner.device.as_ref().expect("op nodes carry a device");
 
-    let q = op
-        .inputs
+    let q = inputs
         .first()
         .ok_or_else(|| Error::InvalidArgument("Sdpa: missing q (inputs[0])".into()))?;
-    let k = op
-        .inputs
+    let k = inputs
         .get(1)
         .ok_or_else(|| Error::InvalidArgument("Sdpa: missing k (inputs[1])".into()))?;
-    let v = op
-        .inputs
+    let v = inputs
         .get(2)
         .ok_or_else(|| Error::InvalidArgument("Sdpa: missing v (inputs[2])".into()))?;
 
