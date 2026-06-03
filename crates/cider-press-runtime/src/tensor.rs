@@ -1523,6 +1523,11 @@ impl Tensor {
             ));
         }
         let hidden = *self.shape().dims().last().expect("rank ≥ 1");
+        if hidden == 0 {
+            return Err(Error::InvalidArgument(
+                "rms_norm: trailing axis must be non-zero".into(),
+            ));
+        }
         if weight.rank() != 1 || weight.shape().dims() != [hidden] {
             return Err(Error::InvalidArgument(format!(
                 "rms_norm: weight must be rank-1 of size {hidden} (got rank {} shape {:?})",
