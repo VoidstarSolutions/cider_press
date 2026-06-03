@@ -198,6 +198,7 @@ impl Generator {
             owner: self,
             device,
             prefill_len,
+            next_id_gpu: idx0,
             inflight,
             depth,
             committed: 0,
@@ -220,6 +221,11 @@ pub struct GenerateIter<'a> {
     owner: &'a mut Generator,
     device: Device,
     prefill_len: usize,
+    /// Most recent argmax tensor (`[1, 1]` U32), fed into the next forward.
+    /// Persists across the in-flight queue draining (needed at depth 0,
+    /// where the queue empties between commits), so it is the chain source
+    /// rather than `inflight.back()`.
+    next_id_gpu: Tensor,
     /// Committed-but-unread tokens in order: (handle, its argmax tensor).
     inflight: VecDeque<(PendingEval, Tensor)>,
     /// Lookahead distance; target in-flight count is `depth + 1`.
@@ -258,12 +264,10 @@ impl Iterator for GenerateIter<'_> {
         while self.inflight.len() < self.depth + 1
             && self.yielded + self.inflight.len() < self.max_new_tokens
         {
-            let feed = match self.inflight.back() {
-                Some((_, idx)) => idx.clone(),
-                None => break, // nothing committed to chain from
-            };
+            let feed = self.next_id_gpu.clone();
             match self.advance(&feed) {
                 Ok((pending, idx)) => {
+                    self.next_id_gpu = idx.clone();
                     self.inflight.push_back((pending, idx));
                     self.committed += 1;
                 }

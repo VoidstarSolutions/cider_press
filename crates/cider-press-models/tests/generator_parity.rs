@@ -122,7 +122,8 @@ fn prompt_ids(checkpoint: &Path) -> Vec<u32> {
 
 /// Greedy decode is deterministic regardless of pipeline depth: deeper
 /// lookahead commits more tokens ahead but must yield the identical
-/// sequence. Exercises on-GPU id chaining at depth 1 vs 2.
+/// sequence. Exercises on-GPU id chaining at depths 0, 1, 2, and 3,
+/// including depth 0 (fully synchronous) which is the regression case.
 #[test]
 fn greedy_output_is_depth_invariant() {
     let Some(checkpoint) = checkpoint_path() else {
@@ -132,27 +133,26 @@ fn greedy_output_is_depth_invariant() {
     let ids = prompt_ids(&checkpoint);
     let max_new = 24usize;
     let ctx = ids.len() + max_new + 1;
-    // Qwen2.5 <|im_end|> = 151645; any fixed non-empty EOS works — both
+    // Qwen2.5 <|im_end|> = 151645; any fixed non-empty EOS works — all
     // depths use the same set, so they stop (if at all) at the same token.
     let eos: HashSet<u32> = HashSet::from([151_645_u32]);
 
-    let mut g1 = build_generator(&checkpoint, ctx, eos.clone());
-    g1.set_inflight_depth(1);
-    let seq1: Vec<u32> = g1
-        .generate(&ids, max_new)
-        .expect("gen d1")
-        .collect::<Result<_, _>>()
-        .expect("collect d1");
-
-    let mut g2 = build_generator(&checkpoint, ctx, eos);
-    g2.set_inflight_depth(2);
-    let seq2: Vec<u32> = g2
-        .generate(&ids, max_new)
-        .expect("gen d2")
-        .collect::<Result<_, _>>()
-        .expect("collect d2");
-
-    assert_eq!(seq1, seq2, "greedy output must not depend on pipeline depth");
+    let mut sequences = Vec::new();
+    for depth in [0usize, 1, 2, 3] {
+        let mut g = build_generator(&checkpoint, ctx, eos.clone());
+        g.set_inflight_depth(depth);
+        let seq: Vec<u32> = g
+            .generate(&ids, max_new)
+            .expect("gen")
+            .collect::<Result<_, _>>()
+            .expect("collect");
+        sequences.push((depth, seq));
+    }
+    let (_, ref baseline) = sequences[0];
+    for (depth, seq) in &sequences {
+        assert_eq!(seq, baseline, "depth {depth} output differs from depth 0");
+        assert!(!seq.is_empty(), "depth {depth} produced no tokens");
+    }
 }
 
 #[test]
