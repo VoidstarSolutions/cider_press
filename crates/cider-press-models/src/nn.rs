@@ -20,10 +20,6 @@ use crate::error::{Error, Result};
 
 /// `RMSNorm`: `y = x * rsqrt(mean(x², axis=-1) + eps) * gamma`.
 ///
-/// Composed entirely from existing ops — no fused kernel. The
-/// roadmap defers `rms_norm.metal` until perf measurement on the
-/// composed path identifies a real bottleneck (`docs/ARCHITECTURE.md`).
-///
 /// Preconditions:
 ///
 /// - `x` is dense, contiguous, and rank ≥ 1 (`hidden_size` is the

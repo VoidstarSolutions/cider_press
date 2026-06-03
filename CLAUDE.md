@@ -99,11 +99,16 @@ forward pass and the prioritized backlog.
 
 ### Design notes (hard-won)
 
-- **Compose at the models layer when `mlx.nn` does.** MLX's `unary.metal`
-  has no `Silu`/`Gelu`; `mlx.nn` composes them in Python, so we mirror
-  that: `nn::silu(x) = x * sigmoid(x)`, `nn::gelu` from `erf`,
-  `nn::rms_norm` from `mean(x²)`/`rsqrt`. Don't reach for a fused kernel
-  MLX itself doesn't ship.
+- **Compose at the models layer when `mlx.nn` does — but only when it
+  actually does.** MLX's `unary.metal` has no `Silu`/`Gelu`; `mlx.nn`
+  composes them in Python, so we mirror that: `nn::silu(x) = x *
+  sigmoid(x)`, `nn::gelu` from `erf`. The test is what `mlx.nn` does, not
+  a blanket "avoid fused kernels": `mlx.nn.RMSNorm` calls
+  `mx.fast.rms_norm` (the fused `rms_norm.metal`), so `nn::rms_norm`
+  delegates to the fused `Tensor::rms_norm` too — composing it would be a
+  six-dispatch deviation *from* MLX, not alignment with it. Don't reach
+  for a fused kernel MLX itself doesn't ship; do use the fused path where
+  MLX has one.
 - **Parity tolerances.** Bit-exact where achievable (pure data movers,
   qmv/qmm, per-row dequantize). For kernels carrying `exp`/`cos`/`sin`
   (sigmoid, softmax, RoPE), bf16-ULP tolerance (~0.005 abs / 0.01 rel) —

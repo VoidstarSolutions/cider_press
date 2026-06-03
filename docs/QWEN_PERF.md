@@ -97,7 +97,11 @@ prefill compute, and is excluded from the table above.
 
 Per-span totals over the timed decode window (~109 timed steps; the
 profiler is reset after warmup, so the spans below show 108 hits).
-Representative warm run, decode wall ≈ 446 ms / 243 tok/s. `tensor.eval` is split into two **nested,
+Representative warm run, decode wall ≈ 446 ms / 243 tok/s — a
+**pre-fusion snapshot** (the headline ~302 tok/s reflects the fused
+`RMSNorm` that landed after this breakdown was captured; the span
+*shape* below is unchanged, RMSNorm fusion removed five dispatches from
+the `tensor.eval.encode` side). `tensor.eval` is split into two **nested,
 non-overlapping** sub-spans: `tensor.eval.encode` (CPU-side command-buffer
 construction) and `tensor.eval.wait` (the synchronous GPU
 `commit_and_wait`); their sum is `tensor.eval` minus the cheap
