@@ -47,8 +47,7 @@ const UNARY_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/unary_inlined
 const REDUCE_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/reduce_inlined.metal"));
 
 /// Pre-flattened MLX `arg_reduce.metal`, produced by `build.rs`.
-const ARG_REDUCE_SOURCE: &str =
-    include_str!(concat!(env!("OUT_DIR"), "/arg_reduce_inlined.metal"));
+const ARG_REDUCE_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/arg_reduce_inlined.metal"));
 
 /// Pre-flattened MLX `rope.metal`, produced by `build.rs`.
 const ROPE_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/rope_inlined.metal"));

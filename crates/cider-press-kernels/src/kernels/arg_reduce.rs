@@ -102,8 +102,16 @@ pub fn argmax_bf16(
     // larger axes). Mirrors MLX primitives.cpp::ArgReduce::eval_gpu.
     let want = axis_size.div_ceil(4);
     let tg = want.min(1024).div_ceil(32) * 32;
-    let grid = MTLSize { width: tg, height: 1, depth: 1 };
-    let threadgroup = MTLSize { width: tg, height: 1, depth: 1 };
+    let grid = MTLSize {
+        width: tg,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroup = MTLSize {
+        width: tg,
+        height: 1,
+        depth: 1,
+    };
     encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
     Ok(())
 }

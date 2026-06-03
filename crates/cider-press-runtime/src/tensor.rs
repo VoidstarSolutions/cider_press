@@ -1102,7 +1102,10 @@ impl Tensor {
             out_shape,
             DType::U32,
             layout,
-            OpKind::ArgReduce { kind: ArgReduceKind::ArgMax, axis: axis_resolved },
+            OpKind::ArgReduce {
+                kind: ArgReduceKind::ArgMax,
+                axis: axis_resolved,
+            },
             vec![self.clone()],
         ))
     }
