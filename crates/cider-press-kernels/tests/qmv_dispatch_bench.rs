@@ -119,11 +119,11 @@ fn bench(device: &Device, library: &KernelLibrary, k: usize, n: usize) {
             let eff_gbps = bytes as f64 / (gpu_ns / 1e9) / 1e9;
             eprintln!(
                 "  {k:>5}x{n:<6} {variant}  wall {wall_us:>7.2}us  gpu {gpu_ns:>8.0}ns  \
-                 {eff_gbps:>6.0} GB/s",
+                 {eff_gbps:>6.0} GB/s"
             );
         }
         None => {
-            eprintln!("  {k:>5}x{n:<6} {variant}  wall {wall_us:>7.2}us  gpu  (no counters)",);
+            eprintln!("  {k:>5}x{n:<6} {variant}  wall {wall_us:>7.2}us  gpu  (no counters)");
         }
     }
 }
