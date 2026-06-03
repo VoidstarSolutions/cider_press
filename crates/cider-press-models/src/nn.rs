@@ -30,74 +30,18 @@ use crate::error::{Error, Result};
 ///   last axis).
 /// - `gamma` is dense, contiguous, and rank-1 with size equal to
 ///   `x.shape().dims().last()`.
-/// - `x` and `gamma` share a [`Device`] and a [`DType`] (one of f32,
-///   f16, bf16).
+/// - `x` and `gamma` share a [`Device`] and are [`DType::BF16`].
 /// - `eps` is finite and non-negative.
 ///
 /// Output has the same shape + dtype as `x`.
 ///
-/// `eps` flows through the graph as a host-side `[1]`-tensor on the
-/// same device + dtype; the broadcast-add path handles the rank
-/// alignment. Skipping the scalar-dispatch sv_/vs_ MLX path is
-/// deliberate — at this scale the perf delta is essentially zero
-/// (still one `MTLBuffer` alloc + one host write + one dispatch either
-/// way), and the synthetic `[1]` tensor keeps the graph free of
-/// scalar-binding surface area we don't yet need.
+/// Delegates to the fused [`Tensor::rms_norm`] kernel — one dispatch of
+/// MLX's `rms_single_row` (reduced per row in fp32), replacing the former
+/// square→mean→rsqrt→mul→mul composition. The fused kernel is what
+/// `mlx.nn.RMSNorm` itself uses (`mx.fast.rms_norm`); the composition was a
+/// six-dispatch deviation. `Tensor::rms_norm` carries the validation.
 pub fn rms_norm(x: &Tensor, gamma: &Tensor, eps: f32) -> Result<Tensor> {
-    if x.is_placeholder() || gamma.is_placeholder() {
-        return Err(Error::InvalidArgument(
-            "rms_norm: cannot apply to a placeholder (no device)".into(),
-        ));
-    }
-    let device = x.device().expect("checked above");
-    let gamma_device = gamma.device().expect("checked above");
-    if !device.ptr_eq(gamma_device) {
-        return Err(Error::InvalidArgument(
-            "rms_norm: x and gamma are on different devices".into(),
-        ));
-    }
-    if x.dtype() != gamma.dtype() {
-        return Err(Error::InvalidArgument(format!(
-            "rms_norm: dtype mismatch (x={:?}, gamma={:?})",
-            x.dtype(),
-            gamma.dtype(),
-        )));
-    }
-    if x.rank() == 0 {
-        return Err(Error::InvalidArgument(
-            "rms_norm: x must have rank ≥ 1 (hidden size is the last axis)".into(),
-        ));
-    }
-    let hidden = *x.shape().dims().last().expect("rank ≥ 1");
-    if gamma.rank() != 1 || gamma.shape().dims() != [hidden] {
-        return Err(Error::InvalidArgument(format!(
-            "rms_norm: gamma must be rank-1 of size {hidden} (got rank {} shape {:?})",
-            gamma.rank(),
-            gamma.shape().dims(),
-        )));
-    }
-    if !eps.is_finite() || eps < 0.0 {
-        return Err(Error::InvalidArgument(format!(
-            "rms_norm: eps must be finite and non-negative (got {eps})",
-        )));
-    }
-
-    // mean(x², axis=-1, keep_dim=true) — shape [..., 1].
-    let squared = x.square()?;
-    let mean_sq = squared.mean(-1, true)?;
-
-    // + eps (broadcast a [1] scalar tensor against the [..., 1] mean).
-    let eps_tensor = scalar_tensor(device, x.dtype(), eps)?;
-    let shifted = mean_sq.add(&eps_tensor)?;
-
-    // rsqrt(...) — shape [..., 1].
-    let inv_rms = shifted.rsqrt()?;
-
-    // x * inv_rms (broadcasts inv_rms across the last axis).
-    let normed = x.mul(&inv_rms)?;
-
-    // * gamma (broadcasts gamma over the leading axes).
-    Ok(normed.mul(gamma)?)
+    Ok(x.rms_norm(gamma, eps)?)
 }
 
 /// `SiLU` (a.k.a. Swish): `y = x * sigmoid(x)`. Element-wise; output
