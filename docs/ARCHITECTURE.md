@@ -52,7 +52,8 @@ HuggingFace / mlx-community 4-bit checkpoint.
 ## Performance backlog
 
 Decode is **critical-path-bound** (`QWEN_PERF.md`): one `Tensor::eval` per
-token (~3.7 ms/token, ~90% of the step), ~2.3× slower than `mlx_lm`. The
+token (~90% of the step), ~1.85× slower than `mlx_lm` (~302 vs ~560 tok/s,
+down from ~2.3× before the fused `RMSNorm`). The
 dispatch round-trip tax (items #1, #3), the CPU-side allocation tax (item
 #2), and the post-eval CPU vocab scan (item #6, GPU argmax) have been
 removed; the `tensor.eval` encode/wait split is now **~86% GPU execution,
@@ -98,14 +99,16 @@ priority:
 4. **Decode GPU wait (the ~900-dependent-dispatch critical path).** This is
    the dominant remaining cost. Three sub-levers, in priority:
 
-   *(a) Kernel fusion — leading lever, untried.* The wait is a deep chain of
-   ~975 dispatches/token, ~900 of them dependent. Fewer dependent dispatches
-   ⇒ a shorter critical path ⇒ less inter-dispatch latency. Targets: fuse
-   RoPE into the projection epilogue, the rms-norm reduction, SwiGLU's
-   `silu*up`, and the residual adds. MLX runs the same model in far fewer
-   dispatches, likely the bulk of its ~2.3× lead. Parity-sensitive (kernel
-   changes); highest-potential, highest-effort. Decode attention is already
-   fused (`sdpa_vector`); the score-matmul/softmax/copy chain is gone.
+   *(a) Kernel fusion — leading lever, in progress.* The wait is a deep chain
+   of dependent dispatches; fewer ⇒ a shorter critical path ⇒ less
+   inter-dispatch latency. **`RMSNorm` fused (done):** the 6-dispatch
+   composition (×49 calls = ~294/token) is now one `rms_single_row` dispatch
+   each, dropping decode ~975 → ~730 dispatches/token and ~240 → ~302 tok/s
+   (~1.26×); it also realigned us with `mlx.nn.RMSNorm`'s own
+   `mx.fast.rms_norm`. Remaining dispatch-count headroom is mostly the ~146
+   materializing `copy`s (attention permute) — strided-aware kernels
+   (item #9). SwiGLU and RoPE are *not* targets (MLX composes SwiGLU; RoPE
+   and decode-SDPA are already fused). Parity-sensitive; highest-potential.
 
    *(b) Faster `qmv` kernels — speeds each link.* The 4-bit `qmv` matvecs are
    the heaviest dispatches. The audit (`docs/QWEN_PERF.md` `## qmv audit`,
