@@ -119,8 +119,12 @@ Reading it:
   allocation is no longer the dominant encode cost.
 - **`tensor.eval.wait` (~3.2 ms/token, ~77% of the step) is GPU execution**
   and is the bottleneck. The heavy compute is the 4-bit `qmv` weight
-  matvecs — every projection and MLP linear at T=1 — which are the vendored
-  MLX kernel, memory-bound near the bandwidth roofline.
+  matvecs — every projection and MLP linear at T=1 — the vendored MLX
+  kernel. The audit (see `## qmv audit`) found these are *not* uniformly
+  roofline-bound: the large-N linears (gate/up/down, lm_head) saturate near
+  the ~464 GB/s empirical ceiling, but the small-N decode projections
+  (k/v_proj ~13 GB/s, q/o_proj ~85 GB/s) are occupancy-starved by the
+  generic launch grid and carry real headroom.
 - **`kvcache.update` is ~3%** — the lazy SliceUpdate op-build, now based on
   the slab leaf rather than chained off the prior op-tensor. Chaining had
   pinned every step's K/V projection graph (and its residual-path
@@ -181,9 +185,14 @@ Reading it:
 - **`quantized_matmul` (qmv) is now the dominant bucket at ~41%** — the
   4-bit weight matvecs (every projection and MLP linear at T=1). Its
   absolute time is unchanged; its *share* rose because the attention
-  overhead it competed with is gone. These are the vendored MLX kernel and
-  memory-bound, near the bandwidth roofline; little headroom in the kernel
-  itself.
+  overhead it competed with is gone. These are the vendored MLX kernel, and
+  per the `## qmv audit` the bandwidth they attain is **N-dependent**: the
+  large-N linears are roofline-bound (~464 GB/s empirical ceiling, near the
+  M4 Max ~410–546 GB/s spec) with little kernel headroom, but the small-N
+  decode projections (k/v_proj ~13 GB/s, q/o_proj ~85 GB/s) are
+  occupancy-starved by the generic `(1, ceil(N/8), 1)` grid and *do* have
+  headroom — so "little headroom" holds only for the large-N shapes, not the
+  decode-dominant small-N projections.
 - **`binary` (~24%, 364 dispatches)** is the elementwise add/mul scatter
   across residuals, RoPE, and SwiGLU — broadly distributed, not a single
   target. Note this is the **vector/decode path**; prefill still runs the
@@ -274,9 +283,14 @@ run of the 4-bit `qmv` matvecs. In measurement-justified priority:
   graph live); **within-eval reuse** (mid-eval freeing, as MLX does) is the
   next RSS lever toward `mlx_lm`'s ~329 MiB.
 - **GPU execution (`qmv`) — the dominant remaining cost.** `tensor.eval.wait`
-  is ~77% of decode and is the vendored 4-bit `qmv` weight matvecs, which
-  are memory-bound near the bandwidth roofline. Closing more of the ~2.3×
-  gap means either faster matvecs or hiding the wait (pipelining, below).
+  is ~77% of decode and is the vendored 4-bit `qmv` weight matvecs. The
+  `## qmv audit` localized the headroom: the large-N linears are
+  roofline-bound (~464 GB/s, near the M4 Max spec), but the small-N decode
+  projections (k/v_proj ~13 GB/s, q/o_proj ~85) are occupancy-starved by the
+  generic launch grid — lever (b), with fast-path absence (lever a)
+  compounding. A small-N qmv launch-config fix (and/or fast-path-via-padding)
+  is the promoted follow-up; closing the rest of the ~2.3× gap is faster
+  matvecs there plus hiding the wait (pipelining, below).
 - **Pipelining (overlap CPU encode with GPU)** — `commit_and_wait` is
   synchronous, so the (now small) CPU encode never overlaps the GPU.
   Multiple command buffers in flight (or Approach-C plumbing threading
@@ -320,3 +334,124 @@ uv run scripts/measure_qwen_mlx.py \
 
 Run the cider-press bench at least twice; the first invocation of a fresh
 process pays the one-time Metal JIT compile in prefill.
+
+## qmv audit
+
+This audits backlog item #4 (the decode 4-bit `qmv` matvecs). It runs two
+microbenches at the five Qwen2.5-0.5B decode shapes plus a forced-fast
+control: cider-press `affine_qmv_bf16` (`crates/cider-press-kernels/tests/qmv_dispatch_bench.rs`)
+and MLX `mx.quantized_matmul` (`scripts/measure_qmv_mlx.py`), gs=64, bits=4.
+
+Read the columns carefully — the two harnesses measure different things:
+
+- **Per-dispatch wall µs is the only apples-to-apples cider-vs-MLX
+  comparator.** Both harnesses do one submit + one wait per dispatch
+  (cider: `commit_and_wait`; MLX: `mx.eval`), so both are
+  **dispatch-latency-bound** — the ~90–360 µs is dominated by the
+  submit+wait floor, not the matvec.
+- **cider's GPU-counter `eff BW` is the kernel-only truth** — pure GPU
+  execution from stage-boundary counters, excluding submit/wait. This is
+  the kernel-internal signal. (Small-shape GPU-counter readings vary
+  run-to-run from thermal/scheduling perturbation; the floor — lowest ns
+  over several runs — is the representative kernel time and is reported
+  below.)
+- MLX's wall-derived BW is **overhead-bound** (the ~100 µs eval floor
+  dominates small shapes), so it is **not** comparable to cider's
+  GPU-counter BW — see the note under the table.
+
+| shape (K×N) | linear       | variant | cider GPU-counter eff BW | cider wall µs | MLX wall µs |
+|-------------|--------------|---------|-------------------------:|--------------:|------------:|
+| 896×896     | q/o_proj     | gen     |  85 GB/s |  ~93 | ~98  |
+| 896×128     | k/v_proj     | gen     |  13 GB/s |  ~92 | ~97  |
+| 896×4864    | gate/up_proj | gen     | 306 GB/s | ~100 | ~106 |
+| 4864×896    | down_proj    | gen     | 272 GB/s | ~105 | ~109 |
+| 896×151936  | lm_head      | gen     | 464 GB/s | ~257 | ~268 |
+| 1024×1024   | forced-fast  | fast    | 151 GB/s |  ~92 | ~99  |
+
+(MLX wall-clock BW, overhead-bound, for context only — not comparable to
+cider's GPU-counter column: q/o ~5, k/v ~1, gate/up ~23, down ~23, lm_head
+~287, fast ~6 GB/s. The ~100 µs `mx.eval` floor swamps every shape but
+lm_head, which is why these are tiny.)
+
+Findings:
+
+1. **The qmv dispatch path is not where cider-press loses to mlx_lm.** On
+   the only comparable axis — per-dispatch wall µs — cider-press is at or
+   slightly ahead of MLX at every shape (~92 vs ~98 µs at q/o_proj, ~257 vs
+   ~268 at lm_head). Both are latency-bound on the submit+wait floor; the
+   matvec itself is a small fraction of that wall time.
+2. **Kernel-internal bandwidth (cider GPU-counter) scales with N (output
+   dim).** Small-N projections are badly under-utilized — k/v_proj (N=128)
+   at ~13 GB/s, q/o_proj (N=896) at ~85 — while large-N linears saturate:
+   gate/up (N=4864) ~306, down ~272, lm_head (N=151936) ~464 GB/s. The
+   generic qmv grid is `(1, ceil(N/8), 1)` threadgroups, so small N
+   launches too few threadgroups to fill the GPU. This is **occupancy
+   starvation (lever b)**.
+3. **The forced-fast control adds a second lever.** At a comparable size,
+   the fast path (1024×1024, ~151 GB/s) runs ~1.7× the generic q/o_proj
+   (896×896, ~85 GB/s). Since every Qwen2.5-0.5B decode shape has
+   `K ∈ {896, 4864}` (neither a 512-multiple), the fast path is never
+   selected — **fast-path absence (lever a)** also contributes.
+4. **The empirical kernel ceiling is ~464 GB/s** (lm_head GPU-counter),
+   approaching the M4 Max ~410–546 GB/s spec roofline — not the bogus
+   ~125 GB/s `copy_v_bf16` probe (which several qmv shapes exceed, so it is
+   not bandwidth-saturating; see the plan's execution amendment). So the
+   large-N linears are essentially roofline-bound, and the headroom is
+   concentrated in the small-N projections.
+5. **This microbench cannot arbitrate the decode gap** — it is
+   latency-bound (one submit+wait per call), whereas decode runs many ops
+   in one command buffer with no per-op wait. The decode-gap arbiter is
+   Approach B (next): a steady-state attribution of a real decode token,
+   comparing Σ(per-shape qmv GPU time) against the `tensor.eval.wait`
+   bucket. That determines whether the residual is kernel/config (levers
+   a/b) or inter-dispatch serialization (lever c).
+
+Reproduce: `cargo test -p cider-press-kernels --release --test
+qmv_dispatch_bench -- --ignored --nocapture` and `uv run
+scripts/measure_qmv_mlx.py`.
+
+### Approach B: steady-state decode attribution
+
+Approach A is latency-bound (one submit+wait per call); Approach B
+arbitrates the decode gap by attributing a *real* decode token. Running
+`bench --gpu-profile --features profiling` on Qwen2.5-0.5B-Instruct-4bit-bf16
+(M4 Max, warm, representative): decode **~217 tok/s**, `tensor.eval.wait`
+**~3.22 ms/token** (the synchronous GPU `commit_and_wait`), and the
+per-op-kind GPU `quantized_matmul` bucket **~1.66–1.68 ms** across 169
+dispatches (24 layers × 7 qmv + 1 lm_head). Note the GPU-counter breakdown
+is the perturbed stage-boundary regime (each sampled dispatch gets its own
+encoder), so the qmv bucket is **not** directly comparable to the
+production `tensor.eval.wait` total; within that breakdown qmv is the
+single largest kind at ~40% of GPU time.
+
+Predicting the per-token qmv GPU time from the Approach A GPU-counter
+bandwidths — for each layer Σ over {q,k,v,o} (896×896 / 896×128) +
+{gate,up} (896×4864) + down (4864×896), ×24 layers, plus one lm_head
+(896×151936) — gives **Σ ≈ 1.27 ms**. This is the same order of magnitude
+as the measured ~1.67 ms bucket (Σ ≈ 0.76× bucket). Given the small-N
+GPU-counter readings are noisy run-to-run (Approach A reports the floor)
+and the per-shape bandwidths are approximate, **Σ ≈ bucket**: there is no
+large residual that would indicate inter-dispatch serialization. The qmv
+cost is genuine kernel/config time, **not** lever (c) bubbles — so the
+addressable headroom is in the kernel launch, not in pipelining.
+
+**Dominant lever: small-N occupancy starvation (lever b)**, compounded by
+fast-path absence (lever a). Approach A already localized the cost — the
+generic `(1, ceil(N/8), 1)` grid leaves the small-N decode projections
+badly under-utilized (k/v_proj N=128 at ~13 GB/s, q/o_proj N=896 at
+~85 GB/s) while the large-N linears saturate near the ~464 GB/s empirical
+ceiling. These small-N projections, which carry the bulk of the
+per-layer qmv dispatch count, are the addressable headroom. The forced-fast
+control (~151 vs ~85 GB/s at comparable size) shows lever (a) compounds it:
+no Qwen2.5-0.5B shape has a 512-multiple K, so the fast path is never
+selected.
+
+**Recommended next move:** a small-N qmv launch-config fix — split the
+output dimension across more threadgroups (e.g. a 2-D `(split_k_or_n, …)`
+grid) so small-N projections fill the GPU rather than launching a handful
+of threadgroups — measured against the Approach A sweep and the
+`qmv_parity` tests, with fast-path-via-padding (pad K to a 512-multiple so
+the fast variant is selected) as a secondary, parity-checked lever. Both
+are dispatch-side changes that do not touch the vendored `quantized.metal`;
+they are promoted to their own follow-up branch (see `docs/ARCHITECTURE.md`
+backlog item #4).

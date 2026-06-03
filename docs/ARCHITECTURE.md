@@ -90,12 +90,26 @@ synchronous GPU wait. In measurement-justified priority:
    `k.eval()` + `v.eval()` per layer is gone. Metal hazard tracking
    serializes the slab write → SDPA read within the single per-token
    command buffer.
-4. **Decode `qmv` matvecs (GPU, ~77% of the step)** — `tensor.eval.wait`
-   is now the dominant cost: the 4-bit `qmv` weight matvecs (every
-   projection and MLP linear at T=1), the vendored MLX kernel, memory-bound
-   near the bandwidth roofline. Decode attention is already fused
-   (`sdpa_vector`); the score-matmul/softmax/copy chain is gone. Audit
-   `qmv`'s launch config before assuming the kernel itself is the gap.
+4. **Decode `qmv` matvecs (GPU) — audited.**
+   `tensor.eval.wait` is the dominant cost: the 4-bit `qmv` weight matvecs
+   (every projection and MLP linear at T=1), the vendored MLX kernel. The
+   audit (`docs/QWEN_PERF.md` `## qmv audit`, Approaches A + B) answered the
+   open question — the per-shape attained bandwidth is **N-dependent**:
+   large-N linears (gate/up/down ~272–306 GB/s, lm_head ~464) are
+   roofline-bound near the M4 Max ~410–546 GB/s spec, but the small-N decode
+   projections (k/v_proj ~13 GB/s, q/o_proj ~85) are occupancy-starved by
+   the generic `(1, ceil(N/8), 1)` grid. Approach B confirmed the
+   per-token qmv GPU time (Σ ≈ 1.27 ms) matches the measured
+   `quantized_matmul` bucket (~1.67 ms) to within counter noise, so the
+   cost is kernel/config, **not** inter-dispatch serialization. Named lever:
+   **small-N occupancy starvation (lever b)**, compounded by fast-path
+   absence (lever a — no Qwen2.5-0.5B shape has a 512-multiple K).
+   Decode attention is already fused (`sdpa_vector`); the
+   score-matmul/softmax/copy chain is gone. **Promoted follow-up branch:** a
+   small-N qmv launch-config fix (split the output dim across more
+   threadgroups so small-N projections fill the GPU) plus, secondarily,
+   fast-path-via-padding (pad K to a 512-multiple) — both dispatch-side,
+   parity-preserving, no edits to vendored `quantized.metal`.
 5. **Pipelining / per-token sync removal (CPU encode, now ~12%)** —
    `commit_and_wait` is synchronous, so the (now ~0.5 ms) CPU encode never
    overlaps the GPU, and each token still round-trips the next-token id

@@ -21,8 +21,8 @@ use crate::dtype::DType;
 use crate::error::{Error, Result};
 use crate::layout::Layout;
 use crate::tensor::{
-    ArgReduceKind, BinaryOp, LeafStorage, OpKind, OpNode, ReduceKind, Tensor, TensorInner,
-    UnaryOp, checked_byte_count,
+    ArgReduceKind, BinaryOp, LeafStorage, OpKind, OpNode, ReduceKind, Tensor, TensorInner, UnaryOp,
+    checked_byte_count,
 };
 
 /// Static label for an [`OpKind`], used as the GPU-segment bucket key in
