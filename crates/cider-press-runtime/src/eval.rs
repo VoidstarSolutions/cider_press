@@ -40,6 +40,7 @@ pub(crate) fn op_kind_label(kind: &OpKind) -> &'static str {
         OpKind::Gather => "gather",
         OpKind::Dequantize { .. } => "dequantize",
         OpKind::Rope { .. } => "rope",
+        OpKind::RmsNorm { .. } => "rms_norm",
         OpKind::Softmax { .. } => "softmax",
         OpKind::MatMul => "matmul",
         OpKind::SliceUpdate { .. } => "slice_update",
@@ -228,6 +229,7 @@ fn gpu_key(label: &'static str) -> &'static str {
         "gather" => "gpu.gather",
         "dequantize" => "gpu.dequantize",
         "rope" => "gpu.rope",
+        "rms_norm" => "gpu.rms_norm",
         "softmax" => "gpu.softmax",
         "matmul" => "gpu.matmul",
         "slice_update" => "gpu.slice_update",
@@ -386,6 +388,9 @@ fn dispatch(
             scale,
             rotary_dims,
         ),
+        OpKind::RmsNorm { eps } => {
+            dispatch_rms_norm(inner, op, commands, outputs, dst, index_of, eps)
+        }
         OpKind::Softmax { precise } => {
             dispatch_softmax(inner, op, commands, outputs, dst, index_of, precise)
         }
@@ -1541,6 +1546,58 @@ fn dispatch_rope(
         &mut dst_typed,
         &off_typed,
         args,
+    )?;
+    Ok(())
+}
+
+fn dispatch_rms_norm(
+    inner: &Arc<TensorInner>,
+    op: &OpNode,
+    commands: &mut Commands<'_>,
+    outputs: &[Buffer<u8>],
+    dst: &mut Buffer<u8>,
+    index_of: &HashMap<*const TensorInner, usize>,
+    eps: f32,
+) -> Result<()> {
+    let device = inner
+        .device
+        .as_ref()
+        .expect("op nodes are always constructed with a device");
+
+    let x = op
+        .inputs
+        .first()
+        .ok_or_else(|| Error::InvalidArgument("RmsNorm: missing x (inputs[0])".into()))?;
+    let w = op
+        .inputs
+        .get(1)
+        .ok_or_else(|| Error::InvalidArgument("RmsNorm: missing weight (inputs[1])".into()))?;
+
+    let x_bytes = dense_input_buffer(x, outputs, index_of)?;
+    let w_bytes = dense_input_buffer(w, outputs, index_of)?;
+    let x_typed = unsafe { x_bytes.reinterpret_as::<half::bf16>() };
+    let w_typed = unsafe { w_bytes.reinterpret_as::<half::bf16>() };
+    let mut dst_typed = unsafe { dst.reinterpret_as::<half::bf16>() };
+
+    // x is [..., axis_size] row-major; the kernel treats it as
+    // [n_rows, axis_size] with one threadgroup per row.
+    let axis_size = *x
+        .shape()
+        .dims()
+        .last()
+        .expect("rms_norm input has rank ≥ 1");
+    let n_rows = x.shape().elem_count() / axis_size;
+
+    let library = device.rms_norm_library()?;
+    cider_press_kernels::kernels::rms_norm::rms_norm_bf16(
+        commands,
+        library,
+        &x_typed,
+        &w_typed,
+        &mut dst_typed,
+        axis_size,
+        n_rows,
+        eps,
     )?;
     Ok(())
 }

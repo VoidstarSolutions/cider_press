@@ -53,6 +53,10 @@ struct DeviceInner {
     /// library and look up the per-specialization pipeline from the
     /// library's own pipeline-state cache.
     rope_library: OnceLock<kernels::KernelLibrary>,
+    /// JIT'd MLX `rms_norm.metal` library. Populated on first
+    /// [`crate::Tensor::rms_norm`] eval; subsequent norms reuse the
+    /// cached library and its single `rmsbfloat16` pipeline state.
+    rms_norm_library: OnceLock<kernels::KernelLibrary>,
     /// JIT'd MLX `softmax.metal` library. Populated on first
     /// [`crate::Tensor::softmax`] eval. Variant selection (default vs
     /// `_precise_`, block vs looped) is by kernel name, so the
@@ -109,6 +113,7 @@ impl Device {
                 unary_library: OnceLock::new(),
                 reduce_library: OnceLock::new(),
                 rope_library: OnceLock::new(),
+                rms_norm_library: OnceLock::new(),
                 softmax_library: OnceLock::new(),
                 gather_libraries: Mutex::new(HashMap::new()),
                 matmul_library: OnceLock::new(),
@@ -144,6 +149,7 @@ impl Device {
             unary_library: OnceLock::new(),
             reduce_library: OnceLock::new(),
             rope_library: OnceLock::new(),
+            rms_norm_library: OnceLock::new(),
             softmax_library: OnceLock::new(),
             gather_libraries: Mutex::new(HashMap::new()),
             matmul_library: OnceLock::new(),
@@ -306,6 +312,15 @@ impl Device {
         }
         let lib = kernels::KernelLibrary::rope(&self.inner.kernels)?;
         Ok(self.inner.rope_library.get_or_init(|| lib))
+    }
+
+    /// Lazily JIT-compile and cache MLX's `rms_norm.metal` library.
+    pub(crate) fn rms_norm_library(&self) -> Result<&kernels::KernelLibrary> {
+        if let Some(lib) = self.inner.rms_norm_library.get() {
+            return Ok(lib);
+        }
+        let lib = kernels::KernelLibrary::rms_norm(&self.inner.kernels)?;
+        Ok(self.inner.rms_norm_library.get_or_init(|| lib))
     }
 
     /// Lazily JIT-compile and cache MLX's `softmax.metal` library.
