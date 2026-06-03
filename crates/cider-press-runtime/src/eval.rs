@@ -1,13 +1,15 @@
 //! Eval: walk the lazy graph, encode one command-buffer batch, commit,
 //! populate result caches.
 //!
-//! Public entry point is [`Tensor::eval`](crate::Tensor::eval); this
-//! module owns the topological walk, the per-op dispatcher, and the
-//! cache-population pass. It is intentionally a *single* `Commands`
-//! per `eval()` call with a synchronous `commit_and_wait` — the
-//! design doc's "first cut" eval. Internal pipelining (multiple
-//! command buffers in flight, completion handlers) is a future
-//! addition that does not change the public surface.
+//! Public entry points are [`Tensor::eval`](crate::Tensor::eval)
+//! (synchronous: one `Commands` per call, `commit_and_wait`) and
+//! [`Tensor::eval_async`](crate::Tensor::eval_async) (commits without
+//! waiting, returning a [`PendingEval`](crate::PendingEval) the caller
+//! waits later — the decode pipeline runs the next token's encode under the
+//! prior token's GPU work). Both share the topo walk, per-op dispatcher,
+//! and cache-population pass, and both run a [`detach_order`] pass after
+//! populating caches so an evaluated node drops its op inputs (MLX's
+//! detach-on-eval) and stops retaining its upstream graph.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
