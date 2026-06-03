@@ -135,16 +135,21 @@ priority:
    `## Concurrent-encoder spike`. A defensive prerequisite did land — the KV
    slabs are now zero-filled (`KvCache::new`) so any future reordering reads
    deterministic zero, not garbage.
-5. **Pipelining / per-token sync removal (CPU encode, now ~12%)** —
-   `commit_and_wait` is synchronous, so the (now ~0.5 ms) CPU encode never
-   overlaps the GPU, and each token still round-trips the next-token id
-   through the CPU. Multiple command buffers in flight, or Approach-C
-   plumbing threading `Commands` through the forward and chaining the GPU
-   argmax id (item 6) straight into the next embedding gather, would hide
-   it and eliminate the per-token sync. Lower priority now that the buffer
-   pool (item 2) removed the allocation portion and encode is ~12% of the
-   step. **Within-eval buffer reuse** (mid-eval freeing) is the related RSS
-   lever toward `mlx_lm`'s ~329 MiB peak.
+5. **Pipelining / per-token sync removal — DONE (~1.40×, ~243 → ~341
+   tok/s).** `Tensor::eval_async` commits a token's command buffer without
+   waiting (returning a `PendingEval` waited later), and the GPU argmax id
+   (item 6) is chained **on-GPU** into the next embedding gather — so token
+   N+1's CPU graph-build + encode overlaps token N's GPU execution and the
+   per-token CPU↔GPU round-trip is gone. Cross-command-buffer ordering rests
+   on the serial queue's hazard tracking; the generator drives a depth-1
+   lookahead (greedy is inherently depth-1). On-GPU chaining initially
+   regressed decode by retaining every token's graph (buffer pool 98% → 0%);
+   the fix was **detach-on-eval** — clear an evaluated node's op inputs so it
+   stops pinning its producers, mirroring MLX's `array::detach()`. Numbers
+   and the retention story: `QWEN_PERF.md` (**Async decode pipelining**);
+   design: `docs/superpowers/specs/2026-06-03-async-pipelining-design.md` and
+   `…-eval-detach-design.md`. **Remaining related lever:** within-eval buffer
+   reuse (mid-eval freeing) toward `mlx_lm`'s ~329 MiB peak.
 6. **GPU argmax — DONE (~210 → ~243 tok/s).** Next-token selection moved
    on-GPU: an in-graph `OpKind::ArgReduce` (MLX's `argmax_bfloat16` from
    `arg_reduce.metal`) reduces the last logits row to a `u32` index inside

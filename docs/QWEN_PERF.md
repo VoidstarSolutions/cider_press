@@ -23,17 +23,24 @@ This pass then moved **next-token selection on-GPU** (in-graph `ArgReduce`):
 the ~444 µs/token CPU `cpu_to_vec` + 151 k-wide scan and the 302 kB logits
 readback are gone, replaced by a sub-µs GPU reduction folded into the decode
 command buffer + a 4-byte index readback, lifting decode **~217 → ~243
-tok/s**, and the fused `RMSNorm` then **~243 → ~302** (first fusion landed).
-The remaining ~1.85× gap is **critical-path-bound**: `tensor.eval`
-is ~90% of the decode step, and its GPU wait is a deep chain of
-**dependent dispatches** — the 4-bit `qmv` matvecs plus the many
-small ops gated behind them. A concurrent-encoder spike (see the
-**Concurrent-encoder spike** section) tested whether the serial Metal
-encoder was throttling this and found it is **not**: with correct hazard
-barriers, overlapping dispatch is a net loss. The levers are fusion (fewer
-dependent dispatches — `RMSNorm` done, ~146 `copy`s remain), faster
-kernels, and pipelining — not the dispatch
-model.
+tok/s**, and the fused `RMSNorm` then **~243 → ~302** (~1.26×, first fusion
+landed). **Async decode pipelining** then committed the next token's command
+buffer without waiting and chained the argmax id on-GPU, so token N+1's CPU
+graph-build + encode overlaps token N's GPU execution — an independent
+**~1.40× (~243 → ~341 tok/s)**, measured on the pre-`RMSNorm` baseline. Both
+optimizations land stacked in this branch but were measured separately; the
+combined steady-state is **pending a re-measure** (the ~302 / ~1.85× headline
+and the throughput table below predate pipelining). See **Async decode
+pipelining** below.
+
+The remaining gap is **critical-path-bound**: `tensor.eval` is ~90% of the
+decode step, and its GPU wait is a deep chain of **dependent dispatches** —
+the 4-bit `qmv` matvecs plus the many small ops gated behind them. A
+concurrent-encoder spike (see the **Concurrent-encoder spike** section) tested
+whether the serial Metal encoder was throttling this and found it is **not**:
+with correct hazard barriers, overlapping dispatch is a net loss. The levers
+are fusion (fewer dependent dispatches — `RMSNorm` done, ~146 `copy`s remain),
+faster kernels, and pipelining (now landed) — not the dispatch model.
 
 ## Environment
 
@@ -92,6 +99,53 @@ to disk cross-process, so runs 2+ prefill in ~130 ms. The 42.6 s is a
 one-time first-token-latency cost (a `.metallib` precompile would
 amortize it; deferred — see `docs/ARCHITECTURE.md`), not representative of
 prefill compute, and is excluded from the table above.
+
+## Async decode pipelining (detach-on-eval)
+
+Decode was synchronous: one `commit_and_wait` per token, and the next
+token's input was the previous argmax read back to the CPU — so the CPU
+graph-build + encode of token N+1 could not overlap token N's GPU work.
+This branch makes `eval` non-blocking (`Tensor::eval_async` →
+`commit` + a `PendingEval` handle waited later) and **chains the argmax id
+on-GPU** (the `[1,1]` U32 argmax feeds the next forward's embedding gather
+directly — no readback), so token N+1 is encoded and committed while token
+N runs. Cross-command-buffer ordering rests on the serial queue's automatic
+hazard tracking; the generator drives a depth-1 lookahead (greedy decode is
+inherently depth-1 — `--inflight-depth` exposes the knob).
+
+**The retention trap.** On-GPU chaining first *regressed* decode: feeding
+the previous argmax (an op tensor) into the next forward made each token's
+graph hold an `Arc` to the prior token's argmax, which transitively pinned
+its entire upstream graph — a backward chain through the whole decode.
+Buffer-pool reuse collapsed **98% → 0%** (every ~975 op-output buffers
+re-allocated per token), `tensor.eval_async` CPU encode ballooned
+**~0.55 → ~3.2 ms/token**, and depth-1 ran **~234 tok/s — below the ~243
+synchronous baseline**. The fix mirrors MLX's eval semantics:
+**detach-on-eval** — after `eval`/`eval_async` populate a node's cache, clear
+its op inputs so an evaluated tensor stops retaining its producers (MLX's
+`array::detach()`). The generator needed no change.
+
+Measured (M4 Max, warm, interleaved A/B vs the pre-branch synchronous
+generator at `260fa97`; `--max-tokens 256 --warmup 16`, 101 timed steps,
+median of 3):
+
+| build | decode tok/s | pool hit | `eval_async` encode |
+|-------|-------------:|---------:|--------------------:|
+| synchronous baseline (`260fa97`) | ~244 | 98.1% | — |
+| depth-1, on-GPU chain, **no detach** | ~234 | **0.0%** | ~3.2 ms |
+| depth-0 (synchronous, detach) | ~237 | 98.1% | ~0.52 ms |
+| **depth-1 (pipelined, detach)** | **~341** | 97.3% | ~0.57 ms |
+
+Detach restores the pool (depth-0 ≈ baseline, confirming the `eval_async`
+machinery itself is neutral); the depth-1 gain is the pipelining overlap:
+**~244 → ~341 tok/s, ~1.40×**. The win exceeds the original ~1.14× estimate
+because pipelining hides *all* per-token CPU work — the `forward()` lazy
+graph-build, not just the `tensor.eval.encode` slice — under the GPU. At
+depth-1 the blocking wait drops to ~1.9 ms/token (vs ~3.2 ms synchronous),
+the GPU time not yet hidden. Greedy decode is depth-1; `--inflight-depth 2`
+measured no further gain. Design:
+`docs/superpowers/specs/2026-06-03-async-pipelining-design.md` and
+`…-eval-detach-design.md`.
 
 ## Decode-step breakdown
 
