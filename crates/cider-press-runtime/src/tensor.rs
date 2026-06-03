@@ -670,7 +670,10 @@ impl Tensor {
                 dtype,
                 layout,
                 device: Some(device.clone()),
-                op: Some(OpNode { kind, inputs: Mutex::new(inputs) }),
+                op: Some(OpNode {
+                    kind,
+                    inputs: Mutex::new(inputs),
+                }),
                 view: None,
                 cache: OnceLock::new(),
             }),

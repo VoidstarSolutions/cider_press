@@ -1988,7 +1988,10 @@ mod async_tests {
         let b = a.add(&a).expect("b = a + a");
         let pending = b.eval_async().expect("eval_async");
         pending.wait().expect("wait");
-        assert_eq!(b.cpu_to_vec::<bf16>().expect("b bytes"), bf16_vec(&[2.0, 4.0, 6.0, 8.0]));
+        assert_eq!(
+            b.cpu_to_vec::<bf16>().expect("b bytes"),
+            bf16_vec(&[2.0, 4.0, 6.0, 8.0])
+        );
     }
 
     /// Two chained async evals — the second consumes the first's output —
@@ -2003,7 +2006,10 @@ mod async_tests {
         let p2 = c.eval_async().expect("p2");
         p1.wait().expect("wait p1");
         p2.wait().expect("wait p2");
-        assert_eq!(c.cpu_to_vec::<bf16>().expect("c bytes"), bf16_vec(&[4.0, 8.0, 12.0, 16.0]));
+        assert_eq!(
+            c.cpu_to_vec::<bf16>().expect("c bytes"),
+            bf16_vec(&[4.0, 8.0, 12.0, 16.0])
+        );
     }
 
     /// Dropping a `PendingEval` without calling `wait()` must still block on GPU
@@ -2111,7 +2117,10 @@ mod detach_tests {
             "intermediate must be detached after eval"
         );
         assert!(c.is_materialized() && b.is_materialized());
-        assert_eq!(c.cpu_to_vec::<bf16>().expect("c"), bf16_vec(&[4.0, 8.0, 12.0, 16.0]));
+        assert_eq!(
+            c.cpu_to_vec::<bf16>().expect("c"),
+            bf16_vec(&[4.0, 8.0, 12.0, 16.0])
+        );
     }
 
     /// `eval_async` detaches at commit time (before wait), while the value is
@@ -2158,7 +2167,10 @@ mod detach_tests {
         b.eval().expect("eval");
         let v = b.reshape([2usize, 2]).expect("reshape view");
         v.eval().expect("eval view");
-        assert_eq!(v.cpu_to_vec::<bf16>().expect("v"), bf16_vec(&[2.0, 4.0, 6.0, 8.0]));
+        assert_eq!(
+            v.cpu_to_vec::<bf16>().expect("v"),
+            bf16_vec(&[2.0, 4.0, 6.0, 8.0])
+        );
     }
 
     /// The regression guard: chaining an evaluated op-tensor across

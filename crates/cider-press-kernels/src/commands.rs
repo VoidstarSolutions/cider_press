@@ -275,7 +275,10 @@ mod tests {
     fn dropping_handle_blocks_until_complete() {
         let device = Device::system_default().expect("device");
         let library = KernelLibrary::arg_reduce(&device).expect("arg_reduce lib");
-        let host: Vec<bf16> = [0.1f32, 0.9, 0.3].iter().map(|&x| bf16::from_f32(x)).collect();
+        let host: Vec<bf16> = [0.1f32, 0.9, 0.3]
+            .iter()
+            .map(|&x| bf16::from_f32(x))
+            .collect();
         let src: Buffer<bf16> = device.upload(&host).expect("upload");
         let mut dst: Buffer<u32> = device.alloc_buffer(1).expect("alloc dst");
 

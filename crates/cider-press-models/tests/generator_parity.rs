@@ -116,7 +116,9 @@ fn prompt_ids(checkpoint: &Path) -> Vec<u32> {
     let chat_template =
         ChatTemplate::from_file(&checkpoint.join("tokenizer_config.json"), &tokenizer)
             .expect("load chat template");
-    let prompt = chat_template.render(&fixed_messages()).expect("render prompt");
+    let prompt = chat_template
+        .render(&fixed_messages())
+        .expect("render prompt");
     tokenizer.encode(&prompt).expect("encode prompt")
 }
 
