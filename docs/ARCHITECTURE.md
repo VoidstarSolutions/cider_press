@@ -52,12 +52,14 @@ HuggingFace / mlx-community 4-bit checkpoint.
 ## Performance backlog
 
 Decode is **critical-path-bound** (`QWEN_PERF.md`): one `Tensor::eval` per
-token (~90% of the step), ~1.35× slower than `mlx_lm` (~420 vs ~566 tok/s,
-down from ~2.3× before the fused `RMSNorm` + async pipelining). The
-dispatch round-trip tax (items #1, #3), the CPU-side allocation tax (item
-#2), and the post-eval CPU vocab scan (item #6, GPU argmax) have been
-removed; the `tensor.eval` encode/wait split is now **~86% GPU execution,
-~14% CPU encode**. The GPU wait is a deep chain of ~900 *dependent*
+token (~90% of the step), ~1.20× slower than `mlx_lm` (~473 vs ~569 tok/s,
+down from ~2.3× before the fused `RMSNorm` + async pipelining + decode
+copy-elimination S1). The dispatch round-trip tax (items #1, #3), the
+CPU-side allocation tax (item #2), the post-eval CPU vocab scan (item #6,
+GPU argmax), and the ~144 degenerate attention-permute copy dispatches
+(S1 copy-elision, item #9) have been removed; the `tensor.eval`
+encode/wait split is now **~308 µs/token CPU encode, ~1624 µs/token GPU
+wait**. The GPU wait is a deep chain of **~536** *dependent*
 dispatches/token (the 4-bit `qmv` matvecs plus the small ops gated behind
 them). A concurrent-encoder spike confirmed this is genuine
 dependency-latency, **not** removable serialization — correct concurrent
@@ -99,16 +101,20 @@ priority:
 4. **Decode GPU wait (the ~900-dependent-dispatch critical path).** This is
    the dominant remaining cost. Three sub-levers, in priority:
 
-   *(a) Kernel fusion — leading lever, in progress.* The wait is a deep chain
-   of dependent dispatches; fewer ⇒ a shorter critical path ⇒ less
-   inter-dispatch latency. **`RMSNorm` fused (done):** the 6-dispatch
+   *(a) Kernel fusion / copy-elision — leading lever, in progress.* The wait
+   is a deep chain of dependent dispatches; fewer ⇒ a shorter critical path ⇒
+   less inter-dispatch latency. **`RMSNorm` fused (done):** the 6-dispatch
    composition (×49 calls = ~294/token) is now one `rms_single_row` dispatch
    each, dropping decode ~975 → ~730 dispatches/token and ~240 → ~302 tok/s
    (~1.26×); it also realigned us with `mlx.nn.RMSNorm`'s own
-   `mx.fast.rms_norm`. Remaining dispatch-count headroom is mostly the ~146
-   materializing `copy`s (attention permute) — strided-aware kernels
-   (item #9). SwiGLU and RoPE are *not* targets (MLX composes SwiGLU; RoPE
-   and decode-SDPA are already fused). Parity-sensitive; highest-potential.
+   `mx.fast.rms_norm`. **Decode copy-elision S1 (done, `perf/strided-copy-elim`):**
+   the ~144 degenerate attention-permute `copy` dispatches at T=1 are now
+   elided as zero-copy views (`Strides::is_contiguous_ignoring_unit_dims`) —
+   ~146 → **2** copy dispatches/token, **~536** total dispatches, decode
+   ~420 → ~473 tok/s (~1.13×). What remains of item #9 (strided-aware kernels)
+   is the **prefill** strided path (S2–S5) — decode is down to 2 copies.
+   SwiGLU and RoPE are *not* targets (MLX composes SwiGLU; RoPE and
+   decode-SDPA are already fused). Parity-sensitive; highest-potential.
 
    *(b) Faster `qmv` kernels — speeds each link.* The 4-bit `qmv` matvecs are
    the heaviest dispatches. The audit (`docs/QWEN_PERF.md` `## qmv audit`,
@@ -169,8 +175,15 @@ priority:
 7. **`.metallib` precompilation** — removes the one-time cold-start JIT
    (~tens of seconds) from first-token latency in a shipped binary.
 8. **Top-k / top-p / temperature sampling** — greedy-only today.
-9. **Strided-aware kernels** (MLX's `g_copy` family) — we materialize
-   strided views via `Copy`; strided kernels are a perf-only improvement.
+9. **Strided-aware kernels** (MLX's `g_copy` family) — S1 (decode
+   copy-elision) is **done** (`perf/strided-copy-elim`): T=1 attention
+   permutes are now zero-copy views rather than `OpKind::Copy` dispatches
+   (`Strides::is_contiguous_ignoring_unit_dims`; design:
+   `docs/superpowers/specs/2026-06-03-strided-copy-elimination-design.md`).
+   Decode is down to 2 copy dispatches/token. Remaining: **S2–S5** (prefill
+   strided consumers — rope strides, `slice_update` strided src, gemm
+   transpose+broadcast, qmv strided); these require strided kernel variants
+   and do not affect decode.
 
 ## Carry-forward items
 

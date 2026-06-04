@@ -64,6 +64,36 @@ impl Strides {
     pub fn is_contiguous(&self, shape: &Shape) -> bool {
         self == &Self::contiguous(shape)
     }
+
+    /// Whether these strides describe a contiguous (row-major) layout
+    /// of `shape` once size-1 axes are ignored.
+    ///
+    /// A size-1 axis contributes exactly one element, so its stride is
+    /// never used during iteration — a view that is row-major over its
+    /// non-unit axes (e.g. a `permute` that only moved a size-1 axis)
+    /// enumerates the same buffer addresses in the same order as a truly
+    /// contiguous tensor. `copy()` uses this to elide a materialization
+    /// that would be byte-identical to its input. Differs from
+    /// [`Strides::is_contiguous`], which requires *exact* equality.
+    #[must_use]
+    pub fn is_contiguous_ignoring_unit_dims(&self, shape: &Shape) -> bool {
+        let dims = shape.dims();
+        debug_assert_eq!(dims.len(), self.0.len());
+        let mut expected: isize = 1;
+        for (axis, &dim) in dims.iter().enumerate().rev() {
+            if dim <= 1 {
+                continue;
+            }
+            if self.0[axis] != expected {
+                return false;
+            }
+            let dim_signed = isize::try_from(dim).expect("shape dimension does not fit in isize");
+            expected = expected
+                .checked_mul(dim_signed)
+                .expect("contiguous stride computation overflowed isize");
+        }
+        true
+    }
 }
 
 impl From<Vec<isize>> for Strides {
@@ -115,5 +145,45 @@ mod tests {
         assert!(strides.is_contiguous(&shape));
         let transposed = Strides::from([1, 4, 12]);
         assert!(!transposed.is_contiguous(&shape));
+    }
+
+    #[test]
+    fn contiguous_ignoring_unit_dims_accepts_exact_contiguous() {
+        let shape = Shape::from([2, 3, 4]);
+        let s = Strides::contiguous(&shape);
+        assert!(s.is_contiguous_ignoring_unit_dims(&shape));
+    }
+
+    #[test]
+    fn contiguous_ignoring_unit_dims_accepts_degenerate_permute() {
+        // [1, H, 1, D] produced by permuting [1, 1, H, D] ([0,2,1,3]).
+        // Canonical would be [H*D, D, D, 1]; the permute leaves the size-1
+        // axis-2 stride at H*D. Only a size-1 axis differs -> contiguous.
+        let shape = Shape::from([1, 5, 1, 4]); // H=5, D=4
+        let s = Strides::from([20isize, 4, 20, 1]);
+        assert!(s.is_contiguous_ignoring_unit_dims(&shape));
+    }
+
+    #[test]
+    fn contiguous_ignoring_unit_dims_rejects_genuine_transpose() {
+        // [2,3] transposed to [3,2]: strides [1,2]. Both dims > 1 -> reorder.
+        let shape = Shape::from([3, 2]);
+        let s = Strides::from([1isize, 2]);
+        assert!(!s.is_contiguous_ignoring_unit_dims(&shape));
+    }
+
+    #[test]
+    fn contiguous_ignoring_unit_dims_rejects_broadcast() {
+        // Broadcast row [1,4] -> [3,4]: leading stride 0 on a size-3 axis.
+        let shape = Shape::from([3, 4]);
+        let s = Strides::from([0isize, 1]);
+        assert!(!s.is_contiguous_ignoring_unit_dims(&shape));
+    }
+
+    #[test]
+    fn contiguous_ignoring_unit_dims_scalar_is_true() {
+        let shape = Shape::scalar();
+        let s = Strides::contiguous(&shape);
+        assert!(s.is_contiguous_ignoring_unit_dims(&shape));
     }
 }
