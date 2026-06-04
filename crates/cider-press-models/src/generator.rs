@@ -144,6 +144,9 @@ impl Generator {
     /// `Some(Err(...))` from the returned iterator, NOT as an `Err` on
     /// `generate()`. Callers iterating manually (rather than with
     /// `.collect::<Result<_, _>>()`) need to handle the `Some(Err)` case.
+    /// A failed speculative lookahead is deferred until earlier committed
+    /// tokens have drained, so the yielded prefix is the same at every
+    /// `inflight_depth`.
     pub fn generate(
         &mut self,
         input_ids: &[u32],
@@ -204,6 +207,7 @@ impl Generator {
             committed: 0,
             yielded: 0,
             done: false,
+            deferred_err: None,
             max_new_tokens,
         })
     }
@@ -236,6 +240,12 @@ pub struct GenerateIter<'a> {
     yielded: usize,
     /// EOS seen or max hit — stop committing further lookaheads.
     done: bool,
+    /// A speculative lookahead `advance()` failed. Stashed (not returned
+    /// immediately) so already-committed earlier tokens still drain first —
+    /// the yielded prefix must not depend on `depth`. Surfaced once the
+    /// in-flight queue is empty; dropped if EOS lands before then (depth 0
+    /// would never have computed the failing forward).
+    deferred_err: Option<Error>,
     max_new_tokens: usize,
 }
 
@@ -258,10 +268,12 @@ impl Iterator for GenerateIter<'_> {
         }
 
         // Commit-ahead: keep `depth + 1` tokens in flight (the one we are
-        // about to read plus `depth` ahead of it), bounded by max_new_tokens.
+        // about to read plus `depth` ahead of it), bounded by max_new_tokens
+        // (saturating: an absurd depth just means "commit everything").
         // Each eval_async here overlaps the prior token's running GPU work.
         // Chain from the most recently committed token's on-GPU argmax.
-        while self.inflight.len() < self.depth + 1
+        while self.deferred_err.is_none()
+            && self.inflight.len() < self.depth.saturating_add(1)
             && self.yielded + self.inflight.len() < self.max_new_tokens
         {
             let feed = self.next_id_gpu.clone();
@@ -271,15 +283,19 @@ impl Iterator for GenerateIter<'_> {
                     self.inflight.push_back((pending, idx));
                     self.committed += 1;
                 }
-                Err(e) => {
-                    self.done = true;
-                    return Some(Err(e));
-                }
+                // Stash, don't surface: earlier committed tokens are still
+                // valid, and a deeper pipeline must not hide tokens depth 0
+                // would yield before failing. Stop committing new work.
+                Err(e) => self.deferred_err = Some(e),
             }
         }
 
         // Drain the oldest committed token: wait its GPU work, read the id.
-        let (pending, idx) = self.inflight.pop_front()?;
+        let Some((pending, idx)) = self.inflight.pop_front() else {
+            // Queue drained — surface a stashed lookahead error, once.
+            self.done = true;
+            return self.deferred_err.take().map(Err);
+        };
         if let Err(e) = pending.wait() {
             self.done = true;
             return Some(Err(Error::Runtime(e)));

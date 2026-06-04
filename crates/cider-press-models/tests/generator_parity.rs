@@ -157,6 +157,43 @@ fn greedy_output_is_depth_invariant() {
     }
 }
 
+/// `usize::MAX` lookahead must not overflow the `depth + 1` in-flight
+/// target (debug panic / release wrap-to-zero, which silently truncated
+/// generation after the prefill token). The commit budget is still
+/// bounded by `max_new_tokens`, so an absurd depth just means "commit
+/// everything up front" — the yielded sequence is unchanged.
+#[test]
+fn usize_max_depth_does_not_overflow() {
+    let Some(checkpoint) = checkpoint_path() else {
+        eprintln!("skipped: set CIDER_QWEN_CHECKPOINT_PATH to run this test");
+        return;
+    };
+    let ids = prompt_ids(&checkpoint);
+    let max_new = 8usize;
+    let ctx = ids.len() + max_new + 1;
+    let eos: HashSet<u32> = HashSet::from([151_645_u32]);
+
+    let mut baseline_gen = build_generator(&checkpoint, ctx, eos.clone());
+    baseline_gen.set_inflight_depth(0);
+    let baseline: Vec<u32> = baseline_gen
+        .generate(&ids, max_new)
+        .expect("gen depth 0")
+        .collect::<Result<_, _>>()
+        .expect("collect depth 0");
+
+    let mut g = build_generator(&checkpoint, ctx, eos);
+    g.set_inflight_depth(usize::MAX);
+    let seq: Vec<u32> = g
+        .generate(&ids, max_new)
+        .expect("gen depth MAX")
+        .collect::<Result<_, _>>()
+        .expect("collect depth MAX");
+    assert_eq!(
+        seq, baseline,
+        "usize::MAX depth output differs from depth 0"
+    );
+}
+
 #[test]
 fn generator_parity_greedy_qwen2() {
     let Some(checkpoint) = checkpoint_path() else {
