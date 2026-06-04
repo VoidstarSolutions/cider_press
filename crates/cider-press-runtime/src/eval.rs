@@ -13,7 +13,7 @@
 //! detach-on-eval) and stops retaining its upstream graph.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use cider_press_kernels::{
     Buffer, Commands, CommandsInFlight, KernelLibrary,
@@ -92,10 +92,23 @@ fn encode_ops(
     let mut in_flight: Vec<CommandsInFlight> =
         Vec::with_capacity(order.len() / OPS_PER_COMMAND_BUFFER + 1);
     let mut commands = device.kernels().commands()?;
+    let elide = barrier_elision_enabled();
+    // Graph-level barrier elision (MLX's window-reset model). A
+    // `memoryBarrier` on the concurrent encoder orders ALL dispatches before
+    // it against ALL after it, so at any encode point only buffers written
+    // since the LAST barrier can race a new dispatch — that working set is
+    // `unsynced`. An op whose reads (and own dst) miss `unsynced` is
+    // independent of everything since the last barrier ⇒ its barrier is
+    // elided and its dst joins `unsynced`. A hazard keeps the barrier, which
+    // syncs everything before it ⇒ `unsynced` collapses to just this op's
+    // dst. The set is cleared at each chunk boundary: a fresh encoder's first
+    // dispatch has no barrier and the fence chain orders prior chunks.
+    let mut unsynced: HashSet<usize> = HashSet::new();
     for (i, inner) in order.iter().enumerate() {
         if i > 0 && i % OPS_PER_COMMAND_BUFFER == 0 {
             in_flight.push(commands.commit()?);
             commands = device.kernels().commands()?;
+            unsynced.clear();
         }
         let op = inner
             .op
@@ -111,6 +124,33 @@ fn encode_ops(
             let byte_count = checked_byte_count(&inner.shape, inner.dtype)?;
             (device.alloc_pooled(byte_count)?, Some(byte_count))
         };
+        if elide {
+            let dst_key = buffer_key(&dst);
+            let mut hazard = unsynced.contains(&dst_key);
+            if !hazard {
+                for input in op.lock_inputs().iter() {
+                    if let Some(key) = input_buffer_key(input, &outputs, &index_of) {
+                        // HAZARD_KEY is an unresolvable input: force a barrier
+                        // (it is never a real, elidable buffer key). A resolved
+                        // key is a hazard only if it was written since the last
+                        // barrier (in `unsynced`).
+                        if key == HAZARD_KEY || unsynced.contains(&key) {
+                            hazard = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if hazard {
+                // Barrier stays. It syncs everything encoded before it; only
+                // this op's own (about-to-be-written) output is unsynced after.
+                unsynced.clear();
+                unsynced.insert(dst_key);
+            } else {
+                commands.elide_next_barrier();
+                unsynced.insert(dst_key);
+            }
+        }
         dispatch(inner, &mut commands, &outputs, &mut dst, &index_of)?;
         outputs.push(dst);
         tags.push(tag);
@@ -334,6 +374,68 @@ fn visit(
     // Placeholders (no op, no view, no cache) are silently skipped —
     // eval() catches the broken case at step 2 if the root needs
     // dispatching.
+}
+
+/// Whether graph-level barrier elision is active. ON unless the
+/// environment variable `CIDER_PRESS_NO_BARRIER_ELISION` is exactly
+/// `"1"` (a bisection kill switch that restores barrier-per-dispatch).
+/// Read once and cached.
+fn barrier_elision_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("CIDER_PRESS_NO_BARRIER_ELISION").as_deref() != Ok("1"))
+}
+
+/// Metal-buffer identity for hazard tracking: the address of the
+/// `MTLBuffer` protocol object, stable for the buffer's life.
+fn buffer_key(buf: &Buffer<u8>) -> usize {
+    std::ptr::from_ref(buf.metal_buffer()).cast::<()>() as usize
+}
+
+/// Sentinel key meaning "input could not be resolved to a buffer
+/// identity" — the encode loop treats it as a forced hazard (barrier
+/// stays). `0` is never a valid objc object pointer, so it can never
+/// collide with a real buffer key.
+const HAZARD_KEY: usize = 0;
+
+/// Resolve an op input to the Metal-buffer identity hazard tracking keys
+/// it by, mirroring exactly how `dense_input_buffer` / `resolve_view_storage`
+/// resolve the *same* input for dispatch:
+///
+/// - op node in this eval ⇒ its allocated `outputs[i]` buffer;
+/// - view chain ⇒ the underlying storage owner's buffer (offset ignored —
+///   we key the whole buffer, the coarsest-correct granularity);
+/// - cached dense leaf / prior-eval op ⇒ its dense buffer (prior-eval
+///   writes are fence-ordered, so the key simply won't be in `unsynced`);
+/// - quantized leaf ⇒ `None`: qmv/qmm/dequantize weight slabs are uploaded
+///   host-side and never written by any dispatch, so they cannot race.
+///
+/// Returns `Some(HAZARD_KEY)` for anything it cannot confidently resolve
+/// (the conservative fallback: barrier stays).
+fn input_buffer_key(
+    input: &Tensor,
+    outputs: &[Buffer<u8>],
+    index_of: &HashMap<*const TensorInner, usize>,
+) -> Option<usize> {
+    let mut current = &input.inner;
+    // Walk any view chain to the storage owner (offset irrelevant — whole
+    // buffer is keyed).
+    while let Some(view) = current.view.as_ref() {
+        current = &view.source.inner;
+    }
+    if let Some(&i) = index_of.get(&Arc::as_ptr(current)) {
+        return match outputs.get(i) {
+            Some(buf) => Some(buffer_key(buf)),
+            // Topo order guarantees this is allocated; if not, be safe.
+            None => Some(HAZARD_KEY),
+        };
+    }
+    match current.cache.get() {
+        Some(LeafStorage::Dense(buf)) => Some(buffer_key(&unsafe { buf.reinterpret_as::<u8>() })),
+        // Quantized weight slabs are never written by a dispatch ⇒ skip.
+        Some(LeafStorage::Quantized { .. }) => None,
+        // Placeholder mid-graph: unresolvable ⇒ hazard.
+        None => Some(HAZARD_KEY),
+    }
 }
 
 /// Resolve a dense op input's backing buffer.

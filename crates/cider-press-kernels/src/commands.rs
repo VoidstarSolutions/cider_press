@@ -62,6 +62,11 @@ pub struct Commands<'d> {
     /// `dispatch_threads`/`dispatch_threadgroups` to insert a barrier
     /// before every dispatch after the first (concurrent encoder model).
     dispatched_in_encoder: usize,
+    /// One-shot: when set, the next `dispatch_*` skips its hazard barrier
+    /// and clears the flag. Set by [`Commands::elide_next_barrier`] after
+    /// the caller has proven the next dispatch reads nothing written since
+    /// the last barrier in this encoder.
+    elide_next_barrier: bool,
 }
 
 impl<'d> Commands<'d> {
@@ -85,6 +90,7 @@ impl<'d> Commands<'d> {
             chain_restore: None,
             chain_started: false,
             dispatched_in_encoder: 0,
+            elide_next_barrier: false,
         })
     }
 
@@ -167,6 +173,11 @@ impl<'d> Commands<'d> {
                     })?
             };
             self.dispatched_in_encoder = 0;
+            // A freshly-opened encoder's first dispatch carries no barrier
+            // anyway; a stale elide flag carried across the open would be a
+            // no-op there but could mask a real first-dispatch barrier in a
+            // future regime — clear it so the flag never crosses encoders.
+            self.elide_next_barrier = false;
             if let Some(prev) = self.device.take_last_fence() {
                 enc.waitForFence(&prev);
                 if !self.chain_started {
@@ -189,10 +200,19 @@ impl<'d> Commands<'d> {
         if let Some(enc) = self.encoder.take() {
             enc.endEncoding();
             self.dispatched_in_encoder = 0;
+            self.elide_next_barrier = false;
             if let Some(fence) = self.fence.take() {
                 self.device.set_last_fence(fence);
             }
         }
+    }
+
+    /// Skip the hazard barrier before the NEXT dispatch only (one-shot).
+    /// Callers must prove the next dispatch reads nothing written since
+    /// the last barrier in this encoder — see eval's graph-level hazard
+    /// tracking. Wrongly eliding corrupts ordering silently.
+    pub fn elide_next_barrier(&mut self) {
+        self.elide_next_barrier = true;
     }
 
     /// Encode a `dispatchThreads` call, fencing it behind every prior
@@ -200,15 +220,15 @@ impl<'d> Commands<'d> {
     /// encoder is concurrent; ordering is explicit). Derived from MLX's
     /// `CommandEncoder::dispatch_threads` (MIT, © 2023-2024 Apple Inc.).
     ///
-    /// This is the barrier-per-dispatch v1: every dispatch pays the barrier
-    /// cost unconditionally. The decode graph is ~92% sequential (each op
-    /// reads the previous op's output), so per-buffer barrier elision
-    /// (skipping the barrier when the next dispatch is independent) is
-    /// deferred — see docs/superpowers/plans/2026-06-04-encoder-dispatch-model.md.
+    /// The barrier is elided when [`Commands::elide_next_barrier`] was
+    /// called before this dispatch (one-shot): the graph-level hazard
+    /// tracker in eval proves the dispatch is independent of everything
+    /// encoded since the last barrier, so it may overlap on the GPU.
     pub fn dispatch_threads(&mut self, grid: MTLSize, threadgroup: MTLSize) -> Result<()> {
+        let elide = std::mem::take(&mut self.elide_next_barrier);
         let n = self.dispatched_in_encoder;
         let encoder = self.encoder()?;
-        if n > 0 {
+        if n > 0 && !elide {
             encoder.memoryBarrierWithScope(MTLBarrierScope::Buffers);
         }
         encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
@@ -218,9 +238,10 @@ impl<'d> Commands<'d> {
 
     /// `dispatchThreadgroups` analogue of [`Commands::dispatch_threads`].
     pub fn dispatch_threadgroups(&mut self, grid: MTLSize, threadgroup: MTLSize) -> Result<()> {
+        let elide = std::mem::take(&mut self.elide_next_barrier);
         let n = self.dispatched_in_encoder;
         let encoder = self.encoder()?;
-        if n > 0 {
+        if n > 0 && !elide {
             encoder.memoryBarrierWithScope(MTLBarrierScope::Buffers);
         }
         encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, threadgroup);
