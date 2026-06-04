@@ -22,6 +22,15 @@ use objc2_metal::{
 use crate::buffer::Buffer;
 use crate::error::{Error, Result};
 
+/// Escape hatch for bisecting sync bugs: `CIDER_PRESS_TRACKED_BUFFERS=1`
+/// restores Metal's automatic hazard tracking (correct but slower —
+/// the explicit fence/barrier sync stays on regardless).
+fn tracked_buffers_requested() -> bool {
+    static TRACKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACKED
+        .get_or_init(|| std::env::var_os("CIDER_PRESS_TRACKED_BUFFERS").is_some_and(|v| v == "1"))
+}
+
 // `MTLCreateSystemDefaultDevice` requires CoreGraphics at link time.
 // Linking once here propagates to every downstream consumer of the crate.
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -89,9 +98,14 @@ impl Device {
         let bytes = len
             .checked_mul(elem_size)
             .ok_or(Error::BufferTooLarge { len, elem_size })?;
+        let options = if tracked_buffers_requested() {
+            MTLResourceOptions::StorageModeShared
+        } else {
+            MTLResourceOptions::StorageModeShared | MTLResourceOptions::HazardTrackingModeUntracked
+        };
         let raw = self
             .device
-            .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
+            .newBufferWithLength_options(bytes, options)
             .ok_or(Error::BufferAllocation { bytes })?;
         // SAFETY: shared-storage allocation succeeded; `len` matches the byte
         // length we requested, divided by `size_of::<T>()`.

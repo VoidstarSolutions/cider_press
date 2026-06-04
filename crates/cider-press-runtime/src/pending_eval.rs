@@ -11,8 +11,8 @@
 //! `cpu_slice` / `cpu_to_vec` / `is_materialized` report the tensor as
 //! unmaterialized until this handle observes GPU completion (an explicit
 //! [`PendingEval::wait`] or the blocking drop). GPU→GPU reads across the
-//! next command buffer are unaffected (the serial queue's hazard tracking
-//! orders them) — dependent graphs can chain off in-flight tensors freely.
+//! next command buffer are unaffected (the encoder fence chain orders them) —
+//! dependent graphs can chain off in-flight tensors freely.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;

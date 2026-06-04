@@ -122,6 +122,11 @@ impl<'d> Commands<'d> {
     /// a target for `setBuffer:` / `dispatchThreadgroups:`. They must
     /// not call `endEncoding` on it — the encoder lives until
     /// [`Commands::commit_and_wait`] closes it.
+    ///
+    /// **Warning:** do not encode dispatches directly on the returned encoder.
+    /// Use [`Commands::dispatch_threads`] / [`Commands::dispatch_threadgroups`]
+    /// so the concurrent-encoder barrier is inserted. A raw dispatch silently
+    /// skips the barrier and corrupts ordering under untracked buffers.
     pub(crate) fn encoder(&mut self) -> Result<&ProtocolObject<dyn MTLComputeCommandEncoder>> {
         if self.encoder.is_none() {
             let enc = if let Some((start, end)) = self.armed.take() {
@@ -194,6 +199,12 @@ impl<'d> Commands<'d> {
     /// dispatch in this encoder with a buffer-scope memory barrier (the
     /// encoder is concurrent; ordering is explicit). Derived from MLX's
     /// `CommandEncoder::dispatch_threads` (MIT, © 2023-2024 Apple Inc.).
+    ///
+    /// This is the barrier-per-dispatch v1: every dispatch pays the barrier
+    /// cost unconditionally. The decode graph is ~92% sequential (each op
+    /// reads the previous op's output), so per-buffer barrier elision
+    /// (skipping the barrier when the next dispatch is independent) is
+    /// deferred — see docs/superpowers/plans/2026-06-04-encoder-dispatch-model.md.
     pub fn dispatch_threads(&mut self, grid: MTLSize, threadgroup: MTLSize) -> Result<()> {
         let n = self.dispatched_in_encoder;
         let encoder = self.encoder()?;

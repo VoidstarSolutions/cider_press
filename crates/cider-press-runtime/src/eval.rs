@@ -67,8 +67,9 @@ fn build_order(root: &Tensor) -> Vec<Arc<TensorInner>> {
 /// buffers (the queue pipelines buffer seams; consecutive encoders within
 /// one buffer are driver-merged, so splitting encoders alone does
 /// nothing). MLX commits every ~50 ops on M-class for the same reason
-/// (`get_max_ops_mb_per_buffer`). The serial queue's automatic hazard
-/// tracking on our default-tracked buffers orders the chunks.
+/// (`get_max_ops_mb_per_buffer`). Cross-chunk ordering is carried by the
+/// encoder fence chain (`cider_press_kernels::Commands`): the first encoder
+/// of each new chunk waits the last fence published by the prior chunk.
 const OPS_PER_COMMAND_BUFFER: usize = 50;
 
 /// Steps 3–4: index the nodes, then allocate each op's output and encode
@@ -145,8 +146,8 @@ fn populate_caches(
 /// Call only after the nodes' caches are populated.
 ///
 /// In the async path (`eval_async`) this runs before GPU completion; in-flight
-/// buffer safety is handled by `PendingEval` pinning `order` and by Metal's
-/// serial-queue hazard tracking for cross-eval inputs (see `PooledBuffer` doc).
+/// buffer safety is handled by `PendingEval` pinning `order` and by the encoder
+/// fence chain for cross-eval inputs (see `PooledBuffer` doc).
 fn detach_order(order: &[Arc<TensorInner>]) {
     for inner in order {
         let op = inner
@@ -183,8 +184,8 @@ pub(crate) fn eval_async(root: &Tensor) -> Result<crate::PendingEval> {
     populate_caches(&order, outputs, tags, device);
     // Detach before the GPU finishes. A cross-eval input whose last Arc drops
     // here returns its buffer to the pool mid-flight; reuse by the next eval is
-    // safe via the serial queue's automatic hazard tracking. See the
-    // `PooledBuffer` doc for the full safety argument.
+    // safe via the encoder fence chain. See the `PooledBuffer` doc for the full
+    // safety argument.
     detach_order(&order);
     Ok(crate::PendingEval::new(in_flight, order))
 }

@@ -134,14 +134,14 @@ impl BufferPool {
 /// reference at that point, its `PooledBuffer` may return to the pool while
 /// the just-committed command buffer still references its `MTLBuffer` on the
 /// GPU. A subsequent `eval_async` may then `alloc_pooled` that same buffer
-/// and bind it as a write target. This is safe because: (a) the device uses
-/// a serial command queue with automatic hazard tracking, which orders the
-/// write-after-read across consecutive command buffers; and (b) a committed
-/// command buffer retains its bound `MTLBuffer`s until the GPU completes, so
-/// the underlying Metal allocation is never freed while the GPU reads it.
-/// Correctness in the async path therefore rests on Metal's hazard tracking
-/// and command-buffer retention — not on the GPU being idle when the buffer
-/// returns to the pool.
+/// and bind it as a write target. Ordering is guaranteed by the encoder fence
+/// chain (`cider_press_kernels::Commands`): every encoder waits the previous
+/// encoder's fence, so a re-use dispatch — necessarily encoded in a later
+/// encoder — executes strictly after the in-flight reader finishes. A
+/// committed command buffer retains its bound `MTLBuffer`s until the GPU
+/// completes, so the underlying Metal allocation is never freed while the GPU
+/// reads it. (Previously this rested on Metal's automatic hazard tracking;
+/// buffers are now allocated untracked.)
 ///
 /// The `SliceUpdate` slab and host/constant leaves are minted
 /// [`PooledBuffer::unpooled`] (`pool: None`) and therefore never return to
