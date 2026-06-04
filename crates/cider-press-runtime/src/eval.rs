@@ -11,6 +11,17 @@
 //! and cache-population pass, and both run a [`detach_order`] pass after
 //! populating caches so an evaluated node drops its op inputs (MLX's
 //! detach-on-eval) and stops retaining its upstream graph.
+//!
+//! **Untracked-buffer safety rests on two invariants.** Cross-encoder and
+//! cross-token ordering — the case where a buffer written by one command
+//! buffer is read by a later one — is guaranteed by the encoder fence chain
+//! in [`cider_press_kernels::Commands`] (see also `PooledBuffer`'s doc in
+//! `buffer_pool.rs` for the pool-reuse safety argument). Intra-encoder
+//! ordering — the case where two dispatches in the *same* encoder touch the
+//! same buffer — is guaranteed by `memoryBarrier` calls inserted by
+//! `encode_ops`; those barriers are elidable only when `encode_ops`'s
+//! window-reset hazard tracker (`unsynced`) confirms no overlap since the
+//! last barrier.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -515,6 +526,11 @@ fn input_buffer_key(
         };
     }
     match current.cache.get() {
+        // SAFETY: `Buffer<u8>` → `Buffer<u8>` reinterpret is trivially valid
+        // (any bit pattern is a valid `u8`, lengths match). This is a refcount
+        // bump over the same underlying `MTLBuffer`, used only to read the
+        // buffer pointer for hazard-tracking key derivation; the handle is
+        // dropped immediately after `buffer_key` returns.
         Some(LeafStorage::Dense(buf)) => Some(buffer_key(&unsafe { buf.reinterpret_as::<u8>() })),
         // Quantized weight slabs are never written by a dispatch ⇒ skip.
         Some(LeafStorage::Quantized { .. }) => None,
@@ -2433,5 +2449,63 @@ mod detach_tests {
             device.pool_stats().hits,
             before
         );
+    }
+}
+
+#[cfg(test)]
+mod order_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use super::build_order;
+    use crate::tensor::TensorInner;
+    use crate::{Device, Tensor};
+
+    /// `build_order` emits every producer before its consumer (the defining
+    /// topo property). Tested on a diamond graph:
+    ///
+    /// ```text
+    ///   a (leaf)
+    ///   ├─ b = a + a
+    ///   └─ c = a + a
+    ///       d = b + c
+    /// ```
+    ///
+    /// Both `b` and `c` are producers of `d`, and `a` is a producer of both.
+    /// The Kahn schedule must place `b` and `c` before `d`.
+    #[test]
+    fn build_order_producers_before_consumers() {
+        let device = Device::system_default().expect("device");
+        let a = Tensor::from_slice(&device, &[1.0f32, 2.0], [2]).expect("a");
+        let b = a.add(&a).expect("b = a + a");
+        let c = a.add(&a).expect("c = a + a");
+        let d = b.add(&c).expect("d = b + c");
+
+        let order = build_order(&d);
+
+        // Build a position map: Arc ptr → index in order.
+        let pos: HashMap<*const TensorInner, usize> = order
+            .iter()
+            .enumerate()
+            .map(|(i, inner)| (Arc::as_ptr(inner), i))
+            .collect();
+
+        // For every node in the order, every op-input that is itself scheduled
+        // must appear at an earlier position.
+        for (consumer_pos, inner) in order.iter().enumerate() {
+            let op = inner.op.as_ref().expect("order contains only op nodes");
+            for input in op.inputs() {
+                if let Some(&producer_pos) = pos.get(&Arc::as_ptr(&input.inner)) {
+                    assert!(
+                        producer_pos < consumer_pos,
+                        "producer at position {producer_pos} must precede consumer at \
+                         position {consumer_pos} in build_order output"
+                    );
+                }
+            }
+        }
+
+        // Sanity: diamond has exactly 3 op nodes (b, c, d); `a` is a leaf.
+        assert_eq!(order.len(), 3, "diamond graph should produce 3 op nodes");
     }
 }
