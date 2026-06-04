@@ -5,10 +5,11 @@ measured via `cider-press bench`, compared against `mlx_lm` on the same
 prompt and token budget. Methodology: warm up, then time a steady-state
 window; see `docs/ARCHITECTURE.md` for the architecture and forward backlog.
 
-The headline: decode runs **~1.35× slower than MLX** at the full-model
-scale (~420 vs ~566 tok/s), down from ~2.3× two branches ago — the fused
-`RMSNorm` and **async decode pipelining** stack to **~1.73×** over the
-pre-fusion ~243 baseline. Three
+The headline: decode runs **~1.20× slower than MLX** at the full-model
+scale (~473 vs ~569 tok/s), down from ~1.35× before decode copy-elimination
+and from ~2.3× two branches ago — the fused `RMSNorm`, **async decode
+pipelining**, and **decode copy-elimination (S1)** stack to **~1.95×** over
+the pre-fusion ~243 baseline. Three
 prior changes set the stage — the in-graph KV write (SliceUpdate)
 collapsed each step to **one command buffer per token** (~1.6×), the
 fused `sdpa_vector` decode-attention kernel lifted decode to ~120 tok/s
@@ -32,7 +33,9 @@ branch with both stacked: decode is **~420 tok/s** at the production depth-1
 vs **~317 tok/s** synchronous (depth-0) on the same post-`RMSNorm` base — a
 **~1.33×** pipelining overlap (down from the ~1.40× measured on the pre-fusion
 ~243 baseline: `RMSNorm` already shortened the GPU critical path, so there is
-less CPU encode left to hide). See **Async decode pipelining** below.
+less CPU encode left to hide). Decode copy-elimination (S1) then lifted
+decode to **~473 tok/s** (depth-1) / **~352 tok/s** (depth-0). See
+**Async decode pipelining** and **Decode copy elimination (S1)** below.
 
 The remaining gap is **critical-path-bound**: `tensor.eval` is ~90% of the
 decode step, and its GPU wait is a deep chain of **dependent dispatches** —
@@ -40,8 +43,9 @@ the 4-bit `qmv` matvecs plus the many small ops gated behind them. A
 concurrent-encoder spike (see the **Concurrent-encoder spike** section) tested
 whether the serial Metal encoder was throttling this and found it is **not**:
 with correct hazard barriers, overlapping dispatch is a net loss. The levers
-are fusion (fewer dependent dispatches — `RMSNorm` done, ~146 `copy`s remain),
-faster kernels, and pipelining (now landed) — not the dispatch model.
+are fusion (fewer dependent dispatches — `RMSNorm` done, decode `copy`s now
+elided by S1), faster kernels, and pipelining (now landed) — not the dispatch
+model.
 
 ## Environment
 
@@ -65,7 +69,7 @@ faster kernels, and pipelining (now landed) — not the dispatch model.
 | phase   | cider-press | mlx_lm  | ratio (mlx ÷ cp) |
 |---------|------------:|--------:|-----------------:|
 | prefill | ~376 tok/s  | ~1346 tok/s | ~3.6× |
-| decode  | ~420 tok/s  | ~566 tok/s  | ~1.35× |
+| decode  | ~473 tok/s  | ~569 tok/s  | ~1.20× |
 
 - **Prefill** processes the 39-token prompt in one forward. cider-press
   ranged 346–391 tok/s across warm runs (~376 median); `mlx_lm` ~1346.
@@ -88,11 +92,14 @@ faster kernels, and pipelining (now landed) — not the dispatch model.
   ~444 µs/token CPU vocab scan + 302 kB logits readback (see **GPU argmax**).
   The **fused `RMSNorm`** then lifted decode **~243 → ~302 tok/s** (~1.26×)
   by collapsing the 6-dispatch composition (×49 calls/token) to one
-  `rms_single_row` each (see **Hot spots & next levers**). Finally **async
+  `rms_single_row` each (see **Hot spots & next levers**). **Async
   decode pipelining** lifted the production path to **~420 tok/s** (depth-1,
   range 413–423; ~317 tok/s synchronous depth-0 on the same post-`RMSNorm`
-  base, a ~1.33× overlap). The **remaining ~1.35× gap** to `mlx_lm` (~566) is
-  critical-path-bound — the chain of dependent dispatches in
+  base, a ~1.33× overlap). **Decode copy-elimination (S1)** then lifted
+  **~420 → ~473 tok/s** (~1.13×) by eliding the ~144 degenerate
+  attention-permute copies (zero-copy views, no kernel work); depth-0 likewise
+  rose from ~317 → ~352 tok/s. The **remaining ~1.20× gap** to `mlx_lm`
+  (~569) is critical-path-bound — the chain of dependent dispatches in
   `tensor.eval.wait`, not CPU encode.
 - Load time (excluded from tok/s): ~0.17 s.
 
@@ -163,7 +170,43 @@ predates the fusion, which now lives in the base):
 The pipelining overlap is now **~1.33×** (was ~1.40× pre-fusion): the fused
 `RMSNorm` shortened the GPU critical path, so there is less CPU encode left to
 hide under GPU execution. `mlx_lm` on the same prompt measured **~566 tok/s**
-(560–577, median of 5) — gap **~1.35×**.
+(560–577, median of 5) — gap **~1.35×** (pre-S1 snapshot; see **Decode copy
+elimination (S1)** for the updated figures).
+
+## Decode copy elimination (S1)
+
+At decode (T=1) every attention `permute` is contiguous-modulo-size-1: the
+permute only moves the size-1 T axis, so the resulting strides are already
+contiguous if unit-sized dimensions are ignored. The exact-contiguity check
+in `Tensor::copy()` was the blocker — it required *every* stride to match the
+canonical row-major layout, so it always materialized these permutes as
+`OpKind::Copy` dispatches. MLX's `is_row_contiguous` ignores unit dims; it
+never paid this cost. The fix adds `Strides::is_contiguous_ignoring_unit_dims`
+and returns a zero-copy canonical-strided view over the same storage when the
+check passes. `rope` was the only downstream consumer that required a
+materialised copy (it previously checked for the non-contiguous path); it was
+taught to accept a contiguous view directly. A byte-offset-0 guard preserves
+the existing invariant that a copy starting mid-buffer still materializes (not
+a unit-dim case). Genuine reorders — prefill (T>1) and any permute that truly
+rearranges data — still materialize. No model-layer changes were needed.
+
+The measured effect (M4 Max, warm, `--max-tokens 128 --warmup 8`, median of 5,
+branch `perf/strided-copy-elim`): `gpu.copy` fell from **146 dispatches /
+11.2% GPU** to **2 dispatches / 0.2%**, and total dispatches/token from
+**~680 to ~536**. CPU encode time fell from **~426 → ~308 µs/token**, the
+async wait from **~1810 → ~1624 µs/token**. Production decode (depth-1) rose
+from **~420 → ~473 tok/s** (466–481, median of 5); synchronous decode
+(depth-0) from **~317 → ~352 tok/s** (349–356, median of 3), a ~1.34×
+pipelining overlap. `mlx_lm` on the same prompt measured **~569 tok/s**
+(568.5–570.6, median of 3) — gap **~1.20×** (was ~1.35× pre-S1). The greedy
+parity gate passed: copy-elision is byte-identical (the views are over the
+same storage). Buffer pool hit rate 96.9%; peak RSS ~878 MiB (was ~888).
+
+S1 only targets the decode path. Prefill (T>1) permutes are genuine reorders
+and still materialize via `OpKind::Copy`; the prefill strided-kernel work
+(rope strides, `slice_update` strided src, gemm transpose+broadcast, qmv
+strided — S2–S5) is pending. Design:
+`docs/superpowers/specs/2026-06-03-strided-copy-elimination-design.md`.
 
 ## Decode-step breakdown
 
@@ -295,6 +338,30 @@ that GPU half divides across op kinds. The op-kind breakdown itself is
 unchanged by the buffer pool and the KvCache slab-base collapse — both act
 on CPU-side allocation/retention, not the GPU dispatches.
 
+**Post copy-elimination (S1)** (M4 Max, warm, `--max-tokens 128 --warmup 8`,
+`perf/strided-copy-elim`; counter-sampled, perturbed regime, one token):
+
+| kind             | total (ms) | dispatches | µs/dispatch | % gpu |
+|------------------|-----------:|-----------:|------------:|------:|
+| quantized_matmul |      1.667 |        169 |        9.86 | 58.4% |
+| binary           |      0.430 |        168 |        2.56 | 15.1% |
+| rope             |      0.166 |         48 |        3.46 |  5.8% |
+| sdpa             |      0.195 |         24 |        8.13 |  6.8% |
+| reduce (rms_norm)|      0.162 |         49 |        3.31 |  5.7% |
+| slice_update     |      0.149 |         48 |        3.10 |  5.2% |
+| unary            |      0.064 |         24 |        2.67 |  2.2% |
+| copy             |      0.006 |          2 |        3.00 |  0.2% |
+| gather           |      0.013 |          3 |        4.33 |  0.5% |
+| dequantize       |      0.003 |          1 |        3.00 |  0.1% |
+
+Total dispatches/token: **~536** (was ~680). The `copy` bucket fell from 146
+dispatches / 11.2% to **2 dispatches / 0.2%** — the ~144 degenerate
+attention-permute copies are now elided as zero-copy views. `quantized_matmul`
+rose from ~41% to **~58%** only because the copy work it competed with is
+gone; its absolute time is lower (~1.667 vs ~2.301 ms) because the GPU is no
+longer serialized behind the copy chain. CPU encode likewise fell from ~426 to
+~308 µs/token, and the GPU wait from ~1810 to ~1624 µs/token.
+
 ### GPU argmax
 
 Next-token selection moved on-GPU. Greedy decode previously did
@@ -366,19 +433,25 @@ them — where each link pays GPU launch + inter-dispatch latency. The
 correct concurrent dispatch is a net loss. So the levers shorten or speed
 the critical path. In measurement-justified priority:
 
-- **Kernel fusion — the leading lever (in progress).** Fewer dependent
-  dispatches ⇒ a shorter critical path ⇒ less inter-dispatch latency.
-  **`RMSNorm` is fused (done, ~1.26×):** the composed
+- **Kernel fusion / copy elision — the leading lever (in progress).** Fewer
+  dependent dispatches ⇒ a shorter critical path ⇒ less inter-dispatch
+  latency. **`RMSNorm` is fused (done, ~1.26×):** the composed
   square→mean→rsqrt→mul→mul (6 dispatches × 49 calls = ~294/token) is now
   one `rms_single_row` dispatch each (~49/token), dropping decode to ~730
   dispatches/token — `tensor.eval.wait` ~3290 → ~2902 µs, encode ~440 → ~293
   µs, decode ~240 → ~302 tok/s. This also realigned us with `mlx.nn.RMSNorm`,
-  which uses the same fused `mx.fast.rms_norm`. **Remaining dispatch-count
-  headroom** is mostly the ~146 materializing `copy`s (attention permute
-  materialization) — strided-aware kernels (backlog #9) would remove them.
-  Note SwiGLU's `silu*up` and RoPE are *not* fusion targets: MLX composes
-  SwiGLU itself, and we already dispatch RoPE/decode-SDPA fused. MLX's
-  remaining lead is fewer dispatches still + async pipelining.
+  which uses the same fused `mx.fast.rms_norm`. **Decode copy-elimination S1
+  (done, ~1.13×):** the ~144 degenerate attention-permute `copy` dispatches at
+  T=1 are now elided as zero-copy views (`Strides::is_contiguous_ignoring_unit_dims`),
+  dropping decode from ~420 → ~473 tok/s and total dispatches/token from ~680
+  → ~536; `gpu.copy` is now 2 dispatches / 0.2% GPU (was 146 / 11.2%). The
+  **remaining ~1.20× gap** to `mlx_lm` (~569) is still critical-path-bound.
+  What remains of backlog #9 (strided-aware kernels) is the **prefill** strided
+  path (S2–S5): rope strides, `slice_update` strided src, gemm
+  transpose+broadcast, qmv strided — none of these affect decode, which is
+  down to 2 copy dispatches. Note SwiGLU's `silu*up` and RoPE are *not* fusion
+  targets: MLX composes SwiGLU itself, and we already dispatch RoPE/decode-SDPA
+  fused.
 - **Concurrent dispatch encoder — tested, rejected.** Flipping serial →
   concurrent dispatch and inserting correct hazard barriers is byte-identical
   to serial but ~13% *slower* (~900/975 dispatches need a barrier; almost
@@ -402,11 +475,11 @@ the critical path. In measurement-justified priority:
   is dispatch-side and parity-preserving; it shortens each `qmv` link's
   GPU time but does not reduce the *number* of dependent dispatches (that is
   fusion, above).
-- **Pipelining (overlap CPU encode with GPU)** — `commit_and_wait` is
-  synchronous, so the (now small) CPU encode never overlaps the GPU.
-  Multiple command buffers in flight (or Approach-C plumbing threading
-  `Commands` through the forward) would hide it. Lower priority now that
-  encode is ~12% of the step.
+- **Pipelining (overlap CPU encode with GPU) — done (~1.34× post-S1).**
+  The depth-1 async pipeline overlaps token N+1's CPU graph-build + encode
+  with token N's GPU execution. Post-S1, encode is ~308 µs/token and the
+  pipelining overlap is ~1.34× (~352 → ~473 tok/s). Lower priority now that
+  encode is small relative to the GPU wait (~1624 µs/token).
 - **Fused prefill attention** — prefill still uses the composed path;
   fusing it (steel/nax `sdpa_full`, Plan B) is the prefill attention lever.
 - **GPU argmax — done (~217 → ~243 tok/s).** Next-token selection moved
@@ -478,7 +551,7 @@ concurrent encoder itself is **shelved**.
   the 117 generated for this prompt); `mlx_lm`'s `generation_tps` averages
   over all generated tokens (its `--warmup` flag is accepted only for CLI
   symmetry and is informational). On a pipelined backend the skew is small
-  and, if anything, flatters cider-press — so the ~1.35× gap is not an
+  and, if anything, flatters cider-press — so the ~1.20× gap is not an
   artifact of windowing.
 - **Run-to-run variance** on cider-press decode is larger than MLX's
   because the synchronous per-eval path is more exposed to OS scheduling
