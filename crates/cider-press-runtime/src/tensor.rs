@@ -1409,11 +1409,16 @@ impl Tensor {
                 "rope: input and offset are on different devices".into(),
             ));
         }
-        if self.inner.view.is_some() {
+        // A contiguous view (canonical strides, e.g. a copy()-elided
+        // degenerate permute) is byte-equivalent to a dense leaf, so the
+        // eval-side resolver can read it from offset 0. A strided view
+        // (genuine reorder) is not — its kernel strides aren't wired yet
+        // (deferred to the prefill stage), so reject it.
+        if self.inner.view.is_some() && !self.layout().is_dense_contiguous(self.shape()) {
             return Err(Error::InvalidArgument(
-                "rope: view inputs are not supported; copy() first to materialise \
-                 a dense version (eval-side dispatch reads inputs as dense leaves \
-                 and does not resolve view chains)"
+                "rope: strided view inputs are not supported; copy() first to \
+                 materialise a dense version (the rope dispatch reads inputs as \
+                 contiguous bytes and does not yet pass view strides)"
                     .into(),
             ));
         }
@@ -4430,5 +4435,55 @@ mod tests {
         let t = Tensor::zeros(&device, [1usize, 4], DType::F32).expect("leaf");
         let err = t.argmax(1).unwrap_err();
         assert!(format!("{err}").contains("BF16"), "got: {err}");
+    }
+
+    #[test]
+    fn rope_accepts_canonical_view_matches_leaf() {
+        // rope must accept a *canonical* view (view.is_some() AND
+        // is_dense_contiguous) — that is exactly what copy()'s elision (Task 3)
+        // produces for a degenerate decode permute. It must read identically to
+        // the equivalent dense leaf. (The raw permute view is non-canonical and
+        // is exercised in Task 3; here we test the canonical-view input rope
+        // will actually receive.)
+        let device = Device::shared().expect("system default device");
+        let data: Vec<half::bf16> = (0..8)
+            .map(|i| half::bf16::from_f32(i as f32 + 1.0))
+            .collect();
+        let leaf = Tensor::from_slice(&device, &data, [1usize, 2, 1, 4]).expect("from_slice");
+
+        // Identity permute -> a view that shares the leaf's canonical strides.
+        let view = leaf.permute(&[0, 1, 2, 3]).expect("identity permute");
+        assert!(view.inner.view.is_some(), "test input must be a view");
+        assert!(
+            view.layout().is_dense_contiguous(view.shape()),
+            "test input must be canonical"
+        );
+
+        let offset = Tensor::from_slice(&device, &[0i32], [1usize]).expect("offset");
+        let r_view = view
+            .rope(&offset, 10000.0, 1.0, 4)
+            .expect("rope on canonical view");
+        let r_leaf = leaf.rope(&offset, 10000.0, 1.0, 4).expect("rope on leaf");
+        r_view.eval().expect("eval view");
+        r_leaf.eval().expect("eval leaf");
+
+        assert_eq!(
+            r_view.cpu_slice::<half::bf16>().unwrap(),
+            r_leaf.cpu_slice::<half::bf16>().unwrap()
+        );
+    }
+
+    #[test]
+    fn rope_still_rejects_strided_view() {
+        // A genuine transpose (both axes > 1) is NOT contiguous-mod-unit; rope
+        // must still reject it until S2 wires actual strides into the kernel.
+        let device = Device::shared().expect("system default device");
+        let data: Vec<half::bf16> = (0..24).map(|i| half::bf16::from_f32(i as f32)).collect();
+        // [1,2,3,4] -> permute([0,2,1,3]) -> [1,3,2,4] genuine reorder view.
+        let base = Tensor::from_slice(&device, &data, [1usize, 2, 3, 4]).expect("from_slice");
+        let view = base.permute(&[0, 2, 1, 3]).expect("permute");
+        let offset = Tensor::from_slice(&device, &[0i32], [1usize]).expect("offset");
+        let err = view.rope(&offset, 10000.0, 1.0, 4).unwrap_err();
+        assert!(format!("{err}").contains("view"));
     }
 }
