@@ -1554,7 +1554,12 @@ fn dispatch_rope(
         .get(1)
         .ok_or_else(|| Error::InvalidArgument("Rope: missing offset (inputs[1])".into()))?;
 
-    let in_bytes = dense_input_buffer(input, outputs, index_of)?;
+    // `input` may be a contiguous view (a copy()-elided degenerate permute
+    // from attention); resolve through the view chain and assert offset 0,
+    // exactly like the qmv/slice_update activation paths. `Tensor::rope`
+    // rejects non-contiguous views at construction, so the bytes read here
+    // are contiguous-from-offset-0.
+    let in_bytes = matmul_input_bytes("rope", input, outputs, index_of)?;
     let off_bytes = dense_input_buffer(offset, outputs, index_of)?;
 
     let in_typed = unsafe { in_bytes.reinterpret_as::<half::bf16>() };
