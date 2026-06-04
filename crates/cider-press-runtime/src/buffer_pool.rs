@@ -119,16 +119,34 @@ impl BufferPool {
 /// A `Buffer<u8>` that, when pool-minted, returns itself to its
 /// [`BufferPool`] on drop instead of releasing the `MTLBuffer`.
 ///
-/// Sole-ownership invariant: a pool-minted `PooledBuffer` is the unique
+/// **Sole-ownership invariant**: a pool-minted `PooledBuffer` is the unique
 /// long-lived owner of its `MTLBuffer`. Transient typed views from
-/// `Buffer::reinterpret_as` / `clone_handle` (made during dispatch
-/// encoding) are dropped before the owning tensor node drops, and the
-/// drop happens after `commit_and_wait`, so the GPU is done and no view
-/// is outstanding when the buffer returns to the pool. The `SliceUpdate`
-/// slab and host/constant leaves are minted [`PooledBuffer::unpooled`]
-/// (`pool: None`) and therefore never return — they are not pool-owned
-/// (the slab is co-owned by the [`KvCache`]; recycling it would corrupt
-/// cached K/V).
+/// `Buffer::reinterpret_as` / `clone_handle` (made during dispatch encoding)
+/// are always dropped before the owning tensor node drops.
+///
+/// **Safety under `eval` (synchronous)**: the tensor node drops only after
+/// `commit_and_wait`, so the GPU is already done and no transient view is
+/// outstanding when the buffer returns to the pool.
+///
+/// **Safety under `eval_async` (async pipelining)**: `detach_order` runs
+/// after `commit()` but before the GPU finishes. If a cross-eval input (one
+/// whose node was materialized by an *earlier* eval) loses its last `Arc`
+/// reference at that point, its `PooledBuffer` may return to the pool while
+/// the just-committed command buffer still references its `MTLBuffer` on the
+/// GPU. A subsequent `eval_async` may then `alloc_pooled` that same buffer
+/// and bind it as a write target. This is safe because: (a) the device uses
+/// a serial command queue with automatic hazard tracking, which orders the
+/// write-after-read across consecutive command buffers; and (b) a committed
+/// command buffer retains its bound `MTLBuffer`s until the GPU completes, so
+/// the underlying Metal allocation is never freed while the GPU reads it.
+/// Correctness in the async path therefore rests on Metal's hazard tracking
+/// and command-buffer retention — not on the GPU being idle when the buffer
+/// returns to the pool.
+///
+/// The `SliceUpdate` slab and host/constant leaves are minted
+/// [`PooledBuffer::unpooled`] (`pool: None`) and therefore never return to
+/// the pool — the slab is co-owned by the [`KvCache`]; recycling it would
+/// corrupt cached K/V.
 pub(crate) struct PooledBuffer {
     /// `Some` until `Drop` takes it. `Deref` unwraps it.
     buffer: Option<Buffer<u8>>,

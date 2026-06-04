@@ -158,23 +158,24 @@ struct InFlight {
 ```
 
 In the implemented model (immutable op metadata + `OnceLock<Buffer>`
-cache; see "Materialization state" below), pipelining is just a
-third state for the cache slot: instead of two states (empty,
-populated) we'd have three (empty, in-flight, ready). Two viable
-shapes for that extension:
+cache; see "Materialization state" below), pipelining is a third
+state for the cache slot: instead of two states (empty, populated)
+there are three (empty, in-flight, ready). The shape that shipped
+with `Tensor::eval_async` is lighter than either variant sketched
+above: the cache is still populated at commit time (so dependent
+graphs can chain off the buffer GPU-side), and a separate
+`in_flight: AtomicBool` on the node distinguishes "buffer exists"
+from "bytes host-readable". `resolve_leaf` — the single chokepoint
+for `is_materialized` / `cpu_bytes` / `cpu_slice` / `cpu_iter` —
+treats a flagged leaf as unmaterialized; the `PendingEval` handle
+returned by `eval_async` clears the flags once the GPU completes
+(explicit `wait()` or its blocking drop). The command buffer lives
+on the `PendingEval` (which also pins the topo order's buffers),
+not on the node.
 
-- Add an `in_flight: OnceLock<InFlight>` parallel field, set when
-  eval encodes and commits but doesn't wait; `cache` is populated
-  from a completion handler.
-- Replace `OnceLock<Buffer>` with a small custom state machine
-  (`Empty | Pending(InFlight) | Ready(Buffer)`) behind a `Mutex`,
-  paying the read-path lock cost in exchange for atomic transitions.
-
-The first-slice `eval()` skips the in-flight state entirely — it
-calls `waitUntilCompleted` before populating the cache, so readers
-only ever see the empty → ready transition. Picking between the
-two extension shapes can wait until the scheduler design is
-concrete; the public API doesn't depend on the choice. Metal's
+The synchronous `eval()` skips the in-flight state entirely — it
+calls `waitUntilCompleted` before populating the cache, so its
+readers only ever see the empty → ready transition. Metal's
 `MTLCommandBuffer` exposes `status` and `waitUntilCompleted`
 natively — no futures executor required to express "in flight" or
 "wait."

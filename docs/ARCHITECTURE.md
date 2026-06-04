@@ -52,8 +52,8 @@ HuggingFace / mlx-community 4-bit checkpoint.
 ## Performance backlog
 
 Decode is **critical-path-bound** (`QWEN_PERF.md`): one `Tensor::eval` per
-token (~90% of the step), ~1.85× slower than `mlx_lm` (~302 vs ~560 tok/s,
-down from ~2.3× before the fused `RMSNorm`). The
+token (~90% of the step), ~1.35× slower than `mlx_lm` (~420 vs ~566 tok/s,
+down from ~2.3× before the fused `RMSNorm` + async pipelining). The
 dispatch round-trip tax (items #1, #3), the CPU-side allocation tax (item
 #2), and the post-eval CPU vocab scan (item #6, GPU argmax) have been
 removed; the `tensor.eval` encode/wait split is now **~86% GPU execution,
@@ -135,16 +135,22 @@ priority:
    `## Concurrent-encoder spike`. A defensive prerequisite did land — the KV
    slabs are now zero-filled (`KvCache::new`) so any future reordering reads
    deterministic zero, not garbage.
-5. **Pipelining / per-token sync removal (CPU encode, now ~12%)** —
-   `commit_and_wait` is synchronous, so the (now ~0.5 ms) CPU encode never
-   overlaps the GPU, and each token still round-trips the next-token id
-   through the CPU. Multiple command buffers in flight, or Approach-C
-   plumbing threading `Commands` through the forward and chaining the GPU
-   argmax id (item 6) straight into the next embedding gather, would hide
-   it and eliminate the per-token sync. Lower priority now that the buffer
-   pool (item 2) removed the allocation portion and encode is ~12% of the
-   step. **Within-eval buffer reuse** (mid-eval freeing) is the related RSS
-   lever toward `mlx_lm`'s ~329 MiB peak.
+5. **Pipelining / per-token sync removal — DONE (~1.33× on the post-`RMSNorm`
+   base: depth-0 ~317 → depth-1 ~420 tok/s; ~1.40× when first measured on the
+   pre-fusion ~243 baseline).** `Tensor::eval_async` commits a token's command buffer without
+   waiting (returning a `PendingEval` waited later), and the GPU argmax id
+   (item 6) is chained **on-GPU** into the next embedding gather — so token
+   N+1's CPU graph-build + encode overlaps token N's GPU execution and the
+   per-token CPU↔GPU round-trip is gone. Cross-command-buffer ordering rests
+   on the serial queue's hazard tracking; the generator drives a depth-1
+   lookahead (greedy is inherently depth-1). On-GPU chaining initially
+   regressed decode by retaining every token's graph (buffer pool 98% → 0%);
+   the fix was **detach-on-eval** — clear an evaluated node's op inputs so it
+   stops pinning its producers, mirroring MLX's `array::detach()`. Numbers
+   and the retention story: `QWEN_PERF.md` (**Async decode pipelining**);
+   design: `docs/superpowers/specs/2026-06-03-async-pipelining-design.md` and
+   `…-eval-detach-design.md`. **Remaining related lever:** within-eval buffer
+   reuse (mid-eval freeing) toward `mlx_lm`'s ~329 MiB peak.
 6. **GPU argmax — DONE (~210 → ~243 tok/s).** Next-token selection moved
    on-GPU: an in-graph `OpKind::ArgReduce` (MLX's `argmax_bfloat16` from
    `arg_reduce.metal`) reduces the last logits row to a `u32` index inside
@@ -154,11 +160,12 @@ priority:
    4-byte index readback (the `argmax` span fell ~444 → ~0.8 µs/token).
    Greedy output is unchanged (MLX's own kernel ⇒ matches `mlx_lm` by
    construction; `generator_parity_greedy_qwen2` passes). Design:
-   `docs/superpowers/specs/2026-05-31-gpu-argmax-design.md`. This is the
+   `docs/superpowers/specs/2026-05-31-gpu-argmax-design.md`. This was the
    **enabler** for eliminating the per-token CPU↔GPU sync (item 5): with
-   the logits readback gone, the next-token id can stay on-GPU and feed the
-   following embedding gather directly (command-buffer chaining) — that
-   remains future work.
+   the logits readback gone, the next-token id stays on-GPU and feeds the
+   following embedding gather directly — that command-buffer chaining
+   shipped with item 5 (`Tensor::eval_async` + `PendingEval` +
+   detach-on-eval; see the design notes linked there).
 7. **`.metallib` precompilation** — removes the one-time cold-start JIT
    (~tens of seconds) from first-token latency in a shipped binary.
 8. **Top-k / top-p / temperature sampling** — greedy-only today.

@@ -1,13 +1,15 @@
 //! Eval: walk the lazy graph, encode one command-buffer batch, commit,
 //! populate result caches.
 //!
-//! Public entry point is [`Tensor::eval`](crate::Tensor::eval); this
-//! module owns the topological walk, the per-op dispatcher, and the
-//! cache-population pass. It is intentionally a *single* `Commands`
-//! per `eval()` call with a synchronous `commit_and_wait` — the
-//! design doc's "first cut" eval. Internal pipelining (multiple
-//! command buffers in flight, completion handlers) is a future
-//! addition that does not change the public surface.
+//! Public entry points are [`Tensor::eval`](crate::Tensor::eval)
+//! (synchronous: one `Commands` per call, `commit_and_wait`) and
+//! [`Tensor::eval_async`](crate::Tensor::eval_async) (commits without
+//! waiting, returning a [`PendingEval`](crate::PendingEval) the caller
+//! waits later — the decode pipeline runs the next token's encode under the
+//! prior token's GPU work). Both share the topo walk, per-op dispatcher,
+//! and cache-population pass, and both run a [`detach_order`] pass after
+//! populating caches so an evaluated node drops its op inputs (MLX's
+//! detach-on-eval) and stops retaining its upstream graph.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -49,59 +51,39 @@ pub(crate) fn op_kind_label(kind: &OpKind) -> &'static str {
     }
 }
 
-pub(crate) fn eval(root: &Tensor) -> Result<()> {
-    let _span = crate::profile::span("tensor.eval");
-    // `tensor.eval.encode` isolates the CPU-side cost of *building* the
-    // command buffer — the topo walk, per-op output allocation, and
-    // dispatch encoding (steps 1–4) — from `tensor.eval.wait`, which is
-    // the GPU execution time (the synchronous commit + wait, step 5).
-    // Their sum is the whole eval minus the cheap cache-population pass
-    // (step 6). Splitting them tells us whether decode is bound by
-    // CPU encode/alloc overhead or by GPU kernel time. See
-    // `docs/QWEN_PERF.md`.
-    let encode = crate::profile::span("tensor.eval.encode");
-    // Step 1: topological order of unevaluated op nodes reachable from
-    // `root`. Reverse-postorder DFS, deduped by `Arc` pointer identity.
-    // Skips placeholders, already-materialized leaves, and op nodes
-    // whose cache is already populated.
+/// Step 1: reverse-postorder topo walk of unevaluated op nodes reachable
+/// from `root`, deduped by `Arc` pointer identity.
+fn build_order(root: &Tensor) -> Vec<Arc<TensorInner>> {
     let mut visited: HashSet<*const TensorInner> = HashSet::new();
     let mut order: Vec<Arc<TensorInner>> = Vec::new();
     visit(&root.inner, &mut visited, &mut order);
+    order
+}
 
-    if order.is_empty() {
-        return Ok(()); // every reachable node is already terminal.
-    }
-
-    // Step 2: open one `Commands` for the whole batch.
-    let device = root.inner.device.as_ref().ok_or_else(|| {
-        Error::InvalidArgument("eval: placeholder has no device to dispatch on".into())
-    })?;
-    let mut commands = device.kernels().commands()?;
-
-    // Step 3: index every node we're about to dispatch, so a later
-    // node's dispatcher can look up an earlier node's just-allocated
-    // output without the cache being populated yet (cache writes are
-    // deferred until step 5 — bytes aren't valid until commit + wait).
+/// Steps 3–4: index the nodes, then allocate each op's output and encode
+/// its dispatch into `commands`. Returns the per-node output buffers and
+/// their pool tags (`Some(bytes)` ⇒ pool-minted; `None` ⇒ `SliceUpdate` slab
+/// clone, never pooled).
+#[allow(clippy::type_complexity)]
+fn encode_ops(
+    order: &[Arc<TensorInner>],
+    device: &crate::Device,
+    commands: &mut Commands<'_>,
+) -> Result<(Vec<Buffer<u8>>, Vec<Option<usize>>)> {
     let mut index_of: HashMap<*const TensorInner, usize> = HashMap::new();
     for (i, inner) in order.iter().enumerate() {
         index_of.insert(Arc::as_ptr(inner), i);
     }
-
-    // Step 4: for each op in topo order, allocate output and encode.
-    // `outputs` grows as we go; `&outputs` is a valid shared-borrow
-    // for input lookup on subsequent iterations while we hold an
-    // exclusive `&mut dst` to the fresh local.
     let mut outputs: Vec<Buffer<u8>> = Vec::with_capacity(order.len());
-    // Per-output pool tag: `Some(bytes)` ⇒ pool-minted, return to pool on
-    // drop; `None` ⇒ SliceUpdate slab clone (caller-owned), never pooled.
     let mut tags: Vec<Option<usize>> = Vec::with_capacity(order.len());
-    for inner in &order {
+    for inner in order {
         let op = inner
             .op
             .as_ref()
             .expect("topo invariant: only op nodes are in `order`");
         let (mut dst, tag) = if let OpKind::SliceUpdate { .. } = op.kind {
-            let slab = op.inputs.first().ok_or_else(|| {
+            let op_inputs = op.lock_inputs();
+            let slab = op_inputs.first().ok_or_else(|| {
                 Error::InvalidArgument("SliceUpdate: missing slab input (inputs[0])".into())
             })?;
             (dense_input_buffer(slab, &outputs, &index_of)?, None)
@@ -109,34 +91,106 @@ pub(crate) fn eval(root: &Tensor) -> Result<()> {
             let byte_count = checked_byte_count(&inner.shape, inner.dtype)?;
             (device.alloc_pooled(byte_count)?, Some(byte_count))
         };
-        dispatch(inner, &mut commands, &outputs, &mut dst, &index_of)?;
+        dispatch(inner, commands, &outputs, &mut dst, &index_of)?;
         outputs.push(dst);
         tags.push(tag);
     }
+    Ok((outputs, tags))
+}
 
-    // Step 5: synchronous commit + wait. After this returns, every
-    // encoded dispatch has completed and the output bytes are valid.
-    // Close the encode span here so it excludes GPU time, and time the
-    // commit + wait under its own span.
-    drop(encode);
-    let wait = crate::profile::span("tensor.eval.wait");
-    commands.commit_and_wait()?;
-    drop(wait);
-
-    // Step 6: populate caches. Race-safe: if another thread also
-    // evaluated this node (no concurrent-eval story yet, but the
-    // structure already supports it), one set wins and the other's
-    // buffer is dropped. Op outputs are always dense — no op
-    // currently produces a quantized tensor (no `mx.quantize`
-    // analogue yet).
-    for ((inner, buffer), tag) in order.into_iter().zip(outputs).zip(tags) {
+/// Step 6: populate each node's result cache from its output buffer.
+/// The buffer handle is valid immediately after allocation; its bytes are only
+/// valid after `commit_and_wait` (or equivalent GPU completion). The sync
+/// path orders this after the wait; the async path sets each node's
+/// `in_flight` flag first, so host reads stay gated until `PendingEval`
+/// observes completion.
+fn populate_caches(
+    order: &[Arc<TensorInner>],
+    outputs: Vec<Buffer<u8>>,
+    tags: Vec<Option<usize>>,
+    device: &crate::Device,
+) {
+    for ((inner, buffer), tag) in order.iter().zip(outputs).zip(tags) {
         let storage = match tag {
             Some(bytes) => LeafStorage::Dense(device.pooled(buffer, bytes)),
             None => LeafStorage::Dense(crate::buffer_pool::PooledBuffer::unpooled(buffer)),
         };
         let _ = inner.cache.set(storage);
     }
+}
 
+/// Detach every just-evaluated node from its producers (MLX's
+/// detach-on-eval). Clears each op node's inputs so an evaluated tensor no
+/// longer retains its upstream graph; its own cache/buffer is untouched.
+/// Call only after the nodes' caches are populated.
+///
+/// In the async path (`eval_async`) this runs before GPU completion; in-flight
+/// buffer safety is handled by `PendingEval` pinning `order` and by Metal's
+/// serial-queue hazard tracking for cross-eval inputs (see `PooledBuffer` doc).
+fn detach_order(order: &[Arc<TensorInner>]) {
+    for inner in order {
+        let op = inner
+            .op
+            .as_ref()
+            .expect("topo invariant: only op nodes are in `order`");
+        op.detach();
+    }
+}
+
+/// Commit `root`'s graph without waiting. Populates result caches at commit
+/// time (buffer handles valid now; bytes valid after the returned handle is
+/// waited) and returns a [`PendingEval`](crate::PendingEval) owning the
+/// in-flight command buffer plus the topo order (pinning the in-flight
+/// pooled buffers). See `pending_eval` for the host-read contract.
+pub(crate) fn eval_async(root: &Tensor) -> Result<crate::PendingEval> {
+    let _span = crate::profile::span("tensor.eval_async");
+    let order = build_order(root);
+    if order.is_empty() {
+        return Ok(crate::PendingEval::empty());
+    }
+    let device = root.inner.device.as_ref().ok_or_else(|| {
+        Error::InvalidArgument("eval_async: placeholder has no device to dispatch on".into())
+    })?;
+    let mut commands = device.kernels().commands()?;
+    let (outputs, tags) = encode_ops(&order, device, &mut commands)?;
+    let in_flight = commands.commit()?;
+    // Flag before populating: a populated cache with the flag set means
+    // "buffer exists, bytes not host-readable" (resolve_leaf returns None).
+    // GPU-side chaining reads the cache directly and is unaffected.
+    for inner in &order {
+        inner
+            .in_flight
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    populate_caches(&order, outputs, tags, device);
+    // Detach before the GPU finishes. A cross-eval input whose last Arc drops
+    // here returns its buffer to the pool mid-flight; reuse by the next eval is
+    // safe via the serial queue's automatic hazard tracking. See the
+    // `PooledBuffer` doc for the full safety argument.
+    detach_order(&order);
+    Ok(crate::PendingEval::new(in_flight, order))
+}
+
+pub(crate) fn eval(root: &Tensor) -> Result<()> {
+    let _span = crate::profile::span("tensor.eval");
+    let encode = crate::profile::span("tensor.eval.encode");
+    let order = build_order(root);
+    if order.is_empty() {
+        return Ok(()); // every reachable node is already terminal.
+    }
+    let device = root.inner.device.as_ref().ok_or_else(|| {
+        Error::InvalidArgument("eval: placeholder has no device to dispatch on".into())
+    })?;
+    let mut commands = device.kernels().commands()?;
+    let (outputs, tags) = encode_ops(&order, device, &mut commands)?;
+    drop(encode);
+
+    let wait = crate::profile::span("tensor.eval.wait");
+    commands.commit_and_wait()?;
+    drop(wait);
+
+    populate_caches(&order, outputs, tags, device);
+    detach_order(&order);
     Ok(())
 }
 
@@ -147,9 +201,7 @@ pub(crate) fn eval(root: &Tensor) -> Result<()> {
 /// never as a replacement. Errors if the device lacks stage-boundary
 /// counter sampling.
 pub(crate) fn profiled_eval(root: &Tensor) -> Result<()> {
-    let mut visited: HashSet<*const TensorInner> = HashSet::new();
-    let mut order: Vec<Arc<TensorInner>> = Vec::new();
-    visit(&root.inner, &mut visited, &mut order);
+    let order = build_order(root);
     if order.is_empty() {
         return Ok(());
     }
@@ -178,7 +230,8 @@ pub(crate) fn profiled_eval(root: &Tensor) -> Result<()> {
             .expect("topo invariant: only op nodes are in `order`");
         commands.begin_profiled_op(op_kind_label(&op.kind));
         let (mut dst, tag) = if let OpKind::SliceUpdate { .. } = op.kind {
-            let slab = op.inputs.first().ok_or_else(|| {
+            let op_inputs = op.lock_inputs();
+            let slab = op_inputs.first().ok_or_else(|| {
                 Error::InvalidArgument("SliceUpdate: missing slab input (inputs[0])".into())
             })?;
             (dense_input_buffer(slab, &outputs, &index_of)?, None)
@@ -203,14 +256,8 @@ pub(crate) fn profiled_eval(root: &Tensor) -> Result<()> {
         crate::profile::record_gpu(gpu_key(seg.label), ns);
     }
 
-    for ((inner, buffer), tag) in order.into_iter().zip(outputs).zip(tags) {
-        let storage = match tag {
-            Some(bytes) => LeafStorage::Dense(device.pooled(buffer, bytes)),
-            None => LeafStorage::Dense(crate::buffer_pool::PooledBuffer::unpooled(buffer)),
-        };
-        let _ = inner.cache.set(storage);
-    }
-
+    populate_caches(&order, outputs, tags, device);
+    detach_order(&order);
     Ok(())
 }
 
@@ -252,7 +299,9 @@ fn visit(
         return; // already materialized; skip the whole subtree below.
     }
     if let Some(op) = inner.op.as_ref() {
-        for input in &op.inputs {
+        // Snapshot the handles so the lock isn't held across recursion.
+        let inputs = op.inputs();
+        for input in &inputs {
             visit(&input.inner, visited, order);
         }
         order.push(inner.clone());
@@ -423,8 +472,8 @@ fn dispatch_copy(
         .device
         .as_ref()
         .expect("op nodes are always constructed with a device");
-    let input = op
-        .inputs
+    let inputs = op.lock_inputs();
+    let input = inputs
         .first()
         .expect("Copy has exactly one input by construction");
     let library = device.copy_library()?;
@@ -505,7 +554,8 @@ fn dispatch_slice_update(
         DType::BF16,
         "slice_update dispatch: non-bf16 reached eval"
     );
-    let src = op.inputs.get(1).ok_or_else(|| {
+    let inputs = op.lock_inputs();
+    let src = inputs.get(1).ok_or_else(|| {
         Error::InvalidArgument("SliceUpdate: missing src input (inputs[1])".into())
     })?;
     let src_dims = src.shape().dims();
@@ -759,10 +809,11 @@ fn dispatch_quantized_matmul(
         .device
         .as_ref()
         .expect("op nodes are always constructed with a device");
-    let weight = op.inputs.first().ok_or_else(|| {
+    let inputs = op.lock_inputs();
+    let weight = inputs.first().ok_or_else(|| {
         Error::InvalidArgument("QuantizedMatMul: missing weight input (inputs[0])".into())
     })?;
-    let x_tensor = op.inputs.get(1).ok_or_else(|| {
+    let x_tensor = inputs.get(1).ok_or_else(|| {
         Error::InvalidArgument("QuantizedMatMul: missing activation input (inputs[1])".into())
     })?;
 
@@ -863,12 +914,11 @@ fn dispatch_binary(
         .device
         .as_ref()
         .expect("op nodes are always constructed with a device");
-    let lhs = op
-        .inputs
+    let inputs = op.lock_inputs();
+    let lhs = inputs
         .first()
         .ok_or_else(|| Error::InvalidArgument("Binary: missing lhs input (inputs[0])".into()))?;
-    let rhs = op
-        .inputs
+    let rhs = inputs
         .get(1)
         .ok_or_else(|| Error::InvalidArgument("Binary: missing rhs input (inputs[1])".into()))?;
     let library = device.binary_library()?;
@@ -1123,8 +1173,8 @@ fn dispatch_unary(
         .device
         .as_ref()
         .expect("op nodes are always constructed with a device");
-    let input = op
-        .inputs
+    let inputs = op.lock_inputs();
+    let input = inputs
         .first()
         .ok_or_else(|| Error::InvalidArgument("Unary: missing input (inputs[0])".into()))?;
     let library = device.unary_library()?;
@@ -1195,8 +1245,8 @@ fn dispatch_reduce(
         .device
         .as_ref()
         .expect("op nodes are always constructed with a device");
-    let input = op
-        .inputs
+    let inputs = op.lock_inputs();
+    let input = inputs
         .first()
         .ok_or_else(|| Error::InvalidArgument("Reduce: missing input (inputs[0])".into()))?;
     let library = device.reduce_library()?;
@@ -1291,8 +1341,8 @@ fn dispatch_arg_reduce(
     axis: usize,
 ) -> Result<()> {
     let device = inner.device.as_ref().expect("op nodes carry a device");
-    let input = op
-        .inputs
+    let inputs = op.lock_inputs();
+    let input = inputs
         .first()
         .ok_or_else(|| Error::InvalidArgument("ArgReduce: missing input (inputs[0])".into()))?;
     let axis_size = input.shape().dims()[axis];
@@ -1330,12 +1380,11 @@ fn dispatch_gather(
         .device
         .as_ref()
         .expect("op nodes are always constructed with a device");
-    let src_tensor = op
-        .inputs
+    let inputs = op.lock_inputs();
+    let src_tensor = inputs
         .first()
         .ok_or_else(|| Error::InvalidArgument("Gather: missing src (inputs[0])".into()))?;
-    let idx_tensor = op
-        .inputs
+    let idx_tensor = inputs
         .get(1)
         .ok_or_else(|| Error::InvalidArgument("Gather: missing indices (inputs[1])".into()))?;
 
@@ -1441,16 +1490,14 @@ fn dispatch_dequantize(
              (got group_size={group_size}, bits={bits})",
         )));
     }
-    let w_q = op
-        .inputs
+    let inputs = op.lock_inputs();
+    let w_q = inputs
         .first()
         .ok_or_else(|| Error::InvalidArgument("Dequantize: missing w_q (inputs[0])".into()))?;
-    let scales = op
-        .inputs
+    let scales = inputs
         .get(1)
         .ok_or_else(|| Error::InvalidArgument("Dequantize: missing scales (inputs[1])".into()))?;
-    let biases = op
-        .inputs
+    let biases = inputs
         .get(2)
         .ok_or_else(|| Error::InvalidArgument("Dequantize: missing biases (inputs[2])".into()))?;
 
@@ -1499,12 +1546,11 @@ fn dispatch_rope(
         .as_ref()
         .expect("op nodes are always constructed with a device");
 
-    let input = op
-        .inputs
+    let inputs = op.lock_inputs();
+    let input = inputs
         .first()
         .ok_or_else(|| Error::InvalidArgument("Rope: missing input (inputs[0])".into()))?;
-    let offset = op
-        .inputs
+    let offset = inputs
         .get(1)
         .ok_or_else(|| Error::InvalidArgument("Rope: missing offset (inputs[1])".into()))?;
 
@@ -1564,12 +1610,11 @@ fn dispatch_rms_norm(
         .as_ref()
         .expect("op nodes are always constructed with a device");
 
-    let x = op
-        .inputs
+    let inputs = op.lock_inputs();
+    let x = inputs
         .first()
         .ok_or_else(|| Error::InvalidArgument("RmsNorm: missing x (inputs[0])".into()))?;
-    let w = op
-        .inputs
+    let w = inputs
         .get(1)
         .ok_or_else(|| Error::InvalidArgument("RmsNorm: missing weight (inputs[1])".into()))?;
 
@@ -1621,8 +1666,8 @@ fn dispatch_softmax(
         .as_ref()
         .expect("op nodes are always constructed with a device");
 
-    let input = op
-        .inputs
+    let inputs = op.lock_inputs();
+    let input = inputs
         .first()
         .ok_or_else(|| Error::InvalidArgument("Softmax: missing input (inputs[0])".into()))?;
     let in_bytes = dense_input_buffer(input, outputs, index_of)?;
@@ -1698,12 +1743,11 @@ fn dispatch_matmul(
         .as_ref()
         .expect("op nodes are always constructed with a device");
 
-    let lhs = op
-        .inputs
+    let inputs = op.lock_inputs();
+    let lhs = inputs
         .first()
         .ok_or_else(|| Error::InvalidArgument("MatMul: missing LHS (inputs[0])".into()))?;
-    let rhs = op
-        .inputs
+    let rhs = inputs
         .get(1)
         .ok_or_else(|| Error::InvalidArgument("MatMul: missing RHS (inputs[1])".into()))?;
 
@@ -1766,23 +1810,21 @@ fn dispatch_sdpa(
             "sdpa: causal=true not yet supported in the vector dispatch (Plan B)".into(),
         ));
     }
-    if op.inputs.len() > 3 {
+    let inputs = op.lock_inputs();
+    if inputs.len() > 3 {
         return Err(Error::InvalidArgument(
             "sdpa: mask not yet supported in the vector dispatch (Plan B)".into(),
         ));
     }
     let device = inner.device.as_ref().expect("op nodes carry a device");
 
-    let q = op
-        .inputs
+    let q = inputs
         .first()
         .ok_or_else(|| Error::InvalidArgument("Sdpa: missing q (inputs[0])".into()))?;
-    let k = op
-        .inputs
+    let k = inputs
         .get(1)
         .ok_or_else(|| Error::InvalidArgument("Sdpa: missing k (inputs[1])".into()))?;
-    let v = op
-        .inputs
+    let v = inputs
         .get(2)
         .ok_or_else(|| Error::InvalidArgument("Sdpa: missing v (inputs[2])".into()))?;
 
@@ -1933,6 +1975,251 @@ mod label_tests {
         assert_eq!(
             op_kind_label(&OpKind::SliceUpdate { offset_rows: 0 }),
             "slice_update"
+        );
+    }
+}
+
+#[cfg(test)]
+mod async_tests {
+    use half::bf16;
+
+    use crate::{Device, Tensor};
+
+    fn bf16_vec(xs: &[f32]) -> Vec<bf16> {
+        xs.iter().map(|&x| bf16::from_f32(x)).collect()
+    }
+
+    /// A committed-but-unwaited graph yields correct bytes after `wait()`.
+    #[test]
+    fn eval_async_then_wait_materializes() {
+        let device = Device::system_default().expect("device");
+        let a = Tensor::from_slice(&device, &bf16_vec(&[1.0, 2.0, 3.0, 4.0]), [4]).expect("a");
+        let b = a.add(&a).expect("b = a + a");
+        let pending = b.eval_async().expect("eval_async");
+        pending.wait().expect("wait");
+        assert_eq!(
+            b.cpu_to_vec::<bf16>().expect("b bytes"),
+            bf16_vec(&[2.0, 4.0, 6.0, 8.0])
+        );
+    }
+
+    /// Host reads are gated while a committed batch is in flight: between
+    /// `eval_async` and `wait`, the tensor has storage (dependent graphs can
+    /// chain off it) but must not look host-readable.
+    #[test]
+    fn eval_async_gates_host_reads_until_wait() {
+        let device = Device::system_default().expect("device");
+        let a = Tensor::from_slice(&device, &bf16_vec(&[1.0, 2.0]), [2]).expect("a");
+        let b = a.add(&a).expect("b = a + a");
+        let pending = b.eval_async().expect("eval_async");
+        assert!(
+            !b.is_materialized(),
+            "in-flight tensor must not report host-readable"
+        );
+        assert!(b.cpu_bytes().is_none());
+        assert!(b.cpu_to_vec::<bf16>().is_none());
+        pending.wait().expect("wait");
+        assert!(b.is_materialized());
+        assert_eq!(b.cpu_to_vec::<bf16>().expect("b"), bf16_vec(&[2.0, 4.0]));
+    }
+
+    /// Two chained async evals — the second consumes the first's output —
+    /// equal two synchronous evals. Proves cross-command-buffer ordering.
+    #[test]
+    fn chained_async_evals_order_correctly() {
+        let device = Device::system_default().expect("device");
+        let a = Tensor::from_slice(&device, &bf16_vec(&[1.0, 2.0, 3.0, 4.0]), [4]).expect("a");
+        let b = a.add(&a).expect("b");
+        let p1 = b.eval_async().expect("p1"); // b committed, not waited
+        let c = b.add(&b).expect("c = b + b"); // reads b's in-flight buffer
+        let p2 = c.eval_async().expect("p2");
+        p1.wait().expect("wait p1");
+        p2.wait().expect("wait p2");
+        assert_eq!(
+            c.cpu_to_vec::<bf16>().expect("c bytes"),
+            bf16_vec(&[4.0, 8.0, 12.0, 16.0])
+        );
+    }
+
+    /// Dropping a `PendingEval` without calling `wait()` must still block on GPU
+    /// completion (the in-flight handle's Drop), leaving valid bytes. Guards
+    /// the `in_flight`-before-`order` field drop ordering.
+    #[test]
+    fn dropping_pending_eval_blocks_until_complete() {
+        let device = Device::system_default().expect("device");
+        let a = Tensor::from_slice(&device, &bf16_vec(&[3.0, 4.0]), [2]).expect("a");
+        let b = a.add(&a).expect("b");
+        drop(b.eval_async().expect("eval_async")); // dropped, not waited
+        assert_eq!(b.cpu_to_vec::<bf16>().expect("b"), bf16_vec(&[6.0, 8.0]));
+    }
+
+    /// Holding many `PendingEval`s (never waiting until the end) keeps every
+    /// in-flight buffer pinned, so a long dependent chain stays correct.
+    ///
+    /// Pool-competition note: ideally we would assert that a same-sized
+    /// competing alloc (done while chain handles are held) recycles a freed
+    /// buffer and still produces the wrong result if pinning is broken. In
+    /// practice the chain holds *all* same-sized (2-byte bf16) free-list
+    /// slots while its handles are unwaited, so a competing alloc always
+    /// misses the pool — deterministic freelist-slot contention is not
+    /// achievable here without bypassing the pool's encapsulation. Instead,
+    /// we document the pool's miss count (which must equal 1 for the
+    /// competing eval, proving that all slots were in fact held), and assert
+    /// the chain result is still correct after waiting — the correctness
+    /// assertion is the primary guard; the pool-stats assertion documents
+    /// exactly what "pinning was exercised" means here.
+    #[test]
+    fn held_pending_evals_pin_buffers_through_a_chain() {
+        let device = Device::system_default().expect("device");
+        let mut t = Tensor::from_slice(&device, &bf16_vec(&[1.0]), [1]).expect("t0");
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            t = t.add(&t).expect("double");
+            handles.push(t.eval_async().expect("eval_async"));
+        }
+
+        // While all 16 chain PendingEvals are unwaited, run a competing
+        // same-sized (1-element bf16) synchronous eval. Because all
+        // same-sized free-list slots are pinned by the chain, the
+        // competitor must allocate fresh (miss). The miss count increasing
+        // documents that the freelist was fully occupied — i.e., buffers
+        // are not leaking back to the pool mid-flight.
+        let misses_before = device.pool_stats().misses;
+        let competitor = Tensor::from_slice(&device, &bf16_vec(&[1.0]), [1]).expect("comp");
+        let comp_r = competitor.add(&competitor).expect("comp_r");
+        comp_r.eval().expect("comp eval");
+        let misses_after = device.pool_stats().misses;
+        assert!(
+            misses_after > misses_before,
+            "competitor eval unexpectedly hit the pool while chain buffers should be pinned \
+             (misses before={misses_before}, after={misses_after}); this is surprising — \
+             check whether the chain is actually holding its handles"
+        );
+        assert_eq!(comp_r.cpu_to_vec::<bf16>().expect("comp"), bf16_vec(&[2.0]));
+
+        for h in handles {
+            h.wait().expect("wait");
+        }
+        // 1 doubled 16 times = 2^16 = 65536.
+        assert_eq!(t.cpu_to_vec::<bf16>().expect("final"), bf16_vec(&[65536.0]));
+    }
+
+    /// `eval_async` on an already-materialized tensor returns an empty
+    /// handle that waits trivially.
+    #[test]
+    fn eval_async_on_materialized_is_empty() {
+        let device = Device::system_default().expect("device");
+        let a = Tensor::from_slice(&device, &bf16_vec(&[5.0]), [1]).expect("a");
+        a.eval().expect("eval"); // materialize
+        let pending = a.eval_async().expect("eval_async on materialized");
+        pending.wait().expect("wait");
+        assert_eq!(a.cpu_to_vec::<bf16>().expect("a"), bf16_vec(&[5.0]));
+    }
+}
+
+#[cfg(test)]
+mod detach_tests {
+    use half::bf16;
+
+    use crate::{Device, Tensor};
+
+    fn bf16_vec(xs: &[f32]) -> Vec<bf16> {
+        xs.iter().map(|&x| bf16::from_f32(x)).collect()
+    }
+
+    /// After eval, every evaluated node has dropped its inputs (detached),
+    /// while its value is still correct and materialized.
+    #[test]
+    fn eval_detaches_inputs() {
+        let device = Device::system_default().expect("device");
+        let a = Tensor::from_slice(&device, &bf16_vec(&[1.0, 2.0, 3.0, 4.0]), [4]).expect("a");
+        let b = a.add(&a).expect("b = a + a"); // intermediate, held
+        let c = b.add(&b).expect("c = b + b"); // root, held
+        c.eval().expect("eval");
+
+        assert!(
+            c.op_inputs().expect("c is an op").is_empty(),
+            "root must be detached after eval"
+        );
+        assert!(
+            b.op_inputs().expect("b is an op").is_empty(),
+            "intermediate must be detached after eval"
+        );
+        assert!(c.is_materialized() && b.is_materialized());
+        assert_eq!(
+            c.cpu_to_vec::<bf16>().expect("c"),
+            bf16_vec(&[4.0, 8.0, 12.0, 16.0])
+        );
+    }
+
+    /// `eval_async` detaches at commit time (before wait), while the value is
+    /// still produced correctly once waited.
+    #[test]
+    fn eval_async_detaches_at_commit() {
+        let device = Device::system_default().expect("device");
+        let a = Tensor::from_slice(&device, &bf16_vec(&[1.0, 2.0]), [2]).expect("a");
+        let b = a.add(&a).expect("b");
+        let pending = b.eval_async().expect("eval_async");
+        assert!(
+            b.op_inputs().expect("b is an op").is_empty(),
+            "detach happens at commit, before wait"
+        );
+        pending.wait().expect("wait");
+        assert_eq!(b.cpu_to_vec::<bf16>().expect("b"), bf16_vec(&[2.0, 4.0]));
+    }
+
+    /// Detach is idempotent: a second eval (short-circuited by the cache)
+    /// does not panic and leaves inputs empty.
+    #[test]
+    fn detach_is_idempotent() {
+        let device = Device::system_default().expect("device");
+        let a = Tensor::from_slice(&device, &bf16_vec(&[5.0]), [1]).expect("a");
+        let b = a.add(&a).expect("b");
+        b.eval().expect("eval 1");
+        b.eval().expect("eval 2 (cached, no-op)");
+        assert!(b.op_inputs().expect("b is an op").is_empty());
+        assert_eq!(b.cpu_to_vec::<bf16>().expect("b"), bf16_vec(&[10.0]));
+    }
+
+    /// A view onto a detached node still resolves through its cache.
+    ///
+    /// `b` is already cached before `v` is created, so `v.eval()` short-circuits
+    /// immediately (the topo walk skips cached nodes). This test confirms that
+    /// detaching `b` does not break later view *resolution* through `b`'s cache;
+    /// it does not itself exercise the detach pass (that is covered by
+    /// `eval_detaches_inputs` and `eval_async_detaches_at_commit`).
+    #[test]
+    fn view_of_detached_node_still_resolves() {
+        let device = Device::system_default().expect("device");
+        let a = Tensor::from_slice(&device, &bf16_vec(&[1.0, 2.0, 3.0, 4.0]), [4]).expect("a");
+        let b = a.add(&a).expect("b"); // [2,4,6,8]
+        b.eval().expect("eval");
+        let v = b.reshape([2usize, 2]).expect("reshape view");
+        v.eval().expect("eval view");
+        assert_eq!(
+            v.cpu_to_vec::<bf16>().expect("v"),
+            bf16_vec(&[2.0, 4.0, 6.0, 8.0])
+        );
+    }
+
+    /// The regression guard: chaining an evaluated op-tensor across
+    /// iterations must let the buffer pool recycle scratch. Without detach
+    /// the chain retains every iteration's graph and pool hits stay flat.
+    #[test]
+    fn chaining_evaluated_tensor_recycles_pool() {
+        let device = Device::system_default().expect("device");
+        let mut t = Tensor::from_slice(&device, &bf16_vec(&[1.0, 1.0, 1.0, 1.0]), [4]).expect("t0");
+        let before = device.pool_stats().hits;
+        for _ in 0..8 {
+            let next = t.add(&t).expect("double");
+            next.eval().expect("eval");
+            t = next; // hold the evaluated op-tensor as the next input
+        }
+        assert!(
+            device.pool_stats().hits > before,
+            "detach must free per-iteration scratch for pool reuse (hits {} did not grow from {})",
+            device.pool_stats().hits,
+            before
         );
     }
 }

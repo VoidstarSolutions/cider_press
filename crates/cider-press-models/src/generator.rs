@@ -5,9 +5,9 @@
 //! yields `Result<u32>` ids; UTF-8 detokenization is the caller's
 //! problem (compose `Tokenizer::decode_stream` on top).
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
-use cider_press_runtime::{DType, Device, KvCache, Tensor};
+use cider_press_runtime::{DType, Device, KvCache, PendingEval, Tensor};
 
 use crate::error::{Error, Result};
 use crate::nn::causal_mask;
@@ -22,6 +22,7 @@ pub struct Generator {
     caches: Vec<KvCache>,
     eos_ids: HashSet<u32>,
     context_window: usize,
+    inflight_depth: usize,
 }
 
 impl Generator {
@@ -63,7 +64,24 @@ impl Generator {
             caches,
             eos_ids,
             context_window,
+            inflight_depth: 1,
         })
+    }
+
+    /// Set the decode pipeline lookahead distance: the number of decode
+    /// forwards committed ahead of the token currently being read back. The
+    /// target in-flight count is `depth + 1`. Default 1 — one token's GPU
+    /// work overlaps the readback. Greedy decode is inherently depth-1
+    /// (there is no second independent token to compute ahead), so values
+    /// above 1 do not speed up greedy generation; the knob exists for the
+    /// general async-eval infra and future speculative/batched paths. A
+    /// depth of 0 disables lookahead (fully synchronous per token).
+    ///
+    /// The depth is snapshotted into the iterator when [`Self::generate`] is
+    /// called, so changing it after `generate()` does not affect an already-
+    /// returned iterator; it takes effect on the next `generate()` call.
+    pub fn set_inflight_depth(&mut self, depth: usize) {
+        self.inflight_depth = depth;
     }
 
     /// Reset all `KvCache`s to position 0. Called automatically at the
@@ -126,6 +144,9 @@ impl Generator {
     /// `Some(Err(...))` from the returned iterator, NOT as an `Err` on
     /// `generate()`. Callers iterating manually (rather than with
     /// `.collect::<Result<_, _>>()`) need to handle the `Some(Err)` case.
+    /// A failed speculative lookahead is deferred until earlier committed
+    /// tokens have drained, so the yielded prefix is the same at every
+    /// `inflight_depth`.
     pub fn generate(
         &mut self,
         input_ids: &[u32],
@@ -167,29 +188,64 @@ impl Generator {
         let logits = self
             .model
             .forward(&ids_tensor, Some(&mask), &offset, &mut self.caches)?;
-        let first = argmax_last_position(&logits, self.model.config().vocab_size)?;
+
+        let vocab = self.model.config().vocab_size;
+        let idx0 = argmax_last_position_lazy(&logits, vocab)?;
+        let pending0 = idx0.eval_async()?;
+
+        let depth = self.inflight_depth;
+        let mut inflight: VecDeque<(PendingEval, Tensor)> = VecDeque::new();
+        inflight.push_back((pending0, idx0.clone()));
 
         Ok(GenerateIter {
             owner: self,
             device,
             prefill_len,
-            next_input: Some(first),
-            step: 0,
+            next_id_gpu: idx0,
+            inflight,
+            depth,
+            committed: 0,
+            yielded: 0,
+            done: false,
+            deferred_err: None,
             max_new_tokens,
         })
     }
 }
 
 /// Iterator yielding `Result<u32>` sampled ids. Borrows `&mut Generator`.
+///
+/// Runs a commit-ahead pipeline: each `next()` first commits lookahead
+/// tokens (up to `depth` ahead of the read position) so their CPU encode
+/// overlaps the prior token's GPU work, then waits and reads the oldest
+/// committed token. Ids are chained on-GPU — the argmax tensor feeds the
+/// next forward's embedding gather directly, never round-tripping the CPU.
 #[derive(Debug)]
 pub struct GenerateIter<'a> {
     owner: &'a mut Generator,
     device: Device,
     prefill_len: usize,
-    /// The id to yield next (and to feed into the next forward). `None`
-    /// once the iterator has terminated.
-    next_input: Option<u32>,
-    step: usize,
+    /// Most recent argmax tensor (`[1, 1]` U32), fed into the next forward.
+    /// Persists across the in-flight queue draining (needed at depth 0,
+    /// where the queue empties between commits), so it is the chain source
+    /// rather than `inflight.back()`.
+    next_id_gpu: Tensor,
+    /// Committed-but-unread tokens in order: (handle, its argmax tensor).
+    inflight: VecDeque<(PendingEval, Tensor)>,
+    /// Lookahead distance; target in-flight count is `depth + 1`.
+    depth: usize,
+    /// Decode forwards committed so far (the `RoPE` / cache offset source).
+    committed: usize,
+    /// Tokens handed back so far (caps at `max_new_tokens`).
+    yielded: usize,
+    /// EOS seen or max hit — stop committing further lookaheads.
+    done: bool,
+    /// A speculative lookahead `advance()` failed. Stashed (not returned
+    /// immediately) so already-committed earlier tokens still drain first —
+    /// the yielded prefix must not depend on `depth`. Surfaced once the
+    /// in-flight queue is empty; dropped if EOS lands before then (depth 0
+    /// would never have computed the failing forward).
+    deferred_err: Option<Error>,
     max_new_tokens: usize,
 }
 
@@ -197,43 +253,84 @@ impl Iterator for GenerateIter<'_> {
     type Item = Result<u32>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let id = self.next_input.take()?;
-        // `next_input` always holds the id we're about to yield — it was
-        // pre-computed during the previous call's `advance()` (or during
-        // `Generator::generate()` for the very first yield, which is the
-        // prefill argmax). The pattern per call: (1) take that pre-decided
-        // id, (2) increment `step`, (3) check whether this id terminates
-        // the sequence (EOS or max_new_tokens hit), (4) if not terminal,
-        // run one decode `advance()` to pre-fetch the *next* id into
-        // `next_input` for the following call, then (5) yield the id we
-        // took. Terminal cases yield the id but leave `next_input = None`
-        // so the subsequent `next()` returns None.
-        self.step += 1;
-        if id_is_terminal(id, &self.owner.eos_ids) || self.step >= self.max_new_tokens {
-            // Don't run another forward; iterator ends after we hand this id back.
-            return Some(Ok(id));
+        // Once terminal, the sequence is finished; any still-in-flight
+        // lookahead (committed before we knew it was terminal — at most
+        // `depth` wasted forwards) is discarded when the iterator drops,
+        // its PendingEval blocking on completion before freeing buffers.
+        // Those lookahead forwards also advanced KvCache.position; reusing
+        // the same Generator for another generate() is safe only because
+        // generate() calls reset() unconditionally, and reset()'s precondition
+        // (prior_update_committed) is satisfied because each dropped PendingEval
+        // blocks until its command buffer completes, materializing the KvCache's
+        // latest update before the slab is reused.
+        if self.done {
+            return None;
         }
-        // Forward T=1 to produce the *next* id, store it for the next call.
-        let next_id = match self.advance(id) {
-            Ok(n) => n,
-            Err(e) => return Some(Err(e)),
+
+        // Commit-ahead: keep `depth + 1` tokens in flight (the one we are
+        // about to read plus `depth` ahead of it), bounded by max_new_tokens
+        // (saturating: an absurd depth just means "commit everything").
+        // Each eval_async here overlaps the prior token's running GPU work.
+        // Chain from the most recently committed token's on-GPU argmax.
+        while self.deferred_err.is_none()
+            && self.inflight.len() < self.depth.saturating_add(1)
+            && self.yielded + self.inflight.len() < self.max_new_tokens
+        {
+            let feed = self.next_id_gpu.clone();
+            match self.advance(&feed) {
+                Ok((pending, idx)) => {
+                    self.next_id_gpu = idx.clone();
+                    self.inflight.push_back((pending, idx));
+                    self.committed += 1;
+                }
+                // Stash, don't surface: earlier committed tokens are still
+                // valid, and a deeper pipeline must not hide tokens depth 0
+                // would yield before failing. Stop committing new work.
+                Err(e) => self.deferred_err = Some(e),
+            }
+        }
+
+        // Drain the oldest committed token: wait its GPU work, read the id.
+        let Some((pending, idx)) = self.inflight.pop_front() else {
+            // Queue drained — surface a stashed lookahead error, once.
+            self.done = true;
+            return self.deferred_err.take().map(Err);
         };
-        self.next_input = Some(next_id);
+        if let Err(e) = pending.wait() {
+            self.done = true;
+            return Some(Err(Error::Runtime(e)));
+        }
+        let id = match read_id(&idx) {
+            Ok(id) => id,
+            Err(e) => {
+                self.done = true;
+                return Some(Err(e));
+            }
+        };
+        self.yielded += 1;
+        if id_is_terminal(id, &self.owner.eos_ids) || self.yielded >= self.max_new_tokens {
+            self.done = true;
+        }
         Some(Ok(id))
     }
 }
 
 impl GenerateIter<'_> {
-    fn advance(&mut self, prev_id: u32) -> Result<u32> {
-        let ids = Tensor::from_slice(&self.device, &[prev_id], [1, 1])?;
+    /// One decode forward from the on-GPU `feed` id tensor: build the graph,
+    /// commit it async, and return the handle plus the lazy next-argmax
+    /// tensor. Does not block — readback happens later in `next()`.
+    fn advance(&mut self, feed: &Tensor) -> Result<(PendingEval, Tensor)> {
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let pos = (self.prefill_len + self.step - 1) as i32;
+        let pos = (self.prefill_len + self.committed) as i32;
         let offset = Tensor::from_slice(&self.device, &[pos], [1])?;
         let logits = self
             .owner
             .model
-            .forward(&ids, None, &offset, &mut self.owner.caches)?;
-        argmax_last_position(&logits, self.owner.model.config().vocab_size)
+            .forward(feed, None, &offset, &mut self.owner.caches)?;
+        let vocab = self.owner.model.config().vocab_size;
+        let idx = argmax_last_position_lazy(&logits, vocab)?;
+        let pending = idx.eval_async()?;
+        Ok((pending, idx))
     }
 }
 
@@ -241,20 +338,26 @@ fn id_is_terminal(id: u32, eos_ids: &HashSet<u32>) -> bool {
     eos_ids.contains(&id)
 }
 
-/// Argmax over the last position of a `[1, T, vocab]` BF16 logits tensor.
-fn argmax_last_position(logits: &Tensor, vocab: usize) -> Result<u32> {
+/// Build the lazy argmax over the last position of a `[1, T, vocab]` BF16
+/// logits tensor, returning a `[1, 1]` U32 index tensor **without**
+/// evaluating it — the caller commits it via `eval_async` and reads it back
+/// after waiting.
+fn argmax_last_position_lazy(logits: &Tensor, vocab: usize) -> Result<Tensor> {
     let t = logits.shape().dims()[1];
-    // Decode (T=1): logits is already [1,1,vocab] and dense — argmax it
-    // directly. Prefill (T>1): copy out the last row first (argmax needs
-    // a dense, non-view input).
     let last = if t == 1 {
         logits.clone()
     } else {
         logits.slice(&[0..1, t - 1..t, 0..vocab])?.copy()?
     };
-    let idx = last.argmax(2)?;
-    idx.eval()?;
-    let _span = cider_press_runtime::profile::span("argmax");
+    // argmax(2) over [1, 1, vocab] removes the axis -> [1, 1] U32, which is
+    // exactly forward()'s [1, T] input-ids shape for the next token.
+    Ok(last.argmax(2)?)
+}
+
+/// Read a single token id from an argmax tensor whose `PendingEval` has
+/// already been waited.
+fn read_id(idx: &Tensor) -> Result<u32> {
+    let _span = cider_press_runtime::profile::span("argmax.readback");
     let ids = idx.cpu_slice::<u32>().ok_or_else(|| {
         Error::InvalidArgument(
             "argmax: result not materialised or wrong dtype (expected U32)".into(),

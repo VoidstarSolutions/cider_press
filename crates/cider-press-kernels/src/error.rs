@@ -57,6 +57,13 @@ pub enum Error {
     /// specific violation.
     #[error("{0}")]
     InvalidArgument(String),
+
+    /// A committed command buffer finished with a failure status (GPU
+    /// page fault, timeout, device removed, …). The message is the
+    /// `NSError` localized description when Metal provides one,
+    /// otherwise the raw `MTLCommandBufferStatus` code.
+    #[error("GPU command buffer failed: {0}")]
+    CommandBufferFailed(String),
 }
 
 /// Convenience `Result` alias for the `cider-press-kernels` API.

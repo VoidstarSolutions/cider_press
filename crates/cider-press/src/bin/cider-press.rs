@@ -91,6 +91,13 @@ struct BenchArgs {
     /// Decode steps to discard before timing (warm caches / JIT).
     #[arg(long, default_value_t = 8)]
     warmup: usize,
+    /// Async-pipeline lookahead depth (see `Generator::set_inflight_depth`).
+    /// Default 1 (one decode forward overlapping the readback). 0 disables
+    /// lookahead — one token committed and waited at a time, still through
+    /// the async-eval + on-GPU id-chaining path (not the historical
+    /// pre-pipelining implementation).
+    #[arg(long, default_value_t = 1)]
+    inflight_depth: usize,
     /// Skip `ChatTemplate` rendering; encode the bare --prompt.
     #[arg(long)]
     no_chat_template: bool,
@@ -197,6 +204,7 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
     let prompt_len = ids.len();
 
     let mut generator = Generator::new(loaded.model, args.context_window, loaded.eos_ids)?;
+    generator.set_inflight_depth(args.inflight_depth);
 
     // Prefill is performed inside generate() before it returns the iterator.
     let t_prefill = Instant::now();

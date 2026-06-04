@@ -95,6 +95,105 @@ fn run_mlx_harness(checkpoint: &Path, messages: &[Message], max_tokens: usize) -
     MlxRun { ids, eos }
 }
 
+/// Build a fresh Generator from the checkpoint (loads weights anew each
+/// call, since `Generator::new` consumes the model). Shared by the
+/// depth-invariance test.
+fn build_generator(checkpoint: &Path, context_window: usize, eos: HashSet<u32>) -> Generator {
+    let device = Device::shared().expect("device");
+    let config_bytes = fs::read(checkpoint.join("config.json")).expect("read config.json");
+    let config = Qwen2Config::from_json_bytes(&config_bytes).expect("parse config.json");
+    let archive_bytes =
+        fs::read(checkpoint.join("model.safetensors")).expect("read model.safetensors");
+    let archive = SafeTensors::deserialize(&archive_bytes).expect("deserialize safetensors");
+    let weights = load_qwen2_weights(&archive, &config, &device).expect("load weights");
+    let model = Qwen2Model::from_weights(weights, config).expect("build Qwen2Model");
+    Generator::new(model, context_window, eos).expect("Generator::new")
+}
+
+fn prompt_ids(checkpoint: &Path) -> Vec<u32> {
+    let tokenizer =
+        Tokenizer::from_file(&checkpoint.join("tokenizer.json")).expect("load tokenizer");
+    let chat_template =
+        ChatTemplate::from_file(&checkpoint.join("tokenizer_config.json"), &tokenizer)
+            .expect("load chat template");
+    let prompt = chat_template
+        .render(&fixed_messages())
+        .expect("render prompt");
+    tokenizer.encode(&prompt).expect("encode prompt")
+}
+
+/// Greedy decode is deterministic regardless of pipeline depth: deeper
+/// lookahead commits more tokens ahead but must yield the identical
+/// sequence. Exercises on-GPU id chaining at depths 0, 1, 2, and 3,
+/// including depth 0 (fully synchronous) which is the regression case.
+#[test]
+fn greedy_output_is_depth_invariant() {
+    let Some(checkpoint) = checkpoint_path() else {
+        eprintln!("skipped: set CIDER_QWEN_CHECKPOINT_PATH to run this test");
+        return;
+    };
+    let ids = prompt_ids(&checkpoint);
+    let max_new = 24usize;
+    let ctx = ids.len() + max_new + 1;
+    // Qwen2.5 <|im_end|> = 151645; any fixed non-empty EOS works — all
+    // depths use the same set, so they stop (if at all) at the same token.
+    let eos: HashSet<u32> = HashSet::from([151_645_u32]);
+
+    let mut sequences = Vec::new();
+    for depth in [0usize, 1, 2, 3] {
+        let mut g = build_generator(&checkpoint, ctx, eos.clone());
+        g.set_inflight_depth(depth);
+        let seq: Vec<u32> = g
+            .generate(&ids, max_new)
+            .expect("gen")
+            .collect::<Result<_, _>>()
+            .expect("collect");
+        sequences.push((depth, seq));
+    }
+    let (_, ref baseline) = sequences[0];
+    for (depth, seq) in &sequences {
+        assert_eq!(seq, baseline, "depth {depth} output differs from depth 0");
+        assert!(!seq.is_empty(), "depth {depth} produced no tokens");
+    }
+}
+
+/// `usize::MAX` lookahead must not overflow the `depth + 1` in-flight
+/// target (debug panic / release wrap-to-zero, which silently truncated
+/// generation after the prefill token). The commit budget is still
+/// bounded by `max_new_tokens`, so an absurd depth just means "commit
+/// everything up front" — the yielded sequence is unchanged.
+#[test]
+fn usize_max_depth_does_not_overflow() {
+    let Some(checkpoint) = checkpoint_path() else {
+        eprintln!("skipped: set CIDER_QWEN_CHECKPOINT_PATH to run this test");
+        return;
+    };
+    let ids = prompt_ids(&checkpoint);
+    let max_new = 8usize;
+    let ctx = ids.len() + max_new + 1;
+    let eos: HashSet<u32> = HashSet::from([151_645_u32]);
+
+    let mut baseline_gen = build_generator(&checkpoint, ctx, eos.clone());
+    baseline_gen.set_inflight_depth(0);
+    let baseline: Vec<u32> = baseline_gen
+        .generate(&ids, max_new)
+        .expect("gen depth 0")
+        .collect::<Result<_, _>>()
+        .expect("collect depth 0");
+
+    let mut g = build_generator(&checkpoint, ctx, eos);
+    g.set_inflight_depth(usize::MAX);
+    let seq: Vec<u32> = g
+        .generate(&ids, max_new)
+        .expect("gen depth MAX")
+        .collect::<Result<_, _>>()
+        .expect("collect depth MAX");
+    assert_eq!(
+        seq, baseline,
+        "usize::MAX depth output differs from depth 0"
+    );
+}
+
 #[test]
 fn generator_parity_greedy_qwen2() {
     let Some(checkpoint) = checkpoint_path() else {
@@ -107,27 +206,8 @@ fn generator_parity_greedy_qwen2() {
 
     let messages = fixed_messages();
 
-    // ── Rust side ─────────────────────────────────────────────────────────────
-    let device = Device::shared().expect("device");
-
-    let config_bytes = fs::read(checkpoint.join("config.json")).expect("read config.json");
-    let config = Qwen2Config::from_json_bytes(&config_bytes).expect("parse config.json");
-
-    let archive_bytes =
-        fs::read(checkpoint.join("model.safetensors")).expect("read model.safetensors");
-    let archive = SafeTensors::deserialize(&archive_bytes).expect("deserialize safetensors");
-
-    let weights = load_qwen2_weights(&archive, &config, &device).expect("load weights");
-    let model = Qwen2Model::from_weights(weights, config.clone()).expect("build Qwen2Model");
-
-    let tokenizer =
-        Tokenizer::from_file(&checkpoint.join("tokenizer.json")).expect("load tokenizer");
-    let chat_template =
-        ChatTemplate::from_file(&checkpoint.join("tokenizer_config.json"), &tokenizer)
-            .expect("load chat template");
-
-    let prompt = chat_template.render(&messages).expect("render prompt");
-    let ids = tokenizer.encode(&prompt).expect("encode prompt");
+    // Compute Rust-side prompt ids before the MLX harness runs.
+    let ids = prompt_ids(&checkpoint);
 
     // ── MLX side ──────────────────────────────────────────────────────────────
     // Run first so the Rust Generator can adopt MLX's exact EOS set —
@@ -140,8 +220,7 @@ fn generator_parity_greedy_qwen2() {
         eos: mlx_eos,
     } = run_mlx_harness(&checkpoint, &messages, MAX_NEW_TOKENS);
 
-    let mut generator =
-        Generator::new(model, ids.len() + MAX_NEW_TOKENS + 1, mlx_eos).expect("Generator::new");
+    let mut generator = build_generator(&checkpoint, ids.len() + MAX_NEW_TOKENS + 1, mlx_eos);
 
     let rust_ids: Vec<u32> = generator
         .generate(&ids, MAX_NEW_TOKENS)
