@@ -160,11 +160,12 @@ priority:
    4-byte index readback (the `argmax` span fell ~444 → ~0.8 µs/token).
    Greedy output is unchanged (MLX's own kernel ⇒ matches `mlx_lm` by
    construction; `generator_parity_greedy_qwen2` passes). Design:
-   `docs/superpowers/specs/2026-05-31-gpu-argmax-design.md`. This is the
+   `docs/superpowers/specs/2026-05-31-gpu-argmax-design.md`. This was the
    **enabler** for eliminating the per-token CPU↔GPU sync (item 5): with
-   the logits readback gone, the next-token id can stay on-GPU and feed the
-   following embedding gather directly (command-buffer chaining) — that
-   remains future work.
+   the logits readback gone, the next-token id stays on-GPU and feeds the
+   following embedding gather directly — that command-buffer chaining
+   shipped with item 5 (`Tensor::eval_async` + `PendingEval` +
+   detach-on-eval; see the design notes linked there).
 7. **`.metallib` precompilation** — removes the one-time cold-start JIT
    (~tens of seconds) from first-token latency in a shipped binary.
 8. **Top-k / top-p / temperature sampling** — greedy-only today.

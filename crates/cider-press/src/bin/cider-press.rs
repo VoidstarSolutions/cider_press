@@ -93,7 +93,9 @@ struct BenchArgs {
     warmup: usize,
     /// Async-pipeline lookahead depth (see `Generator::set_inflight_depth`).
     /// Default 1 (one decode forward overlapping the readback). 0 disables
-    /// lookahead (fully synchronous per token) — the pre-pipelining baseline.
+    /// lookahead — one token committed and waited at a time, still through
+    /// the async-eval + on-GPU id-chaining path (not the historical
+    /// pre-pipelining implementation).
     #[arg(long, default_value_t = 1)]
     inflight_depth: usize,
     /// Skip `ChatTemplate` rendering; encode the bare --prompt.

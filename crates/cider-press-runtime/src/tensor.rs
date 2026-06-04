@@ -2429,9 +2429,10 @@ impl Tensor {
 
     /// Inputs to this tensor's op node, or `None` if it wasn't produced by
     /// an op. Returns owned `Tensor` clones (refcount bumps); use
-    /// [`Tensor::ptr_eq`] for identity. (Once detach-on-eval is wired, an
-    /// evaluated node's inputs are cleared, so this returns an empty `Vec`
-    /// for a materialized op tensor.)
+    /// [`Tensor::ptr_eq`] for identity. Eval detaches a node from its
+    /// producers (detach-on-eval), so this returns an empty `Vec` for an
+    /// op tensor that has been evaluated (or committed via
+    /// [`Tensor::eval_async`]).
     #[must_use]
     pub fn op_inputs(&self) -> Option<Vec<Tensor>> {
         self.inner.op.as_ref().map(OpNode::inputs)
