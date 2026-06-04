@@ -1,6 +1,6 @@
 # Strided-aware copy elimination — design
 
-Status: approved (design); implementation pending.
+Status: approved (design); S1 implemented, S2+ pending.
 Branch: `perf/strided-copy-elim` (off `perf/async-pipelining`).
 Date: 2026-06-03.
 
@@ -110,13 +110,14 @@ Constraints:
 ### C3 — lowering helper (the reusable seam)
 
 `ensure_readable(input: &Tensor, req: LayoutReq) -> Result<Tensor>` where
-`LayoutReq` is an enum of what the consuming kernel can read. The full
-variant set is declared up front to lock the seam's shape; only the
-attention-path variants are implemented now (YAGNI on the rest), and
-every unimplemented variant has a safe default so the seam never silently
-narrows.
+`LayoutReq` is an enum of what the consuming kernel can read. C3 lands in
+**S2** (S1 ships only C1+C2; its rope change accepts contiguous views
+directly, without this helper). When it lands, the full variant set is
+declared up front to lock the seam's shape; only the attention-path
+variants are implemented (YAGNI on the rest), and every unimplemented
+variant has a safe default so the seam never silently narrows.
 
-**Implemented now (attention path):**
+**Implemented first (attention path, S2):**
 
 - `Contiguous` — materialize unless already contiguous.
 - `ContiguousModUnit` — accept contiguous-mod-size-1 (tighten via C2);
@@ -197,6 +198,11 @@ each carries a kernel-parity test and a prefill re-measure.
   place; the source stays live via the view's `Arc`. Covered by the
   existing KvCache aliasing contract (drop K/V views before the next
   `update`); add an explicit elision-aliasing test.
+- **Byte-offset restriction.** C2 elision only applies when the view's
+  `byte_offset` is 0 after `flatten_view` — a contiguous-mod-unit view
+  starting mid-buffer (e.g. from an upstream slice) still materializes,
+  because a non-zero offset can't be expressed as a zero-copy view every
+  downstream kernel accepts.
 - **`reshape` on the elided view.** Must stay zero-copy on a
   canonical-strided view — verify (it should: canonical strides are
   contiguous).
