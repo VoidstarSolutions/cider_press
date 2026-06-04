@@ -696,18 +696,22 @@ impl Tensor {
         }
     }
 
-    /// Schedule an identity copy of this tensor.
-    ///
-    /// Returns a new [`Tensor`] backed by an unevaluated
-    /// [`OpKind::Copy`] node referencing `self` as its sole input. No
-    /// GPU work runs and no output buffer is allocated; both happen
-    /// at [`Tensor::eval`] time.
+    /// Schedule a dense, contiguous copy of this tensor's logical values.
     ///
     /// The result inherits this tensor's [`Shape`], [`DType`], and
-    /// [`Device`]; the output [`Layout`] is dense and contiguous,
-    /// regardless of the input's stride pattern (`copy` materializes a
-    /// dense version of the logical values, the same as MLX's
-    /// `mx.copy`).
+    /// [`Device`]; its [`Layout`] is dense and contiguous regardless of
+    /// the input's stride pattern — the same logical values MLX's
+    /// `mx.copy` would produce.
+    ///
+    /// Usually this is an unevaluated [`OpKind::Copy`] node: no GPU work
+    /// runs and no output buffer is allocated until [`Tensor::eval`]. As
+    /// an optimization, when `self` is a view that is already contiguous
+    /// once size-1 axes are ignored (e.g. a permute that only moved a unit
+    /// axis) and lands at byte offset 0, `copy()` instead returns a
+    /// zero-copy view with canonical strides over the same storage —
+    /// byte-identical to the materialized result, but with no op node and
+    /// no dispatch. Callers must therefore not assume the result is an op
+    /// (`op_kind()` may be `None`).
     pub fn copy(&self) -> Result<Self> {
         let device = self.inner.device.as_ref().ok_or_else(|| {
             Error::InvalidArgument("copy: cannot apply an op to a placeholder (no device)".into())
@@ -716,6 +720,35 @@ impl Tensor {
             return Err(Error::InvalidArgument(
                 "copy: only dense tensors are supported".into(),
             ));
+        }
+        // Elide a copy whose output would be byte-identical to its input:
+        // a view that is contiguous once size-1 axes are ignored (e.g. a
+        // decode-time permute that only moved the size-1 T axis). Return a
+        // zero-copy view with canonical strides over the same storage
+        // instead of an OpKind::Copy dispatch. Only views qualify — a
+        // non-view leaf/op is already canonical and callers may rely on
+        // copy() handing back a private buffer, so those still materialize.
+        // Only a byte-offset-0 source qualifies: a non-zero offset (from an
+        // upstream inner slice) can't be expressed as a zero-copy view every
+        // downstream kernel accepts, so it falls through to a real Copy.
+        let strides = match &self.inner.layout {
+            Layout::Dense { strides } => strides,
+            Layout::Quantized(_) => unreachable!("guarded as Dense above"),
+        };
+        if self.inner.view.is_some()
+            && !strides.is_contiguous(&self.inner.shape)
+            && strides.is_contiguous_ignoring_unit_dims(&self.inner.shape)
+        {
+            let (source, byte_offset) = self.flatten_view();
+            if byte_offset == 0 {
+                let canonical = Strides::contiguous(&self.inner.shape);
+                return Ok(Self::view(
+                    source,
+                    byte_offset,
+                    self.inner.shape.clone(),
+                    canonical,
+                ));
+            }
         }
         let layout = dense_layout(&self.inner.shape);
         Ok(Self::op_tensor(
@@ -4435,6 +4468,67 @@ mod tests {
         let t = Tensor::zeros(&device, [1usize, 4], DType::F32).expect("leaf");
         let err = t.argmax(1).unwrap_err();
         assert!(format!("{err}").contains("BF16"), "got: {err}");
+    }
+
+    #[test]
+    fn copy_of_degenerate_permute_view_is_elided() {
+        // [1,1,H,D] -> permute([0,2,1,3]) -> [1,H,1,D] contiguous-mod-unit view.
+        // copy() must return a zero-copy view (no Copy op), with canonical
+        // strides and the correct logical values.
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..8).map(|i| i as f32).collect(); // H=2, D=4
+        let base = Tensor::from_slice(&device, &data, [1usize, 1, 2, 4]).expect("from_slice");
+        let view = base.permute(&[0, 2, 1, 3]).expect("permute"); // [1,2,1,4]
+
+        let copied = view.copy().expect("copy");
+
+        // Elided: it is a view, not a Copy op, and reports canonical strides.
+        assert!(copied.op_kind().is_none(), "expected elision, got an op");
+        assert_eq!(copied.shape().dims(), &[1, 2, 1, 4]);
+        match copied.layout() {
+            Layout::Dense { strides } => {
+                assert!(
+                    strides.is_contiguous(copied.shape()),
+                    "strides not canonical"
+                );
+            }
+            Layout::Quantized(_) => panic!("unexpected quantized layout"),
+        }
+
+        // Values match the logical permute.
+        copied.eval().expect("eval");
+        // element [0,h,0,d] == base[0,0,h,d] == data[h*4+d]; canonical order
+        // over [1,2,1,4] is just data in order.
+        assert_eq!(copied.cpu_slice::<f32>().unwrap(), data.as_slice());
+
+        // Mirrors real decode usage: reshape after elision drops the unit axes
+        // and must still read the same values.
+        let reshaped = copied.reshape([2usize, 4]).expect("reshape after elision");
+        reshaped.eval().expect("eval reshaped");
+        assert_eq!(reshaped.cpu_slice::<f32>().unwrap(), data.as_slice());
+    }
+
+    #[test]
+    fn copy_of_genuine_transpose_still_materializes() {
+        // [2,3] -> [3,2] transpose is NOT contiguous-mod-unit; copy() must
+        // still build a Copy op (existing behavior).
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let src = Tensor::from_slice(&device, &data, [2, 3]).expect("from_slice");
+        let transposed = src.permute(&[1, 0]).expect("permute"); // 3x2 view
+        let copied = transposed.copy().expect("copy");
+        assert_eq!(copied.op_kind(), Some(OpKind::Copy));
+    }
+
+    #[test]
+    fn copy_of_contiguous_leaf_still_materializes() {
+        // A non-view dense leaf: copy() must produce a fresh Copy op (callers
+        // may rely on a private buffer).
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let leaf = Tensor::from_slice(&device, &data, [2, 2]).expect("from_slice");
+        let copied = leaf.copy().expect("copy");
+        assert_eq!(copied.op_kind(), Some(OpKind::Copy));
     }
 
     #[test]
