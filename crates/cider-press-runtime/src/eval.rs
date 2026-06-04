@@ -52,13 +52,128 @@ pub(crate) fn op_kind_label(kind: &OpKind) -> &'static str {
     }
 }
 
-/// Step 1: reverse-postorder topo walk of unevaluated op nodes reachable
-/// from `root`, deduped by `Arc` pointer identity.
+/// Step 1: schedule the unevaluated op nodes reachable from `root` in
+/// Kahn level order (a valid topo order in which every op appears after
+/// all of its producers, and mutually independent ops are adjacent).
+///
+/// Why level order rather than DFS post-order: `encode_ops` elides a
+/// dispatch's memory barrier when none of its inputs were written since
+/// the last barrier. DFS emits each dependency *chain* back-to-back, so
+/// almost every op hazards on its immediate predecessor and the barrier
+/// stays. In a Kahn wave every op depends only on earlier waves, so the
+/// FIRST op of a wave pays the barrier (which collapses the hazard
+/// window) and the REST elide — their producers are no longer in the
+/// window. Barriers drop toward the graph's critical-path length, and the
+/// independent ops a wave groups together (q/k/v projections, the two
+/// rope halves, gate‖up matmuls) land adjacent so they overlap on the
+/// concurrent encoder.
+///
+/// Within a wave, nodes keep reachability-discovery order (a `Vec`
+/// worklist, never `HashMap` iteration) so the schedule is deterministic
+/// across runs.
 fn build_order(root: &Tensor) -> Vec<Arc<TensorInner>> {
-    let mut visited: HashSet<*const TensorInner> = HashSet::new();
-    let mut order: Vec<Arc<TensorInner>> = Vec::new();
-    visit(&root.inner, &mut visited, &mut order);
+    // Reachability pass. Mirrors `visit`'s skip logic exactly: dedup by
+    // `Arc` identity; a node whose cache is already populated is terminal
+    // (skip its whole subtree, even if it carries an op); op nodes are the
+    // only nodes scheduled; views own no storage, so an input reached
+    // through a view chain contributes the view's *source* op as the
+    // dependency. Iterative (graph depth ~600) to avoid blowing the stack.
+    let mut discovered: HashSet<*const TensorInner> = HashSet::new();
+    let mut nodes: Vec<Arc<TensorInner>> = Vec::new();
+    // Producer Arcs per node, parallel to `nodes`; translated to indices
+    // once every node has a slot (a producer may be discovered after its
+    // consumer).
+    let mut producer_arcs: Vec<Vec<Arc<TensorInner>>> = Vec::new();
+    let mut index_of: HashMap<*const TensorInner, usize> = HashMap::new();
+    let mut stack: Vec<Arc<TensorInner>> = Vec::new();
+
+    if let Some(node) = resolve_to_op(&root.inner) {
+        stack.push(node);
+    }
+    while let Some(inner) = stack.pop() {
+        let ptr = Arc::as_ptr(&inner);
+        if !discovered.insert(ptr) {
+            continue;
+        }
+        index_of.insert(ptr, nodes.len());
+        let op = inner
+            .op
+            .as_ref()
+            .expect("resolve_to_op only yields op nodes");
+        // Direct op-node dependencies, deduped per unique producer (an op
+        // reading the same producer twice must not double-count in-degree).
+        let mut node_deps: Vec<Arc<TensorInner>> = Vec::new();
+        let mut seen_dep: HashSet<*const TensorInner> = HashSet::new();
+        for input in op.inputs() {
+            if let Some(dep) = resolve_to_op(&input.inner) {
+                if seen_dep.insert(Arc::as_ptr(&dep)) {
+                    stack.push(dep.clone());
+                    node_deps.push(dep);
+                }
+            }
+        }
+        nodes.push(inner);
+        producer_arcs.push(node_deps);
+    }
+
+    // In-degrees and consumer lists over the discovered subgraph.
+    let mut indegree: Vec<usize> = vec![0; nodes.len()];
+    let mut consumers: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+    for (i, producers) in producer_arcs.iter().enumerate() {
+        for p in producers {
+            let pi = index_of[&Arc::as_ptr(p)];
+            indegree[i] += 1;
+            consumers[pi].push(i);
+        }
+    }
+
+    // Kahn levels. Wave 0 = in-degree-0 nodes in discovery order; emit a
+    // wave, decrement its consumers, the newly-zeroed ones form the next.
+    let mut order: Vec<Arc<TensorInner>> = Vec::with_capacity(nodes.len());
+    let mut wave: Vec<usize> = (0..nodes.len()).filter(|&i| indegree[i] == 0).collect();
+    while !wave.is_empty() {
+        let mut next: Vec<usize> = Vec::new();
+        for &i in &wave {
+            order.push(nodes[i].clone());
+            for &c in &consumers[i] {
+                indegree[c] -= 1;
+                if indegree[c] == 0 {
+                    next.push(c);
+                }
+            }
+        }
+        wave = next;
+    }
+
+    debug_assert_eq!(
+        order.len(),
+        nodes.len(),
+        "Kahn schedule dropped nodes (cycle in a supposedly-acyclic graph?)"
+    );
     order
+}
+
+/// Resolve a node to the op node that must be scheduled before any
+/// consumer reading it, mirroring `visit`'s descent:
+/// - an already-cached node is terminal (no dispatch, no dependency),
+///   even if it carries an op — `visit` skips it identically;
+/// - an op node (uncached) is itself the dependency;
+/// - a view (uncached, no op) owns no storage, so chase its source;
+/// - a placeholder (no cache, no op, no view) is terminal.
+fn resolve_to_op(inner: &Arc<TensorInner>) -> Option<Arc<TensorInner>> {
+    let mut current = inner.clone();
+    loop {
+        if current.cache.get().is_some() {
+            return None;
+        }
+        if current.op.is_some() {
+            return Some(current);
+        }
+        match current.view.as_ref() {
+            Some(view) => current = view.source.inner.clone(),
+            None => return None,
+        }
+    }
 }
 
 /// Ops encoded per command buffer before committing and opening the next.
@@ -344,36 +459,6 @@ fn gpu_key(label: &'static str) -> &'static str {
         "arg_reduce" => "gpu.arg_reduce",
         _ => "gpu.other",
     }
-}
-
-fn visit(
-    inner: &Arc<TensorInner>,
-    visited: &mut HashSet<*const TensorInner>,
-    order: &mut Vec<Arc<TensorInner>>,
-) {
-    let ptr = Arc::as_ptr(inner);
-    if !visited.insert(ptr) {
-        return;
-    }
-    if inner.cache.get().is_some() {
-        return; // already materialized; skip the whole subtree below.
-    }
-    if let Some(op) = inner.op.as_ref() {
-        // Snapshot the handles so the lock isn't held across recursion.
-        let inputs = op.inputs();
-        for input in &inputs {
-            visit(&input.inner, visited, order);
-        }
-        order.push(inner.clone());
-    } else if let Some(view) = inner.view.as_ref() {
-        // Views own no storage; eval needs to chase the source so the
-        // op that backs the view (if any) gets dispatched. The view
-        // itself never enters `order` — it has nothing to dispatch.
-        visit(&view.source.inner, visited, order);
-    }
-    // Placeholders (no op, no view, no cache) are silently skipped —
-    // eval() catches the broken case at step 2 if the root needs
-    // dispatching.
 }
 
 /// Whether graph-level barrier elision is active. ON unless the
