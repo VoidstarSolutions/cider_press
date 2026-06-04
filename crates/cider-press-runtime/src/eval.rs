@@ -82,7 +82,7 @@ fn encode_ops(
             .as_ref()
             .expect("topo invariant: only op nodes are in `order`");
         let (mut dst, tag) = if let OpKind::SliceUpdate { .. } = op.kind {
-            let op_inputs = op.inputs();
+            let op_inputs = op.lock_inputs();
             let slab = op_inputs.first().ok_or_else(|| {
                 Error::InvalidArgument("SliceUpdate: missing slab input (inputs[0])".into())
             })?;
@@ -230,7 +230,7 @@ pub(crate) fn profiled_eval(root: &Tensor) -> Result<()> {
             .expect("topo invariant: only op nodes are in `order`");
         commands.begin_profiled_op(op_kind_label(&op.kind));
         let (mut dst, tag) = if let OpKind::SliceUpdate { .. } = op.kind {
-            let op_inputs = op.inputs();
+            let op_inputs = op.lock_inputs();
             let slab = op_inputs.first().ok_or_else(|| {
                 Error::InvalidArgument("SliceUpdate: missing slab input (inputs[0])".into())
             })?;
@@ -299,11 +299,11 @@ fn visit(
         return; // already materialized; skip the whole subtree below.
     }
     if let Some(op) = inner.op.as_ref() {
-        let inputs = op.inputs.lock().expect("op inputs mutex poisoned");
-        for input in inputs.iter() {
+        // Snapshot the handles so the lock isn't held across recursion.
+        let inputs = op.inputs();
+        for input in &inputs {
             visit(&input.inner, visited, order);
         }
-        drop(inputs);
         order.push(inner.clone());
     } else if let Some(view) = inner.view.as_ref() {
         // Views own no storage; eval needs to chase the source so the
@@ -472,7 +472,7 @@ fn dispatch_copy(
         .device
         .as_ref()
         .expect("op nodes are always constructed with a device");
-    let inputs = op.inputs();
+    let inputs = op.lock_inputs();
     let input = inputs
         .first()
         .expect("Copy has exactly one input by construction");
@@ -554,7 +554,7 @@ fn dispatch_slice_update(
         DType::BF16,
         "slice_update dispatch: non-bf16 reached eval"
     );
-    let inputs = op.inputs();
+    let inputs = op.lock_inputs();
     let src = inputs.get(1).ok_or_else(|| {
         Error::InvalidArgument("SliceUpdate: missing src input (inputs[1])".into())
     })?;
@@ -809,7 +809,7 @@ fn dispatch_quantized_matmul(
         .device
         .as_ref()
         .expect("op nodes are always constructed with a device");
-    let inputs = op.inputs();
+    let inputs = op.lock_inputs();
     let weight = inputs.first().ok_or_else(|| {
         Error::InvalidArgument("QuantizedMatMul: missing weight input (inputs[0])".into())
     })?;
@@ -914,7 +914,7 @@ fn dispatch_binary(
         .device
         .as_ref()
         .expect("op nodes are always constructed with a device");
-    let inputs = op.inputs();
+    let inputs = op.lock_inputs();
     let lhs = inputs
         .first()
         .ok_or_else(|| Error::InvalidArgument("Binary: missing lhs input (inputs[0])".into()))?;
@@ -1173,7 +1173,7 @@ fn dispatch_unary(
         .device
         .as_ref()
         .expect("op nodes are always constructed with a device");
-    let inputs = op.inputs();
+    let inputs = op.lock_inputs();
     let input = inputs
         .first()
         .ok_or_else(|| Error::InvalidArgument("Unary: missing input (inputs[0])".into()))?;
@@ -1245,7 +1245,7 @@ fn dispatch_reduce(
         .device
         .as_ref()
         .expect("op nodes are always constructed with a device");
-    let inputs = op.inputs();
+    let inputs = op.lock_inputs();
     let input = inputs
         .first()
         .ok_or_else(|| Error::InvalidArgument("Reduce: missing input (inputs[0])".into()))?;
@@ -1341,7 +1341,7 @@ fn dispatch_arg_reduce(
     axis: usize,
 ) -> Result<()> {
     let device = inner.device.as_ref().expect("op nodes carry a device");
-    let inputs = op.inputs();
+    let inputs = op.lock_inputs();
     let input = inputs
         .first()
         .ok_or_else(|| Error::InvalidArgument("ArgReduce: missing input (inputs[0])".into()))?;
@@ -1380,7 +1380,7 @@ fn dispatch_gather(
         .device
         .as_ref()
         .expect("op nodes are always constructed with a device");
-    let inputs = op.inputs();
+    let inputs = op.lock_inputs();
     let src_tensor = inputs
         .first()
         .ok_or_else(|| Error::InvalidArgument("Gather: missing src (inputs[0])".into()))?;
@@ -1490,7 +1490,7 @@ fn dispatch_dequantize(
              (got group_size={group_size}, bits={bits})",
         )));
     }
-    let inputs = op.inputs();
+    let inputs = op.lock_inputs();
     let w_q = inputs
         .first()
         .ok_or_else(|| Error::InvalidArgument("Dequantize: missing w_q (inputs[0])".into()))?;
@@ -1546,7 +1546,7 @@ fn dispatch_rope(
         .as_ref()
         .expect("op nodes are always constructed with a device");
 
-    let inputs = op.inputs();
+    let inputs = op.lock_inputs();
     let input = inputs
         .first()
         .ok_or_else(|| Error::InvalidArgument("Rope: missing input (inputs[0])".into()))?;
@@ -1610,7 +1610,7 @@ fn dispatch_rms_norm(
         .as_ref()
         .expect("op nodes are always constructed with a device");
 
-    let inputs = op.inputs();
+    let inputs = op.lock_inputs();
     let x = inputs
         .first()
         .ok_or_else(|| Error::InvalidArgument("RmsNorm: missing x (inputs[0])".into()))?;
@@ -1666,7 +1666,7 @@ fn dispatch_softmax(
         .as_ref()
         .expect("op nodes are always constructed with a device");
 
-    let inputs = op.inputs();
+    let inputs = op.lock_inputs();
     let input = inputs
         .first()
         .ok_or_else(|| Error::InvalidArgument("Softmax: missing input (inputs[0])".into()))?;
@@ -1743,7 +1743,7 @@ fn dispatch_matmul(
         .as_ref()
         .expect("op nodes are always constructed with a device");
 
-    let inputs = op.inputs();
+    let inputs = op.lock_inputs();
     let lhs = inputs
         .first()
         .ok_or_else(|| Error::InvalidArgument("MatMul: missing LHS (inputs[0])".into()))?;
@@ -1810,7 +1810,7 @@ fn dispatch_sdpa(
             "sdpa: causal=true not yet supported in the vector dispatch (Plan B)".into(),
         ));
     }
-    let inputs = op.inputs();
+    let inputs = op.lock_inputs();
     if inputs.len() > 3 {
         return Err(Error::InvalidArgument(
             "sdpa: mask not yet supported in the vector dispatch (Plan B)".into(),

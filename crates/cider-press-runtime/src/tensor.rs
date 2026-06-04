@@ -152,20 +152,22 @@ impl OpNode {
     /// the node has been detached after eval. Locking is uncontended —
     /// eval is single-threaded — so this is just a clone of 1–4 handles.
     pub(crate) fn inputs(&self) -> Vec<Tensor> {
-        self.inputs
-            .lock()
-            .expect("op inputs mutex poisoned")
-            .clone()
+        self.lock_inputs().clone()
+    }
+
+    /// Borrow the input handles under the lock, without cloning. For flat,
+    /// non-recursive readers (the dispatch arms); anything that recurses
+    /// back into the graph must snapshot via [`OpNode::inputs`] instead so
+    /// the lock isn't held across arbitrary-depth descent.
+    pub(crate) fn lock_inputs(&self) -> std::sync::MutexGuard<'_, Vec<Tensor>> {
+        self.inputs.lock().expect("op inputs mutex poisoned")
     }
 
     /// Drop this node's references to its producers, breaking its retention
     /// of the upstream graph. Called after the node's cache is populated.
     /// Idempotent.
     pub(crate) fn detach(&self) {
-        self.inputs
-            .lock()
-            .expect("op inputs mutex poisoned")
-            .clear();
+        self.lock_inputs().clear();
     }
 }
 
