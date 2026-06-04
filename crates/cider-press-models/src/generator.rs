@@ -250,7 +250,7 @@ impl Iterator for GenerateIter<'_> {
         // Those lookahead forwards also advanced KvCache.position; reusing
         // the same Generator for another generate() is safe only because
         // generate() calls reset() unconditionally, and reset()'s precondition
-        // (prior_update_evaluated) is satisfied because each dropped PendingEval
+        // (prior_update_committed) is satisfied because each dropped PendingEval
         // blocks until its command buffer completes, materializing the KvCache's
         // latest update before the slab is reused.
         if self.done {

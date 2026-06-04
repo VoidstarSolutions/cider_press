@@ -32,6 +32,7 @@
 
 use std::marker::PhantomData;
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use cider_press_kernels::Buffer;
@@ -73,6 +74,14 @@ pub(crate) struct TensorInner {
     /// the inner — that's what makes [`Tensor::cpu_bytes`] safe to
     /// expose as `&[u8]`.
     pub(crate) cache: OnceLock<LeafStorage>,
+    /// `true` while a [`Tensor::eval_async`] batch that writes this node's
+    /// buffer is committed but not yet known complete. The cache is
+    /// populated at commit time (so dependent graphs can chain off the
+    /// buffer GPU-side), but host reads must not observe bytes the GPU is
+    /// still writing — [`Tensor::resolve_leaf`] treats an in-flight leaf
+    /// as unmaterialized. Set by `eval_async`, cleared by
+    /// [`crate::PendingEval`] once the GPU is done (wait or drop).
+    pub(crate) in_flight: AtomicBool,
 }
 
 /// A view onto another tensor's storage.
@@ -448,6 +457,7 @@ impl Tensor {
                 op: None,
                 view: None,
                 cache: OnceLock::new(),
+                in_flight: AtomicBool::new(false),
             }),
         }
     }
@@ -469,6 +479,7 @@ impl Tensor {
                 op: None,
                 view: None,
                 cache: OnceLock::new(),
+                in_flight: AtomicBool::new(false),
             }),
         }
     }
@@ -597,6 +608,7 @@ impl Tensor {
                 op: None,
                 view: None,
                 cache,
+                in_flight: AtomicBool::new(false),
             }),
         }
     }
@@ -625,6 +637,7 @@ impl Tensor {
                     byte_offset,
                 }),
                 cache: OnceLock::new(),
+                in_flight: AtomicBool::new(false),
             }),
         }
     }
@@ -676,6 +689,7 @@ impl Tensor {
                 }),
                 view: None,
                 cache: OnceLock::new(),
+                in_flight: AtomicBool::new(false),
             }),
         }
     }
@@ -2319,8 +2333,13 @@ impl Tensor {
     /// Commit this tensor's graph to the GPU **without waiting**, returning
     /// a [`PendingEval`](crate::PendingEval) to block on later. Result
     /// caches are populated at commit time so dependent graphs can chain off
-    /// this tensor immediately, but its bytes are not host-readable until the
-    /// returned handle is waited (see `PendingEval`'s contract).
+    /// this tensor immediately, but its bytes are not host-readable until
+    /// the GPU finishes: while the batch is in flight,
+    /// [`Tensor::is_materialized`] reports `false` and
+    /// [`Tensor::cpu_bytes`] / [`Tensor::cpu_slice`] / [`Tensor::cpu_iter`]
+    /// return `None`. The gate lifts when the returned handle observes
+    /// completion ([`PendingEval::wait`](crate::PendingEval::wait) or its
+    /// blocking drop).
     pub fn eval_async(&self) -> Result<crate::PendingEval> {
         crate::eval::eval_async(self)
     }
@@ -2384,7 +2403,10 @@ impl Tensor {
     /// Whether this tensor's backing buffer has been materialized
     /// and can be read host-side. `true` for host-constructed leaves
     /// (always), for op tensors after [`Tensor::eval`], and for views
-    /// whose source chain terminates at a materialized leaf.
+    /// whose source chain terminates at a materialized leaf. `false`
+    /// while an [`Tensor::eval_async`] batch covering this tensor is
+    /// still in flight — the buffer exists (dependent graphs can chain
+    /// off it) but its bytes are not yet host-readable.
     #[must_use]
     pub fn is_materialized(&self) -> bool {
         self.resolve_leaf().is_some()
@@ -2477,18 +2499,42 @@ impl Tensor {
 
     /// Walk the view chain to the backing leaf, accumulating
     /// byte-offset. Returns `(leaf_storage, total_byte_offset)`. None
-    /// if any link in the chain is unmaterialized (placeholder or an
-    /// op that hasn't been evaluated yet).
+    /// if any link in the chain is unmaterialized (placeholder, an op
+    /// that hasn't been evaluated yet, or an op committed by
+    /// [`Tensor::eval_async`] whose GPU work is still in flight — the
+    /// buffer exists but its bytes are not yet host-readable).
     pub(crate) fn resolve_leaf(&self) -> Option<(&LeafStorage, usize)> {
         let mut current = &self.inner;
         let mut offset: usize = 0;
         loop {
             if let Some(storage) = current.cache.get() {
+                if current.in_flight.load(Ordering::Acquire) {
+                    return None;
+                }
                 return Some((storage, offset));
             }
             let view = current.view.as_ref()?;
             offset = offset.checked_add(view.byte_offset)?;
             current = &view.source.inner;
+        }
+    }
+
+    /// Whether this tensor's backing storage exists, counting buffers
+    /// whose `eval_async` batch is committed but still in flight (which
+    /// [`Tensor::is_materialized`] does not). Crate-internal: `KvCache`'s
+    /// slab-reuse guard needs "the write has been encoded and committed"
+    /// — a committed `SliceUpdate` can never replay, because any later
+    /// eval short-circuits on its populated cache — not host-readability.
+    pub(crate) fn is_committed(&self) -> bool {
+        let mut current = &self.inner;
+        loop {
+            if current.cache.get().is_some() {
+                return true;
+            }
+            match current.view.as_ref() {
+                Some(view) => current = &view.source.inner,
+                None => return false,
+            }
         }
     }
 
@@ -3270,6 +3316,7 @@ mod tests {
                     byte_offset,
                 }),
                 cache: OnceLock::new(),
+                in_flight: AtomicBool::new(false),
             }),
         }
     }

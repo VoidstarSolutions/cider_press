@@ -100,9 +100,10 @@ fn encode_ops(
 
 /// Step 6: populate each node's result cache from its output buffer.
 /// The buffer handle is valid immediately after allocation; its bytes are only
-/// valid after `commit_and_wait` (or equivalent GPU completion), so a caller
-/// must order this so any host read of the cached bytes happens after the GPU
-/// finishes.
+/// valid after `commit_and_wait` (or equivalent GPU completion). The sync
+/// path orders this after the wait; the async path sets each node's
+/// `in_flight` flag first, so host reads stay gated until `PendingEval`
+/// observes completion.
 fn populate_caches(
     order: &[Arc<TensorInner>],
     outputs: Vec<Buffer<u8>>,
@@ -153,6 +154,14 @@ pub(crate) fn eval_async(root: &Tensor) -> Result<crate::PendingEval> {
     let mut commands = device.kernels().commands()?;
     let (outputs, tags) = encode_ops(&order, device, &mut commands)?;
     let in_flight = commands.commit()?;
+    // Flag before populating: a populated cache with the flag set means
+    // "buffer exists, bytes not host-readable" (resolve_leaf returns None).
+    // GPU-side chaining reads the cache directly and is unaffected.
+    for inner in &order {
+        inner
+            .in_flight
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
     populate_caches(&order, outputs, tags, device);
     // Detach before the GPU finishes. A cross-eval input whose last Arc drops
     // here returns its buffer to the pool mid-flight; reuse by the next eval is
@@ -1992,6 +2001,26 @@ mod async_tests {
             b.cpu_to_vec::<bf16>().expect("b bytes"),
             bf16_vec(&[2.0, 4.0, 6.0, 8.0])
         );
+    }
+
+    /// Host reads are gated while a committed batch is in flight: between
+    /// `eval_async` and `wait`, the tensor has storage (dependent graphs can
+    /// chain off it) but must not look host-readable.
+    #[test]
+    fn eval_async_gates_host_reads_until_wait() {
+        let device = Device::system_default().expect("device");
+        let a = Tensor::from_slice(&device, &bf16_vec(&[1.0, 2.0]), [2]).expect("a");
+        let b = a.add(&a).expect("b = a + a");
+        let pending = b.eval_async().expect("eval_async");
+        assert!(
+            !b.is_materialized(),
+            "in-flight tensor must not report host-readable"
+        );
+        assert!(b.cpu_bytes().is_none());
+        assert!(b.cpu_to_vec::<bf16>().is_none());
+        pending.wait().expect("wait");
+        assert!(b.is_materialized());
+        assert_eq!(b.cpu_to_vec::<bf16>().expect("b"), bf16_vec(&[2.0, 4.0]));
     }
 
     /// Two chained async evals — the second consumes the first's output —
