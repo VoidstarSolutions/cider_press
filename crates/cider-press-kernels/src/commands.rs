@@ -46,6 +46,14 @@ pub struct Commands<'d> {
     /// When set, the next `encoder()` opens a sampled pass for this
     /// (start, end) sample-index pair, then clears.
     armed: Option<(usize, usize)>,
+    /// Fence taken from the device when this session's first encoder
+    /// opened. If the session is dropped uncommitted (work discarded),
+    /// this is restored as the device chain tail — fences published by
+    /// this session's encoders would never signal, since their updates
+    /// die with the uncommitted buffer.
+    chain_restore: Option<Retained<ProtocolObject<dyn MTLFence>>>,
+    /// True once this session has opened its first encoder.
+    chain_started: bool,
 }
 
 impl<'d> Commands<'d> {
@@ -66,6 +74,8 @@ impl<'d> Commands<'d> {
             fence: None,
             sampler: None,
             armed: None,
+            chain_restore: None,
+            chain_started: false,
         })
     }
 
@@ -139,7 +149,11 @@ impl<'d> Commands<'d> {
             };
             if let Some(prev) = self.device.take_last_fence() {
                 enc.waitForFence(&prev);
+                if !self.chain_started {
+                    self.chain_restore = Some(prev);
+                }
             }
+            self.chain_started = true;
             let own = self.device.new_fence()?;
             enc.updateFence(&own);
             self.fence = Some(own);
@@ -164,6 +178,7 @@ impl<'d> Commands<'d> {
     /// the GPU reports a failure status for the batch.
     pub fn commit_and_wait(mut self) -> Result<()> {
         self.close_encoder();
+        self.chain_restore = None;
         self.cmd.commit();
         self.cmd.waitUntilCompleted();
         check_completed(&self.cmd)
@@ -176,6 +191,7 @@ impl<'d> Commands<'d> {
     /// re-committed.
     pub fn commit(mut self) -> Result<CommandsInFlight> {
         self.close_encoder();
+        self.chain_restore = None;
         self.cmd.commit();
         // Refcount bump: the `Commands` Drop runs at end of this fn (encoder
         // already taken, so it is a no-op), while the handle keeps the
@@ -190,6 +206,7 @@ impl<'d> Commands<'d> {
     /// Returns an empty vec if this session has no sampler.
     pub fn commit_wait_resolve(mut self) -> Result<Vec<GpuSegment>> {
         self.close_encoder();
+        self.chain_restore = None;
         self.cmd.commit();
         self.cmd.waitUntilCompleted();
         check_completed(&self.cmd)?;
@@ -258,10 +275,17 @@ impl Drop for CommandsInFlight {
 
 impl Drop for Commands<'_> {
     fn drop(&mut self) {
-        // If the user dropped without committing, end encoding cleanly
-        // but don't commit — they explicitly chose not to send this
-        // batch to the GPU. The command buffer reference dies with us.
-        self.close_encoder();
+        // Abandoned (uncommitted) session: the encoded fence updates die
+        // with the buffer, so end the encoder WITHOUT publishing its fence
+        // and restore the chain tail this session displaced. Committed
+        // sessions cleared `chain_restore` and closed their encoder already.
+        if let Some(enc) = self.encoder.take() {
+            enc.endEncoding();
+            self.fence = None;
+        }
+        if let Some(prev) = self.chain_restore.take() {
+            self.device.set_last_fence(prev);
+        }
     }
 }
 
