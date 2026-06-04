@@ -4509,6 +4509,36 @@ mod tests {
     }
 
     #[test]
+    fn elided_copy_aliases_and_retains_its_source() {
+        // The elided copy() is a zero-copy view: it must share the source's
+        // storage (no fresh buffer) and keep the source alive via its
+        // ViewSource Arc — the aliasing the spec's KvCache contract relies on.
+        let device = Device::shared().expect("system default device");
+        let data: Vec<f32> = (0..8_u8).map(f32::from).collect(); // H=2 D=4 shape below
+        let base = Tensor::from_slice(&device, &data, [1usize, 1, 2, 4]).expect("from_slice");
+        let view = base.permute(&[0, 2, 1, 3]).expect("permute"); // [1,2,1,4] degenerate
+        let copied = view.copy().expect("copy");
+
+        // Aliases: the elided view's storage owner is `base` itself.
+        let (source, byte_offset) = copied.flatten_view();
+        assert!(
+            Arc::ptr_eq(&source.inner, &base.inner),
+            "elided copy must share its source's storage"
+        );
+        assert_eq!(byte_offset, 0);
+
+        // Retains: dropping every other handle leaves the data readable
+        // through the elided view alone (the ViewSource Arc keeps the
+        // backing leaf alive).
+        drop(view);
+        drop(base);
+        assert_eq!(
+            copied.cpu_slice::<f32>().expect("read through elided view"),
+            data.as_slice()
+        );
+    }
+
+    #[test]
     fn copy_of_genuine_transpose_still_materializes() {
         // [2,3] -> [3,2] transpose is NOT contiguous-mod-unit; copy() must
         // still build a Copy op (existing behavior).
