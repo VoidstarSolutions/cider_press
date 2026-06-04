@@ -5,11 +5,17 @@ measured via `cider-press bench`, compared against `mlx_lm` on the same
 prompt and token budget. Methodology: warm up, then time a steady-state
 window; see `docs/ARCHITECTURE.md` for the architecture and forward backlog.
 
-The headline: decode runs **~1.20× slower than MLX** at the full-model
-scale (~473 vs ~569 tok/s), down from ~1.35× before decode copy-elimination
-and from ~2.3× two branches ago — the fused `RMSNorm`, **async decode
-pipelining**, and **decode copy-elimination (S1)** stack to **~1.95×** over
-the pre-fusion ~243 baseline. Three
+The headline: decode is **essentially at parity with MLX** at the full-model
+scale (**~561 vs ~564 tok/s, ~1.00×**), down from ~1.20× before the
+**encoder/sync-model port** and from ~2.3× several branches ago — the fused
+`RMSNorm`, **async decode pipelining**, **decode copy-elimination (S1)**, and
+the **encoder/sync-model port** stack to **~2.31×** over the pre-fusion ~243
+baseline. The port replaced Metal's serial-encoder + automatic-hazard-tracking
+dispatch model with MLX's own — hazard-untracked buffers, an explicit
+`MTLFence` chain across encoders, concurrent-dispatch encoders, and
+graph-level barrier elision scheduled in Kahn-wave order — lifting decode
+**~473 → ~561 tok/s** and closing the last of the gap to `mlx_lm`. See
+**Dispatch-serialization gap** below for the measured trajectory. Three
 prior changes set the stage — the in-graph KV write (SliceUpdate)
 collapsed each step to **one command buffer per token** (~1.6×), the
 fused `sdpa_vector` decode-attention kernel lifted decode to ~120 tok/s
@@ -37,18 +43,20 @@ less CPU encode left to hide). Decode copy-elimination (S1) then lifted
 decode to **~473 tok/s** (depth-1) / **~352 tok/s** (depth-0). See
 **Async decode pipelining** and **Decode copy elimination (S1)** below.
 
-The remaining gap is **critical-path-bound**: `tensor.eval` is ~90% of the
-decode step, and its GPU wait is a deep chain of **dependent dispatches** —
-the 4-bit `qmv` matvecs plus the many small ops gated behind them. A
-concurrent-encoder spike (see the **Concurrent-encoder spike** section) tested
-whether the serial Metal encoder was throttling this and found it is **not**:
-with correct hazard barriers, overlapping dispatch is a net loss. The levers
-are fusion (fewer dependent dispatches — `RMSNorm` done, decode `copy`s now
-elided by S1), faster kernels, and pipelining (now landed) — not the dispatch
-model. **Update (2026-06-04):** a trace-level comparison revised this — the
-remaining ~1.20× *is* the dispatch model after all (the spike tested a hybrid
-configuration that pays both tracked-hazard and barrier costs); see
-**Dispatch-serialization gap** below.
+The decode step is dominated by `tensor.eval` (~90%), whose GPU wait is a
+deep chain of **dependent dispatches** — the 4-bit `qmv` matvecs plus the many
+small ops gated behind them. An early concurrent-encoder spike (see the
+**Concurrent-encoder spike** section) concluded the dispatch model was *not*
+the lever; a 2026-06-04 trace-level comparison **overturned that** — the
+remaining ~1.20× *was* the dispatch model (the spike had tested a hybrid
+configuration paying both tracked-hazard and barrier costs). The
+**encoder/sync-model port** that followed (hazard-untracked buffers + fence
+chain + concurrent encoders + graph-level barrier elision in Kahn-wave order)
+closed it: decode **~473 → ~561 tok/s, ~1.00× of `mlx_lm`**. See
+**Dispatch-serialization gap** for the full measured story. The remaining
+levers are now kernel-side (small-N `qmv` launch config), prefill strided work
+(S2–S5), within-eval reuse for RSS, and `.metallib` precompile — not the
+dispatch model, which is done.
 
 ## Environment
 
@@ -71,17 +79,18 @@ configuration that pays both tracked-hazard and barrier costs); see
 
 | phase   | cider-press | mlx_lm  | ratio (mlx ÷ cp) |
 |---------|------------:|--------:|-----------------:|
-| prefill | ~376 tok/s  | ~1346 tok/s | ~3.6× |
-| decode  | ~473 tok/s  | ~569 tok/s  | ~1.20× |
+| prefill | ~917 tok/s  | ~1390 tok/s | ~1.52× |
+| decode  | ~561 tok/s  | ~564 tok/s  | ~1.00× |
 
 - **Prefill** processes the 39-token prompt in one forward. cider-press
-  ranged 346–391 tok/s across warm runs (~376 median); `mlx_lm` ~1346.
-  Note this branch does **not** target prefill — a single forward with an
-  empty pool gets no cross-eval reuse, so the figure is within run-to-run
-  variance of the prior ~290 (263–358) baseline, not a pool effect.
-  Prefill still runs the **composed** attention path (the fused vector
-  kernel is the decode/T=1 path; prefill fusion is deferred — see
-  `docs/ARCHITECTURE.md`).
+  ranged 880–943 tok/s across warm runs (~917 median); `mlx_lm` ~1390.
+  This branch does **not** target prefill, but the encoder/sync-model port
+  lifted it incidentally (the prior baseline was ~376) — the same
+  untracked-buffer + fence-chain dispatch model that pays off in decode
+  also unblocks the prefill command buffer. Prefill still runs the
+  **composed** attention path (the fused vector kernel is the decode/T=1
+  path; prefill fusion is deferred — see `docs/ARCHITECTURE.md`), so the
+  remaining ~1.52× gap is the composed-attention work, not dispatch.
 - **Decode** is the per-token steady state (the perf-dominant path). The
   prior SliceUpdate (~55 → ~90 tok/s, ~1.6×) and fused `sdpa_vector`
   (~90 → ~120 tok/s, ~1.33×) changes preceded this branch. The
@@ -101,9 +110,13 @@ configuration that pays both tracked-hazard and barrier costs); see
   base, a ~1.33× overlap). **Decode copy-elimination (S1)** then lifted
   **~420 → ~473 tok/s** (~1.13×) by eliding the ~144 degenerate
   attention-permute copies (zero-copy views, no kernel work); depth-0 likewise
-  rose from ~317 → ~352 tok/s. The **remaining ~1.20× gap** to `mlx_lm`
-  (~569) is critical-path-bound — the chain of dependent dispatches in
-  `tensor.eval.wait`, not CPU encode.
+  rose from ~317 → ~352 tok/s. The **encoder/sync-model port** then closed the
+  remaining gap, lifting decode **~473 → ~561 tok/s** (depth-1, range
+  553–568) and depth-0 **~352 → ~447 tok/s** by replacing Metal's
+  serial-encoder + automatic-hazard dispatch model with MLX's
+  untracked-buffer + fence-chain + concurrent-encoder model under graph-level
+  barrier elision (see **Dispatch-serialization gap**). At **~561 vs ~564**
+  the decode gap to `mlx_lm` is **~1.00× — essentially closed**.
 - Load time (excluded from tok/s): ~0.17 s.
 
 **Cold-start note:** the very first forward of a fresh process triggers
@@ -418,23 +431,50 @@ KvCache slice-update collapse — once per-step graphs stop being pinned by
 the cache chain, each token's intermediates free as the next token starts,
 so they no longer accumulate. The remaining gap to `mlx_lm`'s ~329 MiB is
 **within-eval reuse**: MLX frees intermediates *during* eval (depth-first)
-and reuses buffers within a single token, while cider-press submits a token
-as one command buffer with every intermediate live simultaneously, so the
-pool reclaims cross-token only. Mid-eval freeing is a separate future
+and reuses buffers within a single token, while cider-press keeps every
+intermediate of a token live simultaneously across its command-buffer chunks,
+so the pool reclaims cross-token only (the encoder/sync-model port chunks the
+token into ~11 command buffers, but they are committed back-to-back with all
+outputs retained, so peak is unchanged). Mid-eval freeing is a separate future
 lever.
 
 ## Hot spots & next levers
 
-The decode step is **critical-path-bound**. The CPU-side taxes are gone —
-the SliceUpdate collapsed the dispatch round-trips, the buffer pool moved
-per-op allocation off the serial encode path (encode ~12% of the step), and
-the GPU argmax removed the post-eval vocab scan. What remains is
-`tensor.eval.wait` (~77% of decode): a deep chain of ~900 *dependent*
-dispatches/token — the 4-bit `qmv` matvecs plus the small ops gated behind
-them — where each link pays GPU launch + inter-dispatch latency. The
-**Concurrent-encoder spike** confirmed this is not removable serialization:
-correct concurrent dispatch is a net loss. So the levers shorten or speed
-the critical path. In measurement-justified priority:
+The decode step is **GPU-bound on a chain of dependent dispatches**, and
+the dispatch-model overhead on that chain is now **gone** — the
+encoder/sync-model port (below) closed the last ~1.20× to `mlx_lm`. The
+CPU-side taxes were already gone (SliceUpdate collapsed the round-trips,
+the buffer pool moved per-op allocation off the encode path, GPU argmax
+removed the post-eval scan). What remains is the ~536 *dependent*
+dispatches/token themselves — the 4-bit `qmv` matvecs plus the small ops
+gated behind them — at MLX's own per-dispatch cost. The levers that remain
+shorten the chain or speed each link. In measurement-justified priority:
+
+- **MLX encoder/sync model — done (~1.19×, ~473 → ~561 tok/s).** Ported
+  MLX's dispatch model: hazard-untracked buffers, an explicit `MTLFence`
+  chain across encoders (signalled at encoder *close* — captures only
+  commands encoded before it), concurrent-dispatch encoders, and
+  **graph-level barrier elision** (a `memoryBarrier` only before dispatches
+  that actually hazard a buffer written since the last barrier), scheduled in
+  **Kahn-wave** order so independent ops sit adjacent and overlap. This
+  closed the dispatch-serialization gap — decode is now **~1.00× of
+  `mlx_lm`**. The trajectory, falsified hypotheses (barrier-per-dispatch
+  worse than serial on real kernels; untracked-alone flat; the `updateFence`
+  no-op bug), and the elision/wave measurements are in
+  **Dispatch-serialization gap § Measured result**. Escape hatches:
+  `CIDER_PRESS_TRACKED_BUFFERS=1`, `CIDER_PRESS_NO_BARRIER_ELISION=1`.
+- **Small-N `qmv` launch config — the leading remaining lever.** With the
+  dispatch model closed, the heaviest dispatches in the chain are the 4-bit
+  `qmv` matvecs (~61% of GPU time, counter-sampled). The `## qmv audit`
+  localized the headroom: the large-N linears are roofline-bound (~464 GB/s,
+  near the M4 Max spec), but the small-N decode projections (k/v_proj
+  ~13 GB/s, q/o_proj ~85) are occupancy-starved by the generic
+  `(1, ceil(N/8), 1)` grid. A small-N launch-config fix (split the output
+  dim across more threadgroups), with fast-path-via-padding as a secondary
+  lever, is dispatch-side and parity-preserving — backlog #4.
+- **Within-eval reuse (RSS) and prefill strided work (S2–S5)** —
+  orthogonal levers (memory, and the composed prefill path); see the
+  per-section notes below.
 
 - **Kernel fusion / copy elision — the leading lever (in progress).** Fewer
   dependent dispatches ⇒ a shorter critical path ⇒ less inter-dispatch
@@ -448,25 +488,23 @@ the critical path. In measurement-justified priority:
   T=1 are now elided as zero-copy views (`Strides::is_contiguous_ignoring_unit_dims`),
   dropping decode from ~420 → ~473 tok/s and total dispatches/token from ~680
   → ~536; `gpu.copy` is now 2 dispatches / 0.2% GPU (was 146 / 11.2%). The
-  **remaining ~1.20× gap** to `mlx_lm` (~569) is still critical-path-bound.
+  ~1.20× gap that remained after S1 was then closed by the encoder/sync-model
+  port (above), not by further fusion.
   What remains of backlog #9 (strided-aware kernels) is the **prefill** strided
   path (S2–S5): rope strides, `slice_update` strided src, gemm
   transpose+broadcast, qmv strided — none of these affect decode, which is
   down to 2 copy dispatches. Note SwiGLU's `silu*up` and RoPE are *not* fusion
   targets: MLX composes SwiGLU itself, and we already dispatch RoPE/decode-SDPA
   fused.
-- **MLX encoder/sync model — the new leading lever (2026-06-04).** The
-  trace comparison localized the remaining ~1.20× to per-dispatch
-  serialization: porting MLX's model (hazard-untracked buffers + explicit
-  per-encoder fences + concurrent encoders with in-chain barriers + the
-  50-op command-buffer chunking already landed) is worth an estimated
-  ~470 → ~550 tok/s. See **Dispatch-serialization gap**.
-- **Concurrent dispatch encoder — tested, rejected (revised 2026-06-04).**
-  Flipping serial → concurrent dispatch and inserting correct hazard
-  barriers *on top of tracked buffers in one monolithic command buffer* is
-  byte-identical to serial but ~13% *slower*. That negative result stands
-  only for the hybrid configuration the spike tested; the full MLX model
-  measures faster (see **Dispatch-serialization gap**).
+- **Concurrent dispatch encoder — superseded (the full port shipped).**
+  An early spike rejected concurrent dispatch + hazard barriers *on top of
+  tracked buffers in one monolithic command buffer* (byte-identical to serial
+  but ~13% slower). That negative result held only for the hybrid
+  configuration; the **full MLX model** — untracked buffers + fence chain +
+  concurrent encoders + graph-level barrier elision in Kahn-wave order — is
+  what shipped and what closed the gap (~1.19×, see the done lever above).
+  Barrier-per-dispatch (the spike's model) really is slower than serial on
+  real kernels; *rare* barriers via elision are what pay.
 - **Buffer pool / allocator — done (~1.75× with the KvCache fix).** A
   cross-token free-list recycles op-output scratch (98% decode hit), and
   the enabling `KvCache::update` slab-base change stopped the cache
@@ -578,7 +616,98 @@ i.e. decode ~470 → ~550 tok/s, closing most of the remaining ~1.20×.
 Design/plan: `docs/superpowers/plans/2026-06-04-encoder-dispatch-model.md`
 (branch `perf/encoder-dispatch-model`).
 
+### Measured result (2026-06-04, post-port)
+
+The port landed and the estimate held — decode finished at **~561 tok/s**
+vs `mlx_lm` **~564** (same-day, same machine), **~1.00×**. But the path was
+not the one the plan drew, and several intermediate hypotheses were
+falsified along the way. The trajectory (M4 Max, warm, `--max-tokens 128
+--warmup 8`, median of 3–5, depth-1 unless noted):
+
+| stage                                            | decode tok/s |
+|--------------------------------------------------|-------------:|
+| S1 baseline (single serial encoder/token)        | ~473 |
+| + 50-op command-buffer chunking (tracked)        | ~463 (neutral) |
+| + concurrent encoders, barrier-per-dispatch (tracked) | ~432 (regression) |
+| + hazard-untracked buffers                        | ~430 (flat) |
+| + graph-level barrier elision, **DFS** order      | ~457 |
+| + `updateFence`-at-close bug fix                  | ~461 |
+| + **Kahn-wave** scheduling                        | **~561** |
+
+What each step taught:
+
+- **Chunking alone was neutral (~463).** Splitting the per-token command
+  buffer every 50 ops dropped per-chunk GPU cost to MLX's (~170 µs/chunk),
+  but with buffers still hazard-**tracked**, Metal's automatic
+  command-buffer-seam analysis stalled the chunks channel-resident (interval
+  sum ~4× the wall span). No wall-clock change.
+- **Concurrent + barrier-per-dispatch was a transient regression
+  (~432).** On the concurrent encoder, a global `memoryBarrier` before every
+  dependent dispatch costs *more* than a serial encoder's implicit
+  per-dispatch serialization on real production kernels. The
+  `encoder_overhead_bench` microbench had predicted the opposite (concurrent
+  ~2.1 vs serial ~3.2 µs/dispatch) — but it chained hidden-dim adds at
+  sub-µs kernel scale, where the barrier is cheap relative to a real qmv;
+  **the microbench misled.** On production kernels the ordering inverts:
+  barrier-per-dispatch is the slow path. The barrier had to become *rare*,
+  not merely cheap — which is what elision does.
+- **Untracked buffers alone were flat (~430).** The hypothesis that the
+  tracked-hazard seam analysis was the wall-clock stall was **falsified at
+  the wall-clock level**: flipping `HazardTrackingModeUntracked` on top of
+  the barrier-per-dispatch model changed nothing (the xctrace timeline stayed
+  fully dense, GPU/token ~2390 µs). The tracked-seam analysis *was* real in
+  the trace, but it was not the binding wall-clock cost — the
+  barrier-per-dispatch tax dominated it.
+- **Graph-level barrier elision (DFS order) was the first real win
+  (+8%, ~457 vs ~424 with elision off).** Modeled on MLX's window-reset
+  hazard tracking: a `memoryBarrier` orders everything before it against
+  everything after, so at each encode point only buffers written *since the
+  last barrier* can race — an op missing that working set elides its barrier.
+  But under the existing **DFS post-order** `build_order`, dependent ops are
+  emitted back-to-back, so consecutive ops almost always hazard: measured
+  elision rate **82/537 dispatches = 15%**. The lever was throttled by
+  schedule order, not by the elision logic.
+- **The `updateFence` placement bug (~461, and it made the chain
+  real).** The fence chain was a **no-op** the whole time: `updateFence` was
+  encoded at encoder *open*, but Metal's fence captures only commands encoded
+  **before** the update — at open there are none, so it signalled
+  immediately and the next encoder's `waitForFence` waited on nothing. The
+  untracked chunks had been racing on timing luck (and passing parity by
+  luck). Moving `updateFence` to `close_encoder` before `endEncoding` (MLX's
+  `end_encoding` placement) made the chain actually order the chunks. The
+  plan had explicitly mis-specified this ("`updateFence` may be encoded at
+  any point — equivalent"); it is not.
+- **Kahn-wave scheduling was the unlock (+22%, ~461 → ~561).** Switching
+  `build_order` from DFS post-order to **Kahn (level/wave) order** places
+  independent ops adjacent: within a wave the first op barriers and the rest
+  elide and overlap. With elision off this configuration runs ~441–447; with
+  elision on, **~561** — the elision rate climbs from 15% and the
+  independent-op overlap is what pays. Wave ordering was **not in the plan**;
+  it was the discovered unlock.
+
+The escape hatches both survive in the shipped build:
+`CIDER_PRESS_TRACKED_BUFFERS=1` restores Metal's automatic hazard tracking
+(measured ~557 — essentially neutral now that the fence chain is real, but
+kept for bisecting sync bugs), and `CIDER_PRESS_NO_BARRIER_ELISION=1`
+disables elision (measured ~442, i.e. the +27% elision win is the dominant
+contributor). Final span split at depth-1: `tensor.eval_async` (CPU encode)
+~670 µs/token, `tensor.eval_async.wait` ~948 µs/token; depth-0 (synchronous)
+~447 tok/s, a ~1.26× pipelining overlap. Peak RSS ~886 MiB, pool 96.9%.
+
+The chunk size was swept ({25, 50, 100} ops/buffer); all three land within
+run-to-run variance (~558/~550/~547 median, and a confirmation re-run of 25
+vs 50 was a tie at ~550), so the const holds at MLX's **50**.
+
 ## Concurrent-encoder spike (tested, rejected)
+
+> **Superseded (2026-06-04).** This section's conclusion — "the serial
+> encoder is not the bottleneck" — was overturned by the trace comparison
+> and the encoder/sync-model port (see **Dispatch-serialization gap §
+> Measured result**). It is preserved as a dated snapshot: its specific
+> finding holds (concurrent + barrier-per-dispatch *on tracked buffers* is
+> ~13% slower than serial), but that hybrid is not MLX's full model. The
+> shipped port — untracked buffers + fence chain + *rare* barriers via
+> elision in Kahn-wave order — measures ~1.19× faster, not slower.
 
 A spike (branch `spike/concurrent-encoder`, 2026-06-02, M4 Max) asked
 whether the serial Metal compute encoder was throttling decode. The
@@ -636,7 +765,7 @@ concurrent encoder itself is **shelved**.
   the 117 generated for this prompt); `mlx_lm`'s `generation_tps` averages
   over all generated tokens (its `--warmup` flag is accepted only for CLI
   symmetry and is informational). On a pipelined backend the skew is small
-  and, if anything, flatters cider-press — so the ~1.20× gap is not an
+  and, if anything, flatters cider-press — so the ~1.00× near-parity is not an
   artifact of windowing.
 - **Run-to-run variance** on cider-press decode is larger than MLX's
   because the synchronous per-eval path is more exposed to OS scheduling

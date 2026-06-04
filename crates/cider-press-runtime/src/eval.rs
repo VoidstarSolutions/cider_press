@@ -193,9 +193,16 @@ fn resolve_to_op(inner: &Arc<TensorInner>) -> Option<Arc<TensorInner>> {
 /// buffers (the queue pipelines buffer seams; consecutive encoders within
 /// one buffer are driver-merged, so splitting encoders alone does
 /// nothing). MLX commits every ~50 ops on M-class for the same reason
-/// (`get_max_ops_mb_per_buffer`). Cross-chunk ordering is carried by the
-/// encoder fence chain (`cider_press_kernels::Commands`): the first encoder
-/// of each new chunk waits the last fence published by the prior chunk.
+/// (`get_max_ops_mb_per_buffer`); a sweep of {25, 50, 100} here is flat
+/// within run-to-run variance, so we hold MLX's 50. Cross-chunk ordering is
+/// carried by the encoder fence chain (`cider_press_kernels::Commands`): the
+/// first encoder of each new chunk waits the last fence published by the
+/// prior chunk. This is load-bearing — buffers are allocated
+/// hazard-untracked (no automatic command-buffer seam analysis), so the
+/// fence chain is the *only* thing ordering one chunk against the next and
+/// against the prior token's still-in-flight tail. Chunk size therefore
+/// trades CPU encode granularity against how finely the GPU can pipeline
+/// seams across tokens.
 const OPS_PER_COMMAND_BUFFER: usize = 50;
 
 /// Steps 3–4: index the nodes, then allocate each op's output and encode
