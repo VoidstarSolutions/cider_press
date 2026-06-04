@@ -1447,13 +1447,26 @@ impl Tensor {
         // eval-side resolver can read it from offset 0. A strided view
         // (genuine reorder) is not — its kernel strides aren't wired yet
         // (deferred to the prefill stage), so reject it.
-        if self.inner.view.is_some() && !self.layout().is_dense_contiguous(self.shape()) {
-            return Err(Error::InvalidArgument(
-                "rope: strided view inputs are not supported; copy() first to \
-                 materialise a dense version (the rope dispatch reads inputs as \
-                 contiguous bytes and does not yet pass view strides)"
-                    .into(),
-            ));
+        if self.inner.view.is_some() {
+            if !self.layout().is_dense_contiguous(self.shape()) {
+                return Err(Error::InvalidArgument(
+                    "rope: strided view inputs are not supported; copy() first to \
+                     materialise a dense version (the rope dispatch reads inputs as \
+                     contiguous bytes and does not yet pass view strides)"
+                        .into(),
+                ));
+            }
+            // The eval-side resolver reads view inputs from byte offset 0
+            // only (matching copy()'s elision constraint), so a contiguous
+            // view starting mid-buffer must be rejected here rather than
+            // failing later inside eval.
+            let (_, byte_offset) = self.flatten_view();
+            if byte_offset != 0 {
+                return Err(Error::InvalidArgument(format!(
+                    "rope: non-zero view byte offset {byte_offset} is not supported; \
+                     copy() first to materialise a dense version at offset 0"
+                )));
+            }
         }
         if offset.inner.view.is_some() {
             return Err(Error::InvalidArgument(
@@ -4595,6 +4608,27 @@ mod tests {
             r_view.cpu_slice::<half::bf16>().unwrap(),
             r_leaf.cpu_slice::<half::bf16>().unwrap()
         );
+    }
+
+    #[test]
+    fn rope_rejects_contiguous_view_with_byte_offset() {
+        // A leading-axis slice stays dense-contiguous but starts mid-buffer.
+        // The eval-side resolver only reads views from byte offset 0, so rope
+        // must reject it at construction, not fail later inside eval.
+        let device = Device::shared().expect("system default device");
+        let data: Vec<half::bf16> = (0..16_u8)
+            .map(|i| half::bf16::from_f32(f32::from(i)))
+            .collect();
+        let base = Tensor::from_slice(&device, &data, [2usize, 1, 1, 8]).expect("from_slice");
+        let view = base.slice(&[1..2, 0..1, 0..1, 0..8]).expect("slice");
+        assert!(
+            view.layout().is_dense_contiguous(view.shape()),
+            "test input must be contiguous (only the offset is non-zero)"
+        );
+
+        let offset = Tensor::from_slice(&device, &[0i32], [1usize]).expect("offset");
+        let err = view.rope(&offset, 10000.0, 1.0, 8).unwrap_err();
+        assert!(format!("{err}").contains("byte offset"));
     }
 
     #[test]
