@@ -45,7 +45,10 @@ whether the serial Metal encoder was throttling this and found it is **not**:
 with correct hazard barriers, overlapping dispatch is a net loss. The levers
 are fusion (fewer dependent dispatches — `RMSNorm` done, decode `copy`s now
 elided by S1), faster kernels, and pipelining (now landed) — not the dispatch
-model.
+model. **Update (2026-06-04):** a trace-level comparison revised this — the
+remaining ~1.20× *is* the dispatch model after all (the spike tested a hybrid
+configuration that pays both tracked-hazard and barrier costs); see
+**Dispatch-serialization gap** below.
 
 ## Environment
 
@@ -452,11 +455,18 @@ the critical path. In measurement-justified priority:
   down to 2 copy dispatches. Note SwiGLU's `silu*up` and RoPE are *not* fusion
   targets: MLX composes SwiGLU itself, and we already dispatch RoPE/decode-SDPA
   fused.
-- **Concurrent dispatch encoder — tested, rejected.** Flipping serial →
-  concurrent dispatch and inserting correct hazard barriers is byte-identical
-  to serial but ~13% *slower* (~900/975 dispatches need a barrier; almost
-  nothing overlaps). The serial encoder is not the bottleneck. See
-  **Concurrent-encoder spike**.
+- **MLX encoder/sync model — the new leading lever (2026-06-04).** The
+  trace comparison localized the remaining ~1.20× to per-dispatch
+  serialization: porting MLX's model (hazard-untracked buffers + explicit
+  per-encoder fences + concurrent encoders with in-chain barriers + the
+  50-op command-buffer chunking already landed) is worth an estimated
+  ~470 → ~550 tok/s. See **Dispatch-serialization gap**.
+- **Concurrent dispatch encoder — tested, rejected (revised 2026-06-04).**
+  Flipping serial → concurrent dispatch and inserting correct hazard
+  barriers *on top of tracked buffers in one monolithic command buffer* is
+  byte-identical to serial but ~13% *slower*. That negative result stands
+  only for the hybrid configuration the spike tested; the full MLX model
+  measures faster (see **Dispatch-serialization gap**).
 - **Buffer pool / allocator — done (~1.75× with the KvCache fix).** A
   cross-token free-list recycles op-output scratch (98% decode hit), and
   the enabling `KvCache::update` slab-base change stopped the cache
@@ -492,6 +502,81 @@ the critical path. In measurement-justified priority:
 - **`.metallib` precompilation** — doesn't touch steady-state tok/s, but
   removes the ~43 s cold-start JIT from first-token latency in a shipped
   binary.
+
+## Dispatch-serialization gap (root cause of the remaining ~1.20×)
+
+A trace-level comparison (2026-06-04, M4 Max, `xctrace` Metal System
+Trace on both runtimes, post-S1) localized the remaining decode gap.
+Headline: **the toll is the per-dispatch serialization model, not any
+kernel** — same kernels, same dispatch counts, both runtimes 100%
+GPU-dense, but cider's single serial encoder pays ~0.6–1 µs more GPU
+time per dependent dispatch than MLX's encoder stack, summed over ~530
+dispatches/token.
+
+Evidence chain:
+
+1. **Decode is GPU-saturated.** Per token: step ~2123 µs = CPU
+   (encode ~358 + graph build ~160) fully hidden under the depth-1
+   pipeline + blocked wait ~1607. The trace confirms: one dense
+   ~2055 µs compute interval per token, inter-token gap ~0.6 µs. The
+   entire gap to `mlx_lm` (~1757 µs/token) is GPU-timeline time.
+2. **Same work on both sides.** Dispatch counts are essentially
+   identical (~536 vs ~510 — same qmv/binary/rope/sdpa/rms/slice-update
+   composition), and the kernels are the same MLX binaries. The qmv +
+   sdpa heavy compute (~1.46 ms predicted) is common to both; the
+   difference sits in the ~370 tiny dispatches and the links between
+   them.
+3. **MLX's structure differs.** Its trace shows **~10 compute encoders
+   per token** — MLX commits a command buffer every **50 ops** on
+   M-class (`get_max_ops_mb_per_buffer`, `device.cpp`) — each ~150–220
+   µs, back-to-back with ~0.7 µs seams and ~14% genuine overlap
+   (cross-token via `mlx_lm`'s async eval, plus seam pipelining).
+4. **Microbench** (`encoder_overhead_bench` in the kernels crate; a
+   512-dispatch dependent chain of hidden-dim-sized adds, command-buffer
+   GPU timestamps): one serial encoder ~1.6–3.2 µs/dispatch; concurrent
+   encoder + `memoryBarrier` every dispatch (MLX's in-chain model) ~2.1;
+   the chain split across 10 command buffers ~1.3; no-dependency floor
+   ~0.22.
+
+Two shortcuts were tested and **falsified**:
+
+- **Encoder rollover within one command buffer** (end/reopen the serial
+  encoder every 50 ops): the driver **merges consecutive serial compute
+  passes** — the trace still shows one ~2120 µs interval per token. No
+  GPU effect; +135 µs/token CPU encode.
+- **Command-buffer chunking alone** (commit every 50 ops; landed on this
+  branch as the structural first half): per-chunk GPU cost drops to
+  MLX's (~170 µs per 50-dispatch chunk), but Metal's **automatic hazard
+  tracking between command buffers** serializes the seams coarsely —
+  chunks sit channel-resident blocked (interval sum ~4× the wall span)
+  and decode is unchanged (~462–465 tok/s).
+
+**Why MLX doesn't pay:** its buffers are allocated
+hazard-**untracked**; it does its own synchronization — per-encoder
+`MTLFence`s (wait on the fences of prior encoders whose outputs
+intersect the new encoder's inputs, signal its own at end) plus
+in-encoder global `memoryBarrier(BarrierScopeBuffers)` on a
+**concurrent**-dispatch encoder before any dispatch whose input was
+written since the last barrier. That removes both costs at once: no
+tracked-resource analysis at command-buffer seams, and a cheaper
+per-link barrier inside the chain (microbench: ~2.1 vs ~3.2
+µs/dispatch).
+
+This **revises the concurrent-encoder spike's conclusion** (next
+section). The spike tested concurrent dispatch + hazard barriers *on
+top of tracked buffers inside one monolithic command buffer* — paying
+tracked-resource bookkeeping *plus* explicit barriers — and measured a
+~13% loss. The microbench isolates the encoder model with everything
+else held constant and finds the opposite ordering. The spike's
+negative result stands only for that hybrid configuration; it does not
+condemn MLX's full model (untracked + fences + concurrent + chunking),
+which the traces show running the same dispatch stream ~300 µs/token
+faster.
+
+**Estimated win for porting the full model:** ~2055 → ~1760 µs/token,
+i.e. decode ~470 → ~550 tok/s, closing most of the remaining ~1.20×.
+Design/plan: `docs/superpowers/plans/2026-06-04-encoder-dispatch-model.md`
+(branch `perf/encoder-dispatch-model`).
 
 ## Concurrent-encoder spike (tested, rejected)
 
