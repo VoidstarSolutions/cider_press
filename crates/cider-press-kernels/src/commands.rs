@@ -188,7 +188,10 @@ impl<'d> Commands<'d> {
             // `chain_restore` is already set: if this `?` aborts the open, Drop
             // still restores the displaced tail instead of losing the chain.
             let own = self.device.new_fence()?;
-            enc.updateFence(&own);
+            // NOTE: updateFence is NOT called here. At encoder open it would
+            // capture no commands and signal immediately — the cross-encoder
+            // chain would be a no-op. It is encoded in close_encoder(), after
+            // all dispatches, matching MLX's end_encoding placement.
             self.fence = Some(own);
             self.encoder = Some(enc);
         }
@@ -198,12 +201,16 @@ impl<'d> Commands<'d> {
     /// Close any open encoder and publish its fence as the chain tail.
     fn close_encoder(&mut self) {
         if let Some(enc) = self.encoder.take() {
+            // updateFence must be encoded after all dispatches — it signals
+            // once all commands encoded before it complete. At encoder open
+            // it would capture nothing and fire immediately.
+            if let Some(fence) = self.fence.take() {
+                enc.updateFence(&fence);
+                self.device.set_last_fence(fence);
+            }
             enc.endEncoding();
             self.dispatched_in_encoder = 0;
             self.elide_next_barrier = false;
-            if let Some(fence) = self.fence.take() {
-                self.device.set_last_fence(fence);
-            }
         }
     }
 
@@ -357,9 +364,12 @@ impl Drop for Commands<'_> {
         // and restore the chain tail this session displaced. Committed
         // sessions cleared `chain_restore` and closed their encoder already.
         if let Some(enc) = self.encoder.take() {
+            // Abandoned path: end the encoder WITHOUT encoding updateFence and
+            // without publishing to the device chain. The buffer is never
+            // committed, so any fence update would never signal — callers
+            // waiting on it would hang. chain_restore (below) puts the old
+            // tail back so the next session's waitForFence doesn't stall.
             enc.endEncoding();
-            // `self.fence` is intentionally NOT published: its updateFence dies
-            // with this uncommitted buffer and would never signal.
         }
         if let Some(prev) = self.chain_restore.take() {
             self.device.set_last_fence(prev);
