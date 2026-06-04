@@ -4476,7 +4476,7 @@ mod tests {
         // copy() must return a zero-copy view (no Copy op), with canonical
         // strides and the correct logical values.
         let device = Device::shared().expect("system default device");
-        let data: Vec<f32> = (0..8).map(|i| i as f32).collect(); // H=2, D=4
+        let data: Vec<f32> = (0..8_u8).map(f32::from).collect(); // H=2, D=4
         let base = Tensor::from_slice(&device, &data, [1usize, 1, 2, 4]).expect("from_slice");
         let view = base.permute(&[0, 2, 1, 3]).expect("permute"); // [1,2,1,4]
 
@@ -4540,8 +4540,8 @@ mod tests {
         // is exercised in Task 3; here we test the canonical-view input rope
         // will actually receive.)
         let device = Device::shared().expect("system default device");
-        let data: Vec<half::bf16> = (0..8)
-            .map(|i| half::bf16::from_f32(i as f32 + 1.0))
+        let data: Vec<half::bf16> = (0..8_u8)
+            .map(|i| half::bf16::from_f32(f32::from(i) + 1.0))
             .collect();
         let leaf = Tensor::from_slice(&device, &data, [1usize, 2, 1, 4]).expect("from_slice");
 
@@ -4572,7 +4572,9 @@ mod tests {
         // A genuine transpose (both axes > 1) is NOT contiguous-mod-unit; rope
         // must still reject it until S2 wires actual strides into the kernel.
         let device = Device::shared().expect("system default device");
-        let data: Vec<half::bf16> = (0..24).map(|i| half::bf16::from_f32(i as f32)).collect();
+        let data: Vec<half::bf16> = (0..24_u8)
+            .map(|i| half::bf16::from_f32(f32::from(i)))
+            .collect();
         // [1,2,3,4] -> permute([0,2,1,3]) -> [1,3,2,4] genuine reorder view.
         let base = Tensor::from_slice(&device, &data, [1usize, 2, 3, 4]).expect("from_slice");
         let view = base.permute(&[0, 2, 1, 3]).expect("permute");
