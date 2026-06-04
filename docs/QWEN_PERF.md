@@ -510,8 +510,9 @@ shorten the chain or speed each link. In measurement-justified priority:
   the enabling `KvCache::update` slab-base change stopped the cache
   pinning per-step graphs. Together: decode ~120 → ~210 tok/s, CPU-encode
   share ~38% → ~11%, peak RSS ~1192 → ~900 MiB. The pool reclaims
-  **cross-token** only (one command buffer per token keeps a token's whole
-  graph live); **within-eval reuse** (mid-eval freeing, as MLX does) is the
+  **cross-token** only (a token's ~11 chunks are committed back-to-back
+  with every output retained until cache population, so its whole graph
+  stays live); **within-eval reuse** (mid-eval freeing, as MLX does) is the
   next RSS lever toward `mlx_lm`'s ~329 MiB.
 - **Faster `qmv` kernels — speeds each critical-path link.** The 4-bit
   `qmv` weight matvecs are the heaviest dispatches in the chain. The
