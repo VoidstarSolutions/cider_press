@@ -20,8 +20,8 @@
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePassDescriptor,
+    MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
+    MTLComputeCommandEncoder, MTLComputePassDescriptor,
 };
 
 use crate::device::Device;
@@ -141,14 +141,15 @@ impl<'d> Commands<'d> {
 
     /// Close any open encoder, commit the command buffer, and block
     /// until the GPU finishes. Consumes the handle so the same batch
-    /// can't be re-committed.
+    /// can't be re-committed. Returns [`Error::CommandBufferFailed`] if
+    /// the GPU reports a failure status for the batch.
     pub fn commit_and_wait(mut self) -> Result<()> {
         if let Some(enc) = self.encoder.take() {
             enc.endEncoding();
         }
         self.cmd.commit();
         self.cmd.waitUntilCompleted();
-        Ok(())
+        check_completed(&self.cmd)
     }
 
     /// Close any open encoder and commit the command buffer **without
@@ -178,11 +179,37 @@ impl<'d> Commands<'d> {
         }
         self.cmd.commit();
         self.cmd.waitUntilCompleted();
+        check_completed(&self.cmd)?;
         match self.sampler.as_ref() {
             Some(sampler) => sampler.resolve(),
             None => Ok(Vec::new()),
         }
     }
+}
+
+/// Map a waited command buffer's final status to a `Result`.
+/// `waitUntilCompleted` returns only once the buffer is `Completed` or
+/// `Error`; any other status here is a Metal contract violation and is
+/// reported as a failure too.
+fn completion_result(
+    status: MTLCommandBufferStatus,
+    error_description: Option<String>,
+) -> Result<()> {
+    if status == MTLCommandBufferStatus::Completed {
+        return Ok(());
+    }
+    Err(Error::CommandBufferFailed(
+        error_description.unwrap_or_else(|| format!("MTLCommandBufferStatus({})", status.0)),
+    ))
+}
+
+/// Check a just-waited command buffer's status, pulling the `NSError`
+/// localized description on failure.
+fn check_completed(cmd: &ProtocolObject<dyn MTLCommandBuffer>) -> Result<()> {
+    completion_result(
+        cmd.status(),
+        cmd.error().map(|e| e.localizedDescription().to_string()),
+    )
 }
 
 /// A committed command buffer whose GPU work may still be in flight.
@@ -197,9 +224,11 @@ pub struct CommandsInFlight {
 
 impl CommandsInFlight {
     /// Block until the GPU finishes this batch. Consumes the handle.
+    /// Returns [`Error::CommandBufferFailed`] if the GPU reports a
+    /// failure status for the batch.
     pub fn wait(self) -> Result<()> {
         self.cmd.waitUntilCompleted();
-        Ok(())
+        check_completed(&self.cmd)
     }
 }
 
@@ -207,7 +236,9 @@ impl Drop for CommandsInFlight {
     fn drop(&mut self) {
         // `wait` consumes `self`, so `Drop` only fires when the caller
         // discards the handle without an explicit wait. `waitUntilCompleted`
-        // on an already-completed buffer returns immediately.
+        // on an already-completed buffer returns immediately. A GPU failure
+        // status is unobservable here (Drop can't return); callers who care
+        // must `wait()` explicitly.
         self.cmd.waitUntilCompleted();
     }
 }
@@ -242,9 +273,30 @@ impl Device {
 #[cfg(test)]
 mod tests {
     use half::bf16;
+    use objc2_metal::MTLCommandBufferStatus;
 
     use crate::kernels::arg_reduce::argmax_bf16;
     use crate::{Buffer, Device, KernelLibrary};
+
+    #[test]
+    fn completion_result_ok_for_completed_status() {
+        assert!(super::completion_result(MTLCommandBufferStatus::Completed, None).is_ok());
+    }
+
+    #[test]
+    fn completion_result_maps_error_status_with_description() {
+        let err = super::completion_result(
+            MTLCommandBufferStatus::Error,
+            Some("IOGPUCommandQueue page fault".into()),
+        )
+        .expect_err("Error status must map to Err");
+        assert!(err.to_string().contains("page fault"), "{err}");
+    }
+
+    #[test]
+    fn completion_result_errs_for_error_status_without_description() {
+        assert!(super::completion_result(MTLCommandBufferStatus::Error, None).is_err());
+    }
 
     /// `commit` (no wait) then waiting the returned handle must produce the
     /// same result as `commit_and_wait` — the GPU work runs, we just defer
