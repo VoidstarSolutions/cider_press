@@ -71,8 +71,10 @@ impl Device {
         self.last_fence.lock().expect("fence mutex poisoned").take()
     }
 
-    pub(crate) fn set_last_fence(&self, fence: Retained<ProtocolObject<dyn MTLFence>>) {
-        *self.last_fence.lock().expect("fence mutex poisoned") = Some(fence);
+    /// Takes an `Option` so an abandoned session can restore a `None`
+    /// tail (fresh device) as well as a displaced fence.
+    pub(crate) fn set_last_fence(&self, fence: Option<Retained<ProtocolObject<dyn MTLFence>>>) {
+        *self.last_fence.lock().expect("fence mutex poisoned") = fence;
     }
 
     pub(crate) fn new_fence(&self) -> Result<Retained<ProtocolObject<dyn MTLFence>>> {

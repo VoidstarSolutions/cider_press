@@ -53,14 +53,12 @@ pub struct Commands<'d> {
     /// When set, the next `encoder()` opens a sampled pass for this
     /// (start, end) sample-index pair, then clears.
     armed: Option<(usize, usize)>,
-    /// Fence taken from the device when this session's first encoder
-    /// opened. If the session is dropped uncommitted (work discarded),
-    /// this is restored as the device chain tail — fences published by
-    /// this session's encoders would never signal, since their updates
-    /// die with the uncommitted buffer.
-    chain_restore: Option<Retained<ProtocolObject<dyn MTLFence>>>,
-    /// True once this session has opened its first encoder.
-    chain_started: bool,
+    /// What Drop should do to the device fence-chain tail if this
+    /// session is abandoned uncommitted (work discarded). Fences
+    /// published by this session's encoders would never signal — their
+    /// updates die with the uncommitted buffer — so the tail the first
+    /// encoder displaced must be put back, even when it was "no tail".
+    chain_restore: ChainRestore,
     /// Number of dispatches issued in the current open encoder. Used by
     /// `dispatch_threads`/`dispatch_threadgroups` to insert a barrier
     /// before every dispatch after the first (concurrent encoder model).
@@ -70,6 +68,18 @@ pub struct Commands<'d> {
     /// the caller has proven the next dispatch reads nothing written since
     /// the last barrier in this encoder.
     elide_next_barrier: bool,
+}
+
+/// Snapshot of the device fence-chain tail a [`Commands`] session
+/// displaced, restored by Drop when the session is abandoned.
+enum ChainRestore {
+    /// No encoder opened yet, or the session committed — leave the
+    /// device tail alone.
+    Untouched,
+    /// The first encoder displaced this tail (`None` on a device with
+    /// no tail yet). Drop puts it back, clearing any never-signaling
+    /// fence this session published.
+    Tail(Option<Retained<ProtocolObject<dyn MTLFence>>>),
 }
 
 impl<'d> Commands<'d> {
@@ -90,8 +100,7 @@ impl<'d> Commands<'d> {
             fence: None,
             sampler: None,
             armed: None,
-            chain_restore: None,
-            chain_started: false,
+            chain_restore: ChainRestore::Untouched,
             dispatched_in_encoder: 0,
             elide_next_barrier: false,
         })
@@ -181,13 +190,13 @@ impl<'d> Commands<'d> {
             // no-op there but could mask a real first-dispatch barrier in a
             // future regime — clear it so the flag never crosses encoders.
             self.elide_next_barrier = false;
-            if let Some(prev) = self.device.take_last_fence() {
-                enc.waitForFence(&prev);
-                if !self.chain_started {
-                    self.chain_restore = Some(prev);
-                }
+            let prev = self.device.take_last_fence();
+            if let Some(prev) = &prev {
+                enc.waitForFence(prev);
             }
-            self.chain_started = true;
+            if matches!(self.chain_restore, ChainRestore::Untouched) {
+                self.chain_restore = ChainRestore::Tail(prev);
+            }
             // `chain_restore` is already set: if this `?` aborts the open, Drop
             // still restores the displaced tail instead of losing the chain.
             let own = self.device.new_fence()?;
@@ -209,7 +218,7 @@ impl<'d> Commands<'d> {
             // it would capture nothing and fire immediately.
             if let Some(fence) = self.fence.take() {
                 enc.updateFence(&fence);
-                self.device.set_last_fence(fence);
+                self.device.set_last_fence(Some(fence));
             }
             enc.endEncoding();
             self.dispatched_in_encoder = 0;
@@ -265,7 +274,7 @@ impl<'d> Commands<'d> {
     /// the GPU reports a failure status for the batch.
     pub fn commit_and_wait(mut self) -> Result<()> {
         self.close_encoder();
-        self.chain_restore = None;
+        self.chain_restore = ChainRestore::Untouched;
         self.cmd.commit();
         self.cmd.waitUntilCompleted();
         check_completed(&self.cmd)
@@ -278,7 +287,7 @@ impl<'d> Commands<'d> {
     /// re-committed.
     pub fn commit(mut self) -> Result<CommandsInFlight> {
         self.close_encoder();
-        self.chain_restore = None;
+        self.chain_restore = ChainRestore::Untouched;
         self.cmd.commit();
         // Refcount bump: the `Commands` Drop runs at end of this fn (encoder
         // already taken, so it is a no-op), while the handle keeps the
@@ -293,7 +302,7 @@ impl<'d> Commands<'d> {
     /// Returns an empty vec if this session has no sampler.
     pub fn commit_wait_resolve(mut self) -> Result<Vec<GpuSegment>> {
         self.close_encoder();
-        self.chain_restore = None;
+        self.chain_restore = ChainRestore::Untouched;
         self.cmd.commit();
         self.cmd.waitUntilCompleted();
         check_completed(&self.cmd)?;
@@ -374,7 +383,11 @@ impl Drop for Commands<'_> {
             // tail back so the next session's waitForFence doesn't stall.
             enc.endEncoding();
         }
-        if let Some(prev) = self.chain_restore.take() {
+        let restore = std::mem::replace(&mut self.chain_restore, ChainRestore::Untouched);
+        if let ChainRestore::Tail(prev) = restore {
+            // Restores a `None` tail too: on a fresh device, a fence this
+            // session published (close_encoder during profiling) must be
+            // CLEARED, not left as a never-signaling tail.
             self.device.set_last_fence(prev);
         }
     }
@@ -506,5 +519,36 @@ mod tests {
         // SAFETY: commit_and_wait blocked; GPU is done writing dst_a / dst_c.
         assert_eq!(unsafe { dst_a.as_slice()[0] }, 3, "session A result");
         assert_eq!(unsafe { dst_c.as_slice()[0] }, 3, "session C result");
+    }
+
+    /// An abandoned session on a FRESH device (no prior fence tail) must
+    /// clear any fence it published, not just restore a displaced one.
+    /// `begin_profiled_op` closes the first encoder, which publishes the
+    /// session's own fence as the device tail; if the session is then
+    /// dropped uncommitted, that fence never signals. Asserts the tail
+    /// state directly — the hang-based variant of this failure would
+    /// stall the suite instead of failing.
+    #[test]
+    fn abandoned_session_on_fresh_device_clears_fence_tail() {
+        let device = Device::system_default().expect("device");
+        let library = KernelLibrary::arg_reduce(&device).expect("arg_reduce lib");
+        let host: Vec<bf16> = [0.1f32, 0.5, 0.3, 0.9, 0.2]
+            .iter()
+            .map(|&x| bf16::from_f32(x))
+            .collect();
+        let src: Buffer<bf16> = device.upload(&host).expect("upload");
+        let mut dst: Buffer<u32> = device.alloc_buffer(1).expect("alloc dst");
+
+        let mut cmds = device.commands_profiled(4).expect("profiled commands");
+        cmds.begin_profiled_op("argmax");
+        argmax_bf16(&mut cmds, &library, &src, &mut dst, host.len()).expect("dispatch");
+        // Closes the open encoder, publishing this session's fence.
+        cmds.begin_profiled_op("next");
+        drop(cmds); // abandoned uncommitted — the published fence never signals
+
+        assert!(
+            device.take_last_fence().is_none(),
+            "abandoned session left its never-signaling fence as the chain tail"
+        );
     }
 }
