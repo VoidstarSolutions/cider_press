@@ -11,15 +11,18 @@
 //! via [`Commands::commit_and_wait`] (blocking) or [`Commands::commit`]
 //! (non-blocking, returning a [`CommandsInFlight`] handle to wait on later).
 //!
-//! This is the design lever that the qmv dispatch-latency benchmark
-//! identified: the ~1.5× latency gap vs. MLX comes from
-//! committing+waiting per dispatch. The runtime layer will batch many
-//! dispatches into one `Commands` to close that gap. The kernel layer
-//! merely needs to make that batching trivial.
+//! The runtime layer batches many dispatches into one `Commands` (the
+//! eval loop commits a fresh session every ~50 ops). Encoders open with
+//! concurrent dispatch; ordering is explicit — a buffer-scope
+//! `memoryBarrier` between dispatches (elidable via
+//! [`Commands::elide_next_barrier`]) inside an encoder, and an
+//! `MTLFence` chain across encoders (wait at open, update at close).
 //!
 //! If a `Commands` is dropped without being committed, its work is
 //! discarded — the GPU never sees the encoded commands. This is the
-//! intended "give up on this batch" behavior.
+//! intended "give up on this batch" behavior; the drop also restores
+//! the fence-chain tail the session displaced (see `chain_restore`),
+//! since fences updated by an uncommitted buffer never signal.
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
