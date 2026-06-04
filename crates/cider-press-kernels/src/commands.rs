@@ -154,6 +154,8 @@ impl<'d> Commands<'d> {
                 }
             }
             self.chain_started = true;
+            // `chain_restore` is already set: if this `?` aborts the open, Drop
+            // still restores the displaced tail instead of losing the chain.
             let own = self.device.new_fence()?;
             enc.updateFence(&own);
             self.fence = Some(own);
@@ -281,7 +283,8 @@ impl Drop for Commands<'_> {
         // sessions cleared `chain_restore` and closed their encoder already.
         if let Some(enc) = self.encoder.take() {
             enc.endEncoding();
-            self.fence = None;
+            // `self.fence` is intentionally NOT published: its updateFence dies
+            // with this uncommitted buffer and would never signal.
         }
         if let Some(prev) = self.chain_restore.take() {
             self.device.set_last_fence(prev);
@@ -374,5 +377,46 @@ mod tests {
         drop(cmds.commit().expect("commit")); // Drop must waitUntilCompleted
 
         assert_eq!(unsafe { dst.as_slice()[0] }, 1);
+    }
+
+    /// An abandoned (uncommitted) Commands session must restore the fence
+    /// chain tail it displaced, so the next session's encoder does not wait
+    /// on a fence whose `updateFence` died with the uncommitted buffer.
+    ///
+    /// Failure mode without `chain_restore`: session C's `encoder()` calls
+    /// `waitForFence` on B's never-signaled fence and hangs forever. CI
+    /// surfaces this as a test timeout.
+    #[test]
+    fn abandoned_session_restores_fence_chain() {
+        let device = Device::system_default().expect("device");
+        let library = KernelLibrary::arg_reduce(&device).expect("arg_reduce lib");
+
+        let host: Vec<bf16> = [0.1f32, 0.5, 0.3, 0.9, 0.2]
+            .iter()
+            .map(|&x| bf16::from_f32(x))
+            .collect();
+        let src: Buffer<bf16> = device.upload(&host).expect("upload src");
+        let mut dst_a: Buffer<u32> = device.alloc_buffer(1).expect("alloc dst_a");
+        let mut dst_c: Buffer<u32> = device.alloc_buffer(1).expect("alloc dst_c");
+
+        // Session A: committed — publishes a real fence tail.
+        let mut cmds_a = device.commands().expect("commands A");
+        argmax_bf16(&mut cmds_a, &library, &src, &mut dst_a, host.len()).expect("dispatch A");
+        cmds_a.commit_and_wait().expect("commit A");
+
+        // Session B: abandoned (dropped uncommitted). Without chain_restore
+        // this would leave B's never-signaling fence as the chain tail.
+        let mut cmds_b = device.commands().expect("commands B");
+        cmds_b.encoder().expect("open encoder B");
+        drop(cmds_b);
+
+        // Session C: must complete — would hang if B's fence is the tail.
+        let mut cmds_c = device.commands().expect("commands C");
+        argmax_bf16(&mut cmds_c, &library, &src, &mut dst_c, host.len()).expect("dispatch C");
+        cmds_c.commit_and_wait().expect("commit C");
+
+        // SAFETY: commit_and_wait blocked; GPU is done writing dst_a / dst_c.
+        assert_eq!(unsafe { dst_a.as_slice()[0] }, 3, "session A result");
+        assert_eq!(unsafe { dst_c.as_slice()[0] }, 3, "session C result");
     }
 }

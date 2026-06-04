@@ -36,8 +36,10 @@ pub struct Device {
     /// Each new encoder waits on it, forming a strict execution chain
     /// across encoders, command buffers, and eval calls — the explicit
     /// replacement for Metal's automatic hazard tracking once buffers
-    /// go untracked. Mutex for `Sync`; the generator is
-    /// single-threaded so it is never contended.
+    /// go untracked (redundant until then — buffers are still tracked).
+    /// Mutex only for `Sync`: the chain's take/set pairing assumes ONE
+    /// thread drives dispatch — concurrent sessions would interleave
+    /// take/set and silently corrupt the ordering, lock notwithstanding.
     last_fence: Mutex<Option<Retained<ProtocolObject<dyn MTLFence>>>>,
 }
 
