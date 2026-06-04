@@ -10,12 +10,13 @@
 //! [`Device`] avoids leaking the raw handle for routine work.
 
 use std::ptr::NonNull;
+use std::sync::Mutex;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandQueue, MTLCounterSamplingPoint, MTLCreateSystemDefaultDevice,
-    MTLDevice, MTLResourceOptions, MTLTimestamp,
+    MTLDevice, MTLFence, MTLResourceOptions, MTLTimestamp,
 };
 
 use crate::buffer::Buffer;
@@ -27,9 +28,17 @@ use crate::error::{Error, Result};
 unsafe extern "C" {}
 
 /// Owns the system default Metal device and a single command queue.
+#[allow(clippy::struct_field_names)]
 pub struct Device {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    /// Fence signaled by the most recently closed compute encoder.
+    /// Each new encoder waits on it, forming a strict execution chain
+    /// across encoders, command buffers, and eval calls — the explicit
+    /// replacement for Metal's automatic hazard tracking once buffers
+    /// go untracked. Mutex for `Sync`; the generator is
+    /// single-threaded so it is never contended.
+    last_fence: Mutex<Option<Retained<ProtocolObject<dyn MTLFence>>>>,
 }
 
 impl Device {
@@ -40,7 +49,25 @@ impl Device {
         let queue = device.newCommandQueue().ok_or(Error::AppleApi {
             context: "MTLDevice::newCommandQueue",
         })?;
-        Ok(Self { device, queue })
+        Ok(Self {
+            device,
+            queue,
+            last_fence: Mutex::new(None),
+        })
+    }
+
+    pub(crate) fn take_last_fence(&self) -> Option<Retained<ProtocolObject<dyn MTLFence>>> {
+        self.last_fence.lock().expect("fence mutex poisoned").take()
+    }
+
+    pub(crate) fn set_last_fence(&self, fence: Retained<ProtocolObject<dyn MTLFence>>) {
+        *self.last_fence.lock().expect("fence mutex poisoned") = Some(fence);
+    }
+
+    pub(crate) fn new_fence(&self) -> Result<Retained<ProtocolObject<dyn MTLFence>>> {
+        self.device.newFence().ok_or(Error::AppleApi {
+            context: "MTLDevice::newFence",
+        })
     }
 
     /// Allocate a typed shared-storage buffer with `len` elements of `T`.

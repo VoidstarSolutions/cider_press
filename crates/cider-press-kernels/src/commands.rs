@@ -21,7 +21,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
-    MTLComputeCommandEncoder, MTLComputePassDescriptor,
+    MTLComputeCommandEncoder, MTLComputePassDescriptor, MTLFence,
 };
 
 use crate::device::Device;
@@ -34,9 +34,12 @@ use crate::gpu_sampler::{GpuSampler, GpuSegment};
 /// one GPU submission. The lifetime parameter ties it to the originating
 /// [`Device`] so the device cannot be dropped while encoding is open.
 pub struct Commands<'d> {
-    _device: &'d Device,
+    device: &'d Device,
     cmd: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     encoder: Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>,
+    /// Fence the current open encoder will signal; published to `device`
+    /// when the encoder is closed.
+    fence: Option<Retained<ProtocolObject<dyn MTLFence>>>,
     /// `Some` only in the profiling regime — one sampled encoder per
     /// dispatch. `None` is the production single-encoder path.
     sampler: Option<GpuSampler>,
@@ -57,9 +60,10 @@ impl<'d> Commands<'d> {
                 context: "MTLCommandQueue::commandBuffer",
             })?;
         Ok(Self {
-            _device: device,
+            device,
             cmd,
             encoder: None,
+            fence: None,
             sampler: None,
             armed: None,
         })
@@ -77,13 +81,12 @@ impl<'d> Commands<'d> {
     /// next `encoder()` to open a sampled pass for `label`. No-op when
     /// not in the profiling regime.
     pub fn begin_profiled_op(&mut self, label: &'static str) {
-        let Some(sampler) = self.sampler.as_mut() else {
+        if self.sampler.is_none() {
             return;
-        };
-        // Close any open encoder so its stage-end timestamp is written.
-        if let Some(enc) = self.encoder.take() {
-            enc.endEncoding();
         }
+        // Close any open encoder so its stage-end timestamp is written.
+        self.close_encoder();
+        let sampler = self.sampler.as_mut().expect("checked above");
         match sampler.reserve(label) {
             Ok(pair) => self.armed = Some(pair),
             // Capacity exhausted: stop sampling further ops rather than
@@ -134,9 +137,25 @@ impl<'d> Commands<'d> {
                     context: "MTLCommandBuffer::computeCommandEncoder",
                 })?
             };
+            if let Some(prev) = self.device.take_last_fence() {
+                enc.waitForFence(&prev);
+            }
+            let own = self.device.new_fence()?;
+            enc.updateFence(&own);
+            self.fence = Some(own);
             self.encoder = Some(enc);
         }
         Ok(self.encoder.as_ref().expect("just inserted"))
+    }
+
+    /// Close any open encoder and publish its fence as the chain tail.
+    fn close_encoder(&mut self) {
+        if let Some(enc) = self.encoder.take() {
+            enc.endEncoding();
+            if let Some(fence) = self.fence.take() {
+                self.device.set_last_fence(fence);
+            }
+        }
     }
 
     /// Close any open encoder, commit the command buffer, and block
@@ -144,9 +163,7 @@ impl<'d> Commands<'d> {
     /// can't be re-committed. Returns [`Error::CommandBufferFailed`] if
     /// the GPU reports a failure status for the batch.
     pub fn commit_and_wait(mut self) -> Result<()> {
-        if let Some(enc) = self.encoder.take() {
-            enc.endEncoding();
-        }
+        self.close_encoder();
         self.cmd.commit();
         self.cmd.waitUntilCompleted();
         check_completed(&self.cmd)
@@ -158,9 +175,7 @@ impl<'d> Commands<'d> {
     /// dropping it). Consumes the handle so the same batch can't be
     /// re-committed.
     pub fn commit(mut self) -> Result<CommandsInFlight> {
-        if let Some(enc) = self.encoder.take() {
-            enc.endEncoding();
-        }
+        self.close_encoder();
         self.cmd.commit();
         // Refcount bump: the `Commands` Drop runs at end of this fn (encoder
         // already taken, so it is a no-op), while the handle keeps the
@@ -174,9 +189,7 @@ impl<'d> Commands<'d> {
     /// encoder, commits, waits, then resolves per-op GPU-tick segments.
     /// Returns an empty vec if this session has no sampler.
     pub fn commit_wait_resolve(mut self) -> Result<Vec<GpuSegment>> {
-        if let Some(enc) = self.encoder.take() {
-            enc.endEncoding();
-        }
+        self.close_encoder();
         self.cmd.commit();
         self.cmd.waitUntilCompleted();
         check_completed(&self.cmd)?;
@@ -248,9 +261,7 @@ impl Drop for Commands<'_> {
         // If the user dropped without committing, end encoding cleanly
         // but don't commit — they explicitly chose not to send this
         // batch to the GPU. The command buffer reference dies with us.
-        if let Some(enc) = self.encoder.take() {
-            enc.endEncoding();
-        }
+        self.close_encoder();
     }
 }
 
