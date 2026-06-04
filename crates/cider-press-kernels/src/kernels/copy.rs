@@ -291,33 +291,6 @@ fn encode_g_copy(
     };
     let pipeline = library.pipeline(&kernel_name)?;
 
-    let encoder = commands.encoder()?;
-    encoder.setComputePipelineState(pipeline.metal_pipeline_state());
-
-    // SAFETY: bind slots / dtypes match the `copy_gg*` MSL signatures
-    // in `kernels-mlx/.../copy.h`. Element strides are passed as
-    // `int64_t`; byte offsets ride along on the buffer bind.
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(src_buffer), src_byte_offset, 0);
-        encoder.setBuffer_offset_atIndex(Some(dst_buffer), dst_byte_offset, 1);
-
-        if ndim > MAX_COPY_SPECIALIZED_DIMS {
-            let shape_ptr: NonNull<c_void> = NonNull::from(shape).cast();
-            encoder.setBytes_length_atIndex(shape_ptr, std::mem::size_of_val(shape), 2);
-        }
-        let src_strides_ptr: NonNull<c_void> = NonNull::from(src_strides).cast();
-        encoder.setBytes_length_atIndex(src_strides_ptr, std::mem::size_of_val(src_strides), 3);
-        let dst_strides_ptr: NonNull<c_void> = NonNull::from(dst_strides).cast();
-        encoder.setBytes_length_atIndex(dst_strides_ptr, std::mem::size_of_val(dst_strides), 4);
-        if ndim > MAX_COPY_SPECIALIZED_DIMS {
-            let ndim_i32 = i32::try_from(ndim).map_err(|_| {
-                Error::InvalidArgument(format!("copy_g: ndim {ndim} does not fit in i32"))
-            })?;
-            let ndim_ptr: NonNull<c_void> = NonNull::from(&ndim_i32).cast();
-            encoder.setBytes_length_atIndex(ndim_ptr, std::mem::size_of::<i32>(), 5);
-        }
-    }
-
     // Grid layout (mirrors `copy.cpp:131–163`):
     //   dim0 = shape[ndim-1], dim1 = shape[ndim-2] (or 1), rest = product of remaining.
     // Negative / zero dims were rejected above, so the `as usize` casts are safe.
@@ -335,14 +308,42 @@ fn encode_g_copy(
         .map(|&d| d as usize)
         .product::<usize>()
         .max(1);
+
+    {
+        let encoder = commands.encoder()?;
+        encoder.setComputePipelineState(pipeline.metal_pipeline_state());
+        // SAFETY: bind slots / dtypes match the `copy_gg*` MSL signatures
+        // in `kernels-mlx/.../copy.h`. Element strides are passed as
+        // `int64_t`; byte offsets ride along on the buffer bind.
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(src_buffer), src_byte_offset, 0);
+            encoder.setBuffer_offset_atIndex(Some(dst_buffer), dst_byte_offset, 1);
+
+            if ndim > MAX_COPY_SPECIALIZED_DIMS {
+                let shape_ptr: NonNull<c_void> = NonNull::from(shape).cast();
+                encoder.setBytes_length_atIndex(shape_ptr, std::mem::size_of_val(shape), 2);
+            }
+            let src_strides_ptr: NonNull<c_void> = NonNull::from(src_strides).cast();
+            encoder.setBytes_length_atIndex(src_strides_ptr, std::mem::size_of_val(src_strides), 3);
+            let dst_strides_ptr: NonNull<c_void> = NonNull::from(dst_strides).cast();
+            encoder.setBytes_length_atIndex(dst_strides_ptr, std::mem::size_of_val(dst_strides), 4);
+            if ndim > MAX_COPY_SPECIALIZED_DIMS {
+                let ndim_i32 = i32::try_from(ndim).map_err(|_| {
+                    Error::InvalidArgument(format!("copy_g: ndim {ndim} does not fit in i32"))
+                })?;
+                let ndim_ptr: NonNull<c_void> = NonNull::from(&ndim_i32).cast();
+                encoder.setBytes_length_atIndex(ndim_ptr, std::mem::size_of::<i32>(), 5);
+            }
+        }
+    }
+
     let threadgroup = get_block_dims(dim0, dim1, rest, 10);
     let grid = MTLSize {
         width: dim0,
         height: dim1,
         depth: rest,
     };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
-    Ok(())
+    commands.dispatch_threads(grid, threadgroup)
 }
 
 /// Port of MLX `get_block_dims_common` (`common/utils.cpp:117`).
@@ -399,19 +400,21 @@ fn encode_v_copy<T>(
     })?;
 
     let pipeline = library.pipeline(kernel_name)?;
-    let encoder = commands.encoder()?;
 
-    encoder.setComputePipelineState(pipeline.metal_pipeline_state());
-    // SAFETY: src/dst are typed `Buffer<T>` whose element type matches the
-    // kernel's MSL scalar type, validated at the call-site by choice of
-    // `kernel_name`. Offsets are 0 and bind-slot indices are fixed by the
-    // kernel signature (see MLX `copy.h::copy_v`).
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(src.metal_buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(dst.metal_buffer()), 0, 1);
-        // `constant uint& size` auto-binds to slot 2 (after the two buffers).
-        let bytes_ptr: NonNull<c_void> = NonNull::from(&size).cast();
-        encoder.setBytes_length_atIndex(bytes_ptr, std::mem::size_of::<u32>(), 2);
+    {
+        let encoder = commands.encoder()?;
+        encoder.setComputePipelineState(pipeline.metal_pipeline_state());
+        // SAFETY: src/dst are typed `Buffer<T>` whose element type matches the
+        // kernel's MSL scalar type, validated at the call-site by choice of
+        // `kernel_name`. Offsets are 0 and bind-slot indices are fixed by the
+        // kernel signature (see MLX `copy.h::copy_v`).
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(src.metal_buffer()), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(dst.metal_buffer()), 0, 1);
+            // `constant uint& size` auto-binds to slot 2 (after the two buffers).
+            let bytes_ptr: NonNull<c_void> = NonNull::from(&size).cast();
+            encoder.setBytes_length_atIndex(bytes_ptr, std::mem::size_of::<u32>(), 2);
+        }
     }
 
     let grid = MTLSize {
@@ -424,6 +427,5 @@ fn encode_v_copy<T>(
         height: 1,
         depth: 1,
     };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
-    Ok(())
+    commands.dispatch_threads(grid, threadgroup)
 }

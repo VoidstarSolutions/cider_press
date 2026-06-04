@@ -340,44 +340,45 @@ pub fn dispatch<T>(
 
     let kernel_name = inst.kernel_name();
     let pipeline = library.pipeline(&kernel_name)?;
-    let encoder = commands.encoder()?;
-    encoder.setComputePipelineState(pipeline.metal_pipeline_state());
 
     let src_ndim = args.src_ndim;
     let idx_ndim = args.idx_ndim;
+    let (d0, d1, d2) = args.grid;
 
-    // SAFETY: slot/dtype bindings match MLX's `Gather::eval_gpu` in
-    // `backend/metal/indexing.cpp` verbatim. The runtime layer owns
-    // buffer typing; this function is called only via the gated
-    // `Tensor::gather` path which enforces dtype agreement.
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(args.src.metal_buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(args.out.metal_buffer()), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(args.src_shape.metal_buffer()), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(args.src_strides.metal_buffer()), 0, 3);
-        let ndim_ptr: NonNull<c_void> = NonNull::from(&src_ndim).cast();
-        encoder.setBytes_length_atIndex(ndim_ptr, std::mem::size_of::<u64>(), 4);
-        encoder.setBuffer_offset_atIndex(Some(args.slice_sizes.metal_buffer()), 0, 5);
-        encoder.setBuffer_offset_atIndex(Some(args.axes.metal_buffer()), 0, 6);
-        encoder.setBuffer_offset_atIndex(Some(args.idx_shapes.metal_buffer()), 0, 7);
-        encoder.setBuffer_offset_atIndex(Some(args.idx_strides.metal_buffer()), 0, 8);
-        encoder.setBuffer_offset_atIndex(Some(args.idx_contigs.metal_buffer()), 0, 9);
-        let idx_ndim_ptr: NonNull<c_void> = NonNull::from(&idx_ndim).cast();
-        encoder.setBytes_length_atIndex(idx_ndim_ptr, std::mem::size_of::<i32>(), 10);
-        for (i, buf) in args.indices.iter().enumerate() {
-            encoder.setBuffer_offset_atIndex(Some(buf.metal_buffer()), 0, 20 + i);
+    {
+        let encoder = commands.encoder()?;
+        encoder.setComputePipelineState(pipeline.metal_pipeline_state());
+        // SAFETY: slot/dtype bindings match MLX's `Gather::eval_gpu` in
+        // `backend/metal/indexing.cpp` verbatim. The runtime layer owns
+        // buffer typing; this function is called only via the gated
+        // `Tensor::gather` path which enforces dtype agreement.
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(args.src.metal_buffer()), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(args.out.metal_buffer()), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(args.src_shape.metal_buffer()), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(args.src_strides.metal_buffer()), 0, 3);
+            let ndim_ptr: NonNull<c_void> = NonNull::from(&src_ndim).cast();
+            encoder.setBytes_length_atIndex(ndim_ptr, std::mem::size_of::<u64>(), 4);
+            encoder.setBuffer_offset_atIndex(Some(args.slice_sizes.metal_buffer()), 0, 5);
+            encoder.setBuffer_offset_atIndex(Some(args.axes.metal_buffer()), 0, 6);
+            encoder.setBuffer_offset_atIndex(Some(args.idx_shapes.metal_buffer()), 0, 7);
+            encoder.setBuffer_offset_atIndex(Some(args.idx_strides.metal_buffer()), 0, 8);
+            encoder.setBuffer_offset_atIndex(Some(args.idx_contigs.metal_buffer()), 0, 9);
+            let idx_ndim_ptr: NonNull<c_void> = NonNull::from(&idx_ndim).cast();
+            encoder.setBytes_length_atIndex(idx_ndim_ptr, std::mem::size_of::<i32>(), 10);
+            for (i, buf) in args.indices.iter().enumerate() {
+                encoder.setBuffer_offset_atIndex(Some(buf.metal_buffer()), 0, 20 + i);
+            }
         }
     }
 
-    let (d0, d1, d2) = args.grid;
     let grid = MTLSize {
         width: d0,
         height: d1,
         depth: d2,
     };
     let threadgroup = block_dims(d0, d1, d2);
-    encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
-    Ok(())
+    commands.dispatch_threads(grid, threadgroup)
 }
 
 #[cfg(test)]

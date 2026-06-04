@@ -132,20 +132,22 @@ pub fn affine_qmv_bf16(
     let kernel_name = format!("affine_{variant}_bfloat16_t_gs_{group_size}_b_{bits}_batch_0");
     let pipeline = library.pipeline(&kernel_name)?;
 
-    let encoder = commands.encoder()?;
-    encoder.setComputePipelineState(pipeline.metal_pipeline_state());
-    // SAFETY: bind slots and dtypes match the `affine_qmv*` MSL
-    // signatures verified bit-exactly against MLX in the qmv parity test.
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(w_q.metal_buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(scales.metal_buffer()), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(biases.metal_buffer()), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(x.metal_buffer()), 0, 3);
-        encoder.setBuffer_offset_atIndex(Some(y.metal_buffer()), 0, 4);
-        let k_ptr: NonNull<c_void> = NonNull::from(&k).cast();
-        let n_ptr: NonNull<c_void> = NonNull::from(&n).cast();
-        encoder.setBytes_length_atIndex(k_ptr, std::mem::size_of::<i32>(), 5);
-        encoder.setBytes_length_atIndex(n_ptr, std::mem::size_of::<i32>(), 6);
+    {
+        let encoder = commands.encoder()?;
+        encoder.setComputePipelineState(pipeline.metal_pipeline_state());
+        // SAFETY: bind slots and dtypes match the `affine_qmv*` MSL
+        // signatures verified bit-exactly against MLX in the qmv parity test.
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(w_q.metal_buffer()), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(scales.metal_buffer()), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(biases.metal_buffer()), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(x.metal_buffer()), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(y.metal_buffer()), 0, 4);
+            let k_ptr: NonNull<c_void> = NonNull::from(&k).cast();
+            let n_ptr: NonNull<c_void> = NonNull::from(&n).cast();
+            encoder.setBytes_length_atIndex(k_ptr, std::mem::size_of::<i32>(), 5);
+            encoder.setBytes_length_atIndex(n_ptr, std::mem::size_of::<i32>(), 6);
+        }
     }
 
     // Grid is in *threadgroups* (dispatchThreadgroups:), not threads.
@@ -159,6 +161,5 @@ pub fn affine_qmv_bf16(
         height: 2,
         depth: 1,
     };
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, threadgroup);
-    Ok(())
+    commands.dispatch_threadgroups(grid, threadgroup)
 }

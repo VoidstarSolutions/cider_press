@@ -261,13 +261,15 @@ fn encode_init_reduce<T>(
 ) -> Result<()> {
     let kernel_name = format!("init_reduce_{op_name}{tname}");
     let pipeline = library.pipeline(&kernel_name)?;
-    let encoder = commands.encoder()?;
-    encoder.setComputePipelineState(pipeline.metal_pipeline_state());
 
-    // SAFETY: matches `init_reduce` in `reduction/reduce_init.h`:
-    // single output buffer at slot 0, one thread per element.
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(dst.metal_buffer()), 0, 0);
+    {
+        let encoder = commands.encoder()?;
+        encoder.setComputePipelineState(pipeline.metal_pipeline_state());
+        // SAFETY: matches `init_reduce` in `reduction/reduce_init.h`:
+        // single output buffer at slot 0, one thread per element.
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(dst.metal_buffer()), 0, 0);
+        }
     }
     let grid = MTLSize {
         width: n,
@@ -279,8 +281,7 @@ fn encode_init_reduce<T>(
         height: 1,
         depth: 1,
     };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
-    Ok(())
+    commands.dispatch_threads(grid, threadgroup)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -298,8 +299,6 @@ fn encode_row_reduce_looped<T>(
     // get_kernel_reduce_ndim(0) → 1.
     let kernel_name = format!("row_reduce_looped_1_reduce_{op_name}{tname}");
     let pipeline = library.pipeline(&kernel_name)?;
-    let encoder = commands.encoder()?;
-    encoder.setComputePipelineState(pipeline.metal_pipeline_state());
 
     // Non-reduce shape/strides (all axes except the last). Strides are
     // *element* strides for a contiguous row-major input.
@@ -338,52 +337,57 @@ fn encode_row_reduce_looped<T>(
     })?;
     let non_row_reductions_i64: i64 = 1; // No axes reduced beyond the row axis itself.
 
-    // SAFETY: bind slots match `row_reduce_looped` in
-    // `kernels-mlx/.../reduction/reduce_row.h`.
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(src.metal_buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(dst.metal_buffer()), 0, 1);
+    {
+        let encoder = commands.encoder()?;
+        encoder.setComputePipelineState(pipeline.metal_pipeline_state());
+        // SAFETY: bind slots match `row_reduce_looped` in
+        // `kernels-mlx/.../reduction/reduce_row.h`.
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(src.metal_buffer()), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(dst.metal_buffer()), 0, 1);
 
-        let row_size_ptr: NonNull<c_void> = NonNull::from(&row_size_i64).cast();
-        encoder.setBytes_length_atIndex(row_size_ptr, std::mem::size_of::<i64>(), 2);
+            let row_size_ptr: NonNull<c_void> = NonNull::from(&row_size_i64).cast();
+            encoder.setBytes_length_atIndex(row_size_ptr, std::mem::size_of::<i64>(), 2);
 
-        let nrr_ptr: NonNull<c_void> = NonNull::from(&non_row_reductions_i64).cast();
-        encoder.setBytes_length_atIndex(nrr_ptr, std::mem::size_of::<i64>(), 3);
+            let nrr_ptr: NonNull<c_void> = NonNull::from(&non_row_reductions_i64).cast();
+            encoder.setBytes_length_atIndex(nrr_ptr, std::mem::size_of::<i64>(), 3);
 
-        let shape_ptr: NonNull<c_void> = NonNull::from(pre_shape_i32.as_slice()).cast();
-        encoder.setBytes_length_atIndex(
-            shape_ptr,
-            std::mem::size_of_val(pre_shape_i32.as_slice()),
-            4,
-        );
+            let shape_ptr: NonNull<c_void> = NonNull::from(pre_shape_i32.as_slice()).cast();
+            encoder.setBytes_length_atIndex(
+                shape_ptr,
+                std::mem::size_of_val(pre_shape_i32.as_slice()),
+                4,
+            );
 
-        let strides_ptr: NonNull<c_void> = NonNull::from(pre_strides_i64.as_slice()).cast();
-        encoder.setBytes_length_atIndex(
-            strides_ptr,
-            std::mem::size_of_val(pre_strides_i64.as_slice()),
-            5,
-        );
+            let strides_ptr: NonNull<c_void> = NonNull::from(pre_strides_i64.as_slice()).cast();
+            encoder.setBytes_length_atIndex(
+                strides_ptr,
+                std::mem::size_of_val(pre_strides_i64.as_slice()),
+                5,
+            );
 
-        let ndim_ptr: NonNull<c_void> = NonNull::from(&ndim_i32).cast();
-        encoder.setBytes_length_atIndex(ndim_ptr, std::mem::size_of::<i32>(), 6);
+            let ndim_ptr: NonNull<c_void> = NonNull::from(&ndim_i32).cast();
+            encoder.setBytes_length_atIndex(ndim_ptr, std::mem::size_of::<i32>(), 6);
 
-        let reduce_shape_ptr: NonNull<c_void> = NonNull::from(reduce_shape_i32.as_slice()).cast();
-        encoder.setBytes_length_atIndex(
-            reduce_shape_ptr,
-            std::mem::size_of_val(reduce_shape_i32.as_slice()),
-            7,
-        );
+            let reduce_shape_ptr: NonNull<c_void> =
+                NonNull::from(reduce_shape_i32.as_slice()).cast();
+            encoder.setBytes_length_atIndex(
+                reduce_shape_ptr,
+                std::mem::size_of_val(reduce_shape_i32.as_slice()),
+                7,
+            );
 
-        let reduce_strides_ptr: NonNull<c_void> =
-            NonNull::from(reduce_strides_i64.as_slice()).cast();
-        encoder.setBytes_length_atIndex(
-            reduce_strides_ptr,
-            std::mem::size_of_val(reduce_strides_i64.as_slice()),
-            8,
-        );
+            let reduce_strides_ptr: NonNull<c_void> =
+                NonNull::from(reduce_strides_i64.as_slice()).cast();
+            encoder.setBytes_length_atIndex(
+                reduce_strides_ptr,
+                std::mem::size_of_val(reduce_strides_i64.as_slice()),
+                8,
+            );
 
-        let reduce_ndim_ptr: NonNull<c_void> = NonNull::from(&reduce_ndim_i32).cast();
-        encoder.setBytes_length_atIndex(reduce_ndim_ptr, std::mem::size_of::<i32>(), 9);
+            let reduce_ndim_ptr: NonNull<c_void> = NonNull::from(&reduce_ndim_i32).cast();
+            encoder.setBytes_length_atIndex(reduce_ndim_ptr, std::mem::size_of::<i32>(), 9);
+        }
     }
 
     // Grid: (threadgroup_size, out_grid.width, out_grid.height).
@@ -402,8 +406,7 @@ fn encode_row_reduce_looped<T>(
         height: 1,
         depth: 1,
     };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
-    Ok(())
+    commands.dispatch_threads(grid, threadgroup)
 }
 
 fn contiguous_strides_with_inner(pre_dims: &[usize], row_size: usize) -> Vec<i64> {

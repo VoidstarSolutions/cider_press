@@ -1,3 +1,7 @@
+// Dispatch wrappers derived from MLX (https://github.com/ml-explore/mlx).
+// Copyright © 2023-2024 Apple Inc. Released under the MIT license — see
+// the full upstream notice at `kernels-mlx/COPYING`.
+
 //! Command-buffer handle for batchable kernel dispatch.
 //!
 //! [`Commands`] owns one `MTLCommandBuffer` plus a lazily-opened compute
@@ -20,8 +24,8 @@
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
-    MTLComputeCommandEncoder, MTLComputePassDescriptor, MTLFence,
+    MTLBarrierScope, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
+    MTLComputeCommandEncoder, MTLComputePassDescriptor, MTLDispatchType, MTLFence, MTLSize,
 };
 
 use crate::device::Device;
@@ -54,6 +58,10 @@ pub struct Commands<'d> {
     chain_restore: Option<Retained<ProtocolObject<dyn MTLFence>>>,
     /// True once this session has opened its first encoder.
     chain_started: bool,
+    /// Number of dispatches issued in the current open encoder. Used by
+    /// `dispatch_threads`/`dispatch_threadgroups` to insert a barrier
+    /// before every dispatch after the first (concurrent encoder model).
+    dispatched_in_encoder: usize,
 }
 
 impl<'d> Commands<'d> {
@@ -76,6 +84,7 @@ impl<'d> Commands<'d> {
             armed: None,
             chain_restore: None,
             chain_started: false,
+            dispatched_in_encoder: 0,
         })
     }
 
@@ -121,6 +130,7 @@ impl<'d> Commands<'d> {
                     .as_ref()
                     .expect("armed implies a sampler is present");
                 let descriptor = MTLComputePassDescriptor::computePassDescriptor();
+                descriptor.setDispatchType(MTLDispatchType::Concurrent);
                 let attachment = {
                     // SAFETY: index 0 is always valid on the attachment
                     // array — it is allocated with at least one slot.
@@ -143,10 +153,15 @@ impl<'d> Commands<'d> {
                         context: "MTLCommandBuffer::computeCommandEncoderWithDescriptor",
                     })?
             } else {
-                self.cmd.computeCommandEncoder().ok_or(Error::AppleApi {
-                    context: "MTLCommandBuffer::computeCommandEncoder",
-                })?
+                let descriptor = MTLComputePassDescriptor::computePassDescriptor();
+                descriptor.setDispatchType(MTLDispatchType::Concurrent);
+                self.cmd
+                    .computeCommandEncoderWithDescriptor(&descriptor)
+                    .ok_or(Error::AppleApi {
+                        context: "MTLCommandBuffer::computeCommandEncoderWithDescriptor",
+                    })?
             };
+            self.dispatched_in_encoder = 0;
             if let Some(prev) = self.device.take_last_fence() {
                 enc.waitForFence(&prev);
                 if !self.chain_started {
@@ -168,10 +183,38 @@ impl<'d> Commands<'d> {
     fn close_encoder(&mut self) {
         if let Some(enc) = self.encoder.take() {
             enc.endEncoding();
+            self.dispatched_in_encoder = 0;
             if let Some(fence) = self.fence.take() {
                 self.device.set_last_fence(fence);
             }
         }
+    }
+
+    /// Encode a `dispatchThreads` call, fencing it behind every prior
+    /// dispatch in this encoder with a buffer-scope memory barrier (the
+    /// encoder is concurrent; ordering is explicit). Derived from MLX's
+    /// `CommandEncoder::dispatch_threads` (MIT, © 2023-2024 Apple Inc.).
+    pub fn dispatch_threads(&mut self, grid: MTLSize, threadgroup: MTLSize) -> Result<()> {
+        let n = self.dispatched_in_encoder;
+        let encoder = self.encoder()?;
+        if n > 0 {
+            encoder.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+        }
+        encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
+        self.dispatched_in_encoder += 1;
+        Ok(())
+    }
+
+    /// `dispatchThreadgroups` analogue of [`Commands::dispatch_threads`].
+    pub fn dispatch_threadgroups(&mut self, grid: MTLSize, threadgroup: MTLSize) -> Result<()> {
+        let n = self.dispatched_in_encoder;
+        let encoder = self.encoder()?;
+        if n > 0 {
+            encoder.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+        }
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, threadgroup);
+        self.dispatched_in_encoder += 1;
+        Ok(())
     }
 
     /// Close any open encoder, commit the command buffer, and block

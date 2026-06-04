@@ -102,19 +102,21 @@ pub fn affine_dequantize_bf16_gs64_b4(
 
     let kernel_name = format!("affine_dequantize_bfloat16_t_gs_{GROUP_SIZE}_b_{BITS}");
     let pipeline = library.pipeline(&kernel_name)?;
-    let encoder = commands.encoder()?;
-    encoder.setComputePipelineState(pipeline.metal_pipeline_state());
 
-    // SAFETY: slot/dtype binding matches MLX's affine_dequantize MSL
-    // signature; the `w` buffer is uint32 in our Rust types but is
-    // bound as the same MTLBuffer the kernel reads as `uint8_t*` (a
-    // reinterpret-as-bytes view — the buffer's byte length is the same
-    // regardless of the Rust element type).
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(w_q.metal_buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(scales.metal_buffer()), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(biases.metal_buffer()), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(out.metal_buffer()), 0, 3);
+    {
+        let encoder = commands.encoder()?;
+        encoder.setComputePipelineState(pipeline.metal_pipeline_state());
+        // SAFETY: slot/dtype binding matches MLX's affine_dequantize MSL
+        // signature; the `w` buffer is uint32 in our Rust types but is
+        // bound as the same MTLBuffer the kernel reads as `uint8_t*` (a
+        // reinterpret-as-bytes view — the buffer's byte length is the same
+        // regardless of the Rust element type).
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(w_q.metal_buffer()), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(scales.metal_buffer()), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(biases.metal_buffer()), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(out.metal_buffer()), 0, 3);
+        }
     }
 
     // 1D grid: one thread per packed byte. Threadgroup width capped at
@@ -129,6 +131,5 @@ pub fn affine_dequantize_bf16_gs64_b4(
         height: 1,
         depth: 1,
     };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
-    Ok(())
+    commands.dispatch_threads(grid, threadgroup)
 }

@@ -180,36 +180,37 @@ pub fn dispatch_sdpa_vector_bf16(
         ],
     )?;
 
-    let encoder = commands.encoder()?;
-    encoder.setComputePipelineState(pipeline.metal_pipeline_state());
+    {
+        let encoder = commands.encoder()?;
+        encoder.setComputePipelineState(pipeline.metal_pipeline_state());
+        // SAFETY: buffer / byte indices match the `sdpa_vector` MSL signature
+        // (sdpa_vector.h): q=0, k=1, v=2, out=3; gqa_factor(int)=4, N(int)=5,
+        // k_head_stride(size_t)=6, k_seq_stride=7, v_head_stride=8,
+        // v_seq_stride=9, scale(float)=10. The mask/sinks slots (11-17) are
+        // gated behind the function constants we pinned false above, so they
+        // are absent from this specialization and must not be bound. Caller
+        // sized the buffers to match (checked above for q/out).
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(q.metal_buffer()), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(k.metal_buffer()), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(v.metal_buffer()), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(out.metal_buffer()), 0, 3);
 
-    // SAFETY: buffer / byte indices match the `sdpa_vector` MSL signature
-    // (sdpa_vector.h): q=0, k=1, v=2, out=3; gqa_factor(int)=4, N(int)=5,
-    // k_head_stride(size_t)=6, k_seq_stride=7, v_head_stride=8,
-    // v_seq_stride=9, scale(float)=10. The mask/sinks slots (11-17) are
-    // gated behind the function constants we pinned false above, so they
-    // are absent from this specialization and must not be bound. Caller
-    // sized the buffers to match (checked above for q/out).
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(q.metal_buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(k.metal_buffer()), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(v.metal_buffer()), 0, 2);
-        encoder.setBuffer_offset_atIndex(Some(out.metal_buffer()), 0, 3);
-
-        let gqa: NonNull<c_void> = NonNull::from(&args.gqa_factor).cast();
-        encoder.setBytes_length_atIndex(gqa, std::mem::size_of::<i32>(), 4);
-        let n: NonNull<c_void> = NonNull::from(&args.n_keys).cast();
-        encoder.setBytes_length_atIndex(n, std::mem::size_of::<i32>(), 5);
-        let khs: NonNull<c_void> = NonNull::from(&args.k_head_stride).cast();
-        encoder.setBytes_length_atIndex(khs, std::mem::size_of::<u64>(), 6);
-        let kss: NonNull<c_void> = NonNull::from(&args.k_seq_stride).cast();
-        encoder.setBytes_length_atIndex(kss, std::mem::size_of::<u64>(), 7);
-        let vhs: NonNull<c_void> = NonNull::from(&args.v_head_stride).cast();
-        encoder.setBytes_length_atIndex(vhs, std::mem::size_of::<u64>(), 8);
-        let vss: NonNull<c_void> = NonNull::from(&args.v_seq_stride).cast();
-        encoder.setBytes_length_atIndex(vss, std::mem::size_of::<u64>(), 9);
-        let scale: NonNull<c_void> = NonNull::from(&args.scale).cast();
-        encoder.setBytes_length_atIndex(scale, std::mem::size_of::<f32>(), 10);
+            let gqa: NonNull<c_void> = NonNull::from(&args.gqa_factor).cast();
+            encoder.setBytes_length_atIndex(gqa, std::mem::size_of::<i32>(), 4);
+            let n: NonNull<c_void> = NonNull::from(&args.n_keys).cast();
+            encoder.setBytes_length_atIndex(n, std::mem::size_of::<i32>(), 5);
+            let khs: NonNull<c_void> = NonNull::from(&args.k_head_stride).cast();
+            encoder.setBytes_length_atIndex(khs, std::mem::size_of::<u64>(), 6);
+            let kss: NonNull<c_void> = NonNull::from(&args.k_seq_stride).cast();
+            encoder.setBytes_length_atIndex(kss, std::mem::size_of::<u64>(), 7);
+            let vhs: NonNull<c_void> = NonNull::from(&args.v_head_stride).cast();
+            encoder.setBytes_length_atIndex(vhs, std::mem::size_of::<u64>(), 8);
+            let vss: NonNull<c_void> = NonNull::from(&args.v_seq_stride).cast();
+            encoder.setBytes_length_atIndex(vss, std::mem::size_of::<u64>(), 9);
+            let scale: NonNull<c_void> = NonNull::from(&args.scale).cast();
+            encoder.setBytes_length_atIndex(scale, std::mem::size_of::<f32>(), 10);
+        }
     }
 
     // Grid: one THREADGROUP per (batch·query-head). MLX dispatches
@@ -226,6 +227,5 @@ pub fn dispatch_sdpa_vector_bf16(
         height: 1,
         depth: 1,
     };
-    encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, group);
-    Ok(())
+    commands.dispatch_threadgroups(grid, group)
 }
