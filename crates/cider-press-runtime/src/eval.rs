@@ -1,8 +1,9 @@
-//! Eval: walk the lazy graph, encode one command-buffer batch, commit,
-//! populate result caches.
+//! Eval: walk the lazy graph, encode its dispatches into command-buffer
+//! chunks (committed every [`OPS_PER_COMMAND_BUFFER`] ops), populate
+//! result caches.
 //!
 //! Public entry points are [`Tensor::eval`](crate::Tensor::eval)
-//! (synchronous: one `Commands` per call, `commit_and_wait`) and
+//! (synchronous: waits every chunk before returning) and
 //! [`Tensor::eval_async`](crate::Tensor::eval_async) (commits without
 //! waiting, returning a [`PendingEval`](crate::PendingEval) the caller
 //! waits later — the decode pipeline runs the next token's encode under the
@@ -15,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use cider_press_kernels::{
-    Buffer, Commands, KernelLibrary,
+    Buffer, Commands, CommandsInFlight, KernelLibrary,
     kernels::{arg_reduce, binary, copy, qmm, qmv, reduce, unary},
 };
 
@@ -60,23 +61,41 @@ fn build_order(root: &Tensor) -> Vec<Arc<TensorInner>> {
     order
 }
 
+/// Ops encoded per command buffer before committing and opening the next.
+/// One monolithic per-token command buffer runs its dependent dispatch
+/// chain measurably slower than the same chain split across several
+/// buffers (the queue pipelines buffer seams; consecutive encoders within
+/// one buffer are driver-merged, so splitting encoders alone does
+/// nothing). MLX commits every ~50 ops on M-class for the same reason
+/// (`get_max_ops_mb_per_buffer`). The serial queue's automatic hazard
+/// tracking on our default-tracked buffers orders the chunks.
+const OPS_PER_COMMAND_BUFFER: usize = 50;
+
 /// Steps 3–4: index the nodes, then allocate each op's output and encode
-/// its dispatch into `commands`. Returns the per-node output buffers and
-/// their pool tags (`Some(bytes)` ⇒ pool-minted; `None` ⇒ `SliceUpdate` slab
-/// clone, never pooled).
+/// its dispatch, committing a command buffer every
+/// [`OPS_PER_COMMAND_BUFFER`] ops. Returns the per-node output buffers,
+/// their pool tags (`Some(bytes)` ⇒ pool-minted; `None` ⇒ `SliceUpdate`
+/// slab clone, never pooled), and the in-flight handles of every committed
+/// chunk in submission order — none of them waited.
 #[allow(clippy::type_complexity)]
 fn encode_ops(
     order: &[Arc<TensorInner>],
     device: &crate::Device,
-    commands: &mut Commands<'_>,
-) -> Result<(Vec<Buffer<u8>>, Vec<Option<usize>>)> {
+) -> Result<(Vec<Buffer<u8>>, Vec<Option<usize>>, Vec<CommandsInFlight>)> {
     let mut index_of: HashMap<*const TensorInner, usize> = HashMap::new();
     for (i, inner) in order.iter().enumerate() {
         index_of.insert(Arc::as_ptr(inner), i);
     }
     let mut outputs: Vec<Buffer<u8>> = Vec::with_capacity(order.len());
     let mut tags: Vec<Option<usize>> = Vec::with_capacity(order.len());
-    for inner in order {
+    let mut in_flight: Vec<CommandsInFlight> =
+        Vec::with_capacity(order.len() / OPS_PER_COMMAND_BUFFER + 1);
+    let mut commands = device.kernels().commands()?;
+    for (i, inner) in order.iter().enumerate() {
+        if i > 0 && i % OPS_PER_COMMAND_BUFFER == 0 {
+            in_flight.push(commands.commit()?);
+            commands = device.kernels().commands()?;
+        }
         let op = inner
             .op
             .as_ref()
@@ -91,11 +110,12 @@ fn encode_ops(
             let byte_count = checked_byte_count(&inner.shape, inner.dtype)?;
             (device.alloc_pooled(byte_count)?, Some(byte_count))
         };
-        dispatch(inner, commands, &outputs, &mut dst, &index_of)?;
+        dispatch(inner, &mut commands, &outputs, &mut dst, &index_of)?;
         outputs.push(dst);
         tags.push(tag);
     }
-    Ok((outputs, tags))
+    in_flight.push(commands.commit()?);
+    Ok((outputs, tags, in_flight))
 }
 
 /// Step 6: populate each node's result cache from its output buffer.
@@ -140,7 +160,7 @@ fn detach_order(order: &[Arc<TensorInner>]) {
 /// Commit `root`'s graph without waiting. Populates result caches at commit
 /// time (buffer handles valid now; bytes valid after the returned handle is
 /// waited) and returns a [`PendingEval`](crate::PendingEval) owning the
-/// in-flight command buffer plus the topo order (pinning the in-flight
+/// in-flight command buffers plus the topo order (pinning the in-flight
 /// pooled buffers). See `pending_eval` for the host-read contract.
 pub(crate) fn eval_async(root: &Tensor) -> Result<crate::PendingEval> {
     let _span = crate::profile::span("tensor.eval_async");
@@ -151,9 +171,7 @@ pub(crate) fn eval_async(root: &Tensor) -> Result<crate::PendingEval> {
     let device = root.inner.device.as_ref().ok_or_else(|| {
         Error::InvalidArgument("eval_async: placeholder has no device to dispatch on".into())
     })?;
-    let mut commands = device.kernels().commands()?;
-    let (outputs, tags) = encode_ops(&order, device, &mut commands)?;
-    let in_flight = commands.commit()?;
+    let (outputs, tags, in_flight) = encode_ops(&order, device)?;
     // Flag before populating: a populated cache with the flag set means
     // "buffer exists, bytes not host-readable" (resolve_leaf returns None).
     // GPU-side chaining reads the cache directly and is unaffected.
@@ -181,12 +199,13 @@ pub(crate) fn eval(root: &Tensor) -> Result<()> {
     let device = root.inner.device.as_ref().ok_or_else(|| {
         Error::InvalidArgument("eval: placeholder has no device to dispatch on".into())
     })?;
-    let mut commands = device.kernels().commands()?;
-    let (outputs, tags) = encode_ops(&order, device, &mut commands)?;
+    let (outputs, tags, in_flight) = encode_ops(&order, device)?;
     drop(encode);
 
     let wait = crate::profile::span("tensor.eval.wait");
-    commands.commit_and_wait()?;
+    for chunk in in_flight {
+        chunk.wait()?;
+    }
     drop(wait);
 
     populate_caches(&order, outputs, tags, device);
