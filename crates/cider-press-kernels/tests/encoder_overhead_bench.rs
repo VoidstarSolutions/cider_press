@@ -131,12 +131,14 @@ fn run_concurrent_free(ctx: &Ctx<'_>) -> f64 {
 /// structure. Tracked (default) hazard mode orders the buffers; the
 /// question is whether the seams overlap on the GPU.
 fn run_split_cmdbufs(ctx: &Ctx<'_>, splits: usize) -> f64 {
-    let per = CHAIN / splits;
     let mut cmds = Vec::with_capacity(splits);
     for s in 0..splits {
         let cmd = ctx.device.metal_queue().commandBuffer().expect("cmdbuf");
         let enc = cmd.computeCommandEncoder().expect("encoder");
-        for i in s * per..(s + 1) * per {
+        // Balanced ranges covering all CHAIN dispatches even when splits
+        // doesn't divide CHAIN (CHAIN / splits alone would drop the
+        // remainder and under-count the per-dispatch normalization).
+        for i in s * CHAIN / splits..(s + 1) * CHAIN / splits {
             encode_dispatch(ctx, &enc, i);
         }
         enc.endEncoding();
@@ -149,11 +151,11 @@ fn run_split_cmdbufs(ctx: &Ctx<'_>, splits: usize) -> f64 {
 
 /// The chain as `splits` serial encoders within ONE command buffer.
 fn run_split_encoders(ctx: &Ctx<'_>, splits: usize) -> f64 {
-    let per = CHAIN / splits;
     let cmd = ctx.device.metal_queue().commandBuffer().expect("cmdbuf");
     for s in 0..splits {
         let enc = cmd.computeCommandEncoder().expect("encoder");
-        for i in s * per..(s + 1) * per {
+        // Balanced ranges covering all CHAIN dispatches (see run_split_cmdbufs).
+        for i in s * CHAIN / splits..(s + 1) * CHAIN / splits {
             encode_dispatch(ctx, &enc, i);
         }
         enc.endEncoding();
