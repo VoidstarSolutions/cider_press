@@ -182,7 +182,19 @@ impl Device {
     /// Allocate a scratch buffer of `bytes`, drawing from the recycling
     /// pool when a freed buffer of the same requested size is available
     /// and falling back to a fresh Metal allocation otherwise.
-    pub(crate) fn alloc_pooled(&self, bytes: usize) -> Result<Buffer<u8>> {
+    ///
+    /// Returns `(buffer, bytes)` where `bytes` is the free-list key for
+    /// returning the buffer to the pool on drop.
+    ///
+    // Metal shared-storage allocations are page-rounded (≥ 4 KiB on Apple
+    // Silicon), so even a logically-small activation buffer has a Metal
+    // allocation large enough for a K-padded qmv read: the activation's
+    // logical byte count (e.g. 896×bf16 = 1792 B) lives in a ≥4096 B Metal
+    // allocation — a padded-K read of 2048 B stays in-bounds on the GPU side.
+    // We do NOT round the Rust logical length here, because dispatch functions
+    // derive element counts from `Buffer::len()` (= logical bytes / sizeof(T));
+    // rounding the logical length would corrupt those counts for unpadded ops.
+    pub(crate) fn alloc_pooled(&self, bytes: usize) -> Result<(Buffer<u8>, usize)> {
         if let Some(buf) = self
             .inner
             .pool
@@ -190,9 +202,9 @@ impl Device {
             .expect("buffer pool mutex poisoned")
             .take(bytes)
         {
-            return Ok(buf);
+            return Ok((buf, bytes));
         }
-        Ok(self.inner.kernels.alloc_buffer::<u8>(bytes)?)
+        Ok((self.inner.kernels.alloc_buffer::<u8>(bytes)?, bytes))
     }
 
     /// Wrap an op-output buffer as a pool-owned [`PooledBuffer`] that

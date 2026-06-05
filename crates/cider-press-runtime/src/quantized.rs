@@ -32,6 +32,12 @@ use crate::tensor::LeafStorage;
 #[derive(Clone)]
 pub struct QuantizedWeight {
     tensor: Tensor,
+    /// Logical inner dim. Equals the physical `shape()[1]` except for
+    /// K-padded weights, where the trailing `k_physical - k_logical`
+    /// columns are zero-scale/zero-bias pad groups that contribute
+    /// exactly 0 to the matvec — activations validate against this,
+    /// the kernel dispatches with the physical K.
+    k_logical: usize,
 }
 
 impl QuantizedWeight {
@@ -56,8 +62,76 @@ impl QuantizedWeight {
         scales: &[u8],
         biases: &[u8],
     ) -> Result<Self> {
-        quantization.validate()?;
         let shape = shape.into();
+        let k_physical = if shape.rank() == 2 {
+            shape.dims()[1]
+        } else {
+            0
+        };
+        Self::from_bytes_inner(
+            device,
+            shape,
+            k_physical,
+            quantization,
+            weights,
+            scales,
+            biases,
+        )
+    }
+
+    /// [`Self::from_bytes`], but the weight is K-padded: `shape` is the
+    /// physical `[N, k_physical]`; activations of width `k_logical` are
+    /// accepted. The caller guarantees columns `k_logical..k_physical`
+    /// decode to zero (zero-scale, zero-bias pad groups) — see
+    /// `pad_quantized_k` in the models crate.
+    pub fn from_bytes_k_padded(
+        device: &Device,
+        shape: impl Into<Shape>,
+        k_logical: usize,
+        quantization: Quantization,
+        weights: &[u8],
+        scales: &[u8],
+        biases: &[u8],
+    ) -> Result<Self> {
+        let shape = shape.into();
+        let k_physical = if shape.rank() == 2 {
+            shape.dims()[1]
+        } else {
+            0
+        };
+        let group_size = quantization.group_size() as usize;
+        if k_logical > k_physical {
+            return Err(Error::InvalidArgument(format!(
+                "QuantizedWeight: k_logical={k_logical} > k_physical={k_physical}",
+            )));
+        }
+        if group_size > 0 && k_logical % group_size != 0 {
+            return Err(Error::InvalidArgument(format!(
+                "QuantizedWeight: k_logical={k_logical} must be a multiple of \
+                 group_size={group_size}",
+            )));
+        }
+        Self::from_bytes_inner(
+            device,
+            shape,
+            k_logical,
+            quantization,
+            weights,
+            scales,
+            biases,
+        )
+    }
+
+    fn from_bytes_inner(
+        device: &Device,
+        shape: Shape,
+        k_logical: usize,
+        quantization: Quantization,
+        weights: &[u8],
+        scales: &[u8],
+        biases: &[u8],
+    ) -> Result<Self> {
+        quantization.validate()?;
         if shape.rank() != 2 {
             return Err(Error::InvalidArgument(format!(
                 "QuantizedWeight: shape must be rank 2 ([N, K]); got rank {} ({:?})",
@@ -121,7 +195,7 @@ impl QuantizedWeight {
         let layout = Layout::Quantized(quantization);
         let tensor =
             Tensor::host_quantized_leaf(device, shape, layout, weights_buf, scales_buf, biases_buf);
-        Ok(Self { tensor })
+        Ok(Self { tensor, k_logical })
     }
 
     /// The underlying [`Tensor`] handle. Use this when an API wants a
@@ -135,6 +209,14 @@ impl QuantizedWeight {
     #[must_use]
     pub fn shape(&self) -> &Shape {
         self.tensor.shape()
+    }
+
+    /// Logical inner dim (K). For unpadded weights this equals `shape()[1]`;
+    /// for K-padded weights it is the original K that activations must match —
+    /// the kernel reads the physical (padded) K from the weight tensor's shape.
+    #[must_use]
+    pub fn k_logical(&self) -> usize {
+        self.k_logical
     }
 
     /// Host-readable byte views of the three component buffers
@@ -268,8 +350,9 @@ impl core::fmt::Debug for QuantizedWeight {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("QuantizedWeight")
             .field("shape", self.shape())
+            .field("k_logical", &self.k_logical)
             .field("quantization", &self.quantization())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

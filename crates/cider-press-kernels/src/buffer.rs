@@ -74,10 +74,19 @@ impl<T> Buffer<T> {
     /// This is the byte count cider-press requested from Metal. The
     /// underlying `MTLBuffer`'s page-aligned allocation may be larger,
     /// but that rounded-up size is not exposed here. Use
-    /// `self.metal_buffer().length()` if you need it.
+    /// [`Self::metal_alloc_len`] if you need it.
     #[must_use]
     pub fn byte_len(&self) -> usize {
         self.len * size_of::<T>()
+    }
+
+    /// The actual byte capacity of the underlying Metal allocation.
+    /// Always a page-multiple (≥ 4 KiB on Apple Silicon) and ≥
+    /// [`Self::byte_len`]. Useful for capacity asserts on ops that
+    /// read past the Rust-logical end (e.g. K-padded qmv activations).
+    #[must_use]
+    pub fn metal_alloc_len(&self) -> usize {
+        self.raw.length()
     }
 
     /// Escape hatch to the underlying [`MTLBuffer`] for use with raw

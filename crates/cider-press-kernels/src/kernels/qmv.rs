@@ -73,15 +73,29 @@ pub fn affine_qmv_bf16(
     biases: &Buffer<bf16>,
     x: &Buffer<bf16>,
     y: &mut Buffer<bf16>,
+    in_vec_size: usize,
     group_size: u32,
     bits: u32,
 ) -> Result<()> {
     // Shape validation. Failing any of these would produce silent garbage
     // on the GPU side (or a div-by-zero panic on `group_size == 0`); reject
     // them with a typed error so callers can recover.
-    let k = i32::try_from(x.len()).map_err(|_| {
-        Error::InvalidArgument(format!("affine_qmv: K={} does not fit in i32", x.len()))
+    let k = i32::try_from(in_vec_size).map_err(|_| {
+        Error::InvalidArgument(format!("affine_qmv: K={in_vec_size} does not fit in i32"))
     })?;
+    // For K-padded weights the physical K exceeds the activation's Rust-logical
+    // byte count, but the Metal page-rounded allocation always covers it: a
+    // 896×bf16 = 1792 B activation lives in a ≥4096 B Metal allocation, so a
+    // padded-K read of 1024×2 = 2048 B stays in-bounds on the GPU. Assert
+    // against the Metal allocation length to catch any future path that
+    // allocates buffers too small for the physical K.
+    debug_assert!(
+        x.metal_alloc_len() >= in_vec_size * 2,
+        "affine_qmv: activation Metal allocation too small for K-padded read: \
+         metal_alloc_len={} < in_vec_size*2={} (K-padding requires Metal capacity >= physical K * 2)",
+        x.metal_alloc_len(),
+        in_vec_size * 2,
+    );
     let n = i32::try_from(y.len()).map_err(|_| {
         Error::InvalidArgument(format!("affine_qmv: N={} does not fit in i32", y.len()))
     })?;
