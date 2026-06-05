@@ -70,6 +70,8 @@ fn synthetic_attention_weights(device: &Device) -> Qwen2AttentionWeights {
     let q_dim = NUM_Q_HEADS * HEAD_DIM; // 896
     let kv_dim = NUM_KV_HEADS * HEAD_DIM; // 128
 
+    // K-padded decode twins: HIDDEN_SIZE=896 → k_pad=1024
+    let k_pad = HIDDEN_SIZE.next_multiple_of(512);
     Qwen2AttentionWeights {
         q_proj: zero_qw(device, q_dim, HIDDEN_SIZE),
         k_proj: zero_qw(device, kv_dim, HIDDEN_SIZE),
@@ -78,6 +80,10 @@ fn synthetic_attention_weights(device: &Device) -> Qwen2AttentionWeights {
         q_bias: zero_bf16_1d(device, q_dim),
         k_bias: zero_bf16_1d(device, kv_dim),
         v_bias: zero_bf16_1d(device, kv_dim),
+        q_proj_padded: zero_qw(device, q_dim, k_pad),
+        k_proj_padded: zero_qw(device, kv_dim, k_pad),
+        v_proj_padded: zero_qw(device, kv_dim, k_pad),
+        o_proj_padded: zero_qw(device, HIDDEN_SIZE, k_pad),
     }
 }
 
