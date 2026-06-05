@@ -100,6 +100,14 @@ impl Device {
         let bytes = len
             .checked_mul(elem_size)
             .ok_or(Error::BufferTooLarge { len, elem_size })?;
+        // Round the Metal allocation to 512 B without changing the Rust-logical
+        // length: K-padded qmv reads `in_vec_size` elements from an activation
+        // whose logical row is shorter (896 bf16 = 1792 B read as 1024 = 2048 B).
+        // Pad weights dequantize to zero so the tail values are irrelevant, but
+        // the read must stay within MTLBuffer.length — rounding gives every
+        // buffer that capacity. Element counts everywhere derive from
+        // Buffer::len, which stays at the requested size.
+        let alloc_bytes = bytes.next_multiple_of(512);
         let options = if tracked_buffers_requested() {
             MTLResourceOptions::StorageModeShared
         } else {
@@ -107,10 +115,10 @@ impl Device {
         };
         let raw = self
             .device
-            .newBufferWithLength_options(bytes, options)
-            .ok_or(Error::BufferAllocation { bytes })?;
-        // SAFETY: shared-storage allocation succeeded; `len` matches the byte
-        // length we requested, divided by `size_of::<T>()`.
+            .newBufferWithLength_options(alloc_bytes, options)
+            .ok_or(Error::BufferAllocation { bytes: alloc_bytes })?;
+        // SAFETY: shared-storage allocation succeeded; the MTLBuffer holds at
+        // least `alloc_bytes` >= `bytes`; `len` is the requested element count.
         Ok(unsafe { Buffer::from_raw_parts(raw, len) })
     }
 
