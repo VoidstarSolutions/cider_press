@@ -186,14 +186,12 @@ impl Device {
     /// Returns `(buffer, bytes)` where `bytes` is the free-list key for
     /// returning the buffer to the pool on drop.
     ///
-    // Metal shared-storage allocations are page-rounded (≥ 4 KiB on Apple
-    // Silicon), so even a logically-small activation buffer has a Metal
-    // allocation large enough for a K-padded qmv read: the activation's
-    // logical byte count (e.g. 896×bf16 = 1792 B) lives in a ≥4096 B Metal
-    // allocation — a padded-K read of 2048 B stays in-bounds on the GPU side.
-    // We do NOT round the Rust logical length here, because dispatch functions
-    // derive element counts from `Buffer::len()` (= logical bytes / sizeof(T));
+    // We do NOT round the Rust logical length here. Dispatch functions derive
+    // element counts from `Buffer::len()` (= logical bytes / sizeof(T));
     // rounding the logical length would corrupt those counts for unpadded ops.
+    // The 512-B rounding that makes K-padded qmv reads safe happens at
+    // `cider_press_kernels::Device::alloc_buffer` — that is the single site
+    // that controls Metal allocation capacity for all runtime buffers.
     pub(crate) fn alloc_pooled(&self, bytes: usize) -> Result<(Buffer<u8>, usize)> {
         if let Some(buf) = self
             .inner

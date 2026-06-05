@@ -205,7 +205,9 @@ impl QuantizedWeight {
         &self.tensor
     }
 
-    /// Logical shape `[N, K]` of the quantized weight.
+    /// Physical shape `[N, K]` of the quantized weight. For K-padded weights
+    /// this is the padded (physical) K; activations must match `k_logical()`,
+    /// not `shape()[1]`.
     #[must_use]
     pub fn shape(&self) -> &Shape {
         self.tensor.shape()
@@ -417,5 +419,68 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    // from_bytes_k_padded tests: shape [8, 128], group_size=64, bits=4
+    // w_bytes = 8 * 128 * 4 / 8 = 512; aux_bytes = 8 * (128/64) * 2 = 32
+    const K_PAD_N: usize = 8;
+    const K_PAD_K_PHYSICAL: usize = 128;
+
+    #[test]
+    fn from_bytes_k_padded_rejects_k_logical_gt_k_physical() {
+        let device = Device::shared().expect("device");
+        let q = Quantization::Q4_GS64;
+        let (w_bytes, aux_bytes) = fixture_sizes(K_PAD_N, K_PAD_K_PHYSICAL, q);
+        let err = QuantizedWeight::from_bytes_k_padded(
+            &device,
+            [K_PAD_N, K_PAD_K_PHYSICAL],
+            K_PAD_K_PHYSICAL + 64, // k_logical > k_physical
+            q,
+            &vec![0u8; w_bytes],
+            &vec![0u8; aux_bytes],
+            &vec![0u8; aux_bytes],
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn from_bytes_k_padded_rejects_k_logical_not_multiple_of_group_size() {
+        let device = Device::shared().expect("device");
+        let q = Quantization::Q4_GS64;
+        let (w_bytes, aux_bytes) = fixture_sizes(K_PAD_N, K_PAD_K_PHYSICAL, q);
+        let err = QuantizedWeight::from_bytes_k_padded(
+            &device,
+            [K_PAD_N, K_PAD_K_PHYSICAL],
+            33, // not a multiple of group_size=64
+            q,
+            &vec![0u8; w_bytes],
+            &vec![0u8; aux_bytes],
+            &vec![0u8; aux_bytes],
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn from_bytes_k_padded_happy_path() {
+        let device = Device::shared().expect("device");
+        let q = Quantization::Q4_GS64;
+        let (w_bytes, aux_bytes) = fixture_sizes(K_PAD_N, K_PAD_K_PHYSICAL, q);
+        let k_logical = 64; // half the physical K
+        let qw = QuantizedWeight::from_bytes_k_padded(
+            &device,
+            [K_PAD_N, K_PAD_K_PHYSICAL],
+            k_logical,
+            q,
+            &vec![0u8; w_bytes],
+            &vec![0u8; aux_bytes],
+            &vec![0u8; aux_bytes],
+        )
+        .expect("k-padded construction should succeed");
+        assert_eq!(qw.k_logical(), k_logical);
+        assert_eq!(qw.shape(), &Shape::from([K_PAD_N, K_PAD_K_PHYSICAL]));
+        assert_eq!(qw.quantization(), q);
+        assert!(matches!(qw.tensor().layout(), Layout::Quantized(_)));
     }
 }

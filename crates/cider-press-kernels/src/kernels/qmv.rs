@@ -44,9 +44,16 @@ const BK: i32 = 32;
 /// dispatch into `commands`; caller flushes via
 /// [`Commands::commit_and_wait`].
 ///
+/// # Parameters
+///
+/// - `in_vec_size`: physical K from the weight shape — NOT the activation
+///   length. For unpadded weights `x.len() == in_vec_size`; for K-padded
+///   weights `x.len() < in_vec_size` and passing `x.len()` would silently
+///   compute garbage. Always read from `QuantizedWeight::shape()[1]`.
+///
 /// # Shape requirements
 ///
-/// Let `K = x.len()`, `N = y.len()`. Then:
+/// Let `K = in_vec_size`, `N = y.len()`. Then:
 /// - `w_q.len()  == N * K * bits / 32`  (int4 lanes packed into uint32)
 /// - `scales.len() == N * K / group_size`
 /// - `biases.len() == N * K / group_size`
@@ -84,12 +91,13 @@ pub fn affine_qmv_bf16(
         Error::InvalidArgument(format!("affine_qmv: K={in_vec_size} does not fit in i32"))
     })?;
     // For K-padded weights the physical K exceeds the activation's Rust-logical
-    // byte count, but the Metal page-rounded allocation always covers it: a
-    // 896×bf16 = 1792 B activation lives in a ≥4096 B Metal allocation, so a
-    // padded-K read of 1024×2 = 2048 B stays in-bounds on the GPU. Assert
-    // against the Metal allocation length to catch any future path that
-    // allocates buffers too small for the physical K.
-    debug_assert!(
+    // length. Every Metal allocation is 512-B rounded at
+    // `cider_press_kernels::Device::alloc_buffer`, so a 1792-B activation row
+    // (896 bf16) has ≥2048-B Metal capacity — enough for a padded-K read of
+    // 1024 bf16. Pad weights dequantize to zero so tail values don't affect
+    // the result. Assert against the Metal allocation length to catch any
+    // future path that skips the 512-B rounding.
+    assert!(
         x.metal_alloc_len() >= in_vec_size * 2,
         "affine_qmv: activation Metal allocation too small for K-padded read: \
          metal_alloc_len={} < in_vec_size*2={} (K-padding requires Metal capacity >= physical K * 2)",
