@@ -2515,4 +2515,36 @@ mod order_tests {
         // Sanity: diamond has exactly 3 op nodes (b, c, d); `a` is a leaf.
         assert_eq!(order.len(), 3, "diamond graph should produce 3 op nodes");
     }
+
+    /// A producer consumed only through a view: `d = v + v` where
+    /// `v = reshape(b)` and `b` is an unevaluated op. Views own no
+    /// storage, so `resolve_to_op` must chase the view chain to its
+    /// source op — `b` must be scheduled, and before `d`.
+    #[test]
+    fn build_order_chases_view_inputs_to_source_op() {
+        let device = Device::system_default().expect("device");
+        let a = Tensor::from_slice(&device, &[1.0f32, 2.0], [2]).expect("a");
+        let b = a.add(&a).expect("b = a + a");
+        let v = b.reshape([1, 2]).expect("v = reshape(b)");
+        let d = v.add(&v).expect("d = v + v");
+
+        let order = build_order(&d);
+
+        assert_eq!(
+            order.len(),
+            2,
+            "b and d are the only op nodes (v is a view, a is a leaf)"
+        );
+        let position = |t: &Tensor| {
+            order
+                .iter()
+                .position(|inner| Arc::as_ptr(inner) == Arc::as_ptr(&t.inner))
+        };
+        let pos_b = position(&b).expect("view source op `b` must be scheduled");
+        let pos_d = position(&d).expect("root op `d` must be scheduled");
+        assert!(
+            pos_b < pos_d,
+            "view source op `b` (pos {pos_b}) must precede its consumer `d` (pos {pos_d})"
+        );
+    }
 }
