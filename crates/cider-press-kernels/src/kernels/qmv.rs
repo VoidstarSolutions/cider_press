@@ -91,12 +91,23 @@ pub fn affine_qmv_bf16(
         Error::InvalidArgument(format!("affine_qmv: K={in_vec_size} does not fit in i32"))
     })?;
     // For K-padded weights the physical K exceeds the activation's Rust-logical
-    // length. Every Metal allocation is 512-B rounded at
-    // `cider_press_kernels::Device::alloc_buffer`, so a 1792-B activation row
-    // (896 bf16) has ≥2048-B Metal capacity — enough for a padded-K read of
-    // 1024 bf16. Pad weights dequantize to zero so tail values don't affect
-    // the result. Assert against the Metal allocation length to catch any
-    // future path that skips the 512-B rounding.
+    // length, so the kernel reads tail elements past the logical row. Safety of
+    // those reads is a THREE-part contract:
+    //   (a) Pad groups carry zero scale AND zero bias. The kernel computes
+    //       `scale·Σ(q·x) + bias·Σx` per group; zero scale kills the first
+    //       term and zero bias kills `bias·Σx_tail` (loader enforces this).
+    //   (b) Buffer capacity ≥ physical K * 2 bytes — the assert below. Every
+    //       Metal allocation is 512-B rounded at
+    //       `cider_press_kernels::Device::alloc_buffer`, so a 1792-B activation
+    //       row (896 bf16) has ≥2048-B Metal capacity — enough for a padded-K
+    //       read of 1024 bf16.
+    //   (c) Tail bytes read as 0.0, guaranteed by the slack-zeroing invariant
+    //       in `alloc_buffer`. This is independent of (a): even with zero
+    //       scale/bias, `accum += x·q` poisons on `0 * NaN = NaN` if a stale
+    //       tail byte decodes as bf16 NaN/Inf, so the tail VALUES matter. The
+    //       alloc-site memset makes them 0.0 for the buffer's lifetime.
+    // Assert against the Metal allocation length to catch any future path that
+    // skips the 512-B rounding (which would also skip the slack-zeroing).
     assert!(
         x.metal_alloc_len() >= in_vec_size * 2,
         "affine_qmv: activation Metal allocation too small for K-padded read: \

@@ -15,8 +15,8 @@ use std::sync::Mutex;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandQueue, MTLCounterSamplingPoint, MTLCreateSystemDefaultDevice,
-    MTLDevice, MTLFence, MTLResourceOptions, MTLTimestamp,
+    MTLBuffer, MTLCommandBuffer, MTLCommandQueue, MTLCounterSamplingPoint,
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLFence, MTLResourceOptions, MTLTimestamp,
 };
 
 use crate::buffer::Buffer;
@@ -102,11 +102,12 @@ impl Device {
             .ok_or(Error::BufferTooLarge { len, elem_size })?;
         // Round the Metal allocation to 512 B without changing the Rust-logical
         // length: K-padded qmv reads `in_vec_size` elements from an activation
-        // whose logical row is shorter (896 bf16 = 1792 B read as 1024 = 2048 B).
-        // Pad weights dequantize to zero so the tail values are irrelevant, but
-        // the read must stay within MTLBuffer.length — rounding gives every
-        // buffer that capacity. Element counts everywhere derive from
-        // Buffer::len, which stays at the requested size.
+        // whose logical row is shorter (896 bf16 = 1792 B read as 1024 = 2048 B),
+        // and the read must stay within MTLBuffer.length — rounding gives every
+        // buffer that capacity. The slack is zeroed below (tail values DO enter
+        // the kernel math — see the three-part contract in kernels/qmv.rs).
+        // Element counts everywhere derive from Buffer::len, which stays at
+        // the requested size.
         let alloc_bytes = bytes.next_multiple_of(512);
         let options = if tracked_buffers_requested() {
             MTLResourceOptions::StorageModeShared
@@ -117,6 +118,28 @@ impl Device {
             .device
             .newBufferWithLength_options(alloc_bytes, options)
             .ok_or(Error::BufferAllocation { bytes: alloc_bytes })?;
+        // Zero the slack [bytes..alloc_bytes): K-padded qmv reads past the
+        // logical row into this region, and the kernel's accum += x*q is
+        // NaN-poisonable even against zero weight nibbles (0 * NaN = NaN).
+        // Zeroing once at allocation makes the tail 0.0 for the buffer's
+        // lifetime: no dispatch or host write ever covers more than the
+        // logical byte length, and the pool recycles within exact-size
+        // buckets, so the slack is never rewritten. That "no write exceeds
+        // the logical byte length" is a codebase-wide write-discipline
+        // CONTRACT this invariant depends on, not a mechanism enforced here:
+        // a future write past Buffer::len would silently dirty the slack.
+        // Storage is always Shared
+        // here (the only two option sets above are Shared / Shared+Untracked),
+        // so the host `contents()` pointer is valid and a write_bytes suffices
+        // — no GPU dispatch has referenced this fresh allocation yet.
+        if alloc_bytes > bytes {
+            let contents = raw.contents().as_ptr().cast::<u8>();
+            // SAFETY: `contents` is the base of a freshly-allocated shared
+            // MTLBuffer of `alloc_bytes`; `[bytes..alloc_bytes)` is in bounds
+            // (alloc_bytes > bytes), the slack is ≤511 B, and no other handle
+            // or dispatch aliases this buffer yet.
+            unsafe { contents.add(bytes).write_bytes(0u8, alloc_bytes - bytes) };
+        }
         // SAFETY: shared-storage allocation succeeded; the MTLBuffer holds at
         // least `alloc_bytes` >= `bytes`; `len` is the requested element count.
         Ok(unsafe { Buffer::from_raw_parts(raw, len) })
