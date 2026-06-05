@@ -538,11 +538,13 @@ mod tests {
 
     /// An abandoned session on a FRESH device (no prior fence tail) must
     /// clear any fence it published, not just restore a displaced one.
-    /// `begin_profiled_op` closes the first encoder, which publishes the
-    /// session's own fence as the device tail; if the session is then
-    /// dropped uncommitted, that fence never signals. Asserts the tail
-    /// state directly — the hang-based variant of this failure would
-    /// stall the suite instead of failing.
+    /// Closing an encoder publishes the session's own fence as the
+    /// device tail; if the session is then dropped uncommitted, that
+    /// fence never signals. Calls the private `close_encoder` directly —
+    /// the public route is `begin_profiled_op`, but GPU counter sampling
+    /// is unavailable on virtualized CI runners. Asserts the tail state
+    /// directly — the hang-based variant of this failure would stall the
+    /// suite instead of failing.
     #[test]
     fn abandoned_session_on_fresh_device_clears_fence_tail() {
         let device = Device::system_default().expect("device");
@@ -554,11 +556,10 @@ mod tests {
         let src: Buffer<bf16> = device.upload(&host).expect("upload");
         let mut dst: Buffer<u32> = device.alloc_buffer(1).expect("alloc dst");
 
-        let mut cmds = device.commands_profiled(4).expect("profiled commands");
-        cmds.begin_profiled_op("argmax");
+        let mut cmds = device.commands().expect("commands");
         argmax_bf16(&mut cmds, &library, &src, &mut dst, host.len()).expect("dispatch");
         // Closes the open encoder, publishing this session's fence.
-        cmds.begin_profiled_op("next");
+        cmds.close_encoder();
         drop(cmds); // abandoned uncommitted — the published fence never signals
 
         assert!(
