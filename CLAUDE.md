@@ -19,14 +19,17 @@ verbatim, dispatch them from Rust, and wrap them in a lazy graph that
 batches command buffers, and we capture most of MLX's perf in idiomatic
 Rust.
 
-Measurement now backs the hypothesis. The vendored MLX kernels run
-bit-exact from Rust, and the performance gap lives where predicted: at
-the dispatch boundary. Running Qwen2.5-0.5B-Instruct-4bit, decode is
-~10× slower than `mlx_lm`, with ~89% of each decode step in
-`Tensor::eval` spread over ~49 synchronous `commit + wait` cycles per
-token. Closing that gap (command-buffer batching) is the next work. See
-`docs/QWEN_PERF.md` for the numbers and `docs/ARCHITECTURE.md` for the
-forward backlog.
+Measurement backed the hypothesis, and the gap is now closed. The
+vendored MLX kernels run bit-exact from Rust, and the dispatch-boundary
+gap that started at ~10× has been worked down stage by stage — fused
+`RMSNorm`, async decode pipelining, decode copy-elimination, and finally
+the **encoder/sync-model port** (MLX's untracked buffers + fence chain +
+concurrent encoders + graph-level barrier elision in Kahn-wave order).
+Running Qwen2.5-0.5B-Instruct-4bit, decode is now **~561 vs ~564 tok/s,
+~1.00× of `mlx_lm`** — essentially at parity. The remaining levers are
+kernel-side (small-N `qmv` launch config), prefill, and memory, not the
+dispatch model. See `docs/QWEN_PERF.md` for the numbers and
+`docs/ARCHITECTURE.md` for the forward backlog.
 
 ### Non-goals
 
@@ -77,12 +80,14 @@ Runs **Qwen2.5-0.5B-Instruct-4bit** end-to-end: load checkpoint →
 tokenize → chat-template → greedy decode, streamed via the `cider-press`
 CLI. The runtime is a lazy `Tensor` graph over vendored MLX Metal
 kernels, with `eval()` as the synchronous dispatch boundary; the models
-crate composes Qwen2 from runtime ops. The performance baseline is
-measured (`docs/QWEN_PERF.md`).
+crate composes Qwen2 from runtime ops. Performance is measured and the
+decode gap to `mlx_lm` is **closed** (~561 vs ~564 tok/s, ~1.00×) after
+the encoder/sync-model port (`docs/QWEN_PERF.md`).
 
-**Next work is performance optimization** — the decode path is
-dispatch-bound (see Project context). `docs/ARCHITECTURE.md` holds the
-forward pass and the prioritized backlog.
+**Remaining perf work is kernel- and memory-side**, not the dispatch
+model: small-N `qmv` launch config (backlog #4), prefill strided work
+(S2–S5), within-eval reuse for RSS, and `.metallib` precompile.
+`docs/ARCHITECTURE.md` holds the forward pass and the prioritized backlog.
 
 ---
 
@@ -133,6 +138,24 @@ forward pass and the prioritized backlog.
   Linear bias) is distinct from `q_proj.biases` (plural, per-group
   quantization bias on the qmv ABI). Only Q/K/V have `.bias`; O has only
   `.biases`.
+- **Metal dispatch model (the encoder/sync port, the decode lever that
+  closed the `mlx_lm` gap).** Consecutive *serial* compute passes in one
+  command buffer are **driver-merged** — splitting encoders alone is inert;
+  you must commit separate command buffers (every ~50 ops, MLX's value) to
+  pipeline the GPU. `updateFence` captures only commands encoded **before**
+  it, so encoding it at encoder *open* is a silent no-op (the fence signals
+  immediately, the next `waitForFence` waits on nothing) — encode it at
+  *close*, before `endEncoding`. A global `memoryBarrier` **before every
+  dispatch** on a concurrent encoder is *slower* than a serial encoder on
+  real kernels (a sub-µs microbench inverts this — don't trust it); what
+  pays is making barriers **rare** via graph-level hazard tracking (elide
+  the barrier unless an op reads a buffer written since the last barrier)
+  scheduled in **Kahn-wave** order so independent ops sit adjacent and
+  overlap. With buffers hazard-**untracked** (no automatic seam analysis),
+  cross-encoder/-token ordering rests entirely on the encoder **fence
+  chain**. Escape hatches: `CIDER_PRESS_TRACKED_BUFFERS=1` (restore
+  automatic tracking), `CIDER_PRESS_NO_BARRIER_ELISION=1` (barrier every
+  dispatch) — both for bisecting sync bugs.
 
 ---
 

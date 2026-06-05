@@ -190,17 +190,19 @@ fn encode_v<T>(
     })?;
 
     let pipeline = library.pipeline(kernel_name)?;
-    let encoder = commands.encoder()?;
-    encoder.setComputePipelineState(pipeline.metal_pipeline_state());
 
-    // SAFETY: slots / dtypes match `unary_v` in `unary.h` — two
-    // device buffers then `constant uint& size`. Buffer typing is
-    // enforced by the typed `Buffer<T>` and the call-site `kernel_name`.
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(src.metal_buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(dst.metal_buffer()), 0, 1);
-        let size_ptr: NonNull<c_void> = NonNull::from(&size).cast();
-        encoder.setBytes_length_atIndex(size_ptr, std::mem::size_of::<u32>(), 2);
+    {
+        let encoder = commands.encoder()?;
+        encoder.setComputePipelineState(pipeline.metal_pipeline_state());
+        // SAFETY: slots / dtypes match `unary_v` in `unary.h` — two
+        // device buffers then `constant uint& size`. Buffer typing is
+        // enforced by the typed `Buffer<T>` and the call-site `kernel_name`.
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(src.metal_buffer()), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(dst.metal_buffer()), 0, 1);
+            let size_ptr: NonNull<c_void> = NonNull::from(&size).cast();
+            encoder.setBytes_length_atIndex(size_ptr, std::mem::size_of::<u32>(), 2);
+        }
     }
 
     // `v_` is the N=1 instantiation — one thread per element.
@@ -214,6 +216,5 @@ fn encode_v<T>(
         height: 1,
         depth: 1,
     };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
-    Ok(())
+    commands.dispatch_threads(grid, threadgroup)
 }

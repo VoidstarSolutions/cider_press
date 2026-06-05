@@ -10,16 +10,26 @@
 //! [`Device`] avoids leaking the raw handle for routine work.
 
 use std::ptr::NonNull;
+use std::sync::Mutex;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandQueue, MTLCounterSamplingPoint, MTLCreateSystemDefaultDevice,
-    MTLDevice, MTLResourceOptions, MTLTimestamp,
+    MTLDevice, MTLFence, MTLResourceOptions, MTLTimestamp,
 };
 
 use crate::buffer::Buffer;
 use crate::error::{Error, Result};
+
+/// Escape hatch for bisecting sync bugs: `CIDER_PRESS_TRACKED_BUFFERS=1`
+/// restores Metal's automatic hazard tracking (correct but slower —
+/// the explicit fence/barrier sync stays on regardless).
+fn tracked_buffers_requested() -> bool {
+    static TRACKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACKED
+        .get_or_init(|| std::env::var_os("CIDER_PRESS_TRACKED_BUFFERS").is_some_and(|v| v == "1"))
+}
 
 // `MTLCreateSystemDefaultDevice` requires CoreGraphics at link time.
 // Linking once here propagates to every downstream consumer of the crate.
@@ -27,9 +37,19 @@ use crate::error::{Error, Result};
 unsafe extern "C" {}
 
 /// Owns the system default Metal device and a single command queue.
+#[allow(clippy::struct_field_names)]
 pub struct Device {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    /// Fence signaled by the most recently closed compute encoder.
+    /// Each new encoder waits on it, forming a strict execution chain
+    /// across encoders, command buffers, and eval calls — the explicit
+    /// replacement for Metal's automatic hazard tracking once buffers
+    /// go untracked (redundant until then — buffers are still tracked).
+    /// Mutex only for `Sync`: the chain's take/set pairing assumes ONE
+    /// thread drives dispatch — concurrent sessions would interleave
+    /// take/set and silently corrupt the ordering, lock notwithstanding.
+    last_fence: Mutex<Option<Retained<ProtocolObject<dyn MTLFence>>>>,
 }
 
 impl Device {
@@ -40,7 +60,27 @@ impl Device {
         let queue = device.newCommandQueue().ok_or(Error::AppleApi {
             context: "MTLDevice::newCommandQueue",
         })?;
-        Ok(Self { device, queue })
+        Ok(Self {
+            device,
+            queue,
+            last_fence: Mutex::new(None),
+        })
+    }
+
+    pub(crate) fn take_last_fence(&self) -> Option<Retained<ProtocolObject<dyn MTLFence>>> {
+        self.last_fence.lock().expect("fence mutex poisoned").take()
+    }
+
+    /// Takes an `Option` so an abandoned session can restore a `None`
+    /// tail (fresh device) as well as a displaced fence.
+    pub(crate) fn set_last_fence(&self, fence: Option<Retained<ProtocolObject<dyn MTLFence>>>) {
+        *self.last_fence.lock().expect("fence mutex poisoned") = fence;
+    }
+
+    pub(crate) fn new_fence(&self) -> Result<Retained<ProtocolObject<dyn MTLFence>>> {
+        self.device.newFence().ok_or(Error::AppleApi {
+            context: "MTLDevice::newFence",
+        })
     }
 
     /// Allocate a typed shared-storage buffer with `len` elements of `T`.
@@ -60,9 +100,14 @@ impl Device {
         let bytes = len
             .checked_mul(elem_size)
             .ok_or(Error::BufferTooLarge { len, elem_size })?;
+        let options = if tracked_buffers_requested() {
+            MTLResourceOptions::StorageModeShared
+        } else {
+            MTLResourceOptions::StorageModeShared | MTLResourceOptions::HazardTrackingModeUntracked
+        };
         let raw = self
             .device
-            .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
+            .newBufferWithLength_options(bytes, options)
             .ok_or(Error::BufferAllocation { bytes })?;
         // SAFETY: shared-storage allocation succeeded; `len` matches the byte
         // length we requested, divided by `size_of::<T>()`.

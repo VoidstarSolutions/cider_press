@@ -1,8 +1,9 @@
-//! Eval: walk the lazy graph, encode one command-buffer batch, commit,
-//! populate result caches.
+//! Eval: walk the lazy graph, encode its dispatches into command-buffer
+//! chunks (committed every [`OPS_PER_COMMAND_BUFFER`] ops), populate
+//! result caches.
 //!
 //! Public entry points are [`Tensor::eval`](crate::Tensor::eval)
-//! (synchronous: one `Commands` per call, `commit_and_wait`) and
+//! (synchronous: waits every chunk before returning) and
 //! [`Tensor::eval_async`](crate::Tensor::eval_async) (commits without
 //! waiting, returning a [`PendingEval`](crate::PendingEval) the caller
 //! waits later — the decode pipeline runs the next token's encode under the
@@ -10,12 +11,23 @@
 //! and cache-population pass, and both run a [`detach_order`] pass after
 //! populating caches so an evaluated node drops its op inputs (MLX's
 //! detach-on-eval) and stops retaining its upstream graph.
+//!
+//! **Untracked-buffer safety rests on two invariants.** Cross-encoder and
+//! cross-token ordering — the case where a buffer written by one command
+//! buffer is read by a later one — is guaranteed by the encoder fence chain
+//! in [`cider_press_kernels::Commands`] (see also `PooledBuffer`'s doc in
+//! `buffer_pool.rs` for the pool-reuse safety argument). Intra-encoder
+//! ordering — the case where two dispatches in the *same* encoder touch the
+//! same buffer — is guaranteed by `memoryBarrier` calls inserted by
+//! `encode_ops`; those barriers are elidable only when `encode_ops`'s
+//! window-reset hazard tracker (`unsynced`) confirms no overlap since the
+//! last barrier.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use cider_press_kernels::{
-    Buffer, Commands, KernelLibrary,
+    Buffer, Commands, CommandsInFlight, KernelLibrary,
     kernels::{arg_reduce, binary, copy, qmm, qmv, reduce, unary},
 };
 
@@ -51,32 +63,186 @@ pub(crate) fn op_kind_label(kind: &OpKind) -> &'static str {
     }
 }
 
-/// Step 1: reverse-postorder topo walk of unevaluated op nodes reachable
-/// from `root`, deduped by `Arc` pointer identity.
+/// Step 1: schedule the unevaluated op nodes reachable from `root` in
+/// Kahn level order (a valid topo order in which every op appears after
+/// all of its producers, and mutually independent ops are adjacent).
+///
+/// Why level order rather than DFS post-order: `encode_ops` elides a
+/// dispatch's memory barrier when none of its inputs were written since
+/// the last barrier. DFS emits each dependency *chain* back-to-back, so
+/// almost every op hazards on its immediate predecessor and the barrier
+/// stays. In a Kahn wave every op depends only on earlier waves, so the
+/// FIRST op of a wave pays the barrier (which collapses the hazard
+/// window) and the REST elide — their producers are no longer in the
+/// window. Barriers drop toward the graph's critical-path length, and the
+/// independent ops a wave groups together (q/k/v projections, the two
+/// rope halves, gate‖up matmuls) land adjacent so they overlap on the
+/// concurrent encoder.
+///
+/// Within a wave, nodes keep reachability-discovery order (a `Vec`
+/// worklist, never `HashMap` iteration) so the schedule is deterministic
+/// across runs.
 fn build_order(root: &Tensor) -> Vec<Arc<TensorInner>> {
-    let mut visited: HashSet<*const TensorInner> = HashSet::new();
-    let mut order: Vec<Arc<TensorInner>> = Vec::new();
-    visit(&root.inner, &mut visited, &mut order);
+    // Reachability pass. Mirrors `visit`'s skip logic exactly: dedup by
+    // `Arc` identity; a node whose cache is already populated is terminal
+    // (skip its whole subtree, even if it carries an op); op nodes are the
+    // only nodes scheduled; views own no storage, so an input reached
+    // through a view chain contributes the view's *source* op as the
+    // dependency. Iterative (graph depth ~600) to avoid blowing the stack.
+    let mut discovered: HashSet<*const TensorInner> = HashSet::new();
+    let mut nodes: Vec<Arc<TensorInner>> = Vec::new();
+    // Producer Arcs per node, parallel to `nodes`; translated to indices
+    // once every node has a slot (a producer may be discovered after its
+    // consumer).
+    let mut producer_arcs: Vec<Vec<Arc<TensorInner>>> = Vec::new();
+    let mut index_of: HashMap<*const TensorInner, usize> = HashMap::new();
+    let mut stack: Vec<Arc<TensorInner>> = Vec::new();
+
+    if let Some(node) = resolve_to_op(&root.inner) {
+        stack.push(node);
+    }
+    while let Some(inner) = stack.pop() {
+        let ptr = Arc::as_ptr(&inner);
+        if !discovered.insert(ptr) {
+            continue;
+        }
+        index_of.insert(ptr, nodes.len());
+        let op = inner
+            .op
+            .as_ref()
+            .expect("resolve_to_op only yields op nodes");
+        // Direct op-node dependencies, deduped per unique producer (an op
+        // reading the same producer twice must not double-count in-degree).
+        let mut node_deps: Vec<Arc<TensorInner>> = Vec::new();
+        let mut seen_dep: HashSet<*const TensorInner> = HashSet::new();
+        for input in op.inputs() {
+            if let Some(dep) = resolve_to_op(&input.inner) {
+                if seen_dep.insert(Arc::as_ptr(&dep)) {
+                    stack.push(dep.clone());
+                    node_deps.push(dep);
+                }
+            }
+        }
+        nodes.push(inner);
+        producer_arcs.push(node_deps);
+    }
+
+    // In-degrees and consumer lists over the discovered subgraph.
+    let mut indegree: Vec<usize> = vec![0; nodes.len()];
+    let mut consumers: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+    for (i, producers) in producer_arcs.iter().enumerate() {
+        for p in producers {
+            let pi = index_of[&Arc::as_ptr(p)];
+            indegree[i] += 1;
+            consumers[pi].push(i);
+        }
+    }
+
+    // Kahn levels. Wave 0 = in-degree-0 nodes in discovery order; emit a
+    // wave, decrement its consumers, the newly-zeroed ones form the next.
+    let mut order: Vec<Arc<TensorInner>> = Vec::with_capacity(nodes.len());
+    let mut wave: Vec<usize> = (0..nodes.len()).filter(|&i| indegree[i] == 0).collect();
+    while !wave.is_empty() {
+        let mut next: Vec<usize> = Vec::new();
+        for &i in &wave {
+            order.push(nodes[i].clone());
+            for &c in &consumers[i] {
+                indegree[c] -= 1;
+                if indegree[c] == 0 {
+                    next.push(c);
+                }
+            }
+        }
+        wave = next;
+    }
+
+    debug_assert_eq!(
+        order.len(),
+        nodes.len(),
+        "Kahn schedule dropped nodes (cycle in a supposedly-acyclic graph?)"
+    );
     order
 }
 
+/// Resolve a node to the op node that must be scheduled before any
+/// consumer reading it, mirroring `visit`'s descent:
+/// - an already-cached node is terminal (no dispatch, no dependency),
+///   even if it carries an op — `visit` skips it identically;
+/// - an op node (uncached) is itself the dependency;
+/// - a view (uncached, no op) owns no storage, so chase its source;
+/// - a placeholder (no cache, no op, no view) is terminal.
+fn resolve_to_op(inner: &Arc<TensorInner>) -> Option<Arc<TensorInner>> {
+    let mut current = inner.clone();
+    loop {
+        if current.cache.get().is_some() {
+            return None;
+        }
+        if current.op.is_some() {
+            return Some(current);
+        }
+        match current.view.as_ref() {
+            Some(view) => current = view.source.inner.clone(),
+            None => return None,
+        }
+    }
+}
+
+/// Ops encoded per command buffer before committing and opening the next.
+/// One monolithic per-token command buffer runs its dependent dispatch
+/// chain measurably slower than the same chain split across several
+/// buffers (the queue pipelines buffer seams; consecutive encoders within
+/// one buffer are driver-merged, so splitting encoders alone does
+/// nothing). MLX commits every ~50 ops on M-class for the same reason
+/// (`get_max_ops_mb_per_buffer`); a sweep of {25, 50, 100} here is flat
+/// within run-to-run variance, so we hold MLX's 50. Cross-chunk ordering is
+/// carried by the encoder fence chain (`cider_press_kernels::Commands`): the
+/// first encoder of each new chunk waits the last fence published by the
+/// prior chunk. This is load-bearing — buffers are allocated
+/// hazard-untracked (no automatic command-buffer seam analysis), so the
+/// fence chain is the *only* thing ordering one chunk against the next and
+/// against the prior token's still-in-flight tail. Chunk size therefore
+/// trades CPU encode granularity against how finely the GPU can pipeline
+/// seams across tokens.
+const OPS_PER_COMMAND_BUFFER: usize = 50;
+
 /// Steps 3–4: index the nodes, then allocate each op's output and encode
-/// its dispatch into `commands`. Returns the per-node output buffers and
-/// their pool tags (`Some(bytes)` ⇒ pool-minted; `None` ⇒ `SliceUpdate` slab
-/// clone, never pooled).
+/// its dispatch, committing a command buffer every
+/// [`OPS_PER_COMMAND_BUFFER`] ops. Returns the per-node output buffers,
+/// their pool tags (`Some(bytes)` ⇒ pool-minted; `None` ⇒ `SliceUpdate`
+/// slab clone, never pooled), and the in-flight handles of every committed
+/// chunk in submission order — none of them waited.
 #[allow(clippy::type_complexity)]
 fn encode_ops(
     order: &[Arc<TensorInner>],
     device: &crate::Device,
-    commands: &mut Commands<'_>,
-) -> Result<(Vec<Buffer<u8>>, Vec<Option<usize>>)> {
+) -> Result<(Vec<Buffer<u8>>, Vec<Option<usize>>, Vec<CommandsInFlight>)> {
     let mut index_of: HashMap<*const TensorInner, usize> = HashMap::new();
     for (i, inner) in order.iter().enumerate() {
         index_of.insert(Arc::as_ptr(inner), i);
     }
     let mut outputs: Vec<Buffer<u8>> = Vec::with_capacity(order.len());
     let mut tags: Vec<Option<usize>> = Vec::with_capacity(order.len());
-    for inner in order {
+    let mut in_flight: Vec<CommandsInFlight> =
+        Vec::with_capacity(order.len() / OPS_PER_COMMAND_BUFFER + 1);
+    let mut commands = device.kernels().commands()?;
+    let elide = barrier_elision_enabled();
+    // Graph-level barrier elision (MLX's window-reset model). A
+    // `memoryBarrier` on the concurrent encoder orders ALL dispatches before
+    // it against ALL after it, so at any encode point only buffers written
+    // since the LAST barrier can race a new dispatch — that working set is
+    // `unsynced`. An op whose reads (and own dst) miss `unsynced` is
+    // independent of everything since the last barrier ⇒ its barrier is
+    // elided and its dst joins `unsynced`. A hazard keeps the barrier, which
+    // syncs everything before it ⇒ `unsynced` collapses to just this op's
+    // dst. The set is cleared at each chunk boundary: a fresh encoder's first
+    // dispatch has no barrier and the fence chain orders prior chunks.
+    let mut unsynced: HashSet<usize> = HashSet::new();
+    for (i, inner) in order.iter().enumerate() {
+        if i > 0 && i % OPS_PER_COMMAND_BUFFER == 0 {
+            in_flight.push(commands.commit()?);
+            commands = device.kernels().commands()?;
+            unsynced.clear();
+        }
         let op = inner
             .op
             .as_ref()
@@ -91,11 +257,39 @@ fn encode_ops(
             let byte_count = checked_byte_count(&inner.shape, inner.dtype)?;
             (device.alloc_pooled(byte_count)?, Some(byte_count))
         };
-        dispatch(inner, commands, &outputs, &mut dst, &index_of)?;
+        if elide {
+            let dst_key = buffer_key(&dst);
+            let mut hazard = unsynced.contains(&dst_key);
+            if !hazard {
+                for input in op.lock_inputs().iter() {
+                    if let Some(key) = input_buffer_key(input, &outputs, &index_of) {
+                        // HAZARD_KEY is an unresolvable input: force a barrier
+                        // (it is never a real, elidable buffer key). A resolved
+                        // key is a hazard only if it was written since the last
+                        // barrier (in `unsynced`).
+                        if key == HAZARD_KEY || unsynced.contains(&key) {
+                            hazard = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if hazard {
+                // Barrier stays. It syncs everything encoded before it; only
+                // this op's own (about-to-be-written) output is unsynced after.
+                unsynced.clear();
+                unsynced.insert(dst_key);
+            } else {
+                commands.elide_next_barrier();
+                unsynced.insert(dst_key);
+            }
+        }
+        dispatch(inner, &mut commands, &outputs, &mut dst, &index_of)?;
         outputs.push(dst);
         tags.push(tag);
     }
-    Ok((outputs, tags))
+    in_flight.push(commands.commit()?);
+    Ok((outputs, tags, in_flight))
 }
 
 /// Step 6: populate each node's result cache from its output buffer.
@@ -125,8 +319,8 @@ fn populate_caches(
 /// Call only after the nodes' caches are populated.
 ///
 /// In the async path (`eval_async`) this runs before GPU completion; in-flight
-/// buffer safety is handled by `PendingEval` pinning `order` and by Metal's
-/// serial-queue hazard tracking for cross-eval inputs (see `PooledBuffer` doc).
+/// buffer safety is handled by `PendingEval` pinning `order` and by the encoder
+/// fence chain for cross-eval inputs (see `PooledBuffer` doc).
 fn detach_order(order: &[Arc<TensorInner>]) {
     for inner in order {
         let op = inner
@@ -140,7 +334,7 @@ fn detach_order(order: &[Arc<TensorInner>]) {
 /// Commit `root`'s graph without waiting. Populates result caches at commit
 /// time (buffer handles valid now; bytes valid after the returned handle is
 /// waited) and returns a [`PendingEval`](crate::PendingEval) owning the
-/// in-flight command buffer plus the topo order (pinning the in-flight
+/// in-flight command buffers plus the topo order (pinning the in-flight
 /// pooled buffers). See `pending_eval` for the host-read contract.
 pub(crate) fn eval_async(root: &Tensor) -> Result<crate::PendingEval> {
     let _span = crate::profile::span("tensor.eval_async");
@@ -151,9 +345,7 @@ pub(crate) fn eval_async(root: &Tensor) -> Result<crate::PendingEval> {
     let device = root.inner.device.as_ref().ok_or_else(|| {
         Error::InvalidArgument("eval_async: placeholder has no device to dispatch on".into())
     })?;
-    let mut commands = device.kernels().commands()?;
-    let (outputs, tags) = encode_ops(&order, device, &mut commands)?;
-    let in_flight = commands.commit()?;
+    let (outputs, tags, in_flight) = encode_ops(&order, device)?;
     // Flag before populating: a populated cache with the flag set means
     // "buffer exists, bytes not host-readable" (resolve_leaf returns None).
     // GPU-side chaining reads the cache directly and is unaffected.
@@ -165,8 +357,8 @@ pub(crate) fn eval_async(root: &Tensor) -> Result<crate::PendingEval> {
     populate_caches(&order, outputs, tags, device);
     // Detach before the GPU finishes. A cross-eval input whose last Arc drops
     // here returns its buffer to the pool mid-flight; reuse by the next eval is
-    // safe via the serial queue's automatic hazard tracking. See the
-    // `PooledBuffer` doc for the full safety argument.
+    // safe via the encoder fence chain. See the `PooledBuffer` doc for the full
+    // safety argument.
     detach_order(&order);
     Ok(crate::PendingEval::new(in_flight, order))
 }
@@ -181,12 +373,13 @@ pub(crate) fn eval(root: &Tensor) -> Result<()> {
     let device = root.inner.device.as_ref().ok_or_else(|| {
         Error::InvalidArgument("eval: placeholder has no device to dispatch on".into())
     })?;
-    let mut commands = device.kernels().commands()?;
-    let (outputs, tags) = encode_ops(&order, device, &mut commands)?;
+    let (outputs, tags, in_flight) = encode_ops(&order, device)?;
     drop(encode);
 
     let wait = crate::profile::span("tensor.eval.wait");
-    commands.commit_and_wait()?;
+    for chunk in in_flight {
+        chunk.wait()?;
+    }
     drop(wait);
 
     populate_caches(&order, outputs, tags, device);
@@ -286,34 +479,71 @@ fn gpu_key(label: &'static str) -> &'static str {
     }
 }
 
-fn visit(
-    inner: &Arc<TensorInner>,
-    visited: &mut HashSet<*const TensorInner>,
-    order: &mut Vec<Arc<TensorInner>>,
-) {
-    let ptr = Arc::as_ptr(inner);
-    if !visited.insert(ptr) {
-        return;
+/// Whether graph-level barrier elision is active. ON unless the
+/// environment variable `CIDER_PRESS_NO_BARRIER_ELISION` is exactly
+/// `"1"` (a bisection kill switch that restores barrier-per-dispatch).
+/// Read once and cached.
+fn barrier_elision_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("CIDER_PRESS_NO_BARRIER_ELISION").as_deref() != Ok("1"))
+}
+
+/// Metal-buffer identity for hazard tracking: the address of the
+/// `MTLBuffer` protocol object, stable for the buffer's life.
+fn buffer_key(buf: &Buffer<u8>) -> usize {
+    std::ptr::from_ref(buf.metal_buffer()).cast::<()>() as usize
+}
+
+/// Sentinel key meaning "input could not be resolved to a buffer
+/// identity" — the encode loop treats it as a forced hazard (barrier
+/// stays). `0` is never a valid objc object pointer, so it can never
+/// collide with a real buffer key.
+const HAZARD_KEY: usize = 0;
+
+/// Resolve an op input to the Metal-buffer identity hazard tracking keys
+/// it by, mirroring exactly how `dense_input_buffer` / `resolve_view_storage`
+/// resolve the *same* input for dispatch:
+///
+/// - op node in this eval ⇒ its allocated `outputs[i]` buffer;
+/// - view chain ⇒ the underlying storage owner's buffer (offset ignored —
+///   we key the whole buffer, the coarsest-correct granularity);
+/// - cached dense leaf / prior-eval op ⇒ its dense buffer (prior-eval
+///   writes are fence-ordered, so the key simply won't be in `unsynced`);
+/// - quantized leaf ⇒ `None`: qmv/qmm/dequantize weight slabs are uploaded
+///   host-side and never written by any dispatch, so they cannot race.
+///
+/// Returns `Some(HAZARD_KEY)` for anything it cannot confidently resolve
+/// (the conservative fallback: barrier stays).
+fn input_buffer_key(
+    input: &Tensor,
+    outputs: &[Buffer<u8>],
+    index_of: &HashMap<*const TensorInner, usize>,
+) -> Option<usize> {
+    let mut current = &input.inner;
+    // Walk any view chain to the storage owner (offset irrelevant — whole
+    // buffer is keyed).
+    while let Some(view) = current.view.as_ref() {
+        current = &view.source.inner;
     }
-    if inner.cache.get().is_some() {
-        return; // already materialized; skip the whole subtree below.
+    if let Some(&i) = index_of.get(&Arc::as_ptr(current)) {
+        return match outputs.get(i) {
+            Some(buf) => Some(buffer_key(buf)),
+            // Topo order guarantees this is allocated; if not, be safe.
+            None => Some(HAZARD_KEY),
+        };
     }
-    if let Some(op) = inner.op.as_ref() {
-        // Snapshot the handles so the lock isn't held across recursion.
-        let inputs = op.inputs();
-        for input in &inputs {
-            visit(&input.inner, visited, order);
-        }
-        order.push(inner.clone());
-    } else if let Some(view) = inner.view.as_ref() {
-        // Views own no storage; eval needs to chase the source so the
-        // op that backs the view (if any) gets dispatched. The view
-        // itself never enters `order` — it has nothing to dispatch.
-        visit(&view.source.inner, visited, order);
+    match current.cache.get() {
+        // SAFETY: `Buffer<u8>` → `Buffer<u8>` reinterpret is trivially valid
+        // (any bit pattern is a valid `u8`, lengths match). This is a refcount
+        // bump over the same underlying `MTLBuffer`, used only to read the
+        // buffer pointer for hazard-tracking key derivation; the handle is
+        // dropped immediately after `buffer_key` returns.
+        Some(LeafStorage::Dense(buf)) => Some(buffer_key(&unsafe { buf.reinterpret_as::<u8>() })),
+        // Quantized weight slabs are never written by a dispatch ⇒ skip.
+        Some(LeafStorage::Quantized { .. }) => None,
+        // Placeholder mid-graph: unresolvable ⇒ hazard.
+        None => Some(HAZARD_KEY),
     }
-    // Placeholders (no op, no view, no cache) are silently skipped —
-    // eval() catches the broken case at step 2 if the root needs
-    // dispatching.
 }
 
 /// Resolve a dense op input's backing buffer.
@@ -2225,6 +2455,96 @@ mod detach_tests {
             "detach must free per-iteration scratch for pool reuse (hits {} did not grow from {})",
             device.pool_stats().hits,
             before
+        );
+    }
+}
+
+#[cfg(test)]
+mod order_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use super::build_order;
+    use crate::tensor::TensorInner;
+    use crate::{Device, Tensor};
+
+    /// `build_order` emits every producer before its consumer (the defining
+    /// topo property). Tested on a diamond graph:
+    ///
+    /// ```text
+    ///   a (leaf)
+    ///   ├─ b = a + a
+    ///   └─ c = a + a
+    ///       d = b + c
+    /// ```
+    ///
+    /// Both `b` and `c` are producers of `d`, and `a` is a producer of both.
+    /// The Kahn schedule must place `b` and `c` before `d`.
+    #[test]
+    fn build_order_producers_before_consumers() {
+        let device = Device::system_default().expect("device");
+        let a = Tensor::from_slice(&device, &[1.0f32, 2.0], [2]).expect("a");
+        let b = a.add(&a).expect("b = a + a");
+        let c = a.add(&a).expect("c = a + a");
+        let d = b.add(&c).expect("d = b + c");
+
+        let order = build_order(&d);
+
+        // Build a position map: Arc ptr → index in order.
+        let pos: HashMap<*const TensorInner, usize> = order
+            .iter()
+            .enumerate()
+            .map(|(i, inner)| (Arc::as_ptr(inner), i))
+            .collect();
+
+        // For every node in the order, every op-input that is itself scheduled
+        // must appear at an earlier position.
+        for (consumer_pos, inner) in order.iter().enumerate() {
+            let op = inner.op.as_ref().expect("order contains only op nodes");
+            for input in op.inputs() {
+                if let Some(&producer_pos) = pos.get(&Arc::as_ptr(&input.inner)) {
+                    assert!(
+                        producer_pos < consumer_pos,
+                        "producer at position {producer_pos} must precede consumer at \
+                         position {consumer_pos} in build_order output"
+                    );
+                }
+            }
+        }
+
+        // Sanity: diamond has exactly 3 op nodes (b, c, d); `a` is a leaf.
+        assert_eq!(order.len(), 3, "diamond graph should produce 3 op nodes");
+    }
+
+    /// A producer consumed only through a view: `d = v + v` where
+    /// `v = reshape(b)` and `b` is an unevaluated op. Views own no
+    /// storage, so `resolve_to_op` must chase the view chain to its
+    /// source op — `b` must be scheduled, and before `d`.
+    #[test]
+    fn build_order_chases_view_inputs_to_source_op() {
+        let device = Device::system_default().expect("device");
+        let a = Tensor::from_slice(&device, &[1.0f32, 2.0], [2]).expect("a");
+        let b = a.add(&a).expect("b = a + a");
+        let v = b.reshape([1, 2]).expect("v = reshape(b)");
+        let d = v.add(&v).expect("d = v + v");
+
+        let order = build_order(&d);
+
+        assert_eq!(
+            order.len(),
+            2,
+            "b and d are the only op nodes (v is a view, a is a leaf)"
+        );
+        let position = |t: &Tensor| {
+            order
+                .iter()
+                .position(|inner| Arc::as_ptr(inner) == Arc::as_ptr(&t.inner))
+        };
+        let pos_b = position(&b).expect("view source op `b` must be scheduled");
+        let pos_d = position(&d).expect("root op `d` must be scheduled");
+        assert!(
+            pos_b < pos_d,
+            "view source op `b` (pos {pos_b}) must precede its consumer `d` (pos {pos_d})"
         );
     }
 }

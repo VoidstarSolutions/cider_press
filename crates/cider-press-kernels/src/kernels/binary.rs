@@ -598,18 +598,20 @@ fn encode_vv<T>(
     })?;
 
     let pipeline = library.pipeline(kernel_name)?;
-    let encoder = commands.encoder()?;
-    encoder.setComputePipelineState(pipeline.metal_pipeline_state());
 
-    // SAFETY: slots / dtypes match `binary_vv` in `binary.h` — three
-    // device buffers then `constant uint& size`. Buffer typing is
-    // enforced by the typed `Buffer<T>` and call-site `kernel_name`.
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(a.metal_buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(b.metal_buffer()), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(c.metal_buffer()), 0, 2);
-        let size_ptr: NonNull<c_void> = NonNull::from(&size).cast();
-        encoder.setBytes_length_atIndex(size_ptr, std::mem::size_of::<u32>(), 3);
+    {
+        let encoder = commands.encoder()?;
+        encoder.setComputePipelineState(pipeline.metal_pipeline_state());
+        // SAFETY: slots / dtypes match `binary_vv` in `binary.h` — three
+        // device buffers then `constant uint& size`. Buffer typing is
+        // enforced by the typed `Buffer<T>` and call-site `kernel_name`.
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(a.metal_buffer()), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(b.metal_buffer()), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(c.metal_buffer()), 0, 2);
+            let size_ptr: NonNull<c_void> = NonNull::from(&size).cast();
+            encoder.setBytes_length_atIndex(size_ptr, std::mem::size_of::<u32>(), 3);
+        }
     }
 
     // `vv_` is the N=1 instantiation — one thread per element.
@@ -623,8 +625,7 @@ fn encode_vv<T>(
         height: 1,
         depth: 1,
     };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
-    Ok(())
+    commands.dispatch_threads(grid, threadgroup)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -643,19 +644,21 @@ fn encode_g1<T>(
         return Ok(());
     }
     let pipeline = library.pipeline(kernel_name)?;
-    let encoder = commands.encoder()?;
-    encoder.setComputePipelineState(pipeline.metal_pipeline_state());
 
-    // SAFETY: matches `binary_g_nd1` in `binary.h`: buffers a,b,c then
-    // two `constant int64_t&` strides.
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(a.metal_buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(b.metal_buffer()), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(c.metal_buffer()), 0, 2);
-        let a_ptr: NonNull<c_void> = NonNull::from(&a_stride).cast();
-        encoder.setBytes_length_atIndex(a_ptr, std::mem::size_of::<i64>(), 3);
-        let b_ptr: NonNull<c_void> = NonNull::from(&b_stride).cast();
-        encoder.setBytes_length_atIndex(b_ptr, std::mem::size_of::<i64>(), 4);
+    {
+        let encoder = commands.encoder()?;
+        encoder.setComputePipelineState(pipeline.metal_pipeline_state());
+        // SAFETY: matches `binary_g_nd1` in `binary.h`: buffers a,b,c then
+        // two `constant int64_t&` strides.
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(a.metal_buffer()), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(b.metal_buffer()), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(c.metal_buffer()), 0, 2);
+            let a_ptr: NonNull<c_void> = NonNull::from(&a_stride).cast();
+            encoder.setBytes_length_atIndex(a_ptr, std::mem::size_of::<i64>(), 3);
+            let b_ptr: NonNull<c_void> = NonNull::from(&b_stride).cast();
+            encoder.setBytes_length_atIndex(b_ptr, std::mem::size_of::<i64>(), 4);
+        }
     }
 
     #[allow(clippy::cast_sign_loss)]
@@ -670,8 +673,7 @@ fn encode_g1<T>(
         height: 1,
         depth: 1,
     };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
-    Ok(())
+    commands.dispatch_threads(grid, threadgroup)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -690,19 +692,21 @@ fn encode_g2<T>(
         return Ok(());
     }
     let pipeline = library.pipeline(kernel_name)?;
-    let encoder = commands.encoder()?;
-    encoder.setComputePipelineState(pipeline.metal_pipeline_state());
 
-    // SAFETY: matches `binary_g_nd2` — three buffers then two
-    // `constant int64_t[2]` stride arrays.
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(a.metal_buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(b.metal_buffer()), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(c.metal_buffer()), 0, 2);
-        let a_ptr: NonNull<c_void> = NonNull::from(&a_strides).cast();
-        encoder.setBytes_length_atIndex(a_ptr, std::mem::size_of_val(&a_strides), 3);
-        let b_ptr: NonNull<c_void> = NonNull::from(&b_strides).cast();
-        encoder.setBytes_length_atIndex(b_ptr, std::mem::size_of_val(&b_strides), 4);
+    {
+        let encoder = commands.encoder()?;
+        encoder.setComputePipelineState(pipeline.metal_pipeline_state());
+        // SAFETY: matches `binary_g_nd2` — three buffers then two
+        // `constant int64_t[2]` stride arrays.
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(a.metal_buffer()), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(b.metal_buffer()), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(c.metal_buffer()), 0, 2);
+            let a_ptr: NonNull<c_void> = NonNull::from(&a_strides).cast();
+            encoder.setBytes_length_atIndex(a_ptr, std::mem::size_of_val(&a_strides), 3);
+            let b_ptr: NonNull<c_void> = NonNull::from(&b_strides).cast();
+            encoder.setBytes_length_atIndex(b_ptr, std::mem::size_of_val(&b_strides), 4);
+        }
     }
 
     // Grid: (inner, outer). Matches MLX `binary.cpp` ndim<=3 path —
@@ -718,8 +722,7 @@ fn encode_g2<T>(
         depth: 1,
     };
     let threadgroup = get_block_dims(dim0, dim1, 1, 10);
-    encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
-    Ok(())
+    commands.dispatch_threads(grid, threadgroup)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -738,19 +741,21 @@ fn encode_g3<T>(
         return Ok(());
     }
     let pipeline = library.pipeline(kernel_name)?;
-    let encoder = commands.encoder()?;
-    encoder.setComputePipelineState(pipeline.metal_pipeline_state());
 
-    // SAFETY: matches `binary_g_nd3` — three buffers then two
-    // `constant int64_t[3]` stride arrays.
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(a.metal_buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(b.metal_buffer()), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(c.metal_buffer()), 0, 2);
-        let a_ptr: NonNull<c_void> = NonNull::from(&a_strides).cast();
-        encoder.setBytes_length_atIndex(a_ptr, std::mem::size_of_val(&a_strides), 3);
-        let b_ptr: NonNull<c_void> = NonNull::from(&b_strides).cast();
-        encoder.setBytes_length_atIndex(b_ptr, std::mem::size_of_val(&b_strides), 4);
+    {
+        let encoder = commands.encoder()?;
+        encoder.setComputePipelineState(pipeline.metal_pipeline_state());
+        // SAFETY: matches `binary_g_nd3` — three buffers then two
+        // `constant int64_t[3]` stride arrays.
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(a.metal_buffer()), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(b.metal_buffer()), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(c.metal_buffer()), 0, 2);
+            let a_ptr: NonNull<c_void> = NonNull::from(&a_strides).cast();
+            encoder.setBytes_length_atIndex(a_ptr, std::mem::size_of_val(&a_strides), 3);
+            let b_ptr: NonNull<c_void> = NonNull::from(&b_strides).cast();
+            encoder.setBytes_length_atIndex(b_ptr, std::mem::size_of_val(&b_strides), 4);
+        }
     }
 
     #[allow(clippy::cast_sign_loss)]
@@ -765,8 +770,7 @@ fn encode_g3<T>(
         depth: dim2,
     };
     let threadgroup = get_block_dims(dim0, dim1, dim2, 10);
-    encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
-    Ok(())
+    commands.dispatch_threads(grid, threadgroup)
 }
 
 /// Port of MLX `get_block_dims_common` (`common/utils.cpp:117`).

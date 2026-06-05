@@ -31,9 +31,9 @@
 //! ## Aliasing contract (append-only)
 //!
 //! `update` performs no host-side mutation: the write is an in-graph
-//! `SliceUpdate` GPU op, ordered against the SDPA read by Metal's hazard
-//! tracking within a command buffer and by `commit_and_wait` across
-//! buffers. The cache is **append-only** — `position` only grows and each
+//! `SliceUpdate` GPU op, ordered against the SDPA read by the encoder fence
+//! chain and in-encoder barriers within a command buffer and by
+//! `commit_and_wait` across buffers. The cache is **append-only** — `position` only grows and each
 //! `update` writes a fresh, disjoint row range — so a [`Tensor`] returned
 //! by [`KvCache::keys_view`]/[`KvCache::values_view`] reads a prefix that
 //! prior dispatches have fully written and remains valid until a later
@@ -140,12 +140,12 @@ impl KvCache {
         let mut keys = device.kernels().alloc_buffer::<u8>(byte_count)?;
         let mut values = device.kernels().alloc_buffer::<u8>(byte_count)?;
         // Zero the full slabs. Reads only ever target the populated prefix
-        // `[0..position]` *under serial dispatch*, where Metal's automatic
-        // hazard tracking orders each `SliceUpdate` write before the SDPA
-        // read. Under concurrent dispatch that ordering is no longer
-        // automatic, so an unwritten row can be read before its write lands;
-        // a deterministically-zero slab makes that read benign instead of
-        // garbage. Cheap (one host memset at construction; shared storage).
+        // `[0..position]`. Under concurrent dispatch with untracked buffers,
+        // an unwritten row can be read before its write lands if the encoder
+        // fence chain has a gap (e.g. the first step before any write has
+        // committed); a deterministically-zero slab makes that read benign
+        // instead of garbage. Cheap (one host memset at construction; shared
+        // storage).
         // SAFETY: freshly allocated; no dispatch has referenced these
         // buffers yet, so the host pointer is exclusively ours to write.
         unsafe {
@@ -246,9 +246,9 @@ impl KvCache {
 
         // Lazy in-graph write: build each SliceUpdate directly on the slab
         // leaf (not chained off the previous op-tensor). The slab already
-        // holds the prior committed rows, and this step's disjoint row
-        // write is ordered before the SDPA read by Metal's hazard tracking
-        // on the shared (default-tracked) slab buffer. Basing on the slab
+        // holds the prior committed rows, and this step's disjoint row write
+        // is ordered before the SDPA read by the encoder fence chain. Basing
+        // on the slab
         // — rather than retaining the prior `keys_latest`/`values_latest`
         // op — means each step's projection graph frees once the next
         // `update` reassigns these fields, so the buffer pool can recycle

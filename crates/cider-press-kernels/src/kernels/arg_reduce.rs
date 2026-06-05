@@ -45,9 +45,6 @@ pub fn argmax_bf16(
         )));
     }
     let pipeline = library.pipeline("argmax_bfloat16")?;
-    let encoder = commands.encoder()?;
-    encoder.setComputePipelineState(pipeline.metal_pipeline_state());
-
     // ndim == 0 (flat scalar reduction): shape/strides slots take a
     // single placeholder element. For the flat ndim==0 case the kernel
     // does not dereference shape/in_strides/out_strides, so single zero
@@ -58,42 +55,46 @@ pub fn argmax_bf16(
     let ndim: usize = 0;
     let axis_stride: i64 = 1;
 
-    // SAFETY: bind slots/dtypes match the `arg_reduce_general` MSL
-    // signature (in@0, out u32@1, shape@2, in_strides@3, out_strides@4,
-    // ndim@5, axis_stride@6, axis_size@7).
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(src.metal_buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(dst.metal_buffer()), 0, 1);
-        encoder.setBytes_length_atIndex(
-            NonNull::from(&shape).cast::<c_void>(),
-            std::mem::size_of_val(&shape),
-            2,
-        );
-        encoder.setBytes_length_atIndex(
-            NonNull::from(&in_strides).cast::<c_void>(),
-            std::mem::size_of_val(&in_strides),
-            3,
-        );
-        encoder.setBytes_length_atIndex(
-            NonNull::from(&out_strides).cast::<c_void>(),
-            std::mem::size_of_val(&out_strides),
-            4,
-        );
-        encoder.setBytes_length_atIndex(
-            NonNull::from(&ndim).cast::<c_void>(),
-            std::mem::size_of::<usize>(),
-            5,
-        );
-        encoder.setBytes_length_atIndex(
-            NonNull::from(&axis_stride).cast::<c_void>(),
-            std::mem::size_of::<i64>(),
-            6,
-        );
-        encoder.setBytes_length_atIndex(
-            NonNull::from(&axis_size).cast::<c_void>(),
-            std::mem::size_of::<usize>(),
-            7,
-        );
+    {
+        let encoder = commands.encoder()?;
+        encoder.setComputePipelineState(pipeline.metal_pipeline_state());
+        // SAFETY: bind slots/dtypes match the `arg_reduce_general` MSL
+        // signature (in@0, out u32@1, shape@2, in_strides@3, out_strides@4,
+        // ndim@5, axis_stride@6, axis_size@7).
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(src.metal_buffer()), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(dst.metal_buffer()), 0, 1);
+            encoder.setBytes_length_atIndex(
+                NonNull::from(&shape).cast::<c_void>(),
+                std::mem::size_of_val(&shape),
+                2,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::from(&in_strides).cast::<c_void>(),
+                std::mem::size_of_val(&in_strides),
+                3,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::from(&out_strides).cast::<c_void>(),
+                std::mem::size_of_val(&out_strides),
+                4,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::from(&ndim).cast::<c_void>(),
+                std::mem::size_of::<usize>(),
+                5,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::from(&axis_stride).cast::<c_void>(),
+                std::mem::size_of::<i64>(),
+                6,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::from(&axis_size).cast::<c_void>(),
+                std::mem::size_of::<usize>(),
+                7,
+            );
+        }
     }
 
     // N_READS = 4 per thread, grid-strided over the axis; one
@@ -112,8 +113,7 @@ pub fn argmax_bf16(
         height: 1,
         depth: 1,
     };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
-    Ok(())
+    commands.dispatch_threads(grid, threadgroup)
 }
 
 #[cfg(test)]

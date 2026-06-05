@@ -157,48 +157,49 @@ pub fn dispatch_rope_bf16(
         ],
     )?;
 
-    let encoder = commands.encoder()?;
-    encoder.setComputePipelineState(pipeline.metal_pipeline_state());
-
-    // SAFETY: slot/dtype layout matches the `rope` kernel signature in
-    // rope.metal under the chosen function-constant specialization.
-    // Bindings:
-    //   0  device T* in            (bf16, elem_count)
-    //   1  device T* out           (bf16, elem_count)
-    //   2  device const int* offset
-    //   3  bytes scale (float)
-    //   4  bytes strides[3]  (int64)
-    //   5  bytes out_strides[3] (int64)
-    //   6  bytes offset_stride (int64)
-    //   7  bytes n_head (int)
-    //  10  bytes base (float, == log2(theta))
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(src.metal_buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(dst.metal_buffer()), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(offset.metal_buffer()), 0, 2);
-
-        let scale_ptr: NonNull<c_void> = NonNull::from(&args.scale).cast();
-        encoder.setBytes_length_atIndex(scale_ptr, std::mem::size_of::<f32>(), 3);
-
-        let strides_ptr: NonNull<c_void> = NonNull::from(&args.strides).cast();
-        encoder.setBytes_length_atIndex(strides_ptr, std::mem::size_of::<[i64; 3]>(), 4);
-
-        let out_strides_ptr: NonNull<c_void> = NonNull::from(&args.out_strides).cast();
-        encoder.setBytes_length_atIndex(out_strides_ptr, std::mem::size_of::<[i64; 3]>(), 5);
-
-        let offset_stride_ptr: NonNull<c_void> = NonNull::from(&args.offset_stride).cast();
-        encoder.setBytes_length_atIndex(offset_stride_ptr, std::mem::size_of::<i64>(), 6);
-
-        let n_head_ptr: NonNull<c_void> = NonNull::from(&args.n_head).cast();
-        encoder.setBytes_length_atIndex(n_head_ptr, std::mem::size_of::<i32>(), 7);
-
-        let base_ptr: NonNull<c_void> = NonNull::from(&args.base_log2).cast();
-        encoder.setBytes_length_atIndex(base_ptr, std::mem::size_of::<f32>(), 10);
-    }
-
     let gx = (args.rotary_dims / 2) as usize;
     let gy = args.seq_len as usize;
     let gz = (args.batch as usize) * (args.n_head as usize).div_ceil(N_PER_THREAD as usize);
+
+    {
+        let encoder = commands.encoder()?;
+        encoder.setComputePipelineState(pipeline.metal_pipeline_state());
+        // SAFETY: slot/dtype layout matches the `rope` kernel signature in
+        // rope.metal under the chosen function-constant specialization.
+        // Bindings:
+        //   0  device T* in            (bf16, elem_count)
+        //   1  device T* out           (bf16, elem_count)
+        //   2  device const int* offset
+        //   3  bytes scale (float)
+        //   4  bytes strides[3]  (int64)
+        //   5  bytes out_strides[3] (int64)
+        //   6  bytes offset_stride (int64)
+        //   7  bytes n_head (int)
+        //  10  bytes base (float, == log2(theta))
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(src.metal_buffer()), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(dst.metal_buffer()), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(offset.metal_buffer()), 0, 2);
+
+            let scale_ptr: NonNull<c_void> = NonNull::from(&args.scale).cast();
+            encoder.setBytes_length_atIndex(scale_ptr, std::mem::size_of::<f32>(), 3);
+
+            let strides_ptr: NonNull<c_void> = NonNull::from(&args.strides).cast();
+            encoder.setBytes_length_atIndex(strides_ptr, std::mem::size_of::<[i64; 3]>(), 4);
+
+            let out_strides_ptr: NonNull<c_void> = NonNull::from(&args.out_strides).cast();
+            encoder.setBytes_length_atIndex(out_strides_ptr, std::mem::size_of::<[i64; 3]>(), 5);
+
+            let offset_stride_ptr: NonNull<c_void> = NonNull::from(&args.offset_stride).cast();
+            encoder.setBytes_length_atIndex(offset_stride_ptr, std::mem::size_of::<i64>(), 6);
+
+            let n_head_ptr: NonNull<c_void> = NonNull::from(&args.n_head).cast();
+            encoder.setBytes_length_atIndex(n_head_ptr, std::mem::size_of::<i32>(), 7);
+
+            let base_ptr: NonNull<c_void> = NonNull::from(&args.base_log2).cast();
+            encoder.setBytes_length_atIndex(base_ptr, std::mem::size_of::<f32>(), 10);
+        }
+    }
 
     let grid = MTLSize {
         width: gx,
@@ -206,8 +207,7 @@ pub fn dispatch_rope_bf16(
         depth: gz,
     };
     let threadgroup = get_block_dims(gx, gy, gz);
-    encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
-    Ok(())
+    commands.dispatch_threads(grid, threadgroup)
 }
 
 /// Ported `get_block_dims_common` from MLX

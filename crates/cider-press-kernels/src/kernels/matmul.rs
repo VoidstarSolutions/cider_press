@@ -128,31 +128,33 @@ pub fn dispatch_gemm_bf16(
     }
 
     let pipeline = library.pipeline("gemm_bfloat16")?;
-    let encoder = commands.encoder()?;
-    encoder.setComputePipelineState(pipeline.metal_pipeline_state());
 
-    // SAFETY: bindings match the kernel signature in matmul.metal —
-    //   0 A (bf16, batch * a_batch_stride)
-    //   1 B (bf16, batch * b_batch_stride)
-    //   2 C (bf16, batch * c_batch_stride)
-    //   3 M, 4 N, 5 K (uint)
-    //   6 a_batch_stride, 7 b_batch_stride, 8 c_batch_stride (uint)
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(src_a.metal_buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(src_b.metal_buffer()), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(dst.metal_buffer()), 0, 2);
-        let m_ptr: NonNull<c_void> = NonNull::from(&m_u32).cast();
-        encoder.setBytes_length_atIndex(m_ptr, std::mem::size_of::<u32>(), 3);
-        let n_ptr: NonNull<c_void> = NonNull::from(&n_u32).cast();
-        encoder.setBytes_length_atIndex(n_ptr, std::mem::size_of::<u32>(), 4);
-        let k_ptr: NonNull<c_void> = NonNull::from(&k_u32).cast();
-        encoder.setBytes_length_atIndex(k_ptr, std::mem::size_of::<u32>(), 5);
-        let a_ptr: NonNull<c_void> = NonNull::from(&a_stride_u32).cast();
-        encoder.setBytes_length_atIndex(a_ptr, std::mem::size_of::<u32>(), 6);
-        let b_ptr: NonNull<c_void> = NonNull::from(&b_stride_u32).cast();
-        encoder.setBytes_length_atIndex(b_ptr, std::mem::size_of::<u32>(), 7);
-        let c_ptr: NonNull<c_void> = NonNull::from(&c_stride_u32).cast();
-        encoder.setBytes_length_atIndex(c_ptr, std::mem::size_of::<u32>(), 8);
+    {
+        let encoder = commands.encoder()?;
+        encoder.setComputePipelineState(pipeline.metal_pipeline_state());
+        // SAFETY: bindings match the kernel signature in matmul.metal —
+        //   0 A (bf16, batch * a_batch_stride)
+        //   1 B (bf16, batch * b_batch_stride)
+        //   2 C (bf16, batch * c_batch_stride)
+        //   3 M, 4 N, 5 K (uint)
+        //   6 a_batch_stride, 7 b_batch_stride, 8 c_batch_stride (uint)
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(src_a.metal_buffer()), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(src_b.metal_buffer()), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(dst.metal_buffer()), 0, 2);
+            let m_ptr: NonNull<c_void> = NonNull::from(&m_u32).cast();
+            encoder.setBytes_length_atIndex(m_ptr, std::mem::size_of::<u32>(), 3);
+            let n_ptr: NonNull<c_void> = NonNull::from(&n_u32).cast();
+            encoder.setBytes_length_atIndex(n_ptr, std::mem::size_of::<u32>(), 4);
+            let k_ptr: NonNull<c_void> = NonNull::from(&k_u32).cast();
+            encoder.setBytes_length_atIndex(k_ptr, std::mem::size_of::<u32>(), 5);
+            let a_ptr: NonNull<c_void> = NonNull::from(&a_stride_u32).cast();
+            encoder.setBytes_length_atIndex(a_ptr, std::mem::size_of::<u32>(), 6);
+            let b_ptr: NonNull<c_void> = NonNull::from(&b_stride_u32).cast();
+            encoder.setBytes_length_atIndex(b_ptr, std::mem::size_of::<u32>(), 7);
+            let c_ptr: NonNull<c_void> = NonNull::from(&c_stride_u32).cast();
+            encoder.setBytes_length_atIndex(c_ptr, std::mem::size_of::<u32>(), 8);
+        }
     }
 
     let grid = MTLSize {
@@ -165,6 +167,5 @@ pub fn dispatch_gemm_bf16(
         height: TG_N.min(n),
         depth: 1,
     };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid, tg);
-    Ok(())
+    commands.dispatch_threads(grid, tg)
 }

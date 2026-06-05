@@ -160,19 +160,21 @@ fn encode_block(
         .ok_or_else(|| Error::InvalidArgument("softmax: thread count overflows usize".into()))?;
 
     let pipeline = library.pipeline(kernel_name)?;
-    let encoder = commands.encoder()?;
-    encoder.setComputePipelineState(pipeline.metal_pipeline_state());
 
-    // SAFETY: slot / dtype layout matches the `softmax_single_row`
-    // kernel signature in softmax.h:
-    //   0  device const T* in   (bf16, n_rows * axis_size)
-    //   1  device T* out        (bf16, n_rows * axis_size)
-    //   2  constant int& axis_size
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(src.metal_buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(dst.metal_buffer()), 0, 1);
-        let axis_ptr: NonNull<c_void> = NonNull::from(&axis_size_i32).cast();
-        encoder.setBytes_length_atIndex(axis_ptr, std::mem::size_of::<i32>(), 2);
+    {
+        let encoder = commands.encoder()?;
+        encoder.setComputePipelineState(pipeline.metal_pipeline_state());
+        // SAFETY: slot / dtype layout matches the `softmax_single_row`
+        // kernel signature in softmax.h:
+        //   0  device const T* in   (bf16, n_rows * axis_size)
+        //   1  device T* out        (bf16, n_rows * axis_size)
+        //   2  constant int& axis_size
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(src.metal_buffer()), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(dst.metal_buffer()), 0, 1);
+            let axis_ptr: NonNull<c_void> = NonNull::from(&axis_size_i32).cast();
+            encoder.setBytes_length_atIndex(axis_ptr, std::mem::size_of::<i32>(), 2);
+        }
     }
 
     let grid = MTLSize {
@@ -185,6 +187,5 @@ fn encode_block(
         height: 1,
         depth: 1,
     };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
-    Ok(())
+    commands.dispatch_threads(grid, threadgroup)
 }

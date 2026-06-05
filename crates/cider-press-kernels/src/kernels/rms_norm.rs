@@ -73,8 +73,6 @@ pub fn rms_norm_bf16(
     }
 
     let pipeline = library.pipeline("rmsbfloat16")?;
-    let encoder = commands.encoder()?;
-    encoder.setComputePipelineState(pipeline.metal_pipeline_state());
 
     let axis_size_u32 = u32::try_from(axis_size).map_err(|_| {
         Error::InvalidArgument(format!(
@@ -85,15 +83,19 @@ pub fn rms_norm_bf16(
     // `(w.ndim() == 1) ? w.strides()[0] : 0`).
     let w_stride: u32 = 1;
 
-    // SAFETY: bind slots/dtypes match `rms_single_row`'s MSL signature
-    // (x@0, w@1, out@2, eps float@3, axis_size uint@4, w_stride uint@5).
-    unsafe {
-        encoder.setBuffer_offset_atIndex(Some(x.metal_buffer()), 0, 0);
-        encoder.setBuffer_offset_atIndex(Some(w.metal_buffer()), 0, 1);
-        encoder.setBuffer_offset_atIndex(Some(out.metal_buffer()), 0, 2);
-        encoder.setBytes_length_atIndex(NonNull::from(&eps).cast::<c_void>(), 4, 3);
-        encoder.setBytes_length_atIndex(NonNull::from(&axis_size_u32).cast::<c_void>(), 4, 4);
-        encoder.setBytes_length_atIndex(NonNull::from(&w_stride).cast::<c_void>(), 4, 5);
+    {
+        let encoder = commands.encoder()?;
+        encoder.setComputePipelineState(pipeline.metal_pipeline_state());
+        // SAFETY: bind slots/dtypes match `rms_single_row`'s MSL signature
+        // (x@0, w@1, out@2, eps float@3, axis_size uint@4, w_stride uint@5).
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(x.metal_buffer()), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(w.metal_buffer()), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(out.metal_buffer()), 0, 2);
+            encoder.setBytes_length_atIndex(NonNull::from(&eps).cast::<c_void>(), 4, 3);
+            encoder.setBytes_length_atIndex(NonNull::from(&axis_size_u32).cast::<c_void>(), 4, 4);
+            encoder.setBytes_length_atIndex(NonNull::from(&w_stride).cast::<c_void>(), 4, 5);
+        }
     }
 
     // One threadgroup per row, sized to cover the axis at N_READS/thread,
@@ -111,6 +113,5 @@ pub fn rms_norm_bf16(
         height: 1,
         depth: 1,
     };
-    encoder.dispatchThreads_threadsPerThreadgroup(grid, threadgroup);
-    Ok(())
+    commands.dispatch_threads(grid, threadgroup)
 }
