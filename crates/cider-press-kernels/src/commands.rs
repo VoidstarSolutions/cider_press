@@ -40,6 +40,17 @@ use crate::gpu_sampler::{GpuSampler, GpuSegment};
 /// Hold onto this across multiple kernel dispatches to batch them into
 /// one GPU submission. The lifetime parameter ties it to the originating
 /// [`Device`] so the device cannot be dropped while encoding is open.
+///
+/// # Concurrency contract
+///
+/// **One open session per device, one thread driving dispatch.** The
+/// cross-encoder fence chain lives on the [`Device`], and concurrent
+/// sessions interleave its take/set pairing — ordering edges between
+/// encoders are silently lost (the per-call mutex on the chain tail
+/// exists only for `Sync`; it cannot make overlapping sessions sound).
+/// This is a documented contract, not a type-enforced one: callers that
+/// need parallel dispatch must use separate [`Device`]s, each with its
+/// own queue and fence chain.
 pub struct Commands<'d> {
     device: &'d Device,
     cmd: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
@@ -397,6 +408,10 @@ impl Drop for Commands<'_> {
 // `Commands<'_>` constructed via the module-private fields above.
 impl Device {
     /// Begin a new [`Commands`] session on this device's queue.
+    ///
+    /// At most one session may be open per device at a time — see the
+    /// concurrency contract on [`Commands`]. Overlapping sessions are
+    /// not detected; they silently corrupt cross-encoder ordering.
     pub fn commands(&self) -> Result<Commands<'_>> {
         Commands::new(self)
     }
