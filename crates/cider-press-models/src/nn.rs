@@ -9,7 +9,8 @@
 //! — matches `mlx.nn.gelu`); [`embed_tokens`] (gather + dequantize
 //! composition over a [`QuantizedWeight`] embedding table); the
 //! [`Module`] trait and stateful building blocks — [`Linear`] (a
-//! quantized projection with optional dense bias) and [`RmsNormLayer`]
+//! quantized projection with optional dense bias), [`PhasedLinear`]
+//! (phase-split decode/prefill variant), and [`RmsNormLayer`]
 //! (the composed [`rms_norm`] carrying its gamma weight). Additional
 //! building blocks land as their underlying ops are added.
 
@@ -227,6 +228,34 @@ impl Module for Linear {
         match &self.bias {
             Some(bias) => Ok(y.add(bias)?),
             None => Ok(y),
+        }
+    }
+}
+
+/// A linear projection with phase-specialized weights: prefill (M>1,
+/// qmm path) uses the checkpoint layout; decode (M=1, qmv path) uses a
+/// K-padded twin that makes the `qmv_fast` variant selectable. First
+/// instance of decode-specialized execution in the models layer.
+#[derive(Clone, Debug)]
+pub struct PhasedLinear {
+    prefill: Linear,
+    decode: Linear,
+}
+
+impl PhasedLinear {
+    #[must_use]
+    pub fn new(prefill: Linear, decode: Linear) -> Self {
+        Self { prefill, decode }
+    }
+}
+
+impl Module for PhasedLinear {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // [B, T, D]: T == 1 is the decode step.
+        if x.rank() == 3 && x.shape().dims()[1] == 1 {
+            self.decode.forward(x)
+        } else {
+            self.prefill.forward(x)
         }
     }
 }

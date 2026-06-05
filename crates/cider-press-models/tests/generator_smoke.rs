@@ -28,8 +28,6 @@ const HEAD_DIM: usize = 64;
 const INTERMEDIATE: usize = 128;
 const GROUP_SIZE: usize = 64;
 const BITS: usize = 4;
-// K-padded decode twin width: HIDDEN rounded up to the next multiple of 512.
-const K_PAD: usize = HIDDEN.div_ceil(512) * 512;
 
 fn synthetic_config() -> Qwen2Config {
     // Qwen2Config and Qwen2QuantizationConfig are #[non_exhaustive],
@@ -114,11 +112,15 @@ fn synthetic_model(device: &Device) -> Qwen2Model {
                     q_bias: random_dense(device, q_dim, s + 7),
                     k_bias: random_dense(device, kv_dim, s + 8),
                     v_bias: random_dense(device, kv_dim, s + 9),
-                    // K-padded decode twins: HIDDEN=128 → k_pad=512
-                    q_proj_padded: random_qweight(device, q_dim, K_PAD, s + 3),
-                    k_proj_padded: random_qweight(device, kv_dim, K_PAD, s + 4),
-                    v_proj_padded: random_qweight(device, kv_dim, K_PAD, s + 5),
-                    o_proj_padded: random_qweight(device, HIDDEN, K_PAD, s + 6),
+                    // The padded decode twins. HIDDEN=128 is too small for
+                    // qmv_fast (requires K%512==0 and buffer ≥1024B), so use
+                    // the unpadded shape (k_physical==k_logical). PhasedLinear
+                    // still routes T=1 decode through these twins; fast-path
+                    // selection is a real-model concern, not a smoke-test one.
+                    q_proj_padded: random_qweight(device, q_dim, HIDDEN, s + 3),
+                    k_proj_padded: random_qweight(device, kv_dim, HIDDEN, s + 4),
+                    v_proj_padded: random_qweight(device, kv_dim, HIDDEN, s + 5),
+                    o_proj_padded: random_qweight(device, HIDDEN, q_dim, s + 6),
                 },
                 mlp: Qwen2MlpWeights {
                     gate_proj: random_qweight(device, INTERMEDIATE, HIDDEN, s + 10),
