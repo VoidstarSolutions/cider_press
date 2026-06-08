@@ -108,6 +108,11 @@ struct BenchArgs {
     /// without --features profiling.
     #[arg(long)]
     gpu_profile: bool,
+    /// After the timed decode window, run ONE prefill forward (T = prompt
+    /// length) through the profiled eval and print a per-OpKind GPU
+    /// breakdown for the prefill path. No-op without --features profiling.
+    #[arg(long)]
+    gpu_profile_prefill: bool,
 }
 
 /// Shared load result for both subcommands.
@@ -184,7 +189,7 @@ fn run_chat(args: &ChatArgs) -> Result<(), BoxError> {
     Ok(())
 }
 
-#[allow(clippy::cast_precision_loss)]
+#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
     let device = Device::shared()?;
 
@@ -296,9 +301,26 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
     print_span_breakdown(&spans);
 
     if profile::is_enabled() {
-        print_gpu_breakdown(&profile::drain_gpu());
+        // Decode breakdown (from gpu_profile_token, if it ran). Labeled so
+        // the prefill table below is unambiguous.
+        let decode_gpu = profile::drain_gpu();
+        if !decode_gpu.is_empty() {
+            println!("  [decode]");
+            print_gpu_breakdown(&decode_gpu);
+        }
     } else if args.gpu_profile {
         println!("  (gpu breakdown unavailable; rebuild with --features profiling)");
+    }
+
+    if args.gpu_profile_prefill {
+        gpu_profile_prefill(&mut generator, &ids)?;
+        if profile::is_enabled() {
+            let prefill_gpu = profile::drain_gpu();
+            if !prefill_gpu.is_empty() {
+                println!("  [prefill]");
+                print_gpu_breakdown(&prefill_gpu);
+            }
+        }
     }
     Ok(())
 }
@@ -315,6 +337,18 @@ fn gpu_profile_token(generator: &mut Generator, last_id: u32) -> Result<(), BoxE
         return Ok(());
     }
     generator.profiled_decode_step(last_id)?;
+    Ok(())
+}
+
+/// Run ONE prefill forward (T = prompt length) through the profiled eval for
+/// a per-OpKind GPU breakdown of the prefill path. Outside the timed window.
+/// Resets + advances the generator's caches as a side effect (one-shot).
+fn gpu_profile_prefill(generator: &mut Generator, ids: &[u32]) -> Result<(), BoxError> {
+    if !profile::is_enabled() {
+        eprintln!("  (--gpu-profile-prefill ignored; rebuild with --features profiling)");
+        return Ok(());
+    }
+    generator.profiled_prefill(ids)?;
     Ok(())
 }
 
