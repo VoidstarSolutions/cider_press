@@ -77,8 +77,11 @@
 //! `[N, 896]` through the generic kernel vs padded `[N, 1024]` through the
 //! **fast** kernel (1024 % 512 == 0). Because the fast variant tiles K
 //! differently, low-bit drift is expected and bounded, so this compares as
-//! bf16 VALUES with the repo's bf16-ULP tolerance (~0.005 abs / 0.01 rel,
-//! per CLAUDE.md parity policy) rather than asserting bytes. It sweeps
+//! bf16 VALUES with the np.allclose combined bound `|a-b| ≤ atol + rtol·|b|`
+//! (atol 0.005, rtol 0.01, per CLAUDE.md parity policy for composed chains)
+//! rather than asserting bytes. The combined bound — not a fixed absolute
+//! floor — is required because a qmv output reaches magnitude ~16, where a
+//! single bf16 ULP is 0.125. It sweeps
 //! several seeds so the tolerance claim is exercised beyond a single draw.
 //! The product-level gate for this drift is the models-crate greedy-token
 //! parity test, not byte-equality here.
@@ -311,10 +314,21 @@ fn as_bf16(bytes: &[u8]) -> Vec<bf16> {
         .collect()
 }
 
-/// bf16-ULP tolerance comparison, mirroring the established kernel-parity
-/// helper (see `cider-press-kernels/tests/{rope,softmax}_parity.rs`):
-/// per-element `(abs, rel)` against `(abs_tol, rel_tol)`, with sampled
-/// mismatch diagnostics on failure.
+/// np.allclose combined-bound tolerance comparison: each element must
+/// satisfy `|a-b| ≤ abs_tol + rel_tol·|b|`. Sampled mismatch diagnostics
+/// on failure.
+///
+/// NOTE: this deliberately diverges from the rope/softmax parity helpers,
+/// which use the *separated* form `max_abs > abs_tol || max_rel > rel_tol`.
+/// That form is fine for those kernels because their outputs are
+/// bounded-magnitude (rope: rotations ~1; softmax: probabilities in [0,1]),
+/// so a fixed `abs_tol ≈ 0.005` is ≈ 1 bf16 ULP across the whole range. A
+/// qmv output is an 896-term accumulation that reaches magnitude ~16, where
+/// one bf16 ULP is `16·2⁻⁷ = 0.125` — far above any fixed absolute floor.
+/// The separated form would flag that genuine 1-ULP regroup drift as a
+/// failure (and, worse, aggregates `max_abs`/`max_rel` across *different*
+/// elements). CLAUDE.md prescribes the combined bound for exactly this case
+/// ("long composed chains ... the np.allclose combined bound").
 fn assert_within_tolerance(
     label: &str,
     got: &[bf16],
@@ -326,6 +340,7 @@ fn assert_within_tolerance(
     let mut max_abs = 0.0f32;
     let mut max_rel = 0.0f32;
     let mut mismatches = 0usize;
+    let mut violations = 0usize;
     let mut samples: Vec<(usize, f32, f32, f32)> = Vec::new();
     for (i, (a, b)) in got.iter().zip(expected.iter()).enumerate() {
         if a == b {
@@ -338,21 +353,26 @@ fn assert_within_tolerance(
         let rel = if bf.abs() > 1e-6 { abs / bf.abs() } else { 0.0 };
         max_abs = max_abs.max(abs);
         max_rel = max_rel.max(rel);
-        if samples.len() < 4 {
-            samples.push((i, af, bf, abs));
+        // np.allclose per-element combined bound.
+        if abs > abs_tol + rel_tol * bf.abs() {
+            violations += 1;
+            if samples.len() < 4 {
+                samples.push((i, af, bf, abs));
+            }
         }
     }
-    if max_abs > abs_tol || max_rel > rel_tol {
+    if violations > 0 {
         eprintln!(
-            "{label}: {mismatches}/{} mismatches, max_abs={max_abs:.6}, max_rel={max_rel:.6}",
+            "{label}: {violations}/{mismatches} elements exceed combined bound \
+             (of {} total); max_abs={max_abs:.6}, max_rel={max_rel:.6}",
             got.len(),
         );
         for (i, g, e, abs) in samples {
             eprintln!("  [{i}] got={g} expected={e} |diff|={abs}");
         }
         panic!(
-            "{label}: tolerance exceeded (max_abs={max_abs} > {abs_tol} \
-             or max_rel={max_rel} > {rel_tol})"
+            "{label}: tolerance exceeded — {violations} element(s) violate \
+             |a-b| ≤ {abs_tol} + {rel_tol}·|b| (max_abs={max_abs}, max_rel={max_rel})"
         );
     }
 }
