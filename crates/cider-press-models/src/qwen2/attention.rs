@@ -25,6 +25,20 @@ use crate::nn::{Linear, Module, PhasedLinear};
 
 use super::{Qwen2AttentionWeights, Qwen2Config};
 
+/// Measurement instrumentation (temporary): when `CIDER_PRESS_ZERO_KV=1`,
+/// the decode (T=1) k/v projections are skipped and replaced by zeros, to
+/// measure the upper bound on any small-N qmv (A2) win. No effect when
+/// unset. Read once and cached; set the env before the first decode step.
+/// See `docs/superpowers/specs/2026-06-08-a2-kv-ceiling-measurement-design.md`.
+#[allow(dead_code)] // consumed in Task 2 (wire into decode k/v forward)
+fn zero_kv_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("CIDER_PRESS_ZERO_KV").is_some_and(|v| v == "1")
+    })
+}
+
 /// Apply rotary positional embedding to a Qwen2 attention projection
 /// (Q or K) at sequence position `offset`.
 ///
@@ -442,4 +456,15 @@ fn broadcast_kv_heads(
         .copy()?
         .reshape([b, h_q, t_cache, head_dim])?;
     Ok(expanded)
+}
+
+#[cfg(test)]
+mod zero_kv_tests {
+    use super::zero_kv_enabled;
+
+    #[test]
+    fn zero_kv_defaults_off_when_env_unset() {
+        // Test processes do not set CIDER_PRESS_ZERO_KV, so the gate is off.
+        assert!(!zero_kv_enabled());
+    }
 }
