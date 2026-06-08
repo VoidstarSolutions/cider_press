@@ -89,8 +89,8 @@ pub struct Qwen2AttentionWeights {
     pub v_bias: Tensor,
     /// Decode-only twin: Q projection K-padded to `K.next_multiple_of(512)`.
     /// The `qmv_fast` variant requires `K % 512 == 0`; this twin makes it
-    /// selectable for single-token decode. Unused until the phase split wires
-    /// `PhasedLinear` in attention.rs (Task 4).
+    /// selectable for single-token decode, where `PhasedLinear` (in
+    /// `qwen2/attention.rs`) routes `T == 1` through the padded weight.
     pub q_proj_padded: QuantizedWeight,
     /// Decode-only twin: K projection K-padded to `K.next_multiple_of(512)`.
     pub k_proj_padded: QuantizedWeight,
@@ -254,15 +254,20 @@ fn load_attention(
     let v_bias = read_dense_tensor(archive, &format!("{prefix}.v_proj.bias"), device)?;
     expect_dense_bf16(&format!("{prefix}.v_proj.bias"), &v_bias, &[kv_proj_dim])?;
 
-    // K-padded decode twins: round K up to the next multiple of 512 so the
-    // `qmv_fast` variant (requires K % 512 == 0) is selectable on the decode
-    // path. For Qwen2.5-0.5B hidden=896 → k_pad=1024. Deriving from K so a
-    // different hidden size still works.
-    let k_pad = hidden.next_multiple_of(512);
-    let q_proj_padded = build_padded_twin(&q_proj, q_proj_dim, hidden, k_pad, quant, device)?;
-    let k_proj_padded = build_padded_twin(&k_proj, kv_proj_dim, hidden, k_pad, quant, device)?;
-    let v_proj_padded = build_padded_twin(&v_proj, kv_proj_dim, hidden, k_pad, quant, device)?;
-    let o_proj_padded = build_padded_twin(&o_proj, hidden, q_proj_dim, k_pad, quant, device)?;
+    // K-padded decode twins: round each projection's K up to the next multiple
+    // of 512 so the `qmv_fast` variant (requires K % 512 == 0) is selectable on
+    // the decode path. q/k/v read the hidden dim; o reads q_proj_dim. For
+    // Qwen2.5-0.5B both are 896 → k_pad=1024, but they can diverge in other
+    // architectures, so each twin pads from its OWN input K.
+    let k_pad_hidden = hidden.next_multiple_of(512);
+    let k_pad_o = q_proj_dim.next_multiple_of(512);
+    let q_proj_padded =
+        build_padded_twin(&q_proj, q_proj_dim, hidden, k_pad_hidden, quant, device)?;
+    let k_proj_padded =
+        build_padded_twin(&k_proj, kv_proj_dim, hidden, k_pad_hidden, quant, device)?;
+    let v_proj_padded =
+        build_padded_twin(&v_proj, kv_proj_dim, hidden, k_pad_hidden, quant, device)?;
+    let o_proj_padded = build_padded_twin(&o_proj, hidden, q_proj_dim, k_pad_o, quant, device)?;
 
     Ok(Qwen2AttentionWeights {
         q_proj,

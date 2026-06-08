@@ -40,6 +40,26 @@ fn zero_qw(device: &Device, n: usize, k: usize) -> QuantizedWeight {
     .expect("zero QuantizedWeight")
 }
 
+/// Zero K-padded twin: physical width `k_pad`, but logical K stays `k_logical`
+/// so a decode step (`T == 1`) accepts a `k_logical`-wide activation. Building
+/// these via `from_bytes` (`k_logical == k_pad`) would make the fixture reject
+/// the real decode activation.
+fn zero_qw_k_padded(device: &Device, n: usize, k_pad: usize, k_logical: usize) -> QuantizedWeight {
+    let elem_count = n * k_pad;
+    let w_bytes = elem_count * 4 / 32 * 4;
+    let aux_bytes = (elem_count / 64) * 2;
+    QuantizedWeight::from_bytes_k_padded(
+        device,
+        [n, k_pad],
+        k_logical,
+        Quantization::Q4_GS64,
+        &vec![0u8; w_bytes],
+        &vec![0u8; aux_bytes],
+        &vec![0u8; aux_bytes],
+    )
+    .expect("zero K-padded QuantizedWeight")
+}
+
 fn synthetic_config() -> Qwen2Config {
     // Qwen2.5-0.5B-Instruct architecture fields. Constructed via
     // `from_json_bytes` because `Qwen2Config` is `#[non_exhaustive]`.
@@ -70,8 +90,11 @@ fn synthetic_attention_weights(device: &Device) -> Qwen2AttentionWeights {
     let q_dim = NUM_Q_HEADS * HEAD_DIM; // 896
     let kv_dim = NUM_KV_HEADS * HEAD_DIM; // 128
 
-    // K-padded decode twins: HIDDEN_SIZE=896 → k_pad=1024
-    let k_pad = HIDDEN_SIZE.next_multiple_of(512);
+    // K-padded decode twins: q/k/v read the hidden dim, o reads q_dim.
+    // HIDDEN_SIZE=896 → k_pad=1024; q_dim=896 → k_pad_o=1024. Logical K stays
+    // the unpadded input width so a decode activation is accepted.
+    let k_pad_hidden = HIDDEN_SIZE.next_multiple_of(512);
+    let k_pad_o = q_dim.next_multiple_of(512);
     Qwen2AttentionWeights {
         q_proj: zero_qw(device, q_dim, HIDDEN_SIZE),
         k_proj: zero_qw(device, kv_dim, HIDDEN_SIZE),
@@ -80,10 +103,10 @@ fn synthetic_attention_weights(device: &Device) -> Qwen2AttentionWeights {
         q_bias: zero_bf16_1d(device, q_dim),
         k_bias: zero_bf16_1d(device, kv_dim),
         v_bias: zero_bf16_1d(device, kv_dim),
-        q_proj_padded: zero_qw(device, q_dim, k_pad),
-        k_proj_padded: zero_qw(device, kv_dim, k_pad),
-        v_proj_padded: zero_qw(device, kv_dim, k_pad),
-        o_proj_padded: zero_qw(device, HIDDEN_SIZE, k_pad),
+        q_proj_padded: zero_qw_k_padded(device, q_dim, k_pad_hidden, HIDDEN_SIZE),
+        k_proj_padded: zero_qw_k_padded(device, kv_dim, k_pad_hidden, HIDDEN_SIZE),
+        v_proj_padded: zero_qw_k_padded(device, kv_dim, k_pad_hidden, HIDDEN_SIZE),
+        o_proj_padded: zero_qw_k_padded(device, HIDDEN_SIZE, k_pad_o, q_dim),
     }
 }
 
