@@ -83,11 +83,18 @@ dispatch model, which is done.
 
 | phase   | cider-press | mlx_lm  | ratio (mlx ÷ cp) |
 |---------|------------:|--------:|-----------------:|
-| prefill | ~917 tok/s  | ~1390 tok/s | ~1.52× |
+| prefill | ~917 tok/s† | ~1390 tok/s† | ~1.52×† |
 | decode  | ~599 tok/s  | ~568 tok/s  | **~0.95× (cider ahead)** |
 
 (Decode reflects **qmv fast-path padding (A1)**; the pre-A1 encoder/sync-model
 parity point was ~561 vs ~564, ~1.00×.)
+
+† **These prefill figures are not comparable** — see **Prefill gap
+analysis** below. cider's ~917 was wall-clock around `generate()`, which
+`eval_async`s the prefill and does *not* wait for the GPU; the ~1390 came
+from mlx_lm's own prompt-eval reporting. Measured apples-to-apples
+(synchronous forward + eval-wait, both sides), the true prefill gap is
+**~1.30×** (cider 10.19 ms vs mlx 7.82 ms at T=39), not 1.52×.
 
 - **Prefill** processes the 39-token prompt in one forward. cider-press
   ranged 880–943 tok/s across warm runs (~917 median); `mlx_lm` ~1390.
@@ -96,8 +103,10 @@ parity point was ~561 vs ~564, ~1.00×.)
   untracked-buffer + fence-chain dispatch model that pays off in decode
   also unblocks the prefill command buffer. Prefill still runs the
   **composed** attention path (the fused vector kernel is the decode/T=1
-  path; prefill fusion is deferred — see `docs/ARCHITECTURE.md`), so the
-  remaining ~1.52× gap is the composed-attention work, not dispatch.
+  path; prefill fusion is deferred — see `docs/ARCHITECTURE.md`). The
+  prefill gap was later **measured** (not inferred) — see **Prefill gap
+  analysis**: the true synchronous gap is ~1.30×, qmm is at parity, and
+  the composed attention is the primary lever.
 - **Decode** is the per-token steady state (the perf-dominant path). The
   prior SliceUpdate (~55 → ~90 tok/s, ~1.6×) and fused `sdpa_vector`
   (~90 → ~120 tok/s, ~1.33×) changes preceded this branch. The
@@ -137,6 +146,91 @@ to disk cross-process, so runs 2+ prefill in ~130 ms. The 42.6 s is a
 one-time first-token-latency cost (a `.metallib` precompile would
 amortize it; deferred — see `docs/ARCHITECTURE.md`), not representative of
 prefill compute, and is excluded from the table above.
+
+## Prefill gap analysis
+
+Decode leads `mlx_lm`; prefill is the largest remaining gap. This section
+**measures** it (the prior attribution was inferred from the decode
+profile). Methodology, per the project's habit: diff the pipeline against
+MLX structurally, *then* profile to confirm — don't hunt slow spots blind.
+Full working notes: `docs/superpowers/notes/2026-06-08-prefill-diff-findings.md`.
+Tooling added: `Generator::profiled_prefill`, `bench --gpu-profile-prefill`,
+`bench --prefill-iters` (synchronous timing), `qmm_dispatch_bench.rs`,
+`scripts/profile_mlx_prefill.py`, `scripts/measure_qmm_mlx.py`.
+
+### The true gap is ~1.30×, not 1.52× (methodology fix)
+
+The 1.52× headline was a **measurement artifact**. cider's ~917 tok/s was
+wall-clock around `generate()`, which `eval_async`s the prefill and does
+not wait for the GPU; the ~1390 mlx figure came from mlx_lm's own
+prompt-eval reporting. Measured apples-to-apples — both sides build the
+prefill graph, forward, and **synchronously** eval the full logits
+(`logits.eval()` / `mx.eval(logits)`), warm, mean of 5, same T=39 prompt
+and 4-bit checkpoint, same M4 Max:
+
+| side  | method                             | prefill (T=39) | tok/s  |
+|-------|------------------------------------|---------------:|-------:|
+| cider | `forward` + `logits.eval()` (sync) |      10.19 ms  | 3829   |
+| mlx   | `model(x)` + `mx.eval(logits)`     |       7.82 ms  | 4988   |
+
+**True gap: ~1.30× — a 2.37 ms delta.**
+
+### First prefill GPU profile (T=39, counter-sampled, perturbed)
+
+`gpu.quantized_matmul` 76.3% · `gpu.copy` 8.2% (266 dispatches) ·
+`gpu.binary` 5.3% · `gpu.matmul` 4.8% (48 = 2/layer) · `gpu.rope` 1.5% ·
+`gpu.rms_norm` 1.4% · `gpu.slice_update` 1.0% · `gpu.softmax` 0.8% ·
+rest <1%. (Decode contrast: `quantized_matmul` 58.4%, `copy` 0.2%, the
+score chain fused into one `gpu.sdpa`.) The 266 copies reconcile exactly
+to 11/layer × 24 + 2 (9 of the 11 per-layer copies are fusible; the 2
+KV-cache-write copies are structural). RoPE is at parity (no extra copy);
+the causal-mask add is a separate `binary` dispatch MLX folds in-kernel.
+
+### qmm is at parity — it is *not* the gap
+
+`quantized_matmul` dominates GPU time but is the **same `affine_qmm_t`
+algorithm on both sides** (cider routes M>1 → `qmm`; MLX routes
+M ≥ `vector_limit` → `qmm`). A microbench at all 8 prefill shapes (M=39),
+cider GPU-counter ns vs **amortized** mlx timing (200 dispatches per
+`mx.eval`, so the per-call host round-trip is amortized to GPU throughput):
+
+| shape | cider GPU µs | mlx amortized µs | ratio |
+|-------|----:|----:|----:|
+| q_proj | 42.1 | 30.2 | 1.40× |
+| k_proj | 24.3 | 12.0 | 2.02× |
+| v_proj | 18.9 | 11.8 | 1.59× |
+| o_proj | 23.2 | 22.7 | 1.02× |
+| gate | 54.1 | 57.8 | 0.94× |
+| up | 53.8 | 58.4 | 0.92× |
+| down | 109.2 | 66.9 | 1.63× |
+| lm_head | 1339 | 1463 | 0.91× |
+
+Summed one-of-each: cider ~1664 µs vs mlx ~1723 µs — **parity**. The
+large shapes that dominate the budget are at parity or cider-faster; the
+apparent 1.4–2.0× on the tiny q/k/v projections is **counter-sampling
+perturbation** (a roughly-fixed sampler overhead that is a large fraction
+of a 12–24 µs dispatch but negligible on a 1.3 ms one — lm_head, fully
+GPU-bound, shows cider *faster* at 0.91× despite carrying that perturbation).
+qmm is ruled out as the gap driver.
+
+### Reconciliation & ranked backlog
+
+| contributor | est. cost | basis |
+|---|---|---|
+| composed attention (9 fusible copies/layer + QKᵀ/scale/mask/softmax/·V) | ~1.5–1.7 ms | GPU shares: copy 8.2% + matmul 4.8% + softmax 0.8% + partial binary, of 10.19 ms |
+| encode / dispatch overhead (residual) | ~0.7–0.9 ms | gap minus the above; unconfirmed (needs Metal trace) |
+| qmm projections | ~0 | microbench parity |
+
+1. **Fused prefill attention** (steel `sdpa_full` / Plan B) — the primary
+   lever (~1.5–1.7 ms, ≈ most of the gap). D_h=64 is a supported steel
+   head dim and T=39 > 8 clears the fused-path threshold, so it is
+   reachable; it deletes 9 of 11 per-layer copies plus the entire
+   QKᵀ/scale/mask/softmax/·V chain in one kernel.
+2. **Encode / dispatch overhead** — the ~0.7–0.9 ms residual; size it with
+   a Metal System Trace (both binaries; the `.gputrace` capture exists)
+   before committing to a fix. Deferred (smaller, and interactive).
+3. **Small-projection qmm (q/k/v)** — *not* a real lever (parity once
+   perturbation is credited); explicitly de-prioritized.
 
 ## Async decode pipelining (detach-on-eval)
 

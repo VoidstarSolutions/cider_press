@@ -187,10 +187,20 @@ priority:
    permutes are now zero-copy views rather than `OpKind::Copy` dispatches
    (`Strides::is_contiguous_ignoring_unit_dims`; design:
    `docs/superpowers/specs/2026-06-03-strided-copy-elimination-design.md`).
-   Decode is down to 2 copy dispatches/token. Remaining: **S2–S5** (prefill
-   strided consumers — rope strides, `slice_update` strided src, gemm
-   transpose+broadcast, qmv strided); these require strided kernel variants
-   and do not affect decode.
+   Decode is down to 2 copy dispatches/token. The remaining strided work is
+   **prefill (T>1)**, now **measured** (`QWEN_PERF.md` § "Prefill gap
+   analysis"): the true synchronous prefill gap is **~1.30×** (cider
+   10.19 ms vs mlx 7.82 ms at T=39), not the 1.52× the async wall-clock
+   implied. qmm is at **parity** (same `affine_qmm_t` on both sides — ruled
+   out by microbench). The gap is the **composed attention path**: 11
+   permute→copy dispatches/layer (9 fusible) + the QKᵀ/scale/mask/softmax/·V
+   chain, ≈ 1.5–1.7 ms. So the prioritized prefill levers are **#1 fused
+   prefill attention** (steel `sdpa_full` / Plan B — D_h=64 is a supported
+   steel head dim and T=39 > 8 clears the fused-path threshold; one kernel
+   subsumes the S2–S5 copies + the score chain), then **#2** the
+   ~0.7–0.9 ms encode/dispatch residual (size with a Metal System Trace
+   first). The piecemeal S2–S5 strided-variant framing is superseded by the
+   fused-attention port, which deletes the copies wholesale.
 
 ## Carry-forward items
 
