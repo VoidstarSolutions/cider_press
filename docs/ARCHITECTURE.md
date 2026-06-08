@@ -116,18 +116,25 @@ priority:
    SwiGLU and RoPE are *not* targets (MLX composes SwiGLU; RoPE and
    decode-SDPA are already fused). Parity-sensitive; highest-potential.
 
-   *(b) Faster `qmv` kernels — speeds each link.* The 4-bit `qmv` matvecs are
+   *(b) Faster `qmv` kernels — speeds each link. Fast-path padding (A1) DONE;
+   small-N launch-config (A2) gated, k/v only.* The 4-bit `qmv` matvecs are
    the heaviest dispatches. The audit (`docs/QWEN_PERF.md` `## qmv audit`,
    Approaches A + B) found the attained bandwidth is **N-dependent**: large-N
    linears (gate/up/down ~272–306 GB/s, lm_head ~464) are roofline-bound near
    the M4 Max ~410–546 GB/s spec, but small-N decode projections (k/v_proj
    ~13 GB/s, q/o_proj ~85) are occupancy-starved by the generic
    `(1, ceil(N/8), 1)` grid — lever (b), compounded by fast-path absence
-   (lever a — no Qwen2.5-0.5B shape has a 512-multiple K). A small-N
-   launch-config fix (split the output dim across more threadgroups) plus
-   fast-path-via-padding are dispatch-side, parity-preserving, no edits to
-   vendored `quantized.metal`. Shortens each `qmv` link but not the dispatch
-   *count* (that is fusion).
+   (lever a — no Qwen2.5-0.5B shape has a 512-multiple K). **A1 (done,
+   `perf/qmv-fast-path-padding`):** lever (a) — pad q/k/v/o to K=1024 so the
+   `qmv_fast` variant fires (q/o ~85 → ~139 GB/s, k/v ~13 → ~22 GB/s,
+   bit-exact via zero-scale/zero-bias pad groups, vendored kernels untouched),
+   lifting decode **~561 → ~599 tok/s, ~1.05× of `mlx_lm`** — see
+   `## qmv fast-path padding (A1)`. **A2 (gated, conditional GO — k/v only):**
+   lever (b) — a cider-owned small-N kernel that fixes occupancy (N=128 launches
+   only 16 threadgroups; k/v padded still ~7× under the kernel's own N=1024
+   bandwidth). q/o is now near the fast-path ceiling, so A1 suffices there;
+   A2 is scoped to k/v on its own branch (new MIT-attributed file). Shortens
+   each `qmv` link but not the dispatch *count* (that is fusion).
 
    *(c) Concurrent dispatch encoder — tested, REJECTED.* A spike
    (`spike/concurrent-encoder`) flipped the serial encoder

@@ -25,10 +25,14 @@ gap that started at ~10× has been worked down stage by stage — fused
 `RMSNorm`, async decode pipelining, decode copy-elimination, and finally
 the **encoder/sync-model port** (MLX's untracked buffers + fence chain +
 concurrent encoders + graph-level barrier elision in Kahn-wave order).
-Running Qwen2.5-0.5B-Instruct-4bit, decode is now **~561 vs ~564 tok/s,
-~1.00× of `mlx_lm`** — essentially at parity. The remaining levers are
-kernel-side (small-N `qmv` launch config), prefill, and memory, not the
-dispatch model. See `docs/QWEN_PERF.md` for the numbers and
+Running Qwen2.5-0.5B-Instruct-4bit, decode now **edges past `mlx_lm` at
+~599 vs ~568 tok/s, ~1.05×** after **qmv fast-path padding (A1)** — padding
+the q/k/v/o decode projections to K=1024 so the vendored `qmv_fast` variant
+fires (bit-exact via zero-scale/zero-bias pad groups; vendored kernels
+untouched). The encoder/sync-model port before it had reached parity
+(~561 vs ~564, ~1.00×). The remaining levers are kernel-side (A2: a
+cider-owned small-N `qmv` kernel, scoped to k/v), prefill, and memory, not
+the dispatch model. See `docs/QWEN_PERF.md` for the numbers and
 `docs/ARCHITECTURE.md` for the forward backlog.
 
 ### Non-goals
@@ -80,12 +84,13 @@ Runs **Qwen2.5-0.5B-Instruct-4bit** end-to-end: load checkpoint →
 tokenize → chat-template → greedy decode, streamed via the `cider-press`
 CLI. The runtime is a lazy `Tensor` graph over vendored MLX Metal
 kernels, with `eval()` as the synchronous dispatch boundary; the models
-crate composes Qwen2 from runtime ops. Performance is measured and the
-decode gap to `mlx_lm` is **closed** (~561 vs ~564 tok/s, ~1.00×) after
-the encoder/sync-model port (`docs/QWEN_PERF.md`).
+crate composes Qwen2 from runtime ops. Performance is measured and decode
+now **leads `mlx_lm`** (~599 vs ~568 tok/s, ~1.05×) after qmv fast-path
+padding (A1), built on the encoder/sync-model port that first reached
+parity (~561 vs ~564, ~1.00×) (`docs/QWEN_PERF.md`).
 
 **Remaining perf work is kernel- and memory-side**, not the dispatch
-model: small-N `qmv` launch config (backlog #4), prefill strided work
+model: A2 small-N `qmv` kernel for k/v (backlog #4, gated GO), prefill strided work
 (S2–S5), within-eval reuse for RSS, and `.metallib` precompile.
 `docs/ARCHITECTURE.md` holds the forward pass and the prioritized backlog.
 
