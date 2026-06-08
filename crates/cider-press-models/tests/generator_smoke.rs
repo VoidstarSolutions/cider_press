@@ -112,6 +112,15 @@ fn synthetic_model(device: &Device) -> Qwen2Model {
                     q_bias: random_dense(device, q_dim, s + 7),
                     k_bias: random_dense(device, kv_dim, s + 8),
                     v_bias: random_dense(device, kv_dim, s + 9),
+                    // The padded decode twins. HIDDEN=128 is too small for
+                    // qmv_fast (requires K%512==0 and buffer ≥1024B), so use
+                    // the unpadded shape (k_physical==k_logical). PhasedLinear
+                    // still routes T=1 decode through these twins; fast-path
+                    // selection is a real-model concern, not a smoke-test one.
+                    q_proj_padded: random_qweight(device, q_dim, HIDDEN, s + 3),
+                    k_proj_padded: random_qweight(device, kv_dim, HIDDEN, s + 4),
+                    v_proj_padded: random_qweight(device, kv_dim, HIDDEN, s + 5),
+                    o_proj_padded: random_qweight(device, HIDDEN, q_dim, s + 6),
                 },
                 mlp: Qwen2MlpWeights {
                     gate_proj: random_qweight(device, INTERMEDIATE, HIDDEN, s + 10),

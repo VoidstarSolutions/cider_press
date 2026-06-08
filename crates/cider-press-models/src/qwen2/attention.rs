@@ -21,7 +21,7 @@ use cider_press_runtime::{DType, KvCache, Tensor};
 use half::bf16;
 
 use crate::error::{Error, Result};
-use crate::nn::{Linear, Module};
+use crate::nn::{Linear, Module, PhasedLinear};
 
 use super::{Qwen2AttentionWeights, Qwen2Config};
 
@@ -239,9 +239,11 @@ fn composed_sdpa(
 /// Qwen2 multi-head self-attention with grouped-query attention (GQA)
 /// and a `RoPE`-positioned KV cache.
 ///
-/// Owns the four projections as [`Linear`]s (`q`/`k`/`v` carry the
-/// dense additive bias; `o` does not) plus a cloned [`Qwen2Config`]
+/// Owns the four projections as [`PhasedLinear`]s (`q`/`k`/`v` carry
+/// the dense additive bias; `o` does not) plus a cloned [`Qwen2Config`]
 /// so [`Attention::forward`] can drive the [`rope`] / [`sdpa`] helpers.
+/// Each `PhasedLinear` holds a prefill `Linear` (checkpoint weights,
+/// qmm path) and a decode `Linear` (K-padded twin, qmv fast-path).
 ///
 /// Deliberately does **not** implement [`crate::nn::Module`]: its
 /// forward genuinely needs the attention mask, the `RoPE` offset, and a
@@ -250,10 +252,10 @@ fn composed_sdpa(
 /// state flows through a layer's own methods, and this is that case.
 #[derive(Clone, Debug)]
 pub struct Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: PhasedLinear,
+    k_proj: PhasedLinear,
+    v_proj: PhasedLinear,
+    o_proj: PhasedLinear,
     config: Qwen2Config,
 }
 
@@ -263,10 +265,22 @@ impl Attention {
     /// device buffers) into owned [`Linear`]s.
     pub fn from_weights(weights: &Qwen2AttentionWeights, config: &Qwen2Config) -> Result<Self> {
         Ok(Self {
-            q_proj: Linear::new(weights.q_proj.clone(), Some(weights.q_bias.clone()))?,
-            k_proj: Linear::new(weights.k_proj.clone(), Some(weights.k_bias.clone()))?,
-            v_proj: Linear::new(weights.v_proj.clone(), Some(weights.v_bias.clone()))?,
-            o_proj: Linear::new(weights.o_proj.clone(), None)?,
+            q_proj: PhasedLinear::new(
+                Linear::new(weights.q_proj.clone(), Some(weights.q_bias.clone()))?,
+                Linear::new(weights.q_proj_padded.clone(), Some(weights.q_bias.clone()))?,
+            ),
+            k_proj: PhasedLinear::new(
+                Linear::new(weights.k_proj.clone(), Some(weights.k_bias.clone()))?,
+                Linear::new(weights.k_proj_padded.clone(), Some(weights.k_bias.clone()))?,
+            ),
+            v_proj: PhasedLinear::new(
+                Linear::new(weights.v_proj.clone(), Some(weights.v_bias.clone()))?,
+                Linear::new(weights.v_proj_padded.clone(), Some(weights.v_bias.clone()))?,
+            ),
+            o_proj: PhasedLinear::new(
+                Linear::new(weights.o_proj.clone(), None)?,
+                Linear::new(weights.o_proj_padded.clone(), None)?,
+            ),
             config: config.clone(),
         })
     }
@@ -393,7 +407,7 @@ impl Attention {
 /// permuted view into contiguous bytes for the downstream matmul /
 /// `RoPE` kernels.
 fn project_heads(
-    proj: &Linear,
+    proj: &dyn Module,
     hidden: &Tensor,
     t: usize,
     h: usize,

@@ -66,7 +66,7 @@ fn qmv_gpu_ns(
     let mut cmds = device.commands_profiled(reps).expect("profiled commands");
     for _ in 0..reps {
         cmds.begin_profiled_op("qmv");
-        kernels::qmv::affine_qmv_bf16(&mut cmds, library, w, s, b, x, y, group_size, bits)
+        kernels::qmv::affine_qmv_bf16(&mut cmds, library, w, s, b, x, y, x.len(), group_size, bits)
             .expect("dispatch");
     }
     let segments = cmds.commit_wait_resolve().expect("resolve");
@@ -93,7 +93,7 @@ fn bench(device: &Device, library: &KernelLibrary, k: usize, n: usize) {
 
     let dispatch = |y: &mut Buffer<bf16>| {
         let mut cmds = device.commands().expect("commands");
-        kernels::qmv::affine_qmv_bf16(&mut cmds, library, &w, &s, &b, &x, y, GROUP_SIZE, BITS)
+        kernels::qmv::affine_qmv_bf16(&mut cmds, library, &w, &s, &b, &x, y, k, GROUP_SIZE, BITS)
             .expect("dispatch");
         cmds.commit_and_wait().expect("commit");
     };
@@ -143,7 +143,9 @@ fn perf_affine_qmv_fast_bf16_gs64_b4() {
     // Qwen2.5-0.5B decode qmv shapes (K=in, N=out), then forced-fast control.
     let shapes: &[(usize, usize, &str)] = &[
         (896, 896, "q/o_proj"),
+        (1024, 896, "q/o_proj PADDED (K=1024 fast)"),
         (896, 128, "k/v_proj"),
+        (1024, 128, "k/v_proj PADDED (K=1024 fast)"),
         (896, 4864, "gate/up_proj"),
         (4864, 896, "down_proj"),
         (896, 151_936, "lm_head"),

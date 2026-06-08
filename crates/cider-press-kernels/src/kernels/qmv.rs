@@ -44,9 +44,16 @@ const BK: i32 = 32;
 /// dispatch into `commands`; caller flushes via
 /// [`Commands::commit_and_wait`].
 ///
+/// # Parameters
+///
+/// - `in_vec_size`: physical K from the weight shape — NOT the activation
+///   length. For unpadded weights `x.len() == in_vec_size`; for K-padded
+///   weights `x.len() < in_vec_size` and passing `x.len()` would silently
+///   compute garbage. Always read from `QuantizedWeight::shape()[1]`.
+///
 /// # Shape requirements
 ///
-/// Let `K = x.len()`, `N = y.len()`. Then:
+/// Let `K = in_vec_size`, `N = y.len()`. Then:
 /// - `w_q.len()  == N * K * bits / 32`  (int4 lanes packed into uint32)
 /// - `scales.len() == N * K / group_size`
 /// - `biases.len() == N * K / group_size`
@@ -73,15 +80,46 @@ pub fn affine_qmv_bf16(
     biases: &Buffer<bf16>,
     x: &Buffer<bf16>,
     y: &mut Buffer<bf16>,
+    in_vec_size: usize,
     group_size: u32,
     bits: u32,
 ) -> Result<()> {
     // Shape validation. Failing any of these would produce silent garbage
     // on the GPU side (or a div-by-zero panic on `group_size == 0`); reject
     // them with a typed error so callers can recover.
-    let k = i32::try_from(x.len()).map_err(|_| {
-        Error::InvalidArgument(format!("affine_qmv: K={} does not fit in i32", x.len()))
+    let k = i32::try_from(in_vec_size).map_err(|_| {
+        Error::InvalidArgument(format!("affine_qmv: K={in_vec_size} does not fit in i32"))
     })?;
+    // For K-padded weights the physical K exceeds the activation's Rust-logical
+    // length, so the kernel reads tail elements past the logical row. Safety of
+    // those reads is a THREE-part contract:
+    //   (a) Pad groups carry zero scale AND zero bias. The kernel computes
+    //       `scale·Σ(q·x) + bias·Σx` per group; zero scale kills the first
+    //       term and zero bias kills `bias·Σx_tail` (loader enforces this).
+    //   (b) Buffer capacity ≥ physical K * 2 bytes — the assert below. Every
+    //       Metal allocation is 512-B rounded at
+    //       `cider_press_kernels::Device::alloc_buffer`, so a 1792-B activation
+    //       row (896 bf16) has ≥2048-B Metal capacity — enough for a padded-K
+    //       read of 1024 bf16.
+    //   (c) Tail bytes read as 0.0, guaranteed by the slack-zeroing invariant
+    //       in `alloc_buffer`. This is independent of (a): even with zero
+    //       scale/bias, `accum += x·q` poisons on `0 * NaN = NaN` if a stale
+    //       tail byte decodes as bf16 NaN/Inf, so the tail VALUES matter. The
+    //       alloc-site memset makes them 0.0 for the buffer's lifetime.
+    // Check against the Metal allocation length to catch any future path that
+    // skips the 512-B rounding (which would also skip the slack-zeroing). This
+    // is recoverable like the rest of this validator — never abort the process.
+    // `in_vec_size * 2` cannot overflow: it is already known to fit in i32 (the
+    // `k` conversion above), so doubling stays well within usize on 64-bit.
+    let required_bytes = in_vec_size * size_of::<bf16>();
+    if x.metal_alloc_len() < required_bytes {
+        return Err(Error::InvalidArgument(format!(
+            "affine_qmv: activation Metal allocation too small for K-padded read: \
+             metal_alloc_len={} < required_bytes={required_bytes} \
+             (K-padding requires Metal capacity >= physical K * 2)",
+            x.metal_alloc_len(),
+        )));
+    }
     let n = i32::try_from(y.len()).map_err(|_| {
         Error::InvalidArgument(format!("affine_qmv: N={} does not fit in i32", y.len()))
     })?;

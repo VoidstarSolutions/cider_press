@@ -87,6 +87,17 @@ pub struct Qwen2AttentionWeights {
     pub k_bias: Tensor,
     /// V linear bias. Shape `[H_kv * D_h]`.
     pub v_bias: Tensor,
+    /// Decode-only twin: Q projection K-padded to `K.next_multiple_of(512)`.
+    /// The `qmv_fast` variant requires `K % 512 == 0`; this twin makes it
+    /// selectable for single-token decode, where `PhasedLinear` (in
+    /// `qwen2/attention.rs`) routes `T == 1` through the padded weight.
+    pub q_proj_padded: QuantizedWeight,
+    /// Decode-only twin: K projection K-padded to `K.next_multiple_of(512)`.
+    pub k_proj_padded: QuantizedWeight,
+    /// Decode-only twin: V projection K-padded to `K.next_multiple_of(512)`.
+    pub v_proj_padded: QuantizedWeight,
+    /// Decode-only twin: output projection K-padded to `K.next_multiple_of(512)`.
+    pub o_proj_padded: QuantizedWeight,
 }
 
 /// `SwiGLU` MLP block weights.
@@ -243,6 +254,21 @@ fn load_attention(
     let v_bias = read_dense_tensor(archive, &format!("{prefix}.v_proj.bias"), device)?;
     expect_dense_bf16(&format!("{prefix}.v_proj.bias"), &v_bias, &[kv_proj_dim])?;
 
+    // K-padded decode twins: round each projection's K up to the next multiple
+    // of 512 so the `qmv_fast` variant (requires K % 512 == 0) is selectable on
+    // the decode path. q/k/v read the hidden dim; o reads q_proj_dim. For
+    // Qwen2.5-0.5B both are 896 → k_pad=1024, but they can diverge in other
+    // architectures, so each twin pads from its OWN input K.
+    let k_pad_hidden = hidden.next_multiple_of(512);
+    let k_pad_o = q_proj_dim.next_multiple_of(512);
+    let q_proj_padded =
+        build_padded_twin(&q_proj, q_proj_dim, hidden, k_pad_hidden, quant, device)?;
+    let k_proj_padded =
+        build_padded_twin(&k_proj, kv_proj_dim, hidden, k_pad_hidden, quant, device)?;
+    let v_proj_padded =
+        build_padded_twin(&v_proj, kv_proj_dim, hidden, k_pad_hidden, quant, device)?;
+    let o_proj_padded = build_padded_twin(&o_proj, hidden, q_proj_dim, k_pad_o, quant, device)?;
+
     Ok(Qwen2AttentionWeights {
         q_proj,
         k_proj,
@@ -251,7 +277,100 @@ fn load_attention(
         q_bias,
         k_bias,
         v_bias,
+        q_proj_padded,
+        k_proj_padded,
+        v_proj_padded,
+        o_proj_padded,
     })
+}
+
+/// Build a K-padded twin from an already-loaded [`QuantizedWeight`].
+///
+/// Extracts the component bytes from `src`, calls `pad_quantized_k`, then
+/// constructs via `from_bytes_k_padded`. `n` and `k` name the logical weight
+/// shape; `k_pad` is the padded physical K (must be `≥ k` and a multiple of
+/// `group_size`).
+fn build_padded_twin(
+    src: &QuantizedWeight,
+    n: usize,
+    k: usize,
+    k_pad: usize,
+    quant: Quantization,
+    device: &Device,
+) -> Result<QuantizedWeight> {
+    let (w_bytes, s_bytes, b_bytes) = src.component_bytes();
+    let (w_pad, s_pad, b_pad) = pad_quantized_k(w_bytes, s_bytes, b_bytes, n, k, k_pad, quant);
+    QuantizedWeight::from_bytes_k_padded(device, [n, k_pad], k, quant, &w_pad, &s_pad, &b_pad)
+        .map_err(crate::error::Error::from)
+}
+
+/// Zero-pad a quantized weight's inner dim from `k` to `k_pad` columns.
+/// Pad groups get zero packed words and zero (bf16) scales AND biases —
+/// the kernel computes `scale·Σ(q·x) + bias·Σx` per group, so zero
+/// scale kills the first term (q=0 anyway) and zero bias the second
+/// (mandatory: the activation tail region is only guaranteed zero by
+/// the alloc-site slack invariant; the loader must not depend on it).
+/// Returns (weights, scales, biases) for the padded `[n, k_pad]` layout.
+fn pad_quantized_k(
+    weights: &[u8],
+    scales: &[u8],
+    biases: &[u8],
+    n: usize,
+    k: usize,
+    k_pad: usize,
+    q: Quantization,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let bits = q.bits() as usize;
+    let group_size = q.group_size() as usize;
+
+    assert!(
+        k % group_size == 0,
+        "k={k} must be a multiple of group_size={group_size}"
+    );
+    assert!(k_pad >= k, "k_pad={k_pad} must be >= k={k}");
+    assert!(
+        k_pad % group_size == 0,
+        "k_pad={k_pad} must be a multiple of group_size={group_size}"
+    );
+
+    // Row stride in bytes for packed weights: k * bits / 8
+    let w_row_src = k * bits / 8;
+    let w_row_dst = k_pad * bits / 8;
+    // Row stride in bytes for scales/biases: (k / group_size) * 2 (bf16)
+    let sb_row_src = (k / group_size) * 2;
+    let sb_row_dst = (k_pad / group_size) * 2;
+
+    assert_eq!(
+        weights.len(),
+        n * w_row_src,
+        "weights buffer length mismatch"
+    );
+    assert_eq!(
+        scales.len(),
+        n * sb_row_src,
+        "scales buffer length mismatch"
+    );
+    assert_eq!(
+        biases.len(),
+        n * sb_row_src,
+        "biases buffer length mismatch"
+    );
+
+    let mut w_out = vec![0u8; n * w_row_dst];
+    let mut s_out = vec![0u8; n * sb_row_dst];
+    let mut b_out = vec![0u8; n * sb_row_dst];
+
+    for row in 0..n {
+        w_out[row * w_row_dst..row * w_row_dst + w_row_src]
+            .copy_from_slice(&weights[row * w_row_src..(row + 1) * w_row_src]);
+        s_out[row * sb_row_dst..row * sb_row_dst + sb_row_src]
+            .copy_from_slice(&scales[row * sb_row_src..(row + 1) * sb_row_src]);
+        b_out[row * sb_row_dst..row * sb_row_dst + sb_row_src]
+            .copy_from_slice(&biases[row * sb_row_src..(row + 1) * sb_row_src]);
+        // Pad region is already zero from vec![0u8; ...] initialisation.
+    }
+
+    (w_out, s_out, b_out)
 }
 
 fn load_mlp(
@@ -337,6 +456,108 @@ mod tests {
     use crate::qwen2::config::Qwen2QuantizationConfig;
     use half::bf16;
     use safetensors::{Dtype as StDtype, tensor::TensorView};
+
+    // ---------- pad_quantized_k unit tests (no Device needed) ----------
+
+    #[test]
+    fn pad_quantized_k_row_strides() {
+        let q = Quantization::Q4_GS64;
+        // n=2, k=128, k_pad=192 (adds one group per row)
+        let n = 2usize;
+        let k = 128usize;
+        let k_pad = 192usize;
+        // k=128, bits=4: w_row_src = 128*4/8 = 64 bytes
+        // k_pad=192: w_row_dst = 192*4/8 = 96 bytes
+        // scales/biases: k/64=2 groups → 4 bytes per row; k_pad/64=3 → 6 bytes
+        let w_src = vec![0xffu8; n * 64];
+        let s_src = vec![0xeeu8; n * 4];
+        let b_src = vec![0xddu8; n * 4];
+        let (w_out, s_out, b_out) = pad_quantized_k(&w_src, &s_src, &b_src, n, k, k_pad, q);
+        assert_eq!(w_out.len(), n * 96, "packed weight output length");
+        assert_eq!(s_out.len(), n * 6, "scales output length");
+        assert_eq!(b_out.len(), n * 6, "biases output length");
+    }
+
+    #[test]
+    fn pad_quantized_k_original_bytes_preserved() {
+        let q = Quantization::Q4_GS64;
+        let n = 3usize;
+        let k = 128usize;
+        let k_pad = 192usize;
+        // Unique bytes per component so we can distinguish them.
+        #[allow(clippy::cast_possible_truncation)]
+        let w_src: Vec<u8> = (0..n * 64)
+            .map(|i: usize| (i as u8).wrapping_add(1))
+            .collect();
+        #[allow(clippy::cast_possible_truncation)]
+        let s_src: Vec<u8> = (0..n * 4)
+            .map(|i: usize| (i as u8).wrapping_add(0x40))
+            .collect();
+        #[allow(clippy::cast_possible_truncation)]
+        let b_src: Vec<u8> = (0..n * 4)
+            .map(|i: usize| (i as u8).wrapping_add(0x80))
+            .collect();
+        let (w_out, s_out, b_out) = pad_quantized_k(&w_src, &s_src, &b_src, n, k, k_pad, q);
+        for row in 0..n {
+            assert_eq!(
+                &w_out[row * 96..row * 96 + 64],
+                &w_src[row * 64..(row + 1) * 64],
+                "w row {row} original bytes"
+            );
+            assert_eq!(
+                &s_out[row * 6..row * 6 + 4],
+                &s_src[row * 4..(row + 1) * 4],
+                "s row {row} original bytes"
+            );
+            assert_eq!(
+                &b_out[row * 6..row * 6 + 4],
+                &b_src[row * 4..(row + 1) * 4],
+                "b row {row} original bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn pad_quantized_k_pad_bytes_are_zero() {
+        let q = Quantization::Q4_GS64;
+        let n = 2usize;
+        let k = 128usize;
+        let k_pad = 192usize;
+        let w_src = vec![0xffu8; n * 64];
+        let s_src = vec![0xeeu8; n * 4];
+        let b_src = vec![0xddu8; n * 4];
+        let (w_out, s_out, b_out) = pad_quantized_k(&w_src, &s_src, &b_src, n, k, k_pad, q);
+        for row in 0..n {
+            // Pad region: bytes [64..96] in the 96-byte packed row
+            assert!(
+                w_out[row * 96 + 64..row * 96 + 96].iter().all(|&b| b == 0),
+                "w row {row} pad region must be zero"
+            );
+            // Pad region: bytes [4..6] in the 6-byte scale/bias row
+            assert!(
+                s_out[row * 6 + 4..row * 6 + 6].iter().all(|&b| b == 0),
+                "s row {row} pad region must be zero"
+            );
+            assert!(
+                b_out[row * 6 + 4..row * 6 + 6].iter().all(|&b| b == 0),
+                "b row {row} pad region must be zero"
+            );
+        }
+    }
+
+    #[test]
+    fn pad_quantized_k_no_op_when_k_equals_k_pad() {
+        let q = Quantization::Q4_GS64;
+        let n = 2usize;
+        let k = 128usize;
+        let w_src = vec![0xaau8; n * 64];
+        let s_src = vec![0xbbu8; n * 4];
+        let b_src = vec![0xccu8; n * 4];
+        let (w_out, s_out, b_out) = pad_quantized_k(&w_src, &s_src, &b_src, n, k, k, q);
+        assert_eq!(w_out, w_src);
+        assert_eq!(s_out, s_src);
+        assert_eq!(b_out, b_src);
+    }
 
     /// Tiny synthetic Qwen2 config that exercises every divisibility
     /// the loader cares about: gs=64 divides every K, bits=4 divides

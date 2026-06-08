@@ -5,9 +5,13 @@ measured via `cider-press bench`, compared against `mlx_lm` on the same
 prompt and token budget. Methodology: warm up, then time a steady-state
 window; see `docs/ARCHITECTURE.md` for the architecture and forward backlog.
 
-The headline: decode is **essentially at parity with MLX** at the full-model
-scale (**~561 vs ~564 tok/s, ~1.00×**), down from ~1.20× before the
-**encoder/sync-model port** and from ~2.3× several branches ago — the fused
+The headline: decode now **edges past MLX** at the full-model scale
+(**~599 vs ~568 tok/s, ~1.05×**) after the **qmv fast-path padding (A1)**
+change padded the q/k/v/o decode projections from K=896 to K=1024, making the
+vendored `qmv_fast` variant selectable — lifting decode **~561 → ~599 tok/s**
+over the prior encoder/sync-model parity point (**~561 vs ~564, ~1.00×**). See
+**qmv fast-path padding (A1)** below. The path to parity, down from ~1.20×
+before the **encoder/sync-model port** and ~2.3× several branches ago — the fused
 `RMSNorm`, **async decode pipelining**, **decode copy-elimination (S1)**, and
 the **encoder/sync-model port** stack to **~2.31×** over the pre-fusion ~243
 baseline. The port replaced Metal's serial-encoder + automatic-hazard-tracking
@@ -80,7 +84,10 @@ dispatch model, which is done.
 | phase   | cider-press | mlx_lm  | ratio (mlx ÷ cp) |
 |---------|------------:|--------:|-----------------:|
 | prefill | ~917 tok/s  | ~1390 tok/s | ~1.52× |
-| decode  | ~561 tok/s  | ~564 tok/s  | ~1.00× |
+| decode  | ~599 tok/s  | ~568 tok/s  | **~0.95× (cider ahead)** |
+
+(Decode reflects **qmv fast-path padding (A1)**; the pre-A1 encoder/sync-model
+parity point was ~561 vs ~564, ~1.00×.)
 
 - **Prefill** processes the 39-token prompt in one forward. cider-press
   ranged 880–943 tok/s across warm runs (~917 median); `mlx_lm` ~1390.
@@ -116,7 +123,11 @@ dispatch model, which is done.
   serial-encoder + automatic-hazard dispatch model with MLX's
   untracked-buffer + fence-chain + concurrent-encoder model under graph-level
   barrier elision (see **Dispatch-serialization gap**). At **~561 vs ~564**
-  the decode gap to `mlx_lm` is **~1.00× — essentially closed**.
+  the decode gap to `mlx_lm` is **~1.00× — essentially closed**. The
+  **qmv fast-path padding (A1)** change then took decode **~561 → ~599 tok/s**
+  (depth-1, range 578–603, median 599) by padding the q/k/v/o decode
+  projections to K=1024 so the `qmv_fast` variant fires — **past** `mlx_lm`'s
+  ~568 (cider ~1.05×). See **qmv fast-path padding (A1)** below.
 - Load time (excluded from tok/s): ~0.17 s.
 
 **Cold-start note:** the very first forward of a fresh process triggers
@@ -412,12 +423,18 @@ for keeping the next-token id on-GPU into the following embedding gather
 | mark        | cider-press RSS |
 |-------------|----------------:|
 | pre-load    | ~14 MiB  |
-| post-load   | ~678 MiB |
-| post-decode | ~900 MiB |
-| peak        | ~900 MiB |
+| post-load   | ~697 MiB |
+| post-decode | ~913 MiB |
+| peak        | ~913 MiB |
 
 `mlx_lm` peak (Metal allocations, `GenerationResponse.peak_memory`):
 **~329 MiB**.
+
+The peak rose **~900 → ~913 MiB** with **qmv fast-path padding (A1)**: the
+phase-split q/k/v/o projections keep both the original (prefill) and K-padded
+(decode) weight sets resident, adding ~28 MiB of weight bytes (~3%) — the
+dual-weight cost the A1 plan predicted. Freeing the prefill twin after the
+first token in a serving context is possible but YAGNI for now.
 
 These measure **different things** — cider-press samples process RSS
 (via mach `task_info`; includes the 278 MB safetensors read into a host
@@ -463,15 +480,18 @@ shorten the chain or speed each link. In measurement-justified priority:
   no-op bug), and the elision/wave measurements are in
   **Dispatch-serialization gap § Measured result**. Escape hatches:
   `CIDER_PRESS_TRACKED_BUFFERS=1`, `CIDER_PRESS_NO_BARRIER_ELISION=1`.
-- **Small-N `qmv` launch config — the leading remaining lever.** With the
-  dispatch model closed, the heaviest dispatches in the chain are the 4-bit
-  `qmv` matvecs (~61% of GPU time, counter-sampled). The `## qmv audit`
-  localized the headroom: the large-N linears are roofline-bound (~464 GB/s,
-  near the M4 Max spec), but the small-N decode projections (k/v_proj
-  ~13 GB/s, q/o_proj ~85) are occupancy-starved by the generic
-  `(1, ceil(N/8), 1)` grid. A small-N launch-config fix (split the output
-  dim across more threadgroups), with fast-path-via-padding as a secondary
-  lever, is dispatch-side and parity-preserving — backlog #4.
+- **Small-N `qmv` — fast-path padding (A1) done; launch-config (A2) the
+  remaining lever.** With the dispatch model closed, the heaviest dispatches
+  in the chain are the 4-bit `qmv` matvecs (~58% of GPU time, counter-sampled).
+  The `## qmv audit` localized the headroom to the small-N decode projections.
+  **A1 (done, ~1.07×, ~561 → ~599 tok/s):** padding q/k/v/o to K=1024 makes the
+  `qmv_fast` variant selectable — q/o ~85 → ~139 GB/s, k/v ~13 → ~22 GB/s,
+  bit-exact (zero-scale/zero-bias pad groups), vendored kernels untouched (see
+  **qmv fast-path padding (A1)**). **A2 (gated, conditional GO — k/v only):**
+  a cider-owned small-N kernel that fixes occupancy (N=128 launches just 16
+  threadgroups); q/o is near the fast-path ceiling so A1 suffices there, but
+  k/v padded still runs ~7× under the kernel's own N=1024 bandwidth. Scoped to
+  k/v on its own branch — see the A1 section's **A2 go/no-go**.
 - **Within-eval reuse (RSS) and prefill strided work (S2–S5)** —
   orthogonal levers (memory, and the composed prefill path); see the
   per-section notes below.
@@ -514,16 +534,15 @@ shorten the chain or speed each link. In measurement-justified priority:
   with every output retained until cache population, so its whole graph
   stays live); **within-eval reuse** (mid-eval freeing, as MLX does) is the
   next RSS lever toward `mlx_lm`'s ~329 MiB.
-- **Faster `qmv` kernels — speeds each critical-path link.** The 4-bit
-  `qmv` weight matvecs are the heaviest dispatches in the chain. The
-  `## qmv audit` localized the headroom: the large-N linears are
-  roofline-bound (~464 GB/s, near the M4 Max spec), but the small-N decode
-  projections (k/v_proj ~13 GB/s, q/o_proj ~85) are occupancy-starved by the
-  generic launch grid — lever (b), with fast-path absence (lever a)
-  compounding. A small-N qmv launch-config fix (and/or fast-path-via-padding)
-  is dispatch-side and parity-preserving; it shortens each `qmv` link's
-  GPU time but does not reduce the *number* of dependent dispatches (that is
-  fusion, above).
+- **Faster `qmv` kernels — speeds each critical-path link (A1 done).** The
+  4-bit `qmv` weight matvecs are the heaviest dispatches in the chain. The
+  `## qmv audit` localized the headroom to the small-N projections; **A1
+  (fast-path padding, done)** addressed lever (a) by padding q/k/v/o to K=1024
+  (`qmv_fast` selectable) — q/o ~85 → ~139 GB/s, k/v ~13 → ~22 GB/s, bit-exact,
+  ~561 → ~599 tok/s. Lever (b) (occupancy) remains for k/v only as **A2** (a
+  cider-owned small-N kernel; q/o is now near the fast-path ceiling). These
+  shorten each `qmv` link's GPU time but do not reduce the *number* of
+  dependent dispatches (that is fusion, above).
 - **Pipelining (overlap CPU encode with GPU) — done (~1.34× post-S1).**
   The depth-1 async pipeline overlaps token N+1's CPU graph-build + encode
   with token N's GPU execution. Post-S1, encode is ~308 µs/token and the
@@ -905,3 +924,84 @@ the fast variant is selected) as a secondary, parity-checked lever. Both
 are dispatch-side changes that do not touch the vendored `quantized.metal`;
 they are promoted to their own follow-up branch (see `docs/ARCHITECTURE.md`
 backlog item #4).
+
+## qmv fast-path padding (A1)
+
+The audit above named two compounding small-N levers: occupancy starvation
+(lever b) and **fast-path absence** (lever a — no Qwen2.5-0.5B shape has a
+512-multiple K, so the faster `qmv_fast` variant is never selected). A1 takes
+lever (a) the cheap, parity-preserving way: **pad the q/k/v/o decode
+projection weights from K=896 to K=1024** so `K % 512 == 0` and the
+`qmv_fast` variant becomes selectable, with **no edits to the vendored
+`quantized.metal`** (per project scope guard).
+
+**Bit-parity by construction.** The 128 pad columns carry zero packed
+weights and **zero (bf16) scale AND zero bias**, so each pad group
+dequantizes to exactly `0·q + 0 = 0` regardless of the activation tail — the
+dot product is bit-identical to the unpadded matvec for *any* activation in
+those columns. The padded activation therefore needs only *capacity*
+(≥1024 elements), not zeroing. Runtime support: `QuantizedWeight` carries a
+logical-K (896) distinct from its physical/padded K (1024) — activations
+validate against the logical K, the kernel dispatches against the physical K
+— and pooled allocations round up to 512 B so the kernel's padded-K read
+(1024×bf16 = 2048 B) stays in-bounds over a 896×bf16 = 1792 B decode row. The
+bit-parity gate (`crates/cider-press-runtime/tests/qmv_padded_parity.rs`)
+proves padded == unpadded byte-for-byte at both decode shapes, and the
+end-to-end greedy parity gate stays byte-identical to the MLX fixtures.
+
+**Phase-split execution.** A new `PhasedLinear` (models layer) holds two
+weight sets: a **prefill** `Linear` (original K=896 layout, qmm path) and a
+**decode** `Linear` (K-padded twin, qmv `qmv_fast` path), selected by sequence
+length (T==1 ⇒ decode). This is the first decode-specialized execution in the
+models layer. Only q/k/v/o are padded — `lm_head` (already roofline-bound at
+~464 GB/s) would *regress* on +14% weight bytes, and gate/up/down are
+near-roofline; both are left unpadded (re-evaluate with data).
+
+**Kernel-level effect** (`qmv_dispatch_bench`, M4 Max, GPU-counter eff BW,
+warm steady-state floor over several runs — early runs are thermal/scheduling
+noise, see the audit's caveat):
+
+| shape (K×N) | linear   | unpadded (gen) | padded (fast) | GPU-time speedup |
+|-------------|----------|---------------:|--------------:|-----------------:|
+| 896→1024 × 896 | q/o_proj | ~85 GB/s | **~139 GB/s** | ~1.37× |
+| 896→1024 × 128 | k/v_proj | ~13 GB/s | **~22 GB/s**  | ~1.43× |
+| 1024 × 1024 (control) | forced-fast | — | ~156 GB/s | — |
+
+**End-to-end effect** (M4 Max, warm, `--max-tokens 128 --warmup 8`, depth-1,
+median of 5): decode **~561 → ~599 tok/s** (578.6–602.7, median 598.6);
+depth-0 (synchronous) ~454 tok/s (450.7–454.7, median of 3). `mlx_lm` same-day
+on the same prompt **~568 tok/s** (552.7–568.6, median 567.7) — cider-press is
+now **~1.05× ahead**. Greedy output is byte-identical to MLX (parity gate
+passes; the padding is provably zero-contribution). Peak RSS rose **~900 →
+~913 MiB**: the dual q/k/v/o weights add ~28 MiB of resident weight bytes
+(~3%), the dual-weight cost the plan predicted. Buffer pool hit-rate ~97%.
+
+### A2 go/no-go (cider-owned small-N qmv kernel)
+
+A2 is the deferred decision: a cider-owned, MIT-attributed small-N `qmv`
+kernel variant (a NEW file — the "adapt vendored kernels" model-shift) that
+splits the output dim across more threadgroups to attack lever (b). A1's
+measurement gates it, and the numbers split the two shapes:
+
+- **q/o_proj (N=896): near-done by A1, low A2 upside.** Padded q/o already
+  attains ~139 GB/s — close to the `qmv_fast` small-N ceiling (the 1024×1024
+  control tops out at ~156, *not* the ~464 roofline; at N≈896–1024 there isn't
+  enough output work to saturate the GPU regardless of launch config). A
+  custom kernel could claim at most ~139 → ~156, ~12%. **Not worth a new
+  kernel.**
+- **k/v_proj (N=128): the real A2 target.** Even padded, k/v sits at
+  ~22 GB/s — **~7× below** the ~156 GB/s the *same* `qmv_fast` kernel reaches
+  at N=1024, and ~20× below the ~464 roofline. N=128 launches only
+  `ceil(128/8) = 16` threadgroups, leaving the GPU mostly idle; the fast-path
+  swap can't fix occupancy. A small-N-specialized launch (split-K across the
+  inner dim, or co-launching k+v as one N=256 dispatch) is where the headroom
+  lives.
+
+**Recommendation: A2 is a conditional GO, scoped narrowly to the k/v
+(N=128) shape only** — q/o is adequately served by A1's padding. The k/v
+projections carry a large per-layer dispatch share and run ~7× under the
+kernel's own demonstrated N=1024 bandwidth, so the occupancy fix has real,
+measurable room there. Sequence it as its own branch (vendored kernels
+untouched; new MIT-attributed file), with the `qmv_padded_parity` and greedy
+gates as the correctness bar. q/o-shape padding is the shipped answer; do not
+build a custom kernel for it.

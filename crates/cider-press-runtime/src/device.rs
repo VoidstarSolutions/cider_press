@@ -182,7 +182,17 @@ impl Device {
     /// Allocate a scratch buffer of `bytes`, drawing from the recycling
     /// pool when a freed buffer of the same requested size is available
     /// and falling back to a fresh Metal allocation otherwise.
-    pub(crate) fn alloc_pooled(&self, bytes: usize) -> Result<Buffer<u8>> {
+    ///
+    /// Returns `(buffer, bytes)` where `bytes` is the free-list key for
+    /// returning the buffer to the pool on drop.
+    ///
+    // We do NOT round the Rust logical length here. Dispatch functions derive
+    // element counts from `Buffer::len()` (= logical bytes / sizeof(T));
+    // rounding the logical length would corrupt those counts for unpadded ops.
+    // The 512-B rounding that makes K-padded qmv reads safe happens at
+    // `cider_press_kernels::Device::alloc_buffer` — that is the single site
+    // that controls Metal allocation capacity for all runtime buffers.
+    pub(crate) fn alloc_pooled(&self, bytes: usize) -> Result<(Buffer<u8>, usize)> {
         if let Some(buf) = self
             .inner
             .pool
@@ -190,9 +200,9 @@ impl Device {
             .expect("buffer pool mutex poisoned")
             .take(bytes)
         {
-            return Ok(buf);
+            return Ok((buf, bytes));
         }
-        Ok(self.inner.kernels.alloc_buffer::<u8>(bytes)?)
+        Ok((self.inner.kernels.alloc_buffer::<u8>(bytes)?, bytes))
     }
 
     /// Wrap an op-output buffer as a pool-owned [`PooledBuffer`] that

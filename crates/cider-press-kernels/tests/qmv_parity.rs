@@ -68,7 +68,7 @@ fn parity_affine_qmv_fast_bf16_gs64_b4() {
 
     let mut cmds = device.commands().expect("commands");
     kernels::qmv::affine_qmv_bf16(
-        &mut cmds, &library, &w_buf, &s_buf, &b_buf, &x_buf, &mut y_buf, GROUP_SIZE, BITS,
+        &mut cmds, &library, &w_buf, &s_buf, &b_buf, &x_buf, &mut y_buf, K, GROUP_SIZE, BITS,
     )
     .expect("dispatch");
     cmds.commit_and_wait().expect("commit");

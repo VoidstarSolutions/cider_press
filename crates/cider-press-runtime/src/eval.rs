@@ -255,7 +255,8 @@ fn encode_ops(
             (dense_input_buffer(slab, &outputs, &index_of)?, None)
         } else {
             let byte_count = checked_byte_count(&inner.shape, inner.dtype)?;
-            (device.alloc_pooled(byte_count)?, Some(byte_count))
+            let (buf, pool_key_bytes) = device.alloc_pooled(byte_count)?;
+            (buf, Some(pool_key_bytes))
         };
         if elide {
             let dst_key = buffer_key(&dst);
@@ -430,7 +431,8 @@ pub(crate) fn profiled_eval(root: &Tensor) -> Result<()> {
             (dense_input_buffer(slab, &outputs, &index_of)?, None)
         } else {
             let byte_count = checked_byte_count(&inner.shape, inner.dtype)?;
-            (device.alloc_pooled(byte_count)?, Some(byte_count))
+            let (buf, pool_key_bytes) = device.alloc_pooled(byte_count)?;
+            (buf, Some(pool_key_bytes))
         };
         dispatch(inner, &mut commands, &outputs, &mut dst, &index_of)?;
         outputs.push(dst);
@@ -1092,10 +1094,14 @@ fn dispatch_quantized_matmul(
             &biases_typed,
             &x_typed,
             &mut y_typed,
+            k,
             group_size,
             u32::from(bits),
         )?;
     } else {
+        // Padded weights are decode-only (M=1); an M>1 activation against a
+        // padded weight self-rejects in `validate_qmm_buffer_lens` because
+        // x.len() == M * k_logical != M * k_physical.
         qmm::affine_qmm_t_bf16(
             commands,
             library,

@@ -1822,7 +1822,12 @@ impl Tensor {
                 w_dims.len()
             )));
         }
-        let (n, k) = (w_dims[0], w_dims[1]);
+        let n = w_dims[0];
+        // Validate activations against logical K (equals physical K for unpadded
+        // weights; equals the original unpadded dim for K-padded weights). The
+        // dispatch keeps the physical weight shape so the kernel reads in_vec_size
+        // = physical K — pad groups dequantize to zero, so the tail contributes 0.
+        let k_logical = weight.k_logical();
         let x_dims = self.shape().dims();
         if x_dims.is_empty() {
             return Err(Error::InvalidArgument(
@@ -1830,9 +1835,9 @@ impl Tensor {
             ));
         }
         let x_k = *x_dims.last().expect("shape is non-empty");
-        if x_k != k {
+        if x_k != k_logical {
             return Err(Error::InvalidArgument(format!(
-                "quantized_matmul: inner dim mismatch: activation last dim {x_k} != weight K {k}",
+                "quantized_matmul: inner dim mismatch: activation last dim {x_k} != weight K {k_logical}",
             )));
         }
         // The M>1 prefill path dispatches `affine_qmm_t`, whose wired
