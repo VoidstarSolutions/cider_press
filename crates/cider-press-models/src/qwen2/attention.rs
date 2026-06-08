@@ -25,19 +25,6 @@ use crate::nn::{Linear, Module, PhasedLinear};
 
 use super::{Qwen2AttentionWeights, Qwen2Config};
 
-/// Measurement instrumentation (temporary): when `CIDER_PRESS_ZERO_KV=1`,
-/// the decode (T=1) k/v projections are skipped and replaced by zeros, to
-/// measure the upper bound on any small-N qmv (A2) win. No effect when
-/// unset. Read once and cached; set the env before the first decode step.
-/// See `docs/superpowers/specs/2026-06-08-a2-kv-ceiling-measurement-design.md`.
-fn zero_kv_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("CIDER_PRESS_ZERO_KV").is_some_and(|v| v == "1")
-    })
-}
-
 /// Apply rotary positional embedding to a Qwen2 attention projection
 /// (Q or K) at sequence position `offset`.
 ///
@@ -363,27 +350,8 @@ impl Attention {
 
         // Project + lay out per head: [1, T, H*D_h] -> [1, H, T, D_h].
         let q = project_heads(&self.q_proj, hidden, t, h_q, head_dim)?;
-        // A2 ceiling instrumentation: when CIDER_PRESS_ZERO_KV=1, skip the
-        // decode (T=1) k/v qmv dispatches and substitute zeros of identical
-        // shape. RoPE/cache.update/sdpa still run, so the dependent-dispatch
-        // chain length is preserved and the measured delta isolates k/v qmv.
-        // Guard is `t == 1` (not `is_decode(t, mask)`): intentional — zero k/v
-        // on every single-token forward regardless of mask, for a tighter ceiling.
-        let (k, v) = if zero_kv_enabled() && t == 1 {
-            let device = hidden.device().ok_or_else(|| {
-                Error::InvalidArgument(
-                    "Attention::forward: hidden has no device (CIDER_PRESS_ZERO_KV)".to_owned(),
-                )
-            })?;
-            let k = Tensor::zeros(device, [1usize, h_kv, t, head_dim], DType::BF16)?;
-            let v = Tensor::zeros(device, [1usize, h_kv, t, head_dim], DType::BF16)?;
-            (k, v)
-        } else {
-            (
-                project_heads(&self.k_proj, hidden, t, h_kv, head_dim)?,
-                project_heads(&self.v_proj, hidden, t, h_kv, head_dim)?,
-            )
-        };
+        let k = project_heads(&self.k_proj, hidden, t, h_kv, head_dim)?;
+        let v = project_heads(&self.v_proj, hidden, t, h_kv, head_dim)?;
 
         // RoPE on Q and K (V is unrotated).
         let q = rope(&q, offset, config)?;
@@ -474,17 +442,4 @@ fn broadcast_kv_heads(
         .copy()?
         .reshape([b, h_q, t_cache, head_dim])?;
     Ok(expanded)
-}
-
-#[cfg(test)]
-mod zero_kv_tests {
-    use super::zero_kv_enabled;
-
-    #[test]
-    fn zero_kv_defaults_off_when_env_unset() {
-        // Test processes do not set CIDER_PRESS_ZERO_KV, so the gate is off.
-        // The enabled (==1) branch is not tested here: OnceLock is process-lifetime,
-        // so setting the env var mid-process would corrupt the cached value for other tests.
-        assert!(!zero_kv_enabled());
-    }
 }
