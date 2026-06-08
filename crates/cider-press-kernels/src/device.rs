@@ -108,7 +108,12 @@ impl Device {
         // the kernel math — see the three-part contract in kernels/qmv.rs).
         // Element counts everywhere derive from Buffer::len, which stays at
         // the requested size.
-        let alloc_bytes = bytes.next_multiple_of(512);
+        // Rounding up can itself overflow (`next_multiple_of` panics in debug,
+        // wraps in release) — a wrap would yield `alloc_bytes < bytes`, breaking
+        // the slack-zeroing and `MTLBuffer.length >= bytes` contracts below.
+        let alloc_bytes = bytes
+            .checked_next_multiple_of(512)
+            .ok_or(Error::BufferTooLarge { len, elem_size })?;
         let options = if tracked_buffers_requested() {
             MTLResourceOptions::StorageModeShared
         } else {

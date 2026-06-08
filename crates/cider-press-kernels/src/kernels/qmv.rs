@@ -106,15 +106,20 @@ pub fn affine_qmv_bf16(
     //       scale/bias, `accum += x·q` poisons on `0 * NaN = NaN` if a stale
     //       tail byte decodes as bf16 NaN/Inf, so the tail VALUES matter. The
     //       alloc-site memset makes them 0.0 for the buffer's lifetime.
-    // Assert against the Metal allocation length to catch any future path that
-    // skips the 512-B rounding (which would also skip the slack-zeroing).
-    assert!(
-        x.metal_alloc_len() >= in_vec_size * 2,
-        "affine_qmv: activation Metal allocation too small for K-padded read: \
-         metal_alloc_len={} < in_vec_size*2={} (K-padding requires Metal capacity >= physical K * 2)",
-        x.metal_alloc_len(),
-        in_vec_size * 2,
-    );
+    // Check against the Metal allocation length to catch any future path that
+    // skips the 512-B rounding (which would also skip the slack-zeroing). This
+    // is recoverable like the rest of this validator — never abort the process.
+    // `in_vec_size * 2` cannot overflow: it is already known to fit in i32 (the
+    // `k` conversion above), so doubling stays well within usize on 64-bit.
+    let required_bytes = in_vec_size * size_of::<bf16>();
+    if x.metal_alloc_len() < required_bytes {
+        return Err(Error::InvalidArgument(format!(
+            "affine_qmv: activation Metal allocation too small for K-padded read: \
+             metal_alloc_len={} < required_bytes={required_bytes} \
+             (K-padding requires Metal capacity >= physical K * 2)",
+            x.metal_alloc_len(),
+        )));
+    }
     let n = i32::try_from(y.len()).map_err(|_| {
         Error::InvalidArgument(format!("affine_qmv: N={} does not fit in i32", y.len()))
     })?;
