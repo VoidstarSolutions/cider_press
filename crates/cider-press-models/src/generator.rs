@@ -124,6 +124,27 @@ impl Generator {
         Ok(())
     }
 
+    /// Shared prefill graph builder for the profiling/timing entry points:
+    /// resets the caches, then runs one forward at `T = input_ids.len()`,
+    /// offset 0, with an explicit causal mask. Returns the lazy logits
+    /// (`[1, T, vocab]`); the caller chooses how to evaluate them. Advances
+    /// the caches to `input_ids.len()` as a side effect.
+    fn prefill_logits(&mut self, input_ids: &[u32]) -> Result<Tensor> {
+        if input_ids.is_empty() {
+            return Err(Error::InvalidArgument(
+                "Generator prefill: input_ids must be non-empty".into(),
+            ));
+        }
+        self.reset()?;
+        let device = Device::shared()?;
+        let prefill_len = input_ids.len();
+        let ids_tensor = Tensor::from_slice(&device, input_ids, [1, prefill_len])?;
+        let offset = Tensor::from_slice(&device, &[0i32], [1])?;
+        let mask = causal_mask(&device, prefill_len)?;
+        self.model
+            .forward(&ids_tensor, Some(&mask), &offset, &mut self.caches)
+    }
+
     /// Run one **prefill** forward (`T = input_ids.len()`, offset = 0,
     /// causal mask) through the profiling-only [`Tensor::profiled_eval`],
     /// recording per-OpKind GPU time into the `profile` GPU store.
@@ -139,21 +160,23 @@ impl Generator {
     /// `input_ids` empty, or device / forward / `profiled_eval` failure.
     #[doc(hidden)]
     pub fn profiled_prefill(&mut self, input_ids: &[u32]) -> Result<()> {
-        if input_ids.is_empty() {
-            return Err(Error::InvalidArgument(
-                "Generator::profiled_prefill: input_ids must be non-empty".into(),
-            ));
-        }
-        self.reset()?;
-        let device = Device::shared()?;
-        let prefill_len = input_ids.len();
-        let ids_tensor = Tensor::from_slice(&device, input_ids, [1, prefill_len])?;
-        let offset = Tensor::from_slice(&device, &[0i32], [1])?;
-        let mask = causal_mask(&device, prefill_len)?;
-        let logits = self
-            .model
-            .forward(&ids_tensor, Some(&mask), &offset, &mut self.caches)?;
+        let logits = self.prefill_logits(input_ids)?;
         logits.profiled_eval()?;
+        Ok(())
+    }
+
+    /// Run one prefill forward (`T = input_ids.len()`, offset 0, causal mask)
+    /// and **synchronously** `eval()` the full `[1, T, vocab]` logits, waiting
+    /// for GPU completion. Mirrors `mlx_lm`'s `model(x); mx.eval(logits)` for
+    /// an apples-to-apples prefill wall-clock measurement (the production
+    /// `generate()` path uses `eval_async` and does not wait). Resets +
+    /// advances the caches as a side effect — one-shot, not resumable.
+    ///
+    /// # Errors
+    /// `input_ids` empty, or device / forward / eval failure.
+    pub fn prefill_sync(&mut self, input_ids: &[u32]) -> Result<()> {
+        let logits = self.prefill_logits(input_ids)?;
+        logits.eval()?;
         Ok(())
     }
 

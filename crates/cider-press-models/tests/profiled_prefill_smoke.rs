@@ -151,3 +151,25 @@ fn profiled_prefill_rejects_empty_ids() {
         cider_press_models::generator::Generator::new(model, 64, eos).expect("generator");
     assert!(generator.profiled_prefill(&[]).is_err());
 }
+
+#[test]
+fn prefill_sync_runs_on_synthetic_model() {
+    let device = Device::shared().expect("device");
+    let model = synthetic_model(&device);
+    let eos = HashSet::from([999u32]);
+    let mut generator =
+        cider_press_models::generator::Generator::new(model, 64, eos).expect("generator");
+    generator
+        .prefill_sync(&[1, 2, 3, 4, 5])
+        .expect("prefill_sync runs");
+}
+
+#[test]
+fn prefill_sync_rejects_empty_ids() {
+    let device = Device::shared().expect("device");
+    let model = synthetic_model(&device);
+    let eos = HashSet::from([999u32]);
+    let mut generator =
+        cider_press_models::generator::Generator::new(model, 64, eos).expect("generator");
+    assert!(generator.prefill_sync(&[]).is_err());
+}
