@@ -113,6 +113,10 @@ struct BenchArgs {
     /// breakdown for the prefill path. No-op without --features profiling.
     #[arg(long)]
     gpu_profile_prefill: bool,
+    /// Iterations for the synchronous prefill measurement (mlx-comparable:
+    /// forward + eval-wait, warm). Mean is reported as "prefill (sync)".
+    #[arg(long, default_value_t = 5)]
+    prefill_iters: usize,
 }
 
 /// Shared load result for both subcommands.
@@ -254,6 +258,21 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
     // store (`record_gpu`) drained later, so it is unaffected.
     let spans = profile::drain();
 
+    // Synchronous prefill timing (mlx-comparable): forward + eval-wait, warm.
+    // The production prefill above is async (eval_async, no GPU wait), so it
+    // is not comparable to mlx_lm's synchronous model(x)+mx.eval. This runs
+    // the same shape synchronously for an apples-to-apples wall-clock.
+    let prefill_sync_dur = {
+        for _ in 0..2 {
+            generator.prefill_sync(&ids)?;
+        }
+        let t = Instant::now();
+        for _ in 0..args.prefill_iters {
+            generator.prefill_sync(&ids)?;
+        }
+        t.elapsed()
+    };
+
     if args.gpu_profile {
         // generate() rejects max_tokens == 0, so last_id is always Some here.
         if let Some(id) = last_id {
@@ -285,6 +304,19 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
     println!(
         "  prefill        {:>8.3} ms   {prefill_tok_s:>8.1} tok/s ({prompt_len} prompt tokens)",
         prefill_dur.as_secs_f64() * 1e3,
+    );
+    #[allow(clippy::cast_precision_loss)]
+    let prefill_sync_per = prefill_sync_dur.as_secs_f64() / args.prefill_iters as f64;
+    #[allow(clippy::cast_precision_loss)]
+    let prefill_sync_tok_s = if prefill_sync_per > 0.0 {
+        prompt_len as f64 / prefill_sync_per
+    } else {
+        0.0
+    };
+    println!(
+        "  prefill (sync) {:>8.3} ms   {prefill_sync_tok_s:>8.1} tok/s (mean of {} iters, eval-wait)",
+        prefill_sync_per * 1e3,
+        args.prefill_iters,
     );
     println!(
         "  decode         {:>8.3} ms   {decode_tok_s:>8.1} tok/s ({timed} tokens)",
