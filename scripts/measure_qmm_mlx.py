@@ -12,6 +12,11 @@ Times MLX's `mx.quantized_matmul` at the eight Qwen2.5-0.5B prefill shapes
 in `crates/cider-press-kernels/tests/qmm_dispatch_bench.rs` so cider-press
 and MLX numbers can be compared column-for-column.
 
+Timing is amortized: REPS dispatches are queued before a single mx.eval so
+each rep sees GPU-execution cost rather than the full host round-trip. Each
+rep adds a cheap .sum() reduction to keep the result live; that cost is
+constant across shapes and far smaller than qmm time on every shape.
+
 Run: `uv run scripts/measure_qmm_mlx.py`
 """
 
@@ -24,7 +29,7 @@ import mlx.core as mx
 GROUP_SIZE = 64
 BITS = 4
 WARMUP = 50
-TIMED = 200
+REPS = 200  # dispatches amortized under one mx.eval
 M = 39
 
 
@@ -43,27 +48,44 @@ def bench(k: int, n: int, label: str) -> None:
     w_q, scales, biases = mx.quantize(w, group_size=GROUP_SIZE, bits=BITS)
     mx.eval(w_q, scales, biases, x)
 
-    def one() -> mx.array:
-        return mx.quantized_matmul(
-            x, w_q, scales, biases,
-            transpose=True, group_size=GROUP_SIZE, bits=BITS,
-        )
-
     for _ in range(WARMUP):
-        mx.eval(one())
+        mx.eval(mx.quantized_matmul(
+            x, w_q, scales=scales, biases=biases,
+            transpose=True, group_size=GROUP_SIZE, bits=BITS,
+        ))
+
+    # Queue REPS dispatches before a single mx.eval to amortize host overhead.
+    # .sum() keeps each qmm live (prevents dead-code elimination) and reduces
+    # each output to a scalar so the accumulator stays memory-flat.
+    # One un-timed amortized pass first to JIT the .astype().sum() graph for
+    # this shape before the timed run.
+    acc = mx.zeros((1,), dtype=mx.float32)
+    for _ in range(REPS):
+        acc = acc + mx.quantized_matmul(
+            x, w_q, scales=scales, biases=biases,
+            transpose=True, group_size=GROUP_SIZE, bits=BITS,
+        ).astype(mx.float32).sum()
+    mx.eval(acc)
 
     t0 = time.perf_counter()
-    for _ in range(TIMED):
-        mx.eval(one())
+    acc = mx.zeros((1,), dtype=mx.float32)
+    for _ in range(REPS):
+        acc = acc + mx.quantized_matmul(
+            x, w_q, scales=scales, biases=biases,
+            transpose=True, group_size=GROUP_SIZE, bits=BITS,
+        ).astype(mx.float32).sum()
+    mx.eval(acc)
     elapsed = time.perf_counter() - t0
 
-    per_us = (elapsed / TIMED) * 1e6
-    eff_gbps = qmm_bytes(k, n) / (elapsed / TIMED) / 1e9
+    per_dispatch = elapsed / REPS
+    per_us = per_dispatch * 1e6
+    eff_gbps = qmm_bytes(k, n) / per_dispatch / 1e9
     print(f"  {label:<10}  M={M:>2} K={k:>4} N={n:>6}  {per_us:>9.2f} us   {eff_gbps:>6.0f} GB/s")
 
 
 def main() -> None:
-    print(f"qmm (MLX Python): mx.quantized_matmul, M={M}, warmup={WARMUP}, timed={TIMED}")
+    print(f"qmm (MLX amortized): mx.quantized_matmul, M={M}, warmup={WARMUP}, reps={REPS} per eval")
+    print("  (each rep includes a cheap .sum() to keep result live; cost is constant across shapes)")
     print("  shape                            per-dispatch    eff BW")
     for k, n, label in [
         (896, 896, "q_proj"),
