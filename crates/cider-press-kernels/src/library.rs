@@ -65,6 +65,11 @@ const QUANTIZED_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/quantized
 const SDPA_VECTOR_SOURCE: &str =
     include_str!(concat!(env!("OUT_DIR"), "/sdpa_vector_inlined.metal"));
 
+/// Pre-flattened MLX `steel/attn/kernels/steel_attention.metal` (fused
+/// prefill / `sdpa_full` path), produced by `build.rs`.
+const STEEL_ATTENTION_SOURCE: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/steel_attention_inlined.metal"));
+
 /// Cider-press own bf16 batched matmul (not MLX-derived). Lives next
 /// to the dispatch routine in `kernels/matmul.metal`; included
 /// directly, no `build.rs` flattening needed since there are no MLX
@@ -234,6 +239,13 @@ impl KernelLibrary {
     /// semantics at the runtime layer.
     pub fn sdpa_vector(device: &Device) -> Result<Self> {
         Self::from_source(device, SDPA_VECTOR_SOURCE)
+    }
+
+    /// JIT-compile MLX's vendored fused attention kernel (`steel_attention`,
+    /// the `sdpa_full` prefill path). All instantiations require
+    /// `[[function_constant]]` specialization — use [`Self::pipeline_specialized`].
+    pub fn steel_attention(device: &Device) -> Result<Self> {
+        Self::from_source(device, STEEL_ATTENTION_SOURCE)
     }
 
     /// JIT-compile cider-press's own naive bf16 batched matmul kernel

@@ -80,6 +80,12 @@ struct DeviceInner {
     /// [`crate::Tensor::sdpa`] eval; subsequent decodes reuse the
     /// cached library and its per-`head_dim` pipeline-state cache.
     sdpa_vector_library: OnceLock<kernels::KernelLibrary>,
+    /// JIT'd MLX `steel_attention` library (fused `sdpa_full` prefill
+    /// path). Populated on first prefill-attention eval; subsequent
+    /// prefills reuse the cached library and its per-specialization
+    /// pipeline-state cache. The dispatch wiring lands in a follow-up.
+    #[allow(dead_code)]
+    steel_attention_library: OnceLock<kernels::KernelLibrary>,
     /// JIT'd MLX `arg_reduce.metal` library. Populated on first
     /// [`crate::Tensor::argmax`] eval; subsequent calls reuse the
     /// cached library.
@@ -118,6 +124,7 @@ impl Device {
                 gather_libraries: Mutex::new(HashMap::new()),
                 matmul_library: OnceLock::new(),
                 sdpa_vector_library: OnceLock::new(),
+                steel_attention_library: OnceLock::new(),
                 arg_reduce_library: OnceLock::new(),
                 pool: Arc::new(Mutex::new(crate::buffer_pool::BufferPool::new(
                     crate::buffer_pool::DEFAULT_POOL_CAP_BYTES,
@@ -154,6 +161,7 @@ impl Device {
             gather_libraries: Mutex::new(HashMap::new()),
             matmul_library: OnceLock::new(),
             sdpa_vector_library: OnceLock::new(),
+            steel_attention_library: OnceLock::new(),
             arg_reduce_library: OnceLock::new(),
             pool: Arc::new(Mutex::new(crate::buffer_pool::BufferPool::new(
                 crate::buffer_pool::DEFAULT_POOL_CAP_BYTES,
@@ -391,6 +399,20 @@ impl Device {
         }
         let lib = kernels::KernelLibrary::sdpa_vector(&self.inner.kernels)?;
         Ok(self.inner.sdpa_vector_library.get_or_init(|| lib))
+    }
+
+    /// Lazily JIT-compile and cache MLX's `steel_attention` library
+    /// (fused `sdpa_full` prefill path). First call pays a one-time
+    /// Metal JIT compile of the large flattened steel source (tens of
+    /// seconds cold, sub-100 ms warm via the cross-process cache);
+    /// subsequent calls return the cached library.
+    #[allow(dead_code)]
+    pub(crate) fn steel_attention_library(&self) -> Result<&kernels::KernelLibrary> {
+        if let Some(lib) = self.inner.steel_attention_library.get() {
+            return Ok(lib);
+        }
+        let lib = kernels::KernelLibrary::steel_attention(&self.inner.kernels)?;
+        Ok(self.inner.steel_attention_library.get_or_init(|| lib))
     }
 
     /// Lazily JIT-compile and cache MLX's `arg_reduce.metal` library.

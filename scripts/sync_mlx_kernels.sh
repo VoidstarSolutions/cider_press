@@ -66,6 +66,13 @@ FILES=(
     mlx/backend/metal/kernels/steel/gemm/mma.h
     mlx/backend/metal/kernels/steel/gemm/params.h
     mlx/backend/metal/kernels/steel/gemm/transforms.h
+    mlx/backend/metal/kernels/steel/attn/attn.h
+    mlx/backend/metal/kernels/steel/attn/loader.h
+    mlx/backend/metal/kernels/steel/attn/mma.h
+    mlx/backend/metal/kernels/steel/attn/params.h
+    mlx/backend/metal/kernels/steel/attn/transforms.h
+    mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h
+    mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.metal
     mlx/backend/metal/kernels/steel/utils/integral_constant.h
     mlx/backend/metal/kernels/steel/utils/type_traits.h
     mlx/backend/metal/kernels/indexing/indexing.h

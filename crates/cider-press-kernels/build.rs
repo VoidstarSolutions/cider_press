@@ -39,6 +39,10 @@ const ENTRY_POINTS: &[(&str, &str)] = &[
         "mlx/backend/metal/kernels/sdpa_vector_only.metal",
         "sdpa_vector",
     ),
+    (
+        "mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.metal",
+        "steel_attention",
+    ),
 ];
 
 /// Header-only bundles for JIT-assembled kernels.
