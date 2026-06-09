@@ -262,12 +262,15 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
     // The production prefill above is async (eval_async, no GPU wait), so it
     // is not comparable to mlx_lm's synchronous model(x)+mx.eval. This runs
     // the same shape synchronously for an apples-to-apples wall-clock.
+    let prefill_iters = args.prefill_iters.max(1);
     let prefill_sync_dur = {
+        // Settle Metal JIT on the synchronous eval() path before timing
+        // (the caches are already warm from generate()).
         for _ in 0..2 {
             generator.prefill_sync(&ids)?;
         }
         let t = Instant::now();
-        for _ in 0..args.prefill_iters {
+        for _ in 0..prefill_iters {
             generator.prefill_sync(&ids)?;
         }
         t.elapsed()
@@ -306,7 +309,7 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
         prefill_dur.as_secs_f64() * 1e3,
     );
     #[allow(clippy::cast_precision_loss)]
-    let prefill_sync_per = prefill_sync_dur.as_secs_f64() / args.prefill_iters as f64;
+    let prefill_sync_per = prefill_sync_dur.as_secs_f64() / prefill_iters as f64;
     #[allow(clippy::cast_precision_loss)]
     let prefill_sync_tok_s = if prefill_sync_per > 0.0 {
         prompt_len as f64 / prefill_sync_per
@@ -316,7 +319,7 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
     println!(
         "  prefill (sync) {:>8.3} ms   {prefill_sync_tok_s:>8.1} tok/s (mean of {} iters, eval-wait)",
         prefill_sync_per * 1e3,
-        args.prefill_iters,
+        prefill_iters,
     );
     println!(
         "  decode         {:>8.3} ms   {decode_tok_s:>8.1} tok/s ({timed} tokens)",
