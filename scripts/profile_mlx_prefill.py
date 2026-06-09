@@ -53,6 +53,8 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=5)
     args = parser.parse_args()
+    if args.iters < 1:
+        parser.error("--iters must be >= 1 (the timed mean divides by it)")
 
     model, tokenizer = load(args.checkpoint)
 
@@ -76,15 +78,21 @@ def main() -> None:
     for _ in range(args.warmup):
         prefill()
 
-    # optional GPU capture (single warm pass inside the capture window)
+    # optional GPU capture (single warm pass inside the capture window).
+    # Capture is best-effort: a start failure (e.g. MTL_CAPTURE_ENABLED unset)
+    # is non-fatal so the timing run below still happens. If start succeeds,
+    # stop_capture runs in a finally so the capture session is never left open.
     if args.trace_out is not None:
         try:
             mx.metal.start_capture(args.trace_out)
-            prefill()
-            mx.metal.stop_capture()
-            print(f"wrote GPU capture: {args.trace_out}")
         except Exception as exc:
-            print(f"GPU capture failed: {exc}")
+            print(f"GPU capture unavailable: {exc} (need MTL_CAPTURE_ENABLED=1)")
+        else:
+            try:
+                prefill()
+            finally:
+                mx.metal.stop_capture()
+            print(f"wrote GPU capture: {args.trace_out}")
 
     # timed loop
     elapsed: list[float] = []
