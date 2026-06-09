@@ -1094,8 +1094,9 @@ measurement gates it, and the numbers split the two shapes:
   inner dim, or co-launching k+v as one N=256 dispatch) is where the headroom
   lives.
 
-**Recommendation (pre-measurement): A2 is a conditional GO, scoped narrowly
-to the k/v (N=128) shape only** — q/o is adequately served by A1's padding.
+**Archived — pre-measurement recommendation (superseded by "A2 measured —
+NO-GO" below): A2 was a conditional GO, scoped narrowly to the k/v (N=128)
+shape only** — q/o is adequately served by A1's padding.
 The k/v projections carry a large per-layer dispatch share and run ~7× under
 the kernel's own demonstrated N=1024 bandwidth, so the occupancy fix has real,
 measurable room there. Sequence it as its own branch (vendored kernels
