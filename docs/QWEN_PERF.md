@@ -574,18 +574,19 @@ shorten the chain or speed each link. In measurement-justified priority:
   no-op bug), and the elision/wave measurements are in
   **Dispatch-serialization gap § Measured result**. Escape hatches:
   `CIDER_PRESS_TRACKED_BUFFERS=1`, `CIDER_PRESS_NO_BARRIER_ELISION=1`.
-- **Small-N `qmv` — fast-path padding (A1) done; launch-config (A2) the
-  remaining lever.** With the dispatch model closed, the heaviest dispatches
+- **Small-N `qmv` — fast-path padding (A1) done; launch-config (A2)
+  measured, NO-GO.** With the dispatch model closed, the heaviest dispatches
   in the chain are the 4-bit `qmv` matvecs (~58% of GPU time, counter-sampled).
   The `## qmv audit` localized the headroom to the small-N decode projections.
   **A1 (done, ~1.07×, ~561 → ~599 tok/s):** padding q/k/v/o to K=1024 makes the
   `qmv_fast` variant selectable — q/o ~85 → ~139 GB/s, k/v ~13 → ~22 GB/s,
   bit-exact (zero-scale/zero-bias pad groups), vendored kernels untouched (see
-  **qmv fast-path padding (A1)**). **A2 (gated, conditional GO — k/v only):**
-  a cider-owned small-N kernel that fixes occupancy (N=128 launches just 16
-  threadgroups); q/o is near the fast-path ceiling so A1 suffices there, but
-  k/v padded still runs ~7× under the kernel's own N=1024 bandwidth. Scoped to
-  k/v on its own branch — see the A1 section's **A2 go/no-go**.
+  **qmv fast-path padding (A1)**). **A2 (measured 2026-06-08, NO-GO):**
+  a cider-owned small-N k/v kernel would fix occupancy (N=128 launches just 16
+  threadgroups, ~7× under the kernel's own N=1024 bandwidth), but the
+  zero-cost-k/v upper bound is **only +1.07%** (k/v latency is already hidden by
+  the async decode pipeline) — below the threshold for owning a Metal kernel.
+  k/v stays on vendored `qmv_fast`; see **A2 measured — NO-GO**.
 - **Within-eval reuse (RSS) and prefill strided work (S2–S5)** —
   orthogonal levers (memory, and the composed prefill path); see the
   per-section notes below.
@@ -633,10 +634,12 @@ shorten the chain or speed each link. In measurement-justified priority:
   `## qmv audit` localized the headroom to the small-N projections; **A1
   (fast-path padding, done)** addressed lever (a) by padding q/k/v/o to K=1024
   (`qmv_fast` selectable) — q/o ~85 → ~139 GB/s, k/v ~13 → ~22 GB/s, bit-exact,
-  ~561 → ~599 tok/s. Lever (b) (occupancy) remains for k/v only as **A2** (a
-  cider-owned small-N kernel; q/o is now near the fast-path ceiling). These
-  shorten each `qmv` link's GPU time but do not reduce the *number* of
-  dependent dispatches (that is fusion, above).
+  ~561 → ~599 tok/s. Lever (b) (occupancy) was the k/v-only **A2** candidate (a
+  cider-owned small-N kernel; q/o is already near the fast-path ceiling) — but
+  it **measured NO-GO** (zero-cost-k/v upper bound +1.07%, latency already
+  hidden by the async pipeline; see **A2 measured — NO-GO**). A1 shortens each
+  `qmv` link's GPU time but does not reduce the *number* of dependent dispatches
+  (that is fusion, above); there is no kernel-side decode headroom left to own.
 - **Pipelining (overlap CPU encode with GPU) — done (~1.34× post-S1).**
   The depth-1 async pipeline overlaps token N+1's CPU graph-build + encode
   with token N's GPU execution. Post-S1, encode is ~308 µs/token and the
