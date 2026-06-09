@@ -258,10 +258,21 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
     // store (`record_gpu`) drained later, so it is unaffected.
     let spans = profile::drain();
 
+    // Decode GPU profile FIRST: `gpu_profile_token` wants the full post-decode
+    // cache context, and the synchronous prefill timing below resets the caches
+    // (`prefill_sync` → `reset`), so it must run after this.
+    if args.gpu_profile {
+        // generate() rejects max_tokens == 0, so last_id is always Some here.
+        if let Some(id) = last_id {
+            gpu_profile_token(&mut generator, id)?;
+        }
+    }
+
     // Synchronous prefill timing (mlx-comparable): forward + eval-wait, warm.
     // The production prefill above is async (eval_async, no GPU wait), so it
     // is not comparable to mlx_lm's synchronous model(x)+mx.eval. This runs
-    // the same shape synchronously for an apples-to-apples wall-clock.
+    // the same shape synchronously for an apples-to-apples wall-clock. It
+    // resets the caches, so it runs after the decode profile above.
     let prefill_iters = args.prefill_iters.max(1);
     let prefill_sync_dur = {
         // Settle Metal JIT on the synchronous eval() path before timing
@@ -275,13 +286,6 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
         }
         t.elapsed()
     };
-
-    if args.gpu_profile {
-        // generate() rejects max_tokens == 0, so last_id is always Some here.
-        if let Some(id) = last_id {
-            gpu_profile_token(&mut generator, id)?;
-        }
-    }
 
     let rss_post_decode = cider_press::sys::resident_bytes();
     let rss_peak = cider_press::sys::peak_resident_bytes();
