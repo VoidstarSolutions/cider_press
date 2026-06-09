@@ -131,6 +131,13 @@ fn synthetic_model(device: &Device) -> Qwen2Model {
 #[test]
 fn profiled_prefill_runs_on_synthetic_model() {
     let device = Device::shared().expect("device");
+    // `profiled_eval` needs GPU stage-boundary counter sampling; CI runners
+    // (and some Apple-Silicon generations) lack it. Skip there — `prefill_sync`
+    // exercises the same forward without counters.
+    if !device.supports_stage_boundary_sampling() {
+        eprintln!("SKIP: no stage-boundary sampling (profiled_eval unavailable)");
+        return;
+    }
     let model = synthetic_model(&device);
     let eos = HashSet::from([999u32]);
     let mut generator =
