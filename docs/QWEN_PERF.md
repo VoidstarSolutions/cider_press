@@ -574,18 +574,19 @@ shorten the chain or speed each link. In measurement-justified priority:
   no-op bug), and the elision/wave measurements are in
   **Dispatch-serialization gap § Measured result**. Escape hatches:
   `CIDER_PRESS_TRACKED_BUFFERS=1`, `CIDER_PRESS_NO_BARRIER_ELISION=1`.
-- **Small-N `qmv` — fast-path padding (A1) done; launch-config (A2) the
-  remaining lever.** With the dispatch model closed, the heaviest dispatches
+- **Small-N `qmv` — fast-path padding (A1) done; launch-config (A2)
+  measured, NO-GO.** With the dispatch model closed, the heaviest dispatches
   in the chain are the 4-bit `qmv` matvecs (~58% of GPU time, counter-sampled).
   The `## qmv audit` localized the headroom to the small-N decode projections.
   **A1 (done, ~1.07×, ~561 → ~599 tok/s):** padding q/k/v/o to K=1024 makes the
   `qmv_fast` variant selectable — q/o ~85 → ~139 GB/s, k/v ~13 → ~22 GB/s,
   bit-exact (zero-scale/zero-bias pad groups), vendored kernels untouched (see
-  **qmv fast-path padding (A1)**). **A2 (gated, conditional GO — k/v only):**
-  a cider-owned small-N kernel that fixes occupancy (N=128 launches just 16
-  threadgroups); q/o is near the fast-path ceiling so A1 suffices there, but
-  k/v padded still runs ~7× under the kernel's own N=1024 bandwidth. Scoped to
-  k/v on its own branch — see the A1 section's **A2 go/no-go**.
+  **qmv fast-path padding (A1)**). **A2 (measured 2026-06-08, NO-GO):**
+  a cider-owned small-N k/v kernel would fix occupancy (N=128 launches just 16
+  threadgroups, ~7× under the kernel's own N=1024 bandwidth), but the
+  zero-cost-k/v upper bound is **only +1.07%** (k/v latency is already hidden by
+  the async decode pipeline) — below the threshold for owning a Metal kernel.
+  k/v stays on vendored `qmv_fast`; see **A2 measured — NO-GO**.
 - **Within-eval reuse (RSS) and prefill strided work (S2–S5)** —
   orthogonal levers (memory, and the composed prefill path); see the
   per-section notes below.
@@ -633,10 +634,12 @@ shorten the chain or speed each link. In measurement-justified priority:
   `## qmv audit` localized the headroom to the small-N projections; **A1
   (fast-path padding, done)** addressed lever (a) by padding q/k/v/o to K=1024
   (`qmv_fast` selectable) — q/o ~85 → ~139 GB/s, k/v ~13 → ~22 GB/s, bit-exact,
-  ~561 → ~599 tok/s. Lever (b) (occupancy) remains for k/v only as **A2** (a
-  cider-owned small-N kernel; q/o is now near the fast-path ceiling). These
-  shorten each `qmv` link's GPU time but do not reduce the *number* of
-  dependent dispatches (that is fusion, above).
+  ~561 → ~599 tok/s. Lever (b) (occupancy) was the k/v-only **A2** candidate (a
+  cider-owned small-N kernel; q/o is already near the fast-path ceiling) — but
+  it **measured NO-GO** (zero-cost-k/v upper bound +1.07%, latency already
+  hidden by the async pipeline; see **A2 measured — NO-GO**). A1 shortens each
+  `qmv` link's GPU time but does not reduce the *number* of dependent dispatches
+  (that is fusion, above); there is no kernel-side decode headroom left to own.
 - **Pipelining (overlap CPU encode with GPU) — done (~1.34× post-S1).**
   The depth-1 async pipeline overlaps token N+1's CPU graph-build + encode
   with token N's GPU execution. Post-S1, encode is ~308 µs/token and the
@@ -1091,11 +1094,55 @@ measurement gates it, and the numbers split the two shapes:
   inner dim, or co-launching k+v as one N=256 dispatch) is where the headroom
   lives.
 
-**Recommendation: A2 is a conditional GO, scoped narrowly to the k/v
-(N=128) shape only** — q/o is adequately served by A1's padding. The k/v
-projections carry a large per-layer dispatch share and run ~7× under the
-kernel's own demonstrated N=1024 bandwidth, so the occupancy fix has real,
+**Archived — pre-measurement recommendation (superseded by "A2 measured —
+NO-GO" below): A2 was a conditional GO, scoped narrowly to the k/v (N=128)
+shape only** — q/o is adequately served by A1's padding.
+The k/v projections carry a large per-layer dispatch share and run ~7× under
+the kernel's own demonstrated N=1024 bandwidth, so the occupancy fix has real,
 measurable room there. Sequence it as its own branch (vendored kernels
 untouched; new MIT-attributed file), with the `qmv_padded_parity` and greedy
 gates as the correctness bar. q/o-shape padding is the shipped answer; do not
 build a custom kernel for it.
+
+### A2 measured — NO-GO (2026-06-08)
+
+The conditional GO above was **gated on a ceiling measurement, and the
+measurement overturns it**. Before designing a kernel, a check confirmed MLX
+itself has no better path for our shape: tracing MLX's full `dispatch_qmv`
+selector (`../mlx/.../quantized.cpp`) against the decode k/v shape (transposed,
+M=1, N=128, K=896→1024, gs=64, b=4), MLX routes it to the **same `qmv_fast`**
+cider-press already dispatches — `qmv_quad` is for K∈{64,128} (small reduction
+dim), `qvm_split_k` is the non-transposed path at K≥1024, and `qmm_t_splitk`
+needs M≥vector_limit. So MLX leaves the same occupancy starvation on the table;
+any win required a cider-owned kernel.
+
+The **zero-cost-k/v upper-bound experiment** (env-gated `CIDER_PRESS_ZERO_KV`
+that skips *only* the decode k/v qmv dispatches and substitutes zeros of
+identical shape — RoPE/cache.update/sdpa still run, so chain length is
+preserved; design spec
+`docs/superpowers/specs/2026-06-08-a2-kv-ceiling-measurement-design.md`)
+measured the hard ceiling (M4 Max, warm, `--max-tokens 128 --warmup 8`,
+depth-1, median of 5):
+
+| build | decode median | range |
+|-------|--------------:|-------|
+| baseline (k/v live)         | **600.1 tok/s** | 590.7–603.2 |
+| zero-cost k/v (upper bound) | **606.5 tok/s** | 593.8–615.9 |
+
+**Upper bound = +1.07%**, and the run-to-run variance (~±10 tok/s) is *larger*
+than the signal — making k/v projections completely free buys ~6 tok/s.
+`--gpu-profile` validated the gate hit the right work: `quantized_matmul`
+dispatches dropped by exactly **48** (169 → 121, = 2 × 24 layers) and the
+perturbed-regime qmv GPU time fell ~204 µs, **but that GPU time is hidden by
+the async decode pipeline** in production — k/v sits off the critical path,
+overlapped with other ops. The occupancy *ratio* (~7×) was real but
+irrelevant: the bytes are tiny and the latency is already hidden.
+
+A real split-K kernel would capture only a *fraction* of the ~1% ceiling, at
+the cost of owning and maintaining a Metal kernel — far below the ~3–4%
+threshold set for breaking pure-vendoring. **A2 is closed as a no-go; k/v stays
+on the vendored `qmv_fast`.** The instrumentation was reverted after measuring
+(branch `perf/qmv-small-n-kernel`); it lives in git history and this record.
+Remaining decode levers are now prefill (S2–S5), within-eval RSS reuse, and
+`.metallib` precompile — there is no kernel-side decode headroom left worth
+owning.

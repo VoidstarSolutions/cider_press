@@ -30,9 +30,12 @@ Running Qwen2.5-0.5B-Instruct-4bit, decode now **edges past `mlx_lm` at
 the q/k/v/o decode projections to K=1024 so the vendored `qmv_fast` variant
 fires (bit-exact via zero-scale/zero-bias pad groups; vendored kernels
 untouched). The encoder/sync-model port before it had reached parity
-(~561 vs ~564, ~1.00×). The remaining levers are kernel-side (A2: a
-cider-owned small-N `qmv` kernel, scoped to k/v), prefill, and memory, not
-the dispatch model. See `docs/QWEN_PERF.md` for the numbers and
+(~561 vs ~564, ~1.00×). A2 (a cider-owned small-N `qmv` kernel for k/v) was
+**measured and closed as a no-go**: a zero-cost-k/v ceiling experiment put the
+hard upper bound at **+1.07%** (within run-to-run noise) — k/v qmv time is
+hidden by the async decode pipeline, so it isn't worth owning a kernel. The
+remaining levers are now prefill and memory, not kernel-side decode. See
+`docs/QWEN_PERF.md` (§ "A2 measured — NO-GO") for the numbers and
 `docs/ARCHITECTURE.md` for the forward backlog.
 
 ### Non-goals
@@ -89,9 +92,11 @@ now **leads `mlx_lm`** (~599 vs ~568 tok/s, ~1.05×) after qmv fast-path
 padding (A1), built on the encoder/sync-model port that first reached
 parity (~561 vs ~564, ~1.00×) (`docs/QWEN_PERF.md`).
 
-**Remaining perf work is kernel- and memory-side**, not the dispatch
-model: A2 small-N `qmv` kernel for k/v (backlog #4, gated GO), prefill strided work
-(S2–S5), within-eval reuse for RSS, and `.metallib` precompile.
+**Remaining perf work is prefill- and memory-side**, not decode kernels: A2
+(small-N `qmv` for k/v, backlog #4) was measured and **closed as a no-go**
+(+1.07% ceiling, hidden by the decode pipeline — see `docs/QWEN_PERF.md`
+§ "A2 measured — NO-GO"). What remains: prefill strided work (S2–S5),
+within-eval reuse for RSS, and `.metallib` precompile.
 `docs/ARCHITECTURE.md` holds the forward pass and the prioritized backlog.
 
 ---

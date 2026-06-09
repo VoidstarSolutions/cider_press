@@ -2,3 +2,7 @@
 __pycache__
 
 .claude/
+
+# Superpowers design specs are local working artifacts (referenced from docs
+# as a dev breadcrumb, but not part of the published tree).
+docs/superpowers/specs/

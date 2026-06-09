@@ -117,7 +117,7 @@ priority:
    decode-SDPA are already fused). Parity-sensitive; highest-potential.
 
    *(b) Faster `qmv` kernels — speeds each link. Fast-path padding (A1) DONE;
-   small-N launch-config (A2) gated, k/v only.* The 4-bit `qmv` matvecs are
+   small-N launch-config (A2) MEASURED + NO-GO.* The 4-bit `qmv` matvecs are
    the heaviest dispatches. The audit (`docs/QWEN_PERF.md` `## qmv audit`,
    Approaches A + B) found the attained bandwidth is **N-dependent**: large-N
    linears (gate/up/down ~272–306 GB/s, lm_head ~464) are roofline-bound near
@@ -129,12 +129,16 @@ priority:
    `qmv_fast` variant fires (q/o ~85 → ~139 GB/s, k/v ~13 → ~22 GB/s,
    bit-exact via zero-scale/zero-bias pad groups, vendored kernels untouched),
    lifting decode **~561 → ~599 tok/s, ~1.05× of `mlx_lm`** — see
-   `## qmv fast-path padding (A1)`. **A2 (gated, conditional GO — k/v only):**
-   lever (b) — a cider-owned small-N kernel that fixes occupancy (N=128 launches
+   `## qmv fast-path padding (A1)`. **A2 (measured 2026-06-08, NO-GO):** lever
+   (b) would be a cider-owned small-N kernel fixing k/v occupancy (N=128 launches
    only 16 threadgroups; k/v padded still ~7× under the kernel's own N=1024
-   bandwidth). q/o is now near the fast-path ceiling, so A1 suffices there;
-   A2 is scoped to k/v on its own branch (new MIT-attributed file). Shortens
-   each `qmv` link but not the dispatch *count* (that is fusion).
+   bandwidth). But a zero-cost-k/v ceiling experiment put the hard upper bound
+   at **+1.07%** (within run-to-run noise) — k/v qmv time is hidden by the async
+   decode pipeline (off the critical path), so even making k/v *free* gains ~1%.
+   Also confirmed MLX's own `dispatch_qmv` routes this shape to the same
+   `qmv_fast` (no free vendored win). A2 closed — k/v stays vendored; see
+   `docs/QWEN_PERF.md` § "A2 measured — NO-GO". There is no kernel-side decode
+   headroom worth owning; fusion already shortened the dispatch count.
 
    *(c) Concurrent dispatch encoder — tested, REJECTED.* A spike
    (`spike/concurrent-encoder`) flipped the serial encoder
