@@ -108,6 +108,15 @@ struct BenchArgs {
     /// without --features profiling.
     #[arg(long)]
     gpu_profile: bool,
+    /// After the timed decode window, run ONE prefill forward (T = prompt
+    /// length) through the profiled eval and print a per-OpKind GPU
+    /// breakdown for the prefill path. No-op without --features profiling.
+    #[arg(long)]
+    gpu_profile_prefill: bool,
+    /// Iterations for the synchronous prefill measurement (mlx-comparable:
+    /// forward + eval-wait, warm). Mean is reported as "prefill (sync)".
+    #[arg(long, default_value_t = 5)]
+    prefill_iters: usize,
 }
 
 /// Shared load result for both subcommands.
@@ -184,7 +193,7 @@ fn run_chat(args: &ChatArgs) -> Result<(), BoxError> {
     Ok(())
 }
 
-#[allow(clippy::cast_precision_loss)]
+#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
     let device = Device::shared()?;
 
@@ -249,12 +258,34 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
     // store (`record_gpu`) drained later, so it is unaffected.
     let spans = profile::drain();
 
+    // Decode GPU profile FIRST: `gpu_profile_token` wants the full post-decode
+    // cache context, and the synchronous prefill timing below resets the caches
+    // (`prefill_sync` → `reset`), so it must run after this.
     if args.gpu_profile {
         // generate() rejects max_tokens == 0, so last_id is always Some here.
         if let Some(id) = last_id {
             gpu_profile_token(&mut generator, id)?;
         }
     }
+
+    // Synchronous prefill timing (mlx-comparable): forward + eval-wait, warm.
+    // The production prefill above is async (eval_async, no GPU wait), so it
+    // is not comparable to mlx_lm's synchronous model(x)+mx.eval. This runs
+    // the same shape synchronously for an apples-to-apples wall-clock. It
+    // resets the caches, so it runs after the decode profile above.
+    let prefill_iters = args.prefill_iters.max(1);
+    let prefill_sync_dur = {
+        // Settle Metal JIT on the synchronous eval() path before timing
+        // (the caches are already warm from generate()).
+        for _ in 0..2 {
+            generator.prefill_sync(&ids)?;
+        }
+        let t = Instant::now();
+        for _ in 0..prefill_iters {
+            generator.prefill_sync(&ids)?;
+        }
+        t.elapsed()
+    };
 
     let rss_post_decode = cider_press::sys::resident_bytes();
     let rss_peak = cider_press::sys::peak_resident_bytes();
@@ -281,6 +312,19 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
         "  prefill        {:>8.3} ms   {prefill_tok_s:>8.1} tok/s ({prompt_len} prompt tokens)",
         prefill_dur.as_secs_f64() * 1e3,
     );
+    #[allow(clippy::cast_precision_loss)]
+    let prefill_sync_per = prefill_sync_dur.as_secs_f64() / prefill_iters as f64;
+    #[allow(clippy::cast_precision_loss)]
+    let prefill_sync_tok_s = if prefill_sync_per > 0.0 {
+        prompt_len as f64 / prefill_sync_per
+    } else {
+        0.0
+    };
+    println!(
+        "  prefill (sync) {:>8.3} ms   {prefill_sync_tok_s:>8.1} tok/s (mean of {} iters, eval-wait)",
+        prefill_sync_per * 1e3,
+        prefill_iters,
+    );
     println!(
         "  decode         {:>8.3} ms   {decode_tok_s:>8.1} tok/s ({timed} tokens)",
         decode_dur.as_secs_f64() * 1e3,
@@ -296,9 +340,26 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
     print_span_breakdown(&spans);
 
     if profile::is_enabled() {
-        print_gpu_breakdown(&profile::drain_gpu());
+        // Decode breakdown (from gpu_profile_token, if it ran). Labeled so
+        // the prefill table below is unambiguous.
+        let decode_gpu = profile::drain_gpu();
+        if !decode_gpu.is_empty() {
+            println!("  [decode]");
+            print_gpu_breakdown(&decode_gpu);
+        }
     } else if args.gpu_profile {
         println!("  (gpu breakdown unavailable; rebuild with --features profiling)");
+    }
+
+    if args.gpu_profile_prefill {
+        gpu_profile_prefill(&mut generator, &ids)?;
+        if profile::is_enabled() {
+            let prefill_gpu = profile::drain_gpu();
+            if !prefill_gpu.is_empty() {
+                println!("  [prefill]");
+                print_gpu_breakdown(&prefill_gpu);
+            }
+        }
     }
     Ok(())
 }
@@ -315,6 +376,18 @@ fn gpu_profile_token(generator: &mut Generator, last_id: u32) -> Result<(), BoxE
         return Ok(());
     }
     generator.profiled_decode_step(last_id)?;
+    Ok(())
+}
+
+/// Run ONE prefill forward (T = prompt length) through the profiled eval for
+/// a per-OpKind GPU breakdown of the prefill path. Outside the timed window.
+/// Resets + advances the generator's caches as a side effect (one-shot).
+fn gpu_profile_prefill(generator: &mut Generator, ids: &[u32]) -> Result<(), BoxError> {
+    if !profile::is_enabled() {
+        eprintln!("  (--gpu-profile-prefill ignored; rebuild with --features profiling)");
+        return Ok(());
+    }
+    generator.profiled_prefill(ids)?;
     Ok(())
 }
 
