@@ -2034,6 +2034,15 @@ impl Tensor {
                 "sdpa: query length T_q must be positive".into(),
             ));
         }
+        // Prefill (T_q>1) routes to the steel `sdpa_full` kernel, which is
+        // only instantiated for head_dim 64. Reject other dims at
+        // construction rather than failing later at dispatch.
+        if qd[2] > 1 && head_dim != 64 {
+            return Err(Error::InvalidArgument(format!(
+                "sdpa: prefill (T_q={}) only supports head_dim 64 (steel sdpa_full); got {head_dim}",
+                qd[2]
+            )));
+        }
         if kd[1] != vd[1] || kd[2] != vd[2] {
             return Err(Error::InvalidArgument(format!(
                 "sdpa: k and v must agree on [H_kv, T_cache]; got k={kd:?}, v={vd:?}"

@@ -337,6 +337,15 @@ pub fn dispatch_sdpa_full_bf16(
             args.h_q, args.h_kv
         )));
     }
+    // `q_l_off = k_len - q_len` is the kernel's causal-window start offset; a
+    // negative value (k_len < q_len) would corrupt the causal masking and the
+    // strided reads. Self-attention prefill always has k_len >= q_len.
+    if args.k_len < args.q_len {
+        return Err(Error::InvalidArgument(format!(
+            "sdpa_full: k_len ({}) must be >= q_len ({})",
+            args.k_len, args.q_len
+        )));
+    }
     let gqa_factor = args.h_q / args.h_kv;
 
     let n_q = (args.q_len + BQ - 1) / BQ;
