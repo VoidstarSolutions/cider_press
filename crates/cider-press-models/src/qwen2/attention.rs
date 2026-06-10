@@ -106,14 +106,6 @@ pub fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor, config: &Qwen2Config) -> Result<
     Ok(Tensor::sdpa(q, k, v, None, scale, gqa_factor, t_q > 1)?)
 }
 
-/// Selects the K/V cache-view strategy in [`Attention::forward`]: decode
-/// (single query step, no mask) broadcasts the cache views stride-0 (no
-/// copy); prefill (`T > 1`) copies them to contiguous.
-#[inline]
-fn is_decode(t_q: usize, mask: Option<&Tensor>) -> bool {
-    t_q == 1 && mask.is_none()
-}
-
 /// Qwen2 multi-head self-attention with grouped-query attention (GQA)
 /// and a `RoPE`-positioned KV cache.
 ///
@@ -124,10 +116,10 @@ fn is_decode(t_q: usize, mask: Option<&Tensor>) -> bool {
 /// qmm path) and a decode `Linear` (K-padded twin, qmv fast-path).
 ///
 /// Deliberately does **not** implement [`crate::nn::Module`]: its
-/// forward genuinely needs the attention mask, the `RoPE` offset, and a
-/// mutable [`KvCache`] — mirroring MLX's `Attention.__call__(x, mask,
-/// cache)`. [`crate::nn::Module`] is single-input by design; auxiliary
-/// state flows through a layer's own methods, and this is that case.
+/// forward genuinely needs the `RoPE` offset and a mutable [`KvCache`] —
+/// mirroring MLX's `Attention.__call__(x, cache)`.
+/// [`crate::nn::Module`] is single-input by design; auxiliary state flows
+/// through a layer's own methods, and this is that case.
 #[derive(Clone, Debug)]
 pub struct Attention {
     q_proj: PhasedLinear,
@@ -166,11 +158,6 @@ impl Attention {
     /// Run self-attention on `hidden` (`[1, T, hidden_size]`, dense
     /// BF16).
     ///
-    /// - `mask`: distinguishes decode (`None`) from prefill (`Some`,
-    ///   the causal mask) so [`forward`](Self::forward) picks the K/V
-    ///   cache-view strategy (`is_decode`). The fused [`sdpa`] is
-    ///   itself causal via the kernel's `do_causal`, so the mask
-    ///   tensor's *contents* are not consumed — only its presence.
     /// - `offset`: length-1 I32 tensor — the number of tokens already
     ///   in `cache` (the `RoPE` position base). Must equal
     ///   `cache.position()` before this call for correct positioning.
@@ -186,13 +173,7 @@ impl Attention {
     /// before the next [`KvCache::update`] on the same cache;
     /// `update` writes the shared slab in place. A decode loop
     /// satisfies this naturally (sampling forces the eval).
-    pub fn forward(
-        &self,
-        hidden: &Tensor,
-        mask: Option<&Tensor>,
-        offset: &Tensor,
-        cache: &mut KvCache,
-    ) -> Result<Tensor> {
+    pub fn forward(&self, hidden: &Tensor, offset: &Tensor, cache: &mut KvCache) -> Result<Tensor> {
         let config = &self.config;
         let head_dim = config.head_dim()?;
         let h_q = config.num_attention_heads;
@@ -252,22 +233,16 @@ impl Attention {
         // Read the populated prefix. keys_view()/values_view() are
         // [T_cache, H_kv, D_h] (T-outer); sdpa wants [1, H_kv, T_cache,
         // D_h]. Permute (1,0,2) → [H_kv, T_cache, D_h], then add the
-        // batch axis. Decode uses broadcast_to (stride-0, no copy);
-        // prefill copies to contiguous for the fused sdpa_full kernel.
+        // batch axis.
         let t_cache = cache.position();
         let k_view = cache.keys_view().permute(&[1, 0, 2])?;
         let v_view = cache.values_view().permute(&[1, 0, 2])?;
-        let (k_sdpa, v_sdpa) = if is_decode(t, mask) {
-            (
-                k_view.broadcast_to([1usize, h_kv, t_cache, head_dim])?,
-                v_view.broadcast_to([1usize, h_kv, t_cache, head_dim])?,
-            )
-        } else {
-            (
-                k_view.copy()?.reshape([1usize, h_kv, t_cache, head_dim])?,
-                v_view.copy()?.reshape([1usize, h_kv, t_cache, head_dim])?,
-            )
-        };
+        // Both decode and prefill feed the D-contiguous strided cache view
+        // straight to the kernel (sdpa_vector / steel sdpa_full both read
+        // K/V by stride — only the head dim must be contiguous, as MLX's
+        // full path also requires). No materialization copy.
+        let k_sdpa = k_view.broadcast_to([1usize, h_kv, t_cache, head_dim])?;
+        let v_sdpa = v_view.broadcast_to([1usize, h_kv, t_cache, head_dim])?;
 
         let attn = sdpa(&q, &k_sdpa, &v_sdpa, config)?; // [1, H_q, T, D_h]
 

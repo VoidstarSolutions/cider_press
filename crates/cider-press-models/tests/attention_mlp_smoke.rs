@@ -128,7 +128,7 @@ fn attention_forward_shape_dtype_and_lazy() {
         KvCache::new(&device, T + 4, NUM_KV_HEADS, HEAD_DIM, DType::BF16).expect("KvCache::new");
 
     let out = attn
-        .forward(&hidden, None, &offset, &mut cache)
+        .forward(&hidden, &offset, &mut cache)
         .expect("attention forward");
 
     assert_eq!(out.shape().dims(), &[1, T, HIDDEN_SIZE], "attn out shape");
@@ -161,7 +161,7 @@ fn attention_forward_rejects_rank2_hidden() {
     )
     .expect("rank-2 hidden");
     let err = attn
-        .forward(&hidden, None, &offset, &mut cache)
+        .forward(&hidden, &offset, &mut cache)
         .expect_err("should reject rank-2 hidden");
     assert!(
         matches!(err, Error::InvalidArgument(_)),
@@ -181,7 +181,7 @@ fn attention_forward_rejects_batch_gt_1() {
     )
     .expect("B=2 hidden");
     let err = attn
-        .forward(&hidden, None, &offset, &mut cache)
+        .forward(&hidden, &offset, &mut cache)
         .expect_err("should reject batch > 1");
     assert!(
         matches!(err, Error::InvalidArgument(_)),
@@ -197,7 +197,7 @@ fn attention_forward_rejects_wrong_hidden_size() {
     let hidden = Tensor::from_slice(&device, &vec![bf16::ZERO; T * 512], [1usize, T, 512])
         .expect("wrong-hidden hidden");
     let err = attn
-        .forward(&hidden, None, &offset, &mut cache)
+        .forward(&hidden, &offset, &mut cache)
         .expect_err("should reject wrong hidden size");
     assert!(
         matches!(err, Error::InvalidArgument(_)),

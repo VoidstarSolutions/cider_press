@@ -13,7 +13,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use cider_press_models::nn;
 use cider_press_models::qwen2::{Qwen2Config, Qwen2Model, load_qwen2_weights};
 use cider_press_runtime::{DType, Device, KvCache, Tensor};
 use cider_press_test_utils::{dump_mlx_op, read_bf16, read_u32, tempdir};
@@ -133,7 +132,6 @@ fn run_qwen2_logits(checkpoint: &Path) {
 
     let input_ids = Tensor::from_slice(&device, &input_ids_ref, [1usize, t]).expect("input_ids");
     let offset_t = Tensor::from_slice(&device, &[0i32], [1usize]).expect("offset tensor");
-    let mask = nn::causal_mask(&device, t).expect("causal mask");
 
     // T tokens go into the cache during prefill; size slabs accordingly with
     // a little headroom.
@@ -145,7 +143,7 @@ fn run_qwen2_logits(checkpoint: &Path) {
         .collect();
 
     let logits = model
-        .forward(&input_ids, Some(&mask), &offset_t, &mut caches)
+        .forward(&input_ids, &offset_t, &mut caches)
         .expect("Qwen2Model forward");
     logits.eval().expect("eval logits");
     let got: Vec<bf16> = logits.cpu_to_vec().expect("cpu_to_vec");

@@ -65,9 +65,6 @@ impl Qwen2Model {
     /// - `input_ids`: `[1, T]` U32 token ids. Flattened to rank-1 for the
     ///   embedding gather, then reshaped back to `[1, T, hidden_size]`
     ///   before the transformer blocks.
-    /// - `mask`: optional additive attention mask broadcastable to
-    ///   `[1, H_q, T, T_cache]` (BF16). Pass `None` for full attention
-    ///   (decode of T=1 typically passes `None`).
     /// - `offset`: length-1 I32 — the number of tokens already in each
     ///   layer's cache (the `RoPE` base / starting attention position).
     /// - `caches`: one [`KvCache`] per layer; length must equal
@@ -77,7 +74,6 @@ impl Qwen2Model {
     pub fn forward(
         &self,
         input_ids: &Tensor,
-        mask: Option<&Tensor>,
         offset: &Tensor,
         caches: &mut [KvCache],
     ) -> Result<Tensor> {
@@ -102,7 +98,7 @@ impl Qwen2Model {
             .reshape([1usize, t, self.config.hidden_size])?
             .copy()?;
         for (block, cache) in self.layers.iter().zip(caches.iter_mut()) {
-            hidden = block.forward(&hidden, mask, offset, cache)?;
+            hidden = block.forward(&hidden, offset, cache)?;
         }
         let normed = self.final_norm.forward(&hidden)?;
         // Tied LM head: the embedding table is [vocab, D], so the standard
