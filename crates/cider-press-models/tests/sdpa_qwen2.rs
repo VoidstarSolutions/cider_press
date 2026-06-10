@@ -2,18 +2,16 @@
 //! attention shapes against `mx.fast.scaled_dot_product_attention`.
 //!
 //! Covers two regimes:
-//! - **Decode** (`T=1`, `T_cache>1`, no mask): GQA fan-out from 2 KV
-//!   heads to 14 Q heads, single-row Q, full attention to the cache.
-//! - **Prefill with causal mask** (`T=T_cache>1`): same GQA but the
-//!   additive `-inf` causal mask folds into the binary-add path
-//!   before softmax. Drives the `mask` argument too.
+//! - **Decode** (`T=1`, `T_cache>1`): GQA fan-out from 2 KV heads to
+//!   14 Q heads, single-row Q, full attention to the cache (vector
+//!   kernel).
+//! - **Prefill causal** (`T=T_cache>1`): same GQA, causal via the
+//!   steel `sdpa_full` kernel's `do_causal` (no materialized mask).
 //!
-//! Tolerance bar: bf16-compose precision (~0.02 abs / 0.05 rel for
-//! the longer prefill chain; tighter for decode). MLX's fused SDPA
-//! kernel does the same `Q @ K^T → scale → softmax → @ V` math but
-//! with a single accumulator path, so the bf16 round-trips between
-//! our composed ops shed an extra ULP or two relative to MLX's
-//! fused execution.
+//! Tolerance bar: bf16 precision (~0.02 abs / 0.05 rel for the longer
+//! prefill chain; tighter for decode). Both regimes drive the single
+//! fused [`cider_press_runtime::Tensor::sdpa`] primitive that MLX's
+//! `mx.fast.scaled_dot_product_attention` also dispatches.
 
 #![cfg(target_os = "macos")]
 #![allow(clippy::cast_precision_loss)]
@@ -83,7 +81,7 @@ fn qwen2_sdpa_decode_matches_mlx() {
     )
     .expect("v");
 
-    let out = attention::sdpa(&q, &k, &v, None, &config).expect("schedule sdpa");
+    let out = attention::sdpa(&q, &k, &v, &config).expect("schedule sdpa");
     out.eval().expect("eval");
     let got: Vec<bf16> = out.cpu_to_vec().expect("dense out");
     assert_within_tolerance("Qwen2 SDPA decode", &got, &fixture.out, 0.02, 0.05);
@@ -130,10 +128,10 @@ fn qwen2_sdpa_prefill_causal_matches_mlx() {
         ],
     )
     .expect("v");
-    // The fused path is causal via the kernel's do_causal; an explicit mask
-    // is now rejected at the runtime layer, so pass `None`. (The fixture's
-    // `mask` field still seeds MLX's reference causal output.)
-    let out = attention::sdpa(&q, &k, &v, None, &config).expect("schedule sdpa");
+    // The fused path is causal via the kernel's do_causal; no mask is
+    // threaded through. (The fixture's `mask` field still seeds MLX's
+    // reference causal output.)
+    let out = attention::sdpa(&q, &k, &v, &config).expect("schedule sdpa");
     out.eval().expect("eval");
     let got: Vec<bf16> = out.cpu_to_vec().expect("dense out");
     assert_within_tolerance("Qwen2 SDPA prefill causal", &got, &fixture.out, 0.03, 0.08);
@@ -143,10 +141,6 @@ struct SdpaFixture {
     q: Vec<bf16>,
     k: Vec<bf16>,
     v: Vec<bf16>,
-    // No longer read now that the fused path is causal via do_causal (the
-    // runtime rejects an explicit mask). Task 5 drops this field.
-    #[allow(dead_code)]
-    mask: Option<Vec<bf16>>,
     out: Vec<bf16>,
 }
 
@@ -187,11 +181,6 @@ fn sdpa_fixture(config: &Qwen2Config, seq_q: usize, seq_kv: usize, causal: bool)
         q: read_bf16(&st, "q"),
         k: read_bf16(&st, "k"),
         v: read_bf16(&st, "v"),
-        mask: if causal {
-            Some(read_bf16(&st, "mask"))
-        } else {
-            None
-        },
         out: read_bf16(&st, "out"),
     }
 }

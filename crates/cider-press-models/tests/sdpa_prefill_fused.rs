@@ -1,7 +1,7 @@
 //! Model-level fused-prefill parity test.
 //!
 //! Drives `qwen2::attention::sdpa` at the real Qwen2.5-0.5B prefill
-//! shape (`T = 39`, causal self-attention) with `None` mask, asserting
+//! shape (`T = 39`, causal self-attention), asserting
 //! the model now dispatches the same fused steel `sdpa_full` kernel MLX
 //! uses (causal via the kernel's `do_causal` function constant — no
 //! materialized mask). Compares to `mx.fast.scaled_dot_product_attention`
@@ -76,9 +76,9 @@ fn qwen2_sdpa_prefill_fused_matches_mlx() {
     )
     .expect("v");
 
-    // None mask: the fused path is causal via the kernel's do_causal; an
-    // explicit mask is now rejected at the runtime layer.
-    let out = attention::sdpa(&q, &k, &v, None, &config).expect("schedule sdpa");
+    // The fused path is causal via the kernel's do_causal; no mask is
+    // threaded through.
+    let out = attention::sdpa(&q, &k, &v, &config).expect("schedule sdpa");
     out.eval().expect("eval");
     let got: Vec<bf16> = out.cpu_to_vec().expect("dense out");
     assert_within_tolerance("Qwen2 SDPA prefill fused", &got, &fixture.out, 0.03, 0.08);
