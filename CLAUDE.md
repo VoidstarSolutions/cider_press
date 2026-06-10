@@ -40,11 +40,17 @@ the composed prefill chain (per-layer GQA-broadcast/Kᵀ copies +
 QKᵀ/scale/mask/softmax/·V) is deleted, replaced by one `sdpa` dispatch per
 layer — synchronous prefill **10.19 → ~9.3 ms**, gap vs mlx **1.30× →
 ~1.19×** (decode unchanged). The realized ~0.86 ms win ≈ the eliminated
-copy traffic (the attention compute moved *into* the kernel, not away). The
-remaining prefill levers are the **194 residual strided copies** (project-
-heads, S2–S5) and the **encode/dispatch residual** (#2). See
-`docs/QWEN_PERF.md` (§ "A2 measured — NO-GO", § "Fused prefill attention
-landed") for the numbers and `docs/ARCHITECTURE.md` for the forward backlog.
+copy traffic (the attention compute moved *into* the kernel, not away).
+The prefill **KV-cache-read copies** were then eliminated (strided cache
+view fed straight to the kernel; `gpu.copy` 194 → 146; `is_decode` + the
+`causal_mask` plumbing retired) but **measured a no-op** — those small
+`[1,2,T,64]` copies are off the qmm-bound critical path, so the **copy
+lever is closed, not escalated** (stride-aware RoPE for the bigger copies
+is ruled out: all copies are <5% of prefill GPU, qmm-hidden). The only
+open prefill lever is the **encode/dispatch residual** (#2, ~0.7–0.9 ms;
+needs a Metal System Trace). See `docs/QWEN_PERF.md` (§ "Fused prefill
+attention landed", § "Strided prefill cache-read") for the numbers and
+`docs/ARCHITECTURE.md` for the forward backlog.
 
 ### Non-goals
 
@@ -106,10 +112,13 @@ deleted): synchronous prefill **~9.3 ms** (was 10.19), gap vs mlx **~1.19×**
 **Remaining perf work is prefill- and memory-side**, not decode kernels: A2
 (small-N `qmv` for k/v, backlog #4) was measured and **closed as a no-go**
 (+1.07% ceiling, hidden by the decode pipeline — see `docs/QWEN_PERF.md`
-§ "A2 measured — NO-GO"). What remains on prefill: the **194 residual
-strided copies** (project-heads, S2–S5) and the **encode/dispatch residual**
-(#2); plus within-eval reuse for RSS and `.metallib` precompile.
-`docs/ARCHITECTURE.md` holds the forward pass and the prioritized backlog.
+§ "A2 measured — NO-GO"). The prefill **strided-copy lever (S2–S5) is also
+closed**: the KV-cache-read copies were eliminated but measured a no-op
+(off the qmm-bound critical path — see `docs/QWEN_PERF.md` § "Strided
+prefill cache-read"). What remains on prefill: the **encode/dispatch
+residual** (#2, needs a Metal trace); plus within-eval reuse for RSS and
+`.metallib` precompile. `docs/ARCHITECTURE.md` holds the forward pass and
+the prioritized backlog.
 
 ---
 

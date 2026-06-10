@@ -111,10 +111,12 @@ priority:
    the ~144 degenerate attention-permute `copy` dispatches at T=1 are now
    elided as zero-copy views (`Strides::is_contiguous_ignoring_unit_dims`) —
    ~146 → **2** copy dispatches/token, **~536** total dispatches, decode
-   ~420 → ~473 tok/s (~1.13×). What remains of item #9 (strided-aware kernels)
-   is the **prefill** strided path (S2–S5) — decode is down to 2 copies.
-   SwiGLU and RoPE are *not* targets (MLX composes SwiGLU; RoPE and
-   decode-SDPA are already fused). Parity-sensitive; highest-potential.
+   ~420 → ~473 tok/s (~1.13×). Item #9 (strided-aware kernels) is now
+   **closed**: decode is at 2 copies, and the prefill strided path (S2–S5)
+   was **measured a no-op** — the KV-cache-read copies were eliminated
+   (194 → 146 dispatches) with no wall-clock change, and the remaining
+   prefill copies are too small / qmm-hidden to be worth pursuing (see the
+   2026-06-10 note above and `QWEN_PERF.md` § "Strided prefill cache-read").
 
    *(b) Faster `qmv` kernels — speeds each link. Fast-path padding (A1) DONE;
    small-N launch-config (A2) MEASURED + NO-GO.* The 4-bit `qmv` matvecs are
@@ -207,10 +209,17 @@ priority:
    win ≈ the eliminated copy traffic (the pre-measurement 1.5–1.7 ms
    estimate double-counted the attention compute, which moved *into* the
    kernel rather than vanishing — see `QWEN_PERF.md` § "Fused prefill
-   attention landed"). **Still open:** the **194 residual prefill copies**
-   (strided project-heads, S2–S5 — the next copy-side lever), and **#2**
+   attention landed"). The **KV-cache-read copies** (2/layer, 48) were then
+   eliminated by feeding the strided cache view straight to the kernel
+   (`gpu.copy` 194 → 146; `is_decode`/`causal_mask` plumbing retired) — but
+   **measured a perf no-op** (prefill flat ~9.4 ms): those small
+   `[1,2,T,64]` copies are off the qmm-bound critical path (all copies now
+   4.8% of prefill GPU). **The copy lever is closed, not escalated** — even
+   eliminating every remaining copy (incl. the project-heads `[1,14,T,64]`
+   via stride-aware RoPE) caps at ~0.45 ms, mostly hidden under qmm; the
+   data rules out S2–S5 as worthwhile. **The only open prefill lever is #2**,
    the ~0.7–0.9 ms encode/dispatch residual (size with a Metal System Trace
-   first).
+   first). See `QWEN_PERF.md` § "Strided prefill cache-read".
 
 ## Carry-forward items
 
