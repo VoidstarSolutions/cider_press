@@ -1968,16 +1968,17 @@ impl Tensor {
         ))
     }
 
-    /// Fused scaled-dot-product attention (lazy). `q` `[1, H_q, 1, D]`,
+    /// Fused scaled-dot-product attention (lazy). `q` `[1, H_q, T_q, D]`,
     /// `k`/`v` `[1, H_kv, T_cache, D]` (typically [`KvCache`](crate::KvCache)
-    /// views, read strided), optional additive `mask`. Returns
-    /// `[1, H_q, 1, D]`.
+    /// views, read strided). Returns `[1, H_q, T_q, D]`.
     ///
-    /// Decode-only: the vector dispatch handles a single query position
-    /// (`T_q = 1`) and batch 1. Validates `head_dim` ∈ {64, 96, 128, 256}
-    /// (the vector kernel's supported set), BF16 dtype, rank-4 shapes,
-    /// `T_q`/batch, K/V cache-axis agreement, and GQA divisibility at
-    /// construction.
+    /// Routes by query length: `T_q == 1` (decode) takes the vector path,
+    /// `T_q > 1` (prefill) the steel `sdpa_full` path (causal via the
+    /// kernel's `do_causal`). Batch 1 only. Validates `head_dim` ∈ {64,
+    /// 96, 128, 256} (the vector kernel's supported set), BF16 dtype,
+    /// rank-4 shapes, K/V cache-axis agreement, and GQA divisibility at
+    /// construction. An explicit `mask` is rejected at construction (the
+    /// param is retained for signature stability but unsupported).
     pub fn sdpa(
         q: &Tensor,
         k: &Tensor,
@@ -2011,6 +2012,11 @@ impl Tensor {
         if q.dtype() != DType::BF16 || k.dtype() != DType::BF16 || v.dtype() != DType::BF16 {
             return Err(Error::InvalidArgument("sdpa: q/k/v must be BF16".into()));
         }
+        if mask.is_some() {
+            return Err(Error::InvalidArgument(
+                "sdpa: explicit mask not supported (prefill is causal via do_causal; decode is unmasked)".into(),
+            ));
+        }
         if gqa_factor == 0 || qd[1] != kd[1] * gqa_factor {
             return Err(Error::InvalidArgument(format!(
                 "sdpa: H_q ({}) must equal H_kv ({}) * gqa_factor ({gqa_factor})",
@@ -2023,11 +2029,10 @@ impl Tensor {
                 qd[0], kd[0], vd[0]
             )));
         }
-        if qd[2] != 1 {
-            return Err(Error::InvalidArgument(format!(
-                "sdpa: only decode T_q=1 is supported in the vector dispatch (got T_q={})",
-                qd[2]
-            )));
+        if qd[2] == 0 {
+            return Err(Error::InvalidArgument(
+                "sdpa: query length T_q must be positive".into(),
+            ));
         }
         if kd[1] != vd[1] || kd[2] != vd[2] {
             return Err(Error::InvalidArgument(format!(
@@ -2048,22 +2053,9 @@ impl Tensor {
                 )));
             }
         }
-        if let Some(m) = mask {
-            let md = m.inner.device.as_ref().ok_or_else(|| {
-                Error::InvalidArgument("sdpa: mask has no device (placeholder?)".into())
-            })?;
-            if !device.ptr_eq(md) {
-                return Err(Error::InvalidArgument(
-                    "sdpa: mask is on a different device than q".into(),
-                ));
-            }
-        }
         let out_shape = Shape::from(vec![qd[0], qd[1], qd[2], head_dim]);
         let layout = dense_layout(&out_shape);
-        let mut inputs = vec![q.clone(), k.clone(), v.clone()];
-        if let Some(m) = mask {
-            inputs.push(m.clone());
-        }
+        let inputs = vec![q.clone(), k.clone(), v.clone()];
         Ok(Self::op_tensor(
             device,
             out_shape,

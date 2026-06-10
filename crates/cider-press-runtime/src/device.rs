@@ -83,8 +83,7 @@ struct DeviceInner {
     /// JIT'd MLX `steel_attention` library (fused `sdpa_full` prefill
     /// path). Populated on first prefill-attention eval; subsequent
     /// prefills reuse the cached library and its per-specialization
-    /// pipeline-state cache. The dispatch wiring lands in a follow-up.
-    #[allow(dead_code)]
+    /// pipeline-state cache.
     steel_attention_library: OnceLock<kernels::KernelLibrary>,
     /// JIT'd MLX `arg_reduce.metal` library. Populated on first
     /// [`crate::Tensor::argmax`] eval; subsequent calls reuse the
@@ -406,7 +405,6 @@ impl Device {
     /// Metal JIT compile of the large flattened steel source (tens of
     /// seconds cold, sub-100 ms warm via the cross-process cache);
     /// subsequent calls return the cached library.
-    #[allow(dead_code)]
     pub(crate) fn steel_attention_library(&self) -> Result<&kernels::KernelLibrary> {
         if let Some(lib) = self.inner.steel_attention_library.get() {
             return Ok(lib);
