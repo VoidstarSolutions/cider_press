@@ -62,19 +62,12 @@ pub fn rope(x: &Tensor, offset: &Tensor, config: &Qwen2Config) -> Result<Tensor>
 
 /// Scaled dot-product attention for Qwen2.5.
 ///
-/// Decode (`T=1`, no mask) routes to the fused `Tensor::sdpa`
-/// (`sdpa_vector` kernel, GQA in-kernel, K/V read strided in place).
-/// Prefill (`T>1`) and masked calls use the composed chain via
-/// [`composed_sdpa`].
-///
-/// Composition (prefill / masked path):
-///
-/// ```text
-/// K_g, V_g = broadcast K/V from H_kv to H_q (GQA fan-out)
-/// scores   = Q @ K_g^T
-/// probs    = softmax(scale * scores [+ mask], precise=true)
-/// out      = probs @ V_g
-/// ```
+/// Makes a single [`Tensor::sdpa`] call; the runtime routes by query
+/// length: `T_q == 1` → `sdpa_vector` (vector decode, GQA in-kernel,
+/// K/V read strided in place), `T_q > 1` → steel `sdpa_full` (prefill,
+/// causal via the kernel's `do_causal` function constant — no
+/// materialized mask). This mirrors MLX's single
+/// `ScaledDotProductAttention` primitive.
 ///
 /// Inputs:
 /// - `q`: `[B, H_q, T, D_h]`, dense contiguous BF16.
@@ -83,9 +76,10 @@ pub fn rope(x: &Tensor, offset: &Tensor, config: &Qwen2Config) -> Result<Tensor>
 ///   populated prefix of the cache.
 /// - `v`: `[B, H_kv, T_cache, D_h]`, dense contiguous BF16. Typically
 ///   the [`cider_press_runtime::KvCache::values_view`].
-/// - `mask`: optional additive attention mask, broadcastable to
-///   `[B, H_q, T, T_cache]`. For decode (T=1, full attention to the
-///   cache) pass `None`; for prefill pass the causal `-inf` mask.
+/// - `mask`: currently unused. Qwen2 prefill is always causal
+///   self-attention, handled by the kernel's `do_causal`; a provided
+///   mask would be rejected by the runtime. The param is retained until
+///   Task 5 removes it from this signature and [`Attention::forward`].
 /// - `config`: pulls `H_q`, `H_kv`, and `D_h` for shape validation
 ///   and the GQA broadcast ratio.
 ///
@@ -93,11 +87,10 @@ pub fn rope(x: &Tensor, offset: &Tensor, config: &Qwen2Config) -> Result<Tensor>
 ///
 /// Mirrors `mlx-lm.models.qwen2.Attention.__call__`'s post-RoPE
 /// arithmetic, which itself delegates to
-/// `mx.fast.scaled_dot_product_attention`. We compose explicitly so
-/// each primitive's parity coverage is independent and verifiable.
-/// Decode fast-path predicate: single query step and no mask — the case
-/// the fused `sdpa_vector` kernel handles. Prefill / masked attention
-/// (`T>1` or a mask) uses the composed chain.
+/// `mx.fast.scaled_dot_product_attention`.
+/// Selects the K/V cache-view strategy in [`Attention::forward`]: decode
+/// (single query step, no mask) broadcasts the cache views stride-0 (no
+/// copy); prefill (`T > 1`) copies them to contiguous.
 #[inline]
 fn is_decode(t_q: usize, mask: Option<&Tensor>) -> bool {
     t_q == 1 && mask.is_none()
@@ -111,6 +104,10 @@ pub fn sdpa(
     mask: Option<&Tensor>,
     config: &Qwen2Config,
 ) -> Result<Tensor> {
+    // `mask` is no longer threaded through: the fused path is causal via
+    // the kernel's do_causal, and the runtime rejects an explicit mask.
+    // Task 5 removes the param from this signature and `Attention::forward`.
+    let _ = mask;
     let head_dim = config.head_dim()?;
     let h_q = config.num_attention_heads;
     let h_kv = config.num_key_value_heads;
@@ -122,22 +119,20 @@ pub fn sdpa(
     let t_q = q.shape().dims().get(2).copied().ok_or_else(|| {
         Error::InvalidArgument("qwen2::attention::sdpa: Q must be rank-4 [B, H, T, D_h]".into())
     })?;
-    // Decode (single Q row, full attention): route to the fused
-    // `sdpa_vector` kernel, which reads K/V strided in place and handles
-    // GQA in-kernel — no GQA-broadcast / Kᵀ / score-matmul / softmax
-    // ops. Prefill (T>1) or any masked call keeps the composed chain.
-    if is_decode(t_q, mask) {
-        let gqa_factor = h_q / h_kv;
-        #[allow(clippy::cast_precision_loss)]
-        let scale = 1.0f32 / (head_dim as f32).sqrt();
-        return Ok(Tensor::sdpa(q, k, v, None, scale, gqa_factor, false)?);
-    }
-    composed_sdpa(q, k, v, mask, config)
+    let gqa_factor = h_q / h_kv;
+    #[allow(clippy::cast_precision_loss)]
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    // Mirror MLX's single ScaledDotProductAttention primitive: eval routes
+    // T_q==1 → sdpa_vector (decode), T_q>1 → steel sdpa_full (prefill,
+    // causal via the kernel's do_causal function constant — no materialized
+    // mask). Qwen2 prefill is always causal self-attention.
+    Ok(Tensor::sdpa(q, k, v, None, scale, gqa_factor, t_q > 1)?)
 }
 
 /// The composed SDPA chain (GQA broadcast → `Q @ Kᵀ` → scale/mask/softmax
 /// → `@ V`), used for prefill (`T>1`) and masked attention. The fused
 /// [`Tensor::sdpa`] path in [`sdpa`] covers decode (`T=1`, no mask).
+#[allow(dead_code)]
 #[allow(clippy::many_single_char_names)]
 fn composed_sdpa(
     q: &Tensor,
@@ -424,6 +419,7 @@ fn project_heads(
 /// the `H_kv` axis out by `ratio = H_q / H_kv`. Zero-copy through
 /// `broadcast_to`, then `copy()` to land a contiguous buffer that
 /// the matmul kernel can read.
+#[allow(dead_code)]
 fn broadcast_kv_heads(
     x: &Tensor,
     b: usize,
