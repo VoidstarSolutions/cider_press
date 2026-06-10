@@ -214,6 +214,14 @@ priority:
 
 ## Carry-forward items
 
+- **Dense `matmul` is now production-unused.** Deleting `composed_sdpa`
+  (the fused-prefill-attention port) removed the only non-test callers of
+  the dense bf16 matmul path — the QKᵀ/·V score matmuls. `Tensor::matmul`,
+  `OpKind::MatMul`, `dispatch_matmul`, `matmul_library`, and the
+  cider-owned `kernels/matmul.metal` now have only test callers (everything
+  in the model forward is *quantized* matmul). Retained as general
+  scaffolding (and its parity test); candidate for removal if no new op
+  needs it.
 - `LanguageModel` trait extraction — `Generator` is concrete on
   `Qwen2Model`; lift when a second architecture lands.
 - `quantized_matmul` `transpose=false` direction — still unimplemented;

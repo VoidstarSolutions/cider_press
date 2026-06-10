@@ -1993,10 +1993,9 @@ fn dispatch_matmul(
         .ok_or_else(|| Error::InvalidArgument("MatMul: missing RHS (inputs[1])".into()))?;
 
     // `Tensor::matmul` enforces contiguous strides on each input, but
-    // a reshape-of-op still leaves a view in the chain (e.g. SDPA's
-    // `probs_3d.reshape([B, H_q, T, T_c])` view of the softmax result).
-    // Walk the chain to the storage owner; the contract guarantees a
-    // byte-offset of zero and contiguous bytes thereafter.
+    // a reshape-of-op still leaves a view in the chain. Walk the chain to
+    // the storage owner; the contract guarantees a byte-offset of zero and
+    // contiguous bytes thereafter.
     let lhs_bytes = matmul_input_bytes("matmul", lhs, outputs, index_of)?;
     let rhs_bytes = matmul_input_bytes("matmul", rhs, outputs, index_of)?;
     let lhs_typed = unsafe { lhs_bytes.reinterpret_as::<half::bf16>() };
