@@ -18,7 +18,7 @@
 //!
 //! Both tests gate on `CIDER_QWEN_CHECKPOINT_PATH`; when unset they
 //! no-op with an `eprintln!` message and return PASS. When set, both
-//! sub-tests must pass within `ATOL=5e-2, RTOL=5e-2` (np.allclose-style
+//! sub-tests must pass within `ATOL=5e-2, RTOL=3e-2` (np.allclose-style
 //! combined bound).
 //!
 //! The checkpoint must be an MLX-format Qwen2.5-0.5B-Instruct-4bit
@@ -39,16 +39,18 @@ use safetensors::SafeTensors;
 /// Tolerance for the composed full-attention pipeline.
 ///
 /// The chain is: qmv/qmm projection × 4 (Q, K, V, O) + bias-add + reshape +
-/// permute + rope + sdpa (itself ~3 ops: `qk_matmul`, softmax, `av_matmul`).
+/// permute + rope + sdpa (now the fused steel `sdpa_full` for prefill,
+/// `sdpa_vector` for decode — the same primitives MLX dispatches).
 /// Decode (T=1) goes through the bit-exact qmv path and matches MLX to
-/// `5e-2` comfortably; prefill (T=8) goes through `qmm_t` whose ~1 ULP
-/// drift vs MLX gets amplified ~50–100× by the composed
-/// bf16 SDPA (no fused kernel yet). Empirically the
-/// worst-element drift at layer-0 prefill is ~0.085 abs, so `1e-1` abs
-/// / `5e-2` rel passes while still failing fast on real bugs. Tighten
-/// when the fused SDPA kernel lands.
-const ATOL: f32 = 1e-1;
-const RTOL: f32 = 5e-2;
+/// `3e-2` comfortably; prefill (T=8) goes through `qmm_t` whose ~1 ULP
+/// drift vs MLX is no longer amplified by a composed bf16 SDPA chain now
+/// that the fused kernel has landed. Empirically the worst-element drift
+/// at layer-0 prefill is ~0.033 abs (near-zero output element where the
+/// rtol term contributes little), so `5e-2` abs / `3e-2` rel passes with
+/// headroom while still failing fast on real bugs — a ~2× tightening of
+/// the pre-fused `1e-1`/`5e-2` bound.
+const ATOL: f32 = 5e-2;
+const RTOL: f32 = 3e-2;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -182,6 +184,12 @@ fn run_layer0(checkpoint: &Path, seq_len: usize, offset: usize) {
         )
         .expect("pad_v");
         cache.update(&pad_k, &pad_v).expect("cache prime");
+        // Commit the priming write before `forward`'s own `cache.update`:
+        // the eager slab-base contract requires successive updates to be
+        // separated by an eval (the next slab-based slice_update would
+        // otherwise drop this unsubmitted write).
+        cache.keys_view().eval().expect("commit primed keys");
+        cache.values_view().eval().expect("commit primed values");
     }
 
     // ── 7. RoPE offset == tokens already cached ───────────────────────────────

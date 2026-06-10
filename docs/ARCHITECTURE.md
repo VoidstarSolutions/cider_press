@@ -196,18 +196,32 @@ priority:
    analysis"): the true synchronous prefill gap is **~1.30×** (cider
    10.19 ms vs mlx 7.82 ms at T=39), not the 1.52× the async wall-clock
    implied. qmm is at **parity** (same `affine_qmm_t` on both sides — ruled
-   out by microbench). The gap is the **composed attention path**: 11
+   out by microbench). The gap was the **composed attention path**: 11
    permute→copy dispatches/layer (9 fusible) + the QKᵀ/scale/mask/softmax/·V
-   chain, ≈ 1.5–1.7 ms. So the prioritized prefill levers are **#1 fused
-   prefill attention** (steel `sdpa_full` / Plan B — D_h=64 is a supported
-   steel head dim and T=39 > 8 clears the fused-path threshold; one kernel
-   subsumes the S2–S5 copies + the score chain), then **#2** the
-   ~0.7–0.9 ms encode/dispatch residual (size with a Metal System Trace
-   first). The piecemeal S2–S5 strided-variant framing is superseded by the
-   fused-attention port, which deletes the copies wholesale.
+   chain. **#1 fused prefill attention** is now **DONE** (2026-06-10):
+   the steel `sdpa_full` kernel (`steel_attention_..._bd64_...`, the kernel
+   mlx_lm dispatches for this shape, bit-exact) replaces the composed
+   chain — prefill **10.19 → ~9.3 ms**, gap **1.30× → ~1.19×**. A new
+   `gpu.sdpa` (1/layer) subsumes the QKᵀ/·V matmuls + softmax; `gpu.copy`
+   drops 266 → 194 (−3/layer GQA-broadcast K/V + Kᵀ). The realized ~0.86 ms
+   win ≈ the eliminated copy traffic (the pre-measurement 1.5–1.7 ms
+   estimate double-counted the attention compute, which moved *into* the
+   kernel rather than vanishing — see `QWEN_PERF.md` § "Fused prefill
+   attention landed"). **Still open:** the **194 residual prefill copies**
+   (strided project-heads, S2–S5 — the next copy-side lever), and **#2**
+   the ~0.7–0.9 ms encode/dispatch residual (size with a Metal System Trace
+   first).
 
 ## Carry-forward items
 
+- **Dense `matmul` is now production-unused.** Deleting `composed_sdpa`
+  (the fused-prefill-attention port) removed the only non-test callers of
+  the dense bf16 matmul path — the QKᵀ/·V score matmuls. `Tensor::matmul`,
+  `OpKind::MatMul`, `dispatch_matmul`, `matmul_library`, and the
+  cider-owned `kernels/matmul.metal` now have only test callers (everything
+  in the model forward is *quantized* matmul). Retained as general
+  scaffolding (and its parity test); candidate for removal if no new op
+  needs it.
 - `LanguageModel` trait extraction — `Generator` is concrete on
   `Qwen2Model`; lift when a second architecture lands.
 - `quantized_matmul` `transpose=false` direction — still unimplemented;

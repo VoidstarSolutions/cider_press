@@ -221,16 +221,86 @@ qmm is ruled out as the gap driver.
 | encode / dispatch overhead (residual) | ~0.7–0.9 ms | gap minus the above; unconfirmed (needs Metal trace) |
 | qmm projections | ~0 | microbench parity |
 
-1. **Fused prefill attention** (steel `sdpa_full` / Plan B) — the primary
-   lever (~1.5–1.7 ms, ≈ most of the gap). D_h=64 is a supported steel
-   head dim and T=39 > 8 clears the fused-path threshold, so it is
-   reachable; it deletes 9 of 11 per-layer copies plus the entire
-   QKᵀ/scale/mask/softmax/·V chain in one kernel.
+1. **Fused prefill attention** (steel `sdpa_full` / Plan B) — **DONE**
+   (2026-06-10, 10.19 → ~9.3 ms; see "Fused prefill attention landed"
+   below). The pre-measurement ~1.5–1.7 ms estimate was **superseded** by
+   the measured ~0.86 ms: the estimate double-counted the QKᵀ/softmax/·V
+   *compute*, which does not vanish — it moves into the fused kernel. The
+   realized win ≈ the eliminated copy traffic (~8.2% ≈ 0.84 ms).
+   D_h=64 is a supported steel head dim and T=39 > 8 clears the fused-path
+   threshold; one kernel subsumes 3/layer GQA/transpose copies plus the
+   QKᵀ/scale/mask/softmax/·V chain.
 2. **Encode / dispatch overhead** — the ~0.7–0.9 ms residual; size it with
    a Metal System Trace (both binaries; the `.gputrace` capture exists)
    before committing to a fix. Deferred (smaller, and interactive).
 3. **Small-projection qmm (q/k/v)** — *not* a real lever (parity once
    perturbation is credited); explicitly de-prioritized.
+
+### Fused prefill attention landed (2026-06-10)
+
+The composed prefill attention chain is replaced by a single fused steel
+`sdpa_full` dispatch. Measured synchronous prefill (warm, mean of 5, same
+T=39 / 4-bit / M4 Max, same `forward` + `logits.eval()` method as the
+table above):
+
+| side  | prefill (T=39) | tok/s  | gap vs mlx |
+|-------|---------------:|-------:|-----------:|
+| cider (was, composed) | 10.19 ms |  3829  | 1.30×  |
+| cider (now, fused)    | ~9.3 ms  | ~4180  | ~1.19× |
+| mlx (unchanged)       |  7.82 ms |  4988  | —      |
+
+Gap narrowed **1.30× → ~1.19×** (median of 5 process runs: 9.31 ms; spread
+9.28–9.49). Decode is **unchanged** (~580–599 tok/s) — the fused change is
+prefill-only.
+
+**GPU-profile deltas** (counter-sampled, perturbed regime — shares +
+dispatch counts, not absolute ms, as elsewhere in this doc):
+
+| op | before | after |
+|---|---|---|
+| `gpu.quantized_matmul` | 76.3%, — | 82.9%, 169 |
+| `gpu.copy` | 8.2%, 266 | 5.9%, 194 |
+| `gpu.binary` | 5.3%, — | 4.1%, 168 |
+| `gpu.matmul` | 4.8%, 48 (2/layer) | **gone** |
+| `gpu.softmax` | 0.8%, — | **gone** |
+| `gpu.sdpa` | — | **2.1%, 24 (1/layer)** |
+| `gpu.rope` | 1.5%, — | 1.6%, 48 |
+| `gpu.rms_norm` | 1.4%, — | 1.5%, 49 |
+| `gpu.slice_update` | 1.0%, — | 1.0%, 48 |
+
+The new `gpu.sdpa` (24 = 1/layer) subsumes the score chain: `gpu.matmul`
+(the 48 = 2/layer QKᵀ and ·V matmuls) and `gpu.softmax` are folded into
+it. `gpu.copy` drops **266 → 194 (−72 = 3/layer)** — the GQA-broadcast K
+and V copies and the Kᵀ transpose copy, which the steel kernel subsumes
+(GQA in-kernel; K read strided, no transpose).
+
+**Honest interpretation.** The QKᵀ/softmax/·V *compute* did not vanish; it
+moved *into* the fused kernel (now `gpu.sdpa`). What is eliminated is the
+**copy traffic + intermediate materialization + multi-dispatch overhead**
+of the composed chain (copy + matmul + softmax + mask-binary per layer →
+one kernel). The realized **~0.86 ms** win tracks the eliminated copy
+share (~8.2% ≈ 0.84 ms) — *not* the pre-measurement 1.5–1.7 ms ceiling,
+which double-counted attention compute as if it were removed rather than
+relocated. Reconciling the copy count against the pre-measurement
+prediction: of the 9 copies/layer that analysis flagged fusible, this port
+subsumed **3** (the GQA-broadcast K and V copies + the Kᵀ transpose — the
+score-chain copies); the remaining **~6/layer** are the project-head
+permute-copies that prepare Q/K/V into `[B,H,T,D]` contiguous, which the
+steel kernel still requires as input — those are exactly the 194 residual
+copies and the next copy-side lever (S2–S5). (The 2 structural KV-cache-
+write copies were never claimed fusible.)
+
+**Kernel.** `steel_attention_bfloat16_bq32_bk32_bd64_wm4_wn1` (non-nax;
+the nax variant is gated off on M4 Max, arch-gen 16) — the same kernel
+`mlx_lm` dispatches for this shape, parity-verified bit-exact at the
+kernel and model layers.
+
+**Remaining prefill levers.** (a) the **194 residual copies** — the
+strided project-heads permute-copies preparing Q/K/V into `[B,H,T,D]`
+contiguous (the prefill analogue of the decode S1 copy-elision; backlog #9
+prefill strided work S2–S5); (b) the **encode/dispatch residual** (lever
+#2, ~0.7–0.9 ms; needs a Metal System Trace before a fix). qmm remains the
+dominant share (82.9%) and is at parity vs mlx (ruled out above).
 
 ## Async decode pipelining (detach-on-eval)
 

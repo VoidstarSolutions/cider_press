@@ -34,9 +34,17 @@ untouched). The encoder/sync-model port before it had reached parity
 **measured and closed as a no-go**: a zero-cost-k/v ceiling experiment put the
 hard upper bound at **+1.07%** (within run-to-run noise) — k/v qmv time is
 hidden by the async decode pipeline, so it isn't worth owning a kernel. The
-remaining levers are now prefill and memory, not kernel-side decode. See
-`docs/QWEN_PERF.md` (§ "A2 measured — NO-GO") for the numbers and
-`docs/ARCHITECTURE.md` for the forward backlog.
+remaining levers are now prefill and memory, not kernel-side decode. On the
+prefill side, the **fused steel `sdpa_full` attention** has now **landed**:
+the composed prefill chain (per-layer GQA-broadcast/Kᵀ copies +
+QKᵀ/scale/mask/softmax/·V) is deleted, replaced by one `sdpa` dispatch per
+layer — synchronous prefill **10.19 → ~9.3 ms**, gap vs mlx **1.30× →
+~1.19×** (decode unchanged). The realized ~0.86 ms win ≈ the eliminated
+copy traffic (the attention compute moved *into* the kernel, not away). The
+remaining prefill levers are the **194 residual strided copies** (project-
+heads, S2–S5) and the **encode/dispatch residual** (#2). See
+`docs/QWEN_PERF.md` (§ "A2 measured — NO-GO", § "Fused prefill attention
+landed") for the numbers and `docs/ARCHITECTURE.md` for the forward backlog.
 
 ### Non-goals
 
@@ -90,13 +98,17 @@ kernels, with `eval()` as the synchronous dispatch boundary; the models
 crate composes Qwen2 from runtime ops. Performance is measured and decode
 now **leads `mlx_lm`** (~599 vs ~568 tok/s, ~1.05×) after qmv fast-path
 padding (A1), built on the encoder/sync-model port that first reached
-parity (~561 vs ~564, ~1.00×) (`docs/QWEN_PERF.md`).
+parity (~561 vs ~564, ~1.00×) (`docs/QWEN_PERF.md`). Prefill now runs the
+**fused steel `sdpa_full` attention** kernel (the composed prefill chain is
+deleted): synchronous prefill **~9.3 ms** (was 10.19), gap vs mlx **~1.19×**
+(was 1.30×); decode unchanged.
 
 **Remaining perf work is prefill- and memory-side**, not decode kernels: A2
 (small-N `qmv` for k/v, backlog #4) was measured and **closed as a no-go**
 (+1.07% ceiling, hidden by the decode pipeline — see `docs/QWEN_PERF.md`
-§ "A2 measured — NO-GO"). What remains: prefill strided work (S2–S5),
-within-eval reuse for RSS, and `.metallib` precompile.
+§ "A2 measured — NO-GO"). What remains on prefill: the **194 residual
+strided copies** (project-heads, S2–S5) and the **encode/dispatch residual**
+(#2); plus within-eval reuse for RSS and `.metallib` precompile.
 `docs/ARCHITECTURE.md` holds the forward pass and the prioritized backlog.
 
 ---

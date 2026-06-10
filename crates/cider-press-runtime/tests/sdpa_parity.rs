@@ -35,14 +35,16 @@ fn sdpa_rejects_gqa_mismatch() {
 }
 
 #[test]
-fn sdpa_rejects_multi_query() {
+fn sdpa_accepts_multi_query() {
     let device = Device::system_default().expect("Metal device");
-    // T_q = 2 is not a decode shape; the vector dispatch is single-query.
+    // T_q > 1 is now a valid prefill shape: it constructs successfully
+    // instead of being rejected. (Routing + eval to the steel fused-full
+    // path is covered by sdpa_full_routing.rs.)
     let q = Tensor::from_slice(&device, &[bf16::ONE; 16 * 2 * 64], [1, 16, 2, 64]).expect("q");
     let k = Tensor::from_slice(&device, &[bf16::ONE; 2 * 16 * 64], [1, 2, 16, 64]).expect("k");
     let v = Tensor::from_slice(&device, &[bf16::ONE; 2 * 16 * 64], [1, 2, 16, 64]).expect("v");
-    let err = Tensor::sdpa(&q, &k, &v, None, 0.125, 8, false).expect_err("T_q>1 must error");
-    assert!(format!("{err}").contains("T_q"), "{err}");
+    let out = Tensor::sdpa(&q, &k, &v, None, 0.125, 8, false).expect("T_q>1 must construct");
+    assert_eq!(out.shape().dims(), &[1, 16, 2, 64]);
 }
 
 #[test]
@@ -119,7 +121,12 @@ fn sdpa_through_op_matches_mlx() {
 }
 
 #[test]
-fn sdpa_rejects_mask_at_eval() {
+fn sdpa_rejects_explicit_mask() {
+    // No dispatch path binds a mask buffer yet (the vector decode path is
+    // unmasked; the steel-full prefill path is causal via do_causal), and
+    // the model always passes None. A provided-but-dropped mask would be a
+    // silent footgun, so an explicitly-provided mask is rejected loudly at
+    // construction time (a true masked path is a later task).
     const H_Q: usize = 8;
     const H_KV: usize = 1;
     const T: usize = 16;
@@ -132,11 +139,10 @@ fn sdpa_rejects_mask_at_eval() {
     let mask = Tensor::from_slice(&device, &[bf16::ZERO; T], [1, 1, 1, T]).expect("mask");
 
     let scale = 1.0f32 / (D as f32).sqrt();
-    let o = Tensor::sdpa(&q, &k, &v, Some(&mask), scale, H_Q / H_KV, false)
-        .expect("construction must succeed");
-    let err = o.eval().expect_err("mask must be rejected at eval");
+    let err = Tensor::sdpa(&q, &k, &v, Some(&mask), scale, H_Q / H_KV, false)
+        .expect_err("explicit mask must be rejected at construction");
     assert!(
-        format!("{err}").contains("mask not yet supported"),
-        "error must mention mask: {err}"
+        err.to_string().contains("mask"),
+        "error should mention the unsupported mask; got: {err}"
     );
 }

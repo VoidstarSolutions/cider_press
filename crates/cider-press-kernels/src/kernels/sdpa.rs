@@ -229,3 +229,264 @@ pub fn dispatch_sdpa_vector_bf16(
     };
     commands.dispatch_threadgroups(grid, group)
 }
+
+/// Mirrors `mlx::steel::AttnParams` (`steel/attn/params.h`) byte-for-byte
+/// — copied raw into the kernel via `setBytes`, so field order and types
+/// must match the C++ struct exactly. Strides are *element* strides for
+/// the `(B, H, L)` axes; the head-dim axis `D` is implicitly contiguous
+/// (stride 1) in the kernel's typed pointer math.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct AttnParams {
+    pub b: i32,
+    pub h: i32,
+    pub d: i32,
+    pub q_l: i32,
+    pub k_l: i32,
+    pub gqa_factor: i32,
+    pub scale: f32,
+    pub n_q: i32,
+    pub n_k: i32,
+    pub n_q_aligned: i32,
+    pub n_k_aligned: i32,
+    pub q_l_rem: i32,
+    pub k_l_rem: i32,
+    pub q_l_off: i32,
+    pub q_strides: [i64; 3],
+    pub k_strides: [i64; 3],
+    pub v_strides: [i64; 3],
+    pub o_strides: [i64; 3],
+}
+
+/// Constants for the pinned `bd64` steel attention instantiation
+/// (`head_dim < 128` ⇒ `bk = 32`). MLX picks `bq = 32`, `wm = 4`,
+/// `wn = 1` for this shape (`sdpa_full_self_attention_metal`).
+const BQ: i32 = 32;
+const BK: i32 = 32;
+const WM: usize = 4;
+const WN: usize = 1;
+
+/// Scalar params for [`dispatch_sdpa_full_bf16`]. Strides are in
+/// *elements* over the `(B, H, L)` axes (head-dim contiguous). For a
+/// row-contiguous Q/O of shape `[B, H_q, T, D]`: batch stride `H_q*T*D`,
+/// head stride `T*D`, seq stride `D`. Same for K/V with `H_kv`.
+#[derive(Clone, Copy, Debug)]
+pub struct SdpaFullArgs {
+    pub batch: i32,
+    pub h_q: i32,
+    pub h_kv: i32,
+    pub head_dim: i32,
+    pub q_len: i32,
+    pub k_len: i32,
+    pub scale: f32,
+    pub q_strides: [i64; 3],
+    pub k_strides: [i64; 3],
+    pub v_strides: [i64; 3],
+    pub o_strides: [i64; 3],
+    pub causal: bool,
+}
+
+/// Fused prefill attention via MLX's vendored `steel_attention`
+/// (`sdpa_full`). Pinned to the `bd64` bf16 instantiation
+/// (`steel_attention_bfloat16_bq32_bk32_bd64_wm4_wn1_maskbfloat16`);
+/// `head_dim` must be 64. Mirrors `sdpa_full_self_attention_metal`
+/// (`backend/metal/scaled_dot_product_attention.cpp`) for the
+/// no-mask / no-sinks case: function constants 200/201 (align Q/K),
+/// 300 = `has_mask` (false), 301 = `do_causal` (`args.causal`), 302 =
+/// `has_sinks` (false). The mask/sinks buffers (5/6/7) are gated behind
+/// those false constants, so they are absent from this specialization
+/// and must not be bound.
+///
+/// `out` must hold `h_q * q_len * head_dim` elements. Buffers are
+/// bounds-checked against the maximum strided element index before
+/// dispatch (fail-loud, no on-GPU OOB).
+// `n_q`/`n_k`, `n_q_aligned`/`n_k_aligned`, `q_l_rem`/`k_l_rem` mirror the
+// `mlx::steel::AttnParams` field names one-for-one — renaming to dodge the
+// near-name lint would obscure the byte-for-byte correspondence.
+#[allow(clippy::too_many_lines, clippy::similar_names)]
+pub fn dispatch_sdpa_full_bf16(
+    commands: &mut Commands<'_>,
+    library: &KernelLibrary,
+    q: &Buffer<bf16>,
+    k: &Buffer<bf16>,
+    v: &Buffer<bf16>,
+    out: &mut Buffer<bf16>,
+    args: SdpaFullArgs,
+) -> Result<()> {
+    if args.head_dim != 64 {
+        return Err(Error::InvalidArgument(format!(
+            "sdpa_full: only head_dim 64 is instantiated (got {})",
+            args.head_dim
+        )));
+    }
+    if args.batch <= 0 || args.h_q <= 0 || args.h_kv <= 0 {
+        return Err(Error::InvalidArgument(format!(
+            "sdpa_full: batch/h_q/h_kv must be positive (got {}, {}, {})",
+            args.batch, args.h_q, args.h_kv
+        )));
+    }
+    if args.q_len <= 0 || args.k_len <= 0 {
+        return Err(Error::InvalidArgument(format!(
+            "sdpa_full: q_len/k_len must be positive (got {}, {})",
+            args.q_len, args.k_len
+        )));
+    }
+    if args.h_q % args.h_kv != 0 {
+        return Err(Error::InvalidArgument(format!(
+            "sdpa_full: h_q ({}) must be divisible by h_kv ({})",
+            args.h_q, args.h_kv
+        )));
+    }
+    // `q_l_off = k_len - q_len` is the kernel's causal-window start offset; a
+    // negative value (k_len < q_len) would corrupt the causal masking and the
+    // strided reads. Self-attention prefill always has k_len >= q_len.
+    if args.k_len < args.q_len {
+        return Err(Error::InvalidArgument(format!(
+            "sdpa_full: k_len ({}) must be >= q_len ({})",
+            args.k_len, args.q_len
+        )));
+    }
+    let gqa_factor = args.h_q / args.h_kv;
+
+    let n_q = (args.q_len + BQ - 1) / BQ;
+    let n_k = (args.k_len + BK - 1) / BK;
+    let n_q_aligned = args.q_len / BQ;
+    let n_k_aligned = args.k_len / BK;
+    let q_l_rem = args.q_len - n_q_aligned * BQ;
+    let k_l_rem = args.k_len - n_k_aligned * BK;
+    let q_l_off = args.k_len - args.q_len;
+
+    let align_q = args.q_len % BQ == 0;
+    let align_k = args.k_len % BK == 0;
+
+    let params = AttnParams {
+        b: args.batch,
+        h: args.h_q,
+        d: args.head_dim,
+        q_l: args.q_len,
+        k_l: args.k_len,
+        gqa_factor,
+        scale: args.scale,
+        n_q,
+        n_k,
+        n_q_aligned,
+        n_k_aligned,
+        q_l_rem,
+        k_l_rem,
+        q_l_off,
+        q_strides: args.q_strides,
+        k_strides: args.k_strides,
+        v_strides: args.v_strides,
+        o_strides: args.o_strides,
+    };
+
+    // Bound-check buffers against the maximum strided element index. The
+    // kernel's typed pointer math reaches batch·head·seq via the passed
+    // (B, H, L) element strides, with D contiguous — fail loud here rather
+    // than OOB on-GPU.
+    let head_dim = usize::try_from(args.head_dim).expect("head_dim 64 checked above");
+    let stride_bound = |strides: &[i64; 3], heads: i32, len: i32| -> Result<usize> {
+        let conv = |s: i64| {
+            usize::try_from(s)
+                .map_err(|_| Error::InvalidArgument("sdpa_full: stride out of range".into()))
+        };
+        let batch_stride = conv(strides[0])?;
+        let head_stride = conv(strides[1])?;
+        let seq_stride = conv(strides[2])?;
+        let n_batch = usize::try_from(args.batch).expect("batch > 0 checked above");
+        let n_heads = usize::try_from(heads).expect("heads > 0 checked above");
+        let n_seq = usize::try_from(len).expect("len > 0 checked above");
+        Ok((n_batch - 1)
+            .saturating_mul(batch_stride)
+            .saturating_add((n_heads - 1).saturating_mul(head_stride))
+            .saturating_add((n_seq - 1).saturating_mul(seq_stride))
+            .saturating_add(head_dim))
+    };
+    let need_q = stride_bound(&args.q_strides, args.h_q, args.q_len)?;
+    if q.len() < need_q {
+        return Err(Error::InvalidArgument(format!(
+            "sdpa_full: q too small (need {need_q}, got {})",
+            q.len()
+        )));
+    }
+    let need_k = stride_bound(&args.k_strides, args.h_kv, args.k_len)?;
+    if k.len() < need_k {
+        return Err(Error::InvalidArgument(format!(
+            "sdpa_full: k too small (need {need_k}, got {})",
+            k.len()
+        )));
+    }
+    let need_v = stride_bound(&args.v_strides, args.h_kv, args.k_len)?;
+    if v.len() < need_v {
+        return Err(Error::InvalidArgument(format!(
+            "sdpa_full: v too small (need {need_v}, got {})",
+            v.len()
+        )));
+    }
+    let need_o = stride_bound(&args.o_strides, args.h_q, args.q_len)?;
+    if out.len() < need_o {
+        return Err(Error::InvalidArgument(format!(
+            "sdpa_full: out too small (need {need_o}, got {})",
+            out.len()
+        )));
+    }
+
+    let pipeline = library.pipeline_specialized(
+        "steel_attention_bfloat16_bq32_bk32_bd64_wm4_wn1_maskbfloat16",
+        &[
+            FunctionConstant::Bool {
+                index: 200,
+                value: align_q,
+            },
+            FunctionConstant::Bool {
+                index: 201,
+                value: align_k,
+            },
+            FunctionConstant::Bool {
+                index: 300,
+                value: false,
+            }, // has_mask
+            FunctionConstant::Bool {
+                index: 301,
+                value: args.causal,
+            }, // do_causal
+            FunctionConstant::Bool {
+                index: 302,
+                value: false,
+            }, // has_sinks
+        ],
+    )?;
+
+    {
+        let encoder = commands.encoder()?;
+        encoder.setComputePipelineState(pipeline.metal_pipeline_state());
+        // SAFETY: buffer / byte indices match the `steel_attention` MSL
+        // signature: q=0, k=1, v=2, o=3, params(AttnParams)=4. The mask
+        // params/array (5/6) and sinks (7) are gated behind has_mask /
+        // has_sinks (both pinned false), so they are absent from this
+        // specialization and must not be bound. Buffers sized to match
+        // (checked above).
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(q.metal_buffer()), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(k.metal_buffer()), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(v.metal_buffer()), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(out.metal_buffer()), 0, 3);
+            let params_ptr: NonNull<c_void> = NonNull::from(&params).cast();
+            encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of::<AttnParams>(), 4);
+        }
+    }
+
+    // MLX dispatches `grid = (NQ, H, B)` *threadgroups* with a
+    // `(32, wm, wn)` group — see `sdpa_full_self_attention_metal`.
+    let grid = MTLSize {
+        width: usize::try_from(n_q).expect("n_q >= 1"),
+        height: usize::try_from(args.h_q).expect("h_q > 0 checked above"),
+        depth: usize::try_from(args.batch).expect("batch > 0 checked above"),
+    };
+    let group = MTLSize {
+        width: 32,
+        height: WM,
+        depth: WN,
+    };
+    commands.dispatch_threadgroups(grid, group)
+}

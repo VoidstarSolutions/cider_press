@@ -1,17 +1,11 @@
-//! Parity test driving `qwen2::attention::sdpa` at Qwen2.5-0.5B
-//! attention shapes against `mx.fast.scaled_dot_product_attention`.
+//! Model-level fused-prefill parity test.
 //!
-//! Covers two regimes:
-//! - **Decode** (`T=1`, `T_cache>1`): GQA fan-out from 2 KV heads to
-//!   14 Q heads, single-row Q, full attention to the cache (vector
-//!   kernel).
-//! - **Prefill causal** (`T=T_cache>1`): same GQA, causal via the
-//!   steel `sdpa_full` kernel's `do_causal` (no materialized mask).
-//!
-//! Tolerance bar: bf16 precision (~0.02 abs / 0.05 rel for the longer
-//! prefill chain; tighter for decode). Both regimes drive the single
-//! fused [`cider_press_runtime::Tensor::sdpa`] primitive that MLX's
-//! `mx.fast.scaled_dot_product_attention` also dispatches.
+//! Drives `qwen2::attention::sdpa` at the real Qwen2.5-0.5B prefill
+//! shape (`T = 39`, causal self-attention), asserting
+//! the model now dispatches the same fused steel `sdpa_full` kernel MLX
+//! uses (causal via the kernel's `do_causal` function constant — no
+//! materialized mask). Compares to `mx.fast.scaled_dot_product_attention`
+//! with a causal mask.
 
 #![cfg(target_os = "macos")]
 #![allow(clippy::cast_precision_loss)]
@@ -40,58 +34,11 @@ const PINNED_CONFIG_JSON: &str = r#"{
 const B: usize = 1;
 
 #[test]
-fn qwen2_sdpa_decode_matches_mlx() {
+fn qwen2_sdpa_prefill_fused_matches_mlx() {
     let config = Qwen2Config::from_json_bytes(PINNED_CONFIG_JSON.as_bytes()).expect("parse config");
-    let seq_q = 1;
-    let seq_kv = 8;
-    let fixture = sdpa_fixture(&config, seq_q, seq_kv, false);
-
-    let device = Device::system_default().expect("device");
-    let q = Tensor::from_slice(
-        &device,
-        &fixture.q,
-        [
-            B,
-            config.num_attention_heads,
-            seq_q,
-            config.head_dim().unwrap(),
-        ],
-    )
-    .expect("q");
-    let k = Tensor::from_slice(
-        &device,
-        &fixture.k,
-        [
-            B,
-            config.num_key_value_heads,
-            seq_kv,
-            config.head_dim().unwrap(),
-        ],
-    )
-    .expect("k");
-    let v = Tensor::from_slice(
-        &device,
-        &fixture.v,
-        [
-            B,
-            config.num_key_value_heads,
-            seq_kv,
-            config.head_dim().unwrap(),
-        ],
-    )
-    .expect("v");
-
-    let out = attention::sdpa(&q, &k, &v, &config).expect("schedule sdpa");
-    out.eval().expect("eval");
-    let got: Vec<bf16> = out.cpu_to_vec().expect("dense out");
-    assert_within_tolerance("Qwen2 SDPA decode", &got, &fixture.out, 0.02, 0.05);
-}
-
-#[test]
-fn qwen2_sdpa_prefill_causal_matches_mlx() {
-    let config = Qwen2Config::from_json_bytes(PINNED_CONFIG_JSON.as_bytes()).expect("parse config");
-    let seq_q = 8;
-    let seq_kv = 8;
+    // T = 39: the real Qwen2 prompt length used elsewhere in the repo.
+    let seq_q = 39;
+    let seq_kv = 39;
     let fixture = sdpa_fixture(&config, seq_q, seq_kv, true);
 
     let device = Device::system_default().expect("device");
@@ -128,13 +75,13 @@ fn qwen2_sdpa_prefill_causal_matches_mlx() {
         ],
     )
     .expect("v");
+
     // The fused path is causal via the kernel's do_causal; no mask is
-    // threaded through. (The fixture's `mask` field still seeds MLX's
-    // reference causal output.)
+    // threaded through.
     let out = attention::sdpa(&q, &k, &v, &config).expect("schedule sdpa");
     out.eval().expect("eval");
     let got: Vec<bf16> = out.cpu_to_vec().expect("dense out");
-    assert_within_tolerance("Qwen2 SDPA prefill causal", &got, &fixture.out, 0.03, 0.08);
+    assert_within_tolerance("Qwen2 SDPA prefill fused", &got, &fixture.out, 0.03, 0.08);
 }
 
 struct SdpaFixture {
@@ -145,7 +92,7 @@ struct SdpaFixture {
 }
 
 fn sdpa_fixture(config: &Qwen2Config, seq_q: usize, seq_kv: usize, causal: bool) -> SdpaFixture {
-    let tmp = tempdir("models-sdpa-qwen2");
+    let tmp = tempdir("models-sdpa-prefill-fused");
     let tag = if causal { "causal" } else { "nomask" };
     let path = tmp.join(format!("sdpa-{tag}-{seq_q}x{seq_kv}.safetensors"));
     let h_q = config.num_attention_heads.to_string();
@@ -192,12 +139,7 @@ fn assert_within_tolerance(
     abs_tol: f32,
     rel_tol: f32,
 ) {
-    // np.allclose-style combined bound: `|a - b| <= abs_tol + rel_tol *
-    // |b|`. The composed-SDPA chain produces 1-ULP drift on individual
-    // bf16 values; near zero a 1-ULP absolute diff is huge relatively,
-    // which the pure AND form (used by earlier branches) flags
-    // spuriously. The combined form is what numpy / mlx use for
-    // tolerance comparisons.
+    // np.allclose-style combined bound: `|a - b| <= abs_tol + rel_tol * |b|`.
     assert_eq!(got.len(), expected.len(), "{label}: length mismatch");
     let mut worst_excess = 0.0f32;
     let mut worst_at = 0usize;

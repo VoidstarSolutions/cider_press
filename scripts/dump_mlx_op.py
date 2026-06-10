@@ -630,8 +630,14 @@ def run_attention_layer0(args: argparse.Namespace) -> dict[str, mx.array]:
 
     if args.offset == 0:
         # Prefill: no cache — mlx_lm.Qwen2Attention.__call__ uses offset=0 RoPE
-        # and omits the KV-cache update when cache=None.
-        out = attn(x, mask=None, cache=None)
+        # and omits the KV-cache update when cache=None. Pass mask="causal" to
+        # match the real model: Qwen2Model.__call__ builds a causal mask via
+        # create_attention_mask and threads it down; calling the layer's
+        # attention directly bypasses that, so we supply the causal mask
+        # explicitly. (Without it the reference is non-causal full attention,
+        # which the fused steel sdpa_full prefill path — always causal — would
+        # not match.)
+        out = attn(x, mask="causal", cache=None)
     else:
         # Decode: pre-prime the KVCache with `offset` zero rows so that
         # mlx_lm's attention uses `cache.offset` for RoPE positioning.

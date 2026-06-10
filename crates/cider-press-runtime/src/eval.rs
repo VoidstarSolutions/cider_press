@@ -1993,10 +1993,9 @@ fn dispatch_matmul(
         .ok_or_else(|| Error::InvalidArgument("MatMul: missing RHS (inputs[1])".into()))?;
 
     // `Tensor::matmul` enforces contiguous strides on each input, but
-    // a reshape-of-op still leaves a view in the chain (e.g. SDPA's
-    // `probs_3d.reshape([B, H_q, T, T_c])` view of the softmax result).
-    // Walk the chain to the storage owner; the contract guarantees a
-    // byte-offset of zero and contiguous bytes thereafter.
+    // a reshape-of-op still leaves a view in the chain. Walk the chain to
+    // the storage owner; the contract guarantees a byte-offset of zero and
+    // contiguous bytes thereafter.
     let lhs_bytes = matmul_input_bytes("matmul", lhs, outputs, index_of)?;
     let rhs_bytes = matmul_input_bytes("matmul", rhs, outputs, index_of)?;
     let lhs_typed = unsafe { lhs_bytes.reinterpret_as::<half::bf16>() };
@@ -2029,11 +2028,13 @@ fn dispatch_matmul(
     Ok(())
 }
 
-/// Dispatch the fused vector SDPA. Q is dense `[1,H_q,1,D]`; K/V are
-/// `[1,H_kv,T_cache,D]`, read strided in place via `layout_strides`
-/// (contiguous in Plan A's tests; real cache views in Task 7) — no
-/// GQA-broadcast/transpose copy. Decode-only: no mask, causal=false
-/// (Plan B adds masked/causal).
+/// Dispatch fused SDPA, routing on query length `T_q`: `T_q==1` (decode)
+/// takes the vector path here, `T_q>1` (prefill) delegates to
+/// `dispatch_sdpa_full` (steel `sdpa_full`, causal via the kernel's
+/// `do_causal`). Explicit masks are rejected at construction, so neither
+/// path handles one. Vector path: Q is dense `[1,H_q,1,D]`; K/V are
+/// `[1,H_kv,T_cache,D]`, read strided in place via `layout_strides` — no
+/// GQA-broadcast/transpose copy.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_sdpa(
     inner: &Arc<TensorInner>,
@@ -2046,17 +2047,22 @@ fn dispatch_sdpa(
     gqa_factor: usize,
     causal: bool,
 ) -> Result<()> {
-    if causal {
-        return Err(Error::InvalidArgument(
-            "sdpa: causal=true not yet supported in the vector dispatch (Plan B)".into(),
-        ));
+    // Route by query length: T_q>1 (prefill) takes the steel fused-full
+    // path, T_q==1 (decode) the vector path. The lock is scoped so it is
+    // released before either path re-locks the same inputs (re-locking
+    // under a held guard would deadlock).
+    let t_q = {
+        let inputs = op.lock_inputs();
+        let q = inputs
+            .first()
+            .ok_or_else(|| Error::InvalidArgument("Sdpa: missing q (inputs[0])".into()))?;
+        q.shape().dims()[2]
+    };
+    if t_q > 1 {
+        return dispatch_sdpa_full(inner, op, commands, outputs, dst, index_of, scale, causal);
     }
-    let inputs = op.lock_inputs();
-    if inputs.len() > 3 {
-        return Err(Error::InvalidArgument(
-            "sdpa: mask not yet supported in the vector dispatch (Plan B)".into(),
-        ));
-    }
+
+    let inputs = op.lock_inputs(); // vector (decode) path re-locks
     let device = inner.device.as_ref().expect("op nodes carry a device");
 
     let q = inputs
@@ -2141,6 +2147,104 @@ fn dispatch_sdpa(
             })?,
             scale,
             head_dim,
+        },
+    )?;
+    Ok(())
+}
+
+/// Fused full-attention (prefill, `T_q>1`) via MLX's vendored steel
+/// `sdpa_full` kernel. Mirrors the vector path's storage/stride
+/// resolution but requires a contiguous head dimension and zero view
+/// offset on Q/K/V. Does not guard `head_dim` locally: `head_dim != 64`
+/// is rejected downstream by `dispatch_sdpa_full_bf16` (the only
+/// instantiated steel shape).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_sdpa_full(
+    inner: &Arc<TensorInner>,
+    op: &OpNode,
+    commands: &mut Commands<'_>,
+    outputs: &[Buffer<u8>],
+    dst: &mut Buffer<u8>,
+    index_of: &HashMap<*const TensorInner, usize>,
+    scale: f32,
+    causal: bool,
+) -> Result<()> {
+    let device = inner.device.as_ref().expect("op nodes carry a device");
+    let inputs = op.lock_inputs();
+    let q = inputs
+        .first()
+        .ok_or_else(|| Error::InvalidArgument("Sdpa: missing q (inputs[0])".into()))?;
+    let k = inputs
+        .get(1)
+        .ok_or_else(|| Error::InvalidArgument("Sdpa: missing k (inputs[1])".into()))?;
+    let v = inputs
+        .get(2)
+        .ok_or_else(|| Error::InvalidArgument("Sdpa: missing v (inputs[2])".into()))?;
+
+    let qd = q.shape().dims().to_vec(); // [1, H_q, qL, D]
+    let kd = k.shape().dims().to_vec(); // [1, H_kv, kL, D]
+    let (h_q, q_len, head_dim) = (qd[1], qd[2], qd[3]);
+    let (h_kv, k_len) = (kd[1], kd[2]);
+
+    let (q_bytes, q_off) = resolve_view_storage(q, outputs, index_of)?;
+    let (k_bytes, k_off) = resolve_view_storage(k, outputs, index_of)?;
+    let (v_bytes, v_off) = resolve_view_storage(v, outputs, index_of)?;
+    if q_off != 0 || k_off != 0 || v_off != 0 {
+        return Err(Error::InvalidArgument(format!(
+            "sdpa_full: non-zero view byte offset (q={q_off}, k={k_off}, v={v_off}) not supported"
+        )));
+    }
+
+    let qs = layout_strides(q)?;
+    let ks = layout_strides(k)?;
+    let vs = layout_strides(v)?;
+    // The steel `sdpa_full` kernel reads each head's D elements with a
+    // unit-stride pointer walk, so it assumes the head dimension is
+    // contiguous; a non-unit D stride would silently read the wrong
+    // elements. Fail loud rather than dispatch a garbage attention.
+    if qs[3] != 1 || ks[3] != 1 || vs[3] != 1 {
+        return Err(Error::InvalidArgument(format!(
+            "sdpa_full: Q/K/V head dim must be contiguous (D stride 1); got q={}, k={}, v={}",
+            qs[3], ks[3], vs[3]
+        )));
+    }
+    let os = element_strides(&[1, h_q, q_len, head_dim]); // dense output (B,H,L,D)
+
+    // SAFETY: `Tensor::sdpa` pinned BF16 at construction; each buffer was
+    // sized as `elem_count * size_bytes`, so the typed reinterpret divides
+    // evenly and the strides describe valid in-bounds reads.
+    let q_typed = unsafe { q_bytes.reinterpret_as::<half::bf16>() };
+    let k_typed = unsafe { k_bytes.reinterpret_as::<half::bf16>() };
+    let v_typed = unsafe { v_bytes.reinterpret_as::<half::bf16>() };
+    let mut dst_typed = unsafe { dst.reinterpret_as::<half::bf16>() };
+
+    let conv = |s: &[isize]| -> [i64; 3] { [s[0] as i64, s[1] as i64, s[2] as i64] };
+    let library = device.steel_attention_library()?;
+    cider_press_kernels::kernels::sdpa::dispatch_sdpa_full_bf16(
+        commands,
+        library,
+        &q_typed,
+        &k_typed,
+        &v_typed,
+        &mut dst_typed,
+        cider_press_kernels::kernels::sdpa::SdpaFullArgs {
+            batch: 1,
+            h_q: i32::try_from(h_q)
+                .map_err(|_| Error::InvalidArgument("sdpa_full: h_q too large".into()))?,
+            h_kv: i32::try_from(h_kv)
+                .map_err(|_| Error::InvalidArgument("sdpa_full: h_kv too large".into()))?,
+            head_dim: i32::try_from(head_dim)
+                .map_err(|_| Error::InvalidArgument("sdpa_full: head_dim too large".into()))?,
+            q_len: i32::try_from(q_len)
+                .map_err(|_| Error::InvalidArgument("sdpa_full: q_len too large".into()))?,
+            k_len: i32::try_from(k_len)
+                .map_err(|_| Error::InvalidArgument("sdpa_full: k_len too large".into()))?,
+            scale,
+            q_strides: conv(qs),
+            k_strides: conv(ks),
+            v_strides: conv(vs),
+            o_strides: [os[0], os[1], os[2]],
+            causal,
         },
     )?;
     Ok(())
