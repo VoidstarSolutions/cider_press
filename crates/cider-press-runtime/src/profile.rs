@@ -158,4 +158,136 @@ mod imp {
     }
 }
 
+/// `os_signpost` interval markers for Instruments (Points of Interest /
+/// Metal System Trace). No-op unless the `profiling` feature is on.
+pub mod signpost {
+    /// The eval phase a marker brackets. The discriminant is the
+    /// `os_signpost_id_t` — distinct per region, stable across begin/end.
+    #[cfg_attr(not(feature = "profiling"), allow(dead_code))]
+    #[derive(Clone, Copy)]
+    pub enum Region {
+        Encode = 1,
+        Wait = 2,
+    }
+
+    /// Token returned by [`interval_begin`], consumed by [`interval_end`]
+    /// to close the same interval id with the same name.
+    #[must_use]
+    pub struct Marker(#[cfg_attr(not(feature = "profiling"), allow(dead_code))] Region);
+
+    #[cfg(feature = "profiling")]
+    mod ffi {
+        use std::ffi::c_char;
+        use std::os::raw::c_void;
+        use std::sync::OnceLock;
+
+        #[repr(transparent)]
+        struct OsLog(*mut c_void);
+        // SAFETY: os_log_t is an immutable, thread-safe handle.
+        unsafe impl Send for OsLog {}
+        unsafe impl Sync for OsLog {}
+
+        // `os_signpost_interval_begin/end` are header-only macros; the real C
+        // entry point they expand to is `_os_signpost_emit_with_name_impl`
+        // (asm symbol `__os_signpost_emit_with_name_impl`, in libsystem_trace
+        // via the dyld shared cache). `_os_signpost_emit_with_type` named in
+        // the task spec is itself a macro, not a linkable symbol — it resolves
+        // neither statically (no SDK .tbd export) nor at runtime (dlsym NULL).
+        // The impl requires a non-null `dso` (image handle, for Instruments to
+        // resolve the binary) and a non-null format buffer — passing NULL for
+        // either traps (SIGTRAP). We pass `&__dso_handle` and a zeroed buffer.
+        unsafe extern "C" {
+            fn os_log_create(subsystem: *const c_char, category: *const c_char) -> *mut c_void;
+            fn _os_signpost_emit_with_name_impl(
+                dso: *mut c_void,
+                log: *mut c_void,
+                typ: u8,
+                spid: u64,
+                name: *const c_char,
+                format: *const c_char,
+                buf: *mut u8,
+                size: u32,
+            );
+            #[link_name = "__dso_handle"]
+            static DSO_HANDLE: c_void;
+        }
+
+        fn log() -> *mut c_void {
+            static LOG: OnceLock<OsLog> = OnceLock::new();
+            LOG.get_or_init(|| {
+                let subsystem = c"com.cider-press.prefill";
+                let category = c"PointsOfInterest";
+                // SAFETY: both pointers are valid nul-terminated statics.
+                OsLog(unsafe { os_log_create(subsystem.as_ptr(), category.as_ptr()) })
+            })
+            .0
+        }
+
+        /// Emit one signpost interval marker (begin or end). `typ` is the
+        /// `os_signpost_type_t` (begin = 1, end = 2).
+        pub(super) fn emit(typ: u8, spid: u64, name: *const c_char) {
+            const BUF_LEN: u32 = 16;
+            let mut buf = [0u8; BUF_LEN as usize];
+            // SAFETY: `log()` returns a valid os_log_t; `name`/format are
+            // valid nul-terminated statics; `DSO_HANDLE` is this image's
+            // header; `buf` is a valid writable region matching `size`.
+            unsafe {
+                _os_signpost_emit_with_name_impl(
+                    std::ptr::addr_of!(DSO_HANDLE).cast_mut(),
+                    log(),
+                    typ,
+                    spid,
+                    name,
+                    c"".as_ptr(),
+                    buf.as_mut_ptr(),
+                    BUF_LEN,
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "profiling")]
+    fn name_of(r: Region) -> &'static std::ffi::CStr {
+        match r {
+            Region::Encode => c"eval.encode",
+            Region::Wait => c"eval.wait",
+        }
+    }
+
+    /// Open an interval for `region`. Returns a [`Marker`] that
+    /// [`interval_end`] must consume to close it.
+    pub fn interval_begin(region: Region) -> Marker {
+        #[cfg(feature = "profiling")]
+        {
+            const INTERVAL_BEGIN: u8 = 1;
+            ffi::emit(INTERVAL_BEGIN, region as u64, name_of(region).as_ptr());
+        }
+        Marker(region)
+    }
+
+    /// Close the interval opened by [`interval_begin`]. Takes the
+    /// [`Marker`] by value (consuming the must-use token) so a closed
+    /// interval cannot be re-ended; the inner [`Region`] is `Copy`, hence
+    /// the `needless_pass_by_value` allow.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn interval_end(marker: Marker) {
+        #[cfg(feature = "profiling")]
+        {
+            const INTERVAL_END: u8 = 2;
+            ffi::emit(INTERVAL_END, marker.0 as u64, name_of(marker.0).as_ptr());
+        }
+        let _ = marker;
+    }
+}
+
 pub use imp::{Span, drain, drain_gpu, is_enabled, record_gpu, reset, span};
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn signpost_emit_does_not_panic() {
+        // No-op when profiling is off; FFI emit when on. Either way: no panic.
+        let s = super::signpost::interval_begin(super::signpost::Region::Encode);
+        super::signpost::interval_end(s);
+    }
+}

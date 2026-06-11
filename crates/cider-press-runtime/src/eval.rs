@@ -366,9 +366,12 @@ pub(crate) fn eval_async(root: &Tensor) -> Result<crate::PendingEval> {
 
 pub(crate) fn eval(root: &Tensor) -> Result<()> {
     let _span = crate::profile::span("tensor.eval");
+    let sp_encode =
+        crate::profile::signpost::interval_begin(crate::profile::signpost::Region::Encode);
     let encode = crate::profile::span("tensor.eval.encode");
     let order = build_order(root);
     if order.is_empty() {
+        crate::profile::signpost::interval_end(sp_encode);
         return Ok(()); // every reachable node is already terminal.
     }
     let device = root.inner.device.as_ref().ok_or_else(|| {
@@ -376,12 +379,15 @@ pub(crate) fn eval(root: &Tensor) -> Result<()> {
     })?;
     let (outputs, tags, in_flight) = encode_ops(&order, device)?;
     drop(encode);
+    crate::profile::signpost::interval_end(sp_encode);
 
+    let sp_wait = crate::profile::signpost::interval_begin(crate::profile::signpost::Region::Wait);
     let wait = crate::profile::span("tensor.eval.wait");
     for chunk in in_flight {
         chunk.wait()?;
     }
     drop(wait);
+    crate::profile::signpost::interval_end(sp_wait);
 
     populate_caches(&order, outputs, tags, device);
     detach_order(&order);
