@@ -63,13 +63,22 @@ parity unchanged) — **but the bubble did NOT recover**: GPU-wait stayed flat
 So the **dispatch-count → bubble hypothesis is REFUTED** — the copies were off
 the qmm-bound critical path (PR #37 outcome at 5× scale). The change is kept
 (correct, less memory traffic, matches mlx) but the prefill gap is ~unchanged
-(~1.28× → ~1.26×). Site 3 (o_proj) + bias stay — mlx hits the same kernels.
-**Next prefill diagnostic: the `OPS_PER_COMMAND_BUFFER` cadence probe**
-(`eval.rs:206`) — directly vary the ~14-buffer count; if the gaps aren't at
-commit boundaries, prefill is near its floor and the residual is structural
-(synchronous per-eval + <50% occupancy → needs *concurrency*, not fewer
-dispatches). See `docs/QWEN_PERF.md` (§ "Copy elimination measured — dispatch-
-count hypothesis REFUTED") and `docs/ARCHITECTURE.md` for the backlog.
+(~1.28× → ~1.26×). A `OPS_PER_COMMAND_BUFFER` cadence sweep then also failed
+(fewer/bigger buffers made GPU-wait *worse* — loses CPU/GPU pipelining), so both
+count-reduction levers are refuted. **Reading BOTH schedulers side-by-side then
+found the MATERIAL difference (the real next direction): cider OVER-SERIALIZES
+what mlx OVERLAPS** — same ~6.06 ms compute, cider 8.2 ms wall, the <50%
+occupancy is the symptom. (1) cider's **strict per-buffer fence chain**
+(`commands.rs:204-232`; one fence/buffer, captures the whole buffer) drains the
+GPU at every ~50-op seam, where mlx uses a **per-output-buffer fence map**
+(`../mlx/.../device.cpp:404-415`) that waits only real cross-buffer edges; (2)
+cider's **coarse pool-aliased hazard key** (`eval.rs:498-502`, whole-MTLBuffer
+ptr + pooled outputs) fires false barriers on the concurrent encoder that mlx's
+per-array RAW check (`device.cpp:307-309`) does not. **Next lever: port mlx's
+per-output fence map + make the hazard key allocation-aware** so cider's
+already-concurrent encoders actually run concurrently. Both are IDENTICAL to mlx
+otherwise (1 concurrent encoder/buffer, ~50 ops, commit-chain+1-wait, no fusion).
+See `docs/QWEN_PERF.md` (§ "Copy elimination measured") and `docs/ARCHITECTURE.md`.
 
 ### Non-goals
 
