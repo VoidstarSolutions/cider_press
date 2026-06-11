@@ -54,13 +54,22 @@ of GPU compute** (qmm at parity) — so cider's GPU-wait (8.27 ms) − compute
 (6.06) ≈ **~2.2 ms of bubbles** at command-buffer commit boundaries (~14
 buffers vs ~10). The surplus is **146 copies + ~72 Q/K/V bias-adds** (46% of
 dispatches, ~10% of compute) that mlx avoids via lazy strided views + fused
-bias. So the **copy lever is REOPENED** — not for its compute, for its
-dispatch count. Next prefill lever (follow-up branch): **eliminate the 146
-copies** (stride-aware RoPE / cache-write / collapse-heads→o_proj) + **fold
-Q/K/V bias into qmm** → ~460 dispatches, below mlx. (One direct check still
-owed: confirm the GPU idle gaps land at the commit boundaries in the
-timeline.) See `docs/QWEN_PERF.md` (§ "Prefill encode/dispatch trace —
-findings") for the full numbers and `docs/ARCHITECTURE.md` for the backlog.
+bias. The copy lever was then **acted on and measured** (branch
+`perf/prefill-dispatch-reduction`): the 120 runtime-only copies (Q/K/V
+project-heads + K/V rope→cache) were eliminated via strided RoPE + strided
+KV-cache write (`gpu.copy` **146 → 26**, dispatch ~680 → ~560, `qwen2_logits`
+parity unchanged) — **but the bubble did NOT recover**: GPU-wait stayed flat
+(~8.27 → ~8.35 ms), prefill only **9.32 → ~9.18 ms** (the CPU-encode saving).
+So the **dispatch-count → bubble hypothesis is REFUTED** — the copies were off
+the qmm-bound critical path (PR #37 outcome at 5× scale). The change is kept
+(correct, less memory traffic, matches mlx) but the prefill gap is ~unchanged
+(~1.28× → ~1.26×). Site 3 (o_proj) + bias stay — mlx hits the same kernels.
+**Next prefill diagnostic: the `OPS_PER_COMMAND_BUFFER` cadence probe**
+(`eval.rs:206`) — directly vary the ~14-buffer count; if the gaps aren't at
+commit boundaries, prefill is near its floor and the residual is structural
+(synchronous per-eval + <50% occupancy → needs *concurrency*, not fewer
+dispatches). See `docs/QWEN_PERF.md` (§ "Copy elimination measured — dispatch-
+count hypothesis REFUTED") and `docs/ARCHITECTURE.md` for the backlog.
 
 ### Non-goals
 
@@ -122,16 +131,18 @@ deleted): synchronous prefill **~9.3 ms** (was 10.19), gap vs mlx **~1.19×**
 **Remaining perf work is prefill- and memory-side**, not decode kernels: A2
 (small-N `qmv` for k/v, backlog #4) was measured and **closed as a no-go**
 (+1.07% ceiling, hidden by the decode pipeline — see `docs/QWEN_PERF.md`
-§ "A2 measured — NO-GO"). The **encode/dispatch trace (#2) has now run**
-(PR #38 tooling) and **localized the prefill gap to dispatch-count GPU
-bubbles** (~2.2 ms; cider 680 dispatches vs mlx 507, both ~6.06 ms GPU
-compute). This **reopened the prefill copy lever**: the next prefill work is
-**eliminating the 146 copies** (stride-aware RoPE / cache-write /
-collapse-heads→o_proj) + **folding Q/K/V bias into qmm** to drop ~218
-dispatches below mlx's count (see `docs/QWEN_PERF.md` § "Prefill
-encode/dispatch trace — findings"). Also still open: within-eval reuse for
-RSS and `.metallib` precompile. `docs/ARCHITECTURE.md` holds the forward pass and
-the prioritized backlog.
+§ "A2 measured — NO-GO"). The encode/dispatch trace (#2, PR #38 tooling)
+localized the prefill gap to a ~2.2 ms GPU bubble and the **copy elimination
+then ran** (`perf/prefill-dispatch-reduction`): 120 copies removed via strided
+RoPE + KV-cache write (`gpu.copy` 146 → 26), parity unchanged — **but the
+bubble did not recover** (GPU-wait flat, prefill 9.32 → ~9.18 ms). **The
+dispatch-count → bubble hypothesis is refuted** (copies off the critical path,
+PR #37 redux); the change is kept but the gap is ~unchanged. **Next prefill
+diagnostic: the `OPS_PER_COMMAND_BUFFER` cadence probe** — if the gaps aren't at
+commit boundaries, prefill is near its floor (structural: synchronous per-eval
++ <50% occupancy → needs concurrency). Also open: within-eval reuse for RSS and
+`.metallib` precompile. See `docs/QWEN_PERF.md` § "Copy elimination measured".
+`docs/ARCHITECTURE.md` holds the forward pass and the prioritized backlog.
 
 ---
 

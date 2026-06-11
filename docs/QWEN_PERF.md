@@ -434,6 +434,45 @@ agree), not yet *directly* observed. The confirming check before the engineering
 spend: in cider's `.gputrace` timeline, verify the GPU idle gaps land at the
 command-buffer commit boundaries.
 
+### Copy elimination measured — dispatch-count hypothesis REFUTED (2026-06-11)
+
+Acted on the lever: eliminated 120 of the 146 prefill copies (Sites 1+2 — the
+Q/K/V project-heads + K/V rope→cache materializations) by feeding strided views
+to RoPE and the KV-cache write (`copy_g`), both already strided-capable in
+vendored code. Site 3 (o_proj, 24 copies) and the Q/K/V bias-adds were kept —
+the qmm kernel needs contiguous input and has no bias epilogue, and **mlx faces
+the same kernels**, so eliminating them would mean owning a kernel mlx isn't
+modifying either. End-to-end `qwen2_logits` parity unchanged (bit-exact data
+movers; bf16-ULP RoPE).
+
+The copies vanished as designed — **the bubble did not**:
+
+| | before | after |
+| --- | ---: | ---: |
+| `gpu.copy` dispatches | 146 | **26** |
+| total dispatches | ~680 | ~560 |
+| GPU-wait (the bubble) | ~8.27 ms | **~8.35 ms (flat)** |
+| CPU-encode | ~0.85 ms | ~0.67 ms |
+| prefill (sync) | ~9.32 ms | **~9.18 ms** |
+
+**The dispatch-count → bubble hypothesis is refuted.** Removing 120 dispatches
+left GPU-wait flat; the only wall-clock movement (~0.14 ms) is the smaller CPU
+encode (fewer ops to build). The copies were off the qmm-bound critical path —
+cheap (~3.8 µs each), overlapped, hidden — exactly the PR #37 outcome reproduced
+at 5× the scale. The ~2.2 ms bubble is **not** caused by the copy *count*.
+
+The change is kept regardless: it's correct, parity-clean, removes 120 copies of
+memory traffic, matches mlx's lazy-view design, and rules out a hypothesis. But
+the prefill gap to mlx (~1.28× → ~1.26×) is essentially unchanged.
+
+**Open, re-prioritized:** the real bubble is still unlocalized and is *not*
+dispatch count. Next diagnostic — the **`OPS_PER_COMMAND_BUFFER` cadence probe**
+(`eval.rs:206`): directly vary the ~14-command-buffer count. If the gaps are at
+commit boundaries (as the trace suggested), the cadence moves the bubble; if not,
+prefill is near its floor and the residual is structural — the synchronous
+per-eval model and the <50%-occupancy under-utilization seen in the trace, which
+needs *concurrency* (overlapping independent dispatches), not fewer dispatches.
+
 ## Async decode pipelining (detach-on-eval)
 
 Decode was synchronous: one `commit_and_wait` per token, and the next
