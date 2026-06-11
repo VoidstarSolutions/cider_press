@@ -189,11 +189,7 @@ impl Device {
     /// Capture one GPU frame produced by `f` to a `.gputrace` at `path`.
     /// Delegates to [`kernels::Device::capture_gpu_trace`]; requires
     /// `MTL_CAPTURE_ENABLED=1`. See that method for the contract.
-    pub fn capture_gpu_trace<T>(
-        &self,
-        path: &std::path::Path,
-        f: impl FnOnce() -> T,
-    ) -> Result<T> {
+    pub fn capture_gpu_trace<T>(&self, path: &std::path::Path, f: impl FnOnce() -> T) -> Result<T> {
         Ok(self.kernels().capture_gpu_trace(path, f)?)
     }
 
