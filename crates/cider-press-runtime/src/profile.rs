@@ -158,4 +158,160 @@ mod imp {
     }
 }
 
+/// `os_signpost` interval markers for Instruments (Points of Interest /
+/// Metal System Trace). No-op unless the `profiling` feature is on.
+pub mod signpost {
+    /// The eval phase a marker brackets; selects the interval name only.
+    #[cfg_attr(not(feature = "profiling"), allow(dead_code))]
+    #[derive(Clone, Copy)]
+    pub enum Region {
+        Encode,
+        Wait,
+    }
+
+    /// RAII guard returned by [`interval_begin`]; its drop emits the matching
+    /// `END` marker, so a `?`/panic unwind still closes the interval balanced.
+    /// Drop it explicitly at a phase boundary to end the interval early.
+    ///
+    /// Carries a freshly-generated `os_signpost_id_t` (not the region
+    /// discriminant): Apple requires the id be unique among intervals that can
+    /// be simultaneously in-flight under the same (log, name), so a per-begin
+    /// id keeps Instruments from mis-pairing begin/end even if eval intervals
+    /// ever overlap.
+    #[must_use]
+    pub struct Marker {
+        #[cfg_attr(not(feature = "profiling"), allow(dead_code))]
+        region: Region,
+        #[cfg_attr(not(feature = "profiling"), allow(dead_code))]
+        spid: u64,
+    }
+
+    impl Drop for Marker {
+        fn drop(&mut self) {
+            #[cfg(feature = "profiling")]
+            {
+                const INTERVAL_END: u8 = 2;
+                ffi::emit(INTERVAL_END, self.spid, name_of(self.region).as_ptr());
+            }
+        }
+    }
+
+    #[cfg(feature = "profiling")]
+    mod ffi {
+        use std::ffi::c_char;
+        use std::os::raw::c_void;
+        use std::sync::OnceLock;
+
+        #[repr(transparent)]
+        struct OsLog(*mut c_void);
+        // SAFETY: os_log_t is an immutable, thread-safe handle.
+        unsafe impl Send for OsLog {}
+        unsafe impl Sync for OsLog {}
+
+        // `os_signpost_interval_begin/end` are header-only macros; the real C
+        // entry point they expand to is `_os_signpost_emit_with_name_impl`
+        // (asm symbol `__os_signpost_emit_with_name_impl`, in libsystem_trace
+        // via the dyld shared cache). `_os_signpost_emit_with_type` named in
+        // the task spec is itself a macro, not a linkable symbol — it resolves
+        // neither statically (no SDK .tbd export) nor at runtime (dlsym NULL).
+        // The impl requires a non-null `dso` (image handle, for Instruments to
+        // resolve the binary) and a non-null format buffer — passing NULL for
+        // either traps (SIGTRAP). We pass `&__dso_handle` and a zeroed buffer.
+        unsafe extern "C" {
+            fn os_log_create(subsystem: *const c_char, category: *const c_char) -> *mut c_void;
+            fn _os_signpost_emit_with_name_impl(
+                dso: *mut c_void,
+                log: *mut c_void,
+                typ: u8,
+                spid: u64,
+                name: *const c_char,
+                format: *const c_char,
+                buf: *mut u8,
+                size: u32,
+            );
+            #[link_name = "__dso_handle"]
+            static DSO_HANDLE: c_void;
+        }
+
+        fn log() -> *mut c_void {
+            static LOG: OnceLock<OsLog> = OnceLock::new();
+            LOG.get_or_init(|| {
+                let subsystem = c"com.cider-press.prefill";
+                let category = c"PointsOfInterest";
+                // SAFETY: both pointers are valid nul-terminated statics.
+                OsLog(unsafe { os_log_create(subsystem.as_ptr(), category.as_ptr()) })
+            })
+            .0
+        }
+
+        /// Emit one signpost interval marker (begin or end). `typ` is the
+        /// `os_signpost_type_t` (begin = 1, end = 2).
+        pub(super) fn emit(typ: u8, spid: u64, name: *const c_char) {
+            const BUF_LEN: u32 = 16;
+            let mut buf = [0u8; BUF_LEN as usize];
+            // SAFETY: `log()` returns a valid os_log_t; `name`/format are
+            // valid nul-terminated statics; `DSO_HANDLE` is this image's
+            // header; `buf` is a valid writable region matching `size`.
+            unsafe {
+                _os_signpost_emit_with_name_impl(
+                    std::ptr::addr_of!(DSO_HANDLE).cast_mut(),
+                    log(),
+                    typ,
+                    spid,
+                    name,
+                    c"".as_ptr(),
+                    buf.as_mut_ptr(),
+                    BUF_LEN,
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "profiling")]
+    fn name_of(r: Region) -> &'static std::ffi::CStr {
+        match r {
+            Region::Encode => c"eval.encode",
+            Region::Wait => c"eval.wait",
+        }
+    }
+
+    /// A fresh `os_signpost_id_t`, unique per call. Starts at 1 (0 is the
+    /// reserved NULL id) via a monotonic counter — uniqueness among in-flight
+    /// intervals is all Apple requires; the value is otherwise opaque.
+    #[cfg(feature = "profiling")]
+    fn next_spid() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    }
+
+    #[cfg(not(feature = "profiling"))]
+    fn next_spid() -> u64 {
+        0
+    }
+
+    /// Open an interval for `region`, returning an RAII [`Marker`] whose drop
+    /// emits the matching end. Drop it at the phase boundary to end early.
+    pub fn interval_begin(region: Region) -> Marker {
+        let spid = next_spid();
+        #[cfg(feature = "profiling")]
+        {
+            const INTERVAL_BEGIN: u8 = 1;
+            ffi::emit(INTERVAL_BEGIN, spid, name_of(region).as_ptr());
+        }
+        Marker { region, spid }
+    }
+}
+
 pub use imp::{Span, drain, drain_gpu, is_enabled, record_gpu, reset, span};
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn signpost_emit_does_not_panic() {
+        // No-op when profiling is off; FFI emit (begin + drop-end) when on.
+        // Either way: no panic.
+        let s = super::signpost::interval_begin(super::signpost::Region::Encode);
+        drop(s);
+    }
+}

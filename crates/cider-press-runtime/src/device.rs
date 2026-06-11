@@ -186,6 +186,13 @@ impl Device {
         &self.inner.kernels
     }
 
+    /// Capture one GPU frame produced by `f` to a `.gputrace` at `path`.
+    /// Delegates to [`kernels::Device::capture_gpu_trace`]; requires
+    /// `MTL_CAPTURE_ENABLED=1`. See that method for the contract.
+    pub fn capture_gpu_trace<T>(&self, path: &std::path::Path, f: impl FnOnce() -> T) -> Result<T> {
+        Ok(self.kernels().capture_gpu_trace(path, f)?)
+    }
+
     /// Allocate a scratch buffer of `bytes`, drawing from the recycling
     /// pool when a freed buffer of the same requested size is available
     /// and falling back to a fresh Metal allocation otherwise.

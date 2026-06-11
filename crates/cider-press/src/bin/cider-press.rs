@@ -117,6 +117,11 @@ struct BenchArgs {
     /// forward + eval-wait, warm). Mean is reported as "prefill (sync)".
     #[arg(long, default_value_t = 5)]
     prefill_iters: usize,
+    /// Capture ONE warm synchronous prefill eval to a .gputrace document at
+    /// this path (for Xcode / Instruments), then exit — skips the normal
+    /// bench flow. Requires `MTL_CAPTURE_ENABLED=1` in the environment.
+    #[arg(long, value_name = "PATH")]
+    gpu_capture: Option<PathBuf>,
 }
 
 /// Shared load result for both subcommands.
@@ -193,8 +198,38 @@ fn run_chat(args: &ChatArgs) -> Result<(), BoxError> {
     Ok(())
 }
 
+/// One-shot: load, warm the prefill path twice (settle Metal JIT), then
+/// capture exactly one synchronous prefill eval to `path` as a .gputrace.
+/// Exits without the normal bench reporting. Requires `MTL_CAPTURE_ENABLED=1`.
+fn run_gpu_capture(args: &BenchArgs, path: &Path) -> Result<(), BoxError> {
+    let device = Device::shared()?;
+    let loaded = load(&args.checkpoint, &device)?;
+    let prompt = build_prompt(
+        &loaded.chat_template,
+        &args.prompt,
+        args.system.as_deref(),
+        args.no_chat_template,
+    )?;
+    let ids = loaded.tokenizer.encode(&prompt)?;
+
+    let mut generator = Generator::new(loaded.model, args.context_window, loaded.eos_ids)?;
+    // Warm: JIT-compile the Metal libraries off the captured frame.
+    generator.prefill_sync(&ids)?;
+    generator.prefill_sync(&ids)?;
+
+    device.capture_gpu_trace(path, || generator.prefill_sync(&ids))??;
+
+    println!("wrote prefill .gputrace to {}", path.display());
+    println!("open in Xcode/Instruments (MTL_CAPTURE_ENABLED=1 was required to record)");
+    Ok(())
+}
+
 #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
+    if let Some(path) = args.gpu_capture.as_deref() {
+        return run_gpu_capture(args, path);
+    }
+
     let device = Device::shared()?;
 
     let rss_pre_load = cider_press::sys::resident_bytes();
@@ -274,17 +309,22 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
     // the same shape synchronously for an apples-to-apples wall-clock. It
     // resets the caches, so it runs after the decode profile above.
     let prefill_iters = args.prefill_iters.max(1);
-    let prefill_sync_dur = {
+    let (prefill_sync_dur, prefill_spans) = {
         // Settle Metal JIT on the synchronous eval() path before timing
         // (the caches are already warm from generate()).
         for _ in 0..2 {
             generator.prefill_sync(&ids)?;
         }
+        // Discard the settle-iter wall spans; keep the GPU store intact (the
+        // decode GPU breakdown is drained later). drain() touches only the
+        // wall-clock store, reset() would wipe both.
+        let _ = profile::drain();
         let t = Instant::now();
         for _ in 0..prefill_iters {
             generator.prefill_sync(&ids)?;
         }
-        t.elapsed()
+        let dur = t.elapsed();
+        (dur, profile::drain())
     };
 
     let rss_post_decode = cider_press::sys::resident_bytes();
@@ -325,6 +365,7 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
         prefill_sync_per * 1e3,
         prefill_iters,
     );
+    print_prefill_eval_split(&prefill_spans, prefill_iters);
     println!(
         "  decode         {:>8.3} ms   {decode_tok_s:>8.1} tok/s ({timed} tokens)",
         decode_dur.as_secs_f64() * 1e3,
@@ -415,6 +456,40 @@ fn print_span_breakdown(spans: &[(&'static str, std::time::Duration, u64)]) {
     }
 }
 
+/// Per-iter CPU-encode and GPU-wait microseconds from drained prefill
+/// spans. `tensor.eval.encode` / `tensor.eval.wait` accumulate across all
+/// `iters` synchronous prefill evals; divide the totals by `iters`. Missing
+/// spans or `iters == 0` yield 0.0 (profiling off ⇒ empty drain).
+#[allow(clippy::cast_precision_loss)]
+fn eval_split_us(spans: &[(&'static str, std::time::Duration, u64)], iters: usize) -> (f64, f64) {
+    if iters == 0 {
+        return (0.0, 0.0);
+    }
+    let total_us = |name: &str| -> f64 {
+        spans
+            .iter()
+            .find(|(n, _, _)| *n == name)
+            .map_or(0.0, |(_, d, _)| d.as_secs_f64() * 1e6)
+    };
+    let n = iters as f64;
+    (
+        total_us("tensor.eval.encode") / n,
+        total_us("tensor.eval.wait") / n,
+    )
+}
+
+/// Print the prefill CPU-encode vs GPU-wait split (per-iter). The GPU-wait
+/// figure is the apples-to-apples comparison point against mlx's synchronous
+/// prefill; a wait near mlx with a larger total ⇒ the gap is CPU-encode.
+#[allow(clippy::cast_precision_loss)]
+fn print_prefill_eval_split(spans: &[(&'static str, std::time::Duration, u64)], iters: usize) {
+    if !profile::is_enabled() {
+        return;
+    }
+    let (encode_us, wait_us) = eval_split_us(spans, iters);
+    println!("  prefill eval   encode (CPU) {encode_us:>7.1} us   wait (GPU) {wait_us:>7.1} us");
+}
+
 /// Print the per-OpKind GPU-time breakdown from `profiled_eval`. No-op when
 /// the slice is empty (no `--gpu-profile`, or feature off).
 #[allow(clippy::cast_precision_loss)]
@@ -491,5 +566,35 @@ fn main() -> ExitCode {
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn eval_split_us_averages_over_iters() {
+        let spans = vec![
+            ("tensor.eval.encode", Duration::from_micros(1200), 4),
+            ("tensor.eval.wait", Duration::from_micros(31_280), 4),
+            ("tensor.eval", Duration::from_micros(32_480), 4),
+        ];
+        let (encode_us, wait_us) = eval_split_us(&spans, 4);
+        assert!((encode_us - 300.0).abs() < 1e-6, "encode {encode_us}");
+        assert!((wait_us - 7820.0).abs() < 1e-6, "wait {wait_us}");
+    }
+
+    #[test]
+    fn eval_split_us_missing_spans_are_zero() {
+        let (e, w) = eval_split_us(&[], 5);
+        assert_eq!((e, w), (0.0, 0.0));
+    }
+
+    #[test]
+    fn eval_split_us_zero_iters_is_zero() {
+        let spans = vec![("tensor.eval.encode", Duration::from_millis(1), 1)];
+        assert_eq!(eval_split_us(&spans, 0), (0.0, 0.0));
     }
 }

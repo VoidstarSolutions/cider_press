@@ -337,6 +337,103 @@ vs mlx 7.82 ms, ~1.21×) is **not in copies** — it is qmm (at parity) plus
 the **encode/dispatch residual (#2)**. The next prefill lever is the Metal
 System Trace of that residual, not more strided-copy work.
 
+### How to capture a prefill trace (lever #2 tooling, 2026-06-11)
+
+Three instruments, cheapest first:
+
+1. **CPU-encode vs GPU-wait split (no trace).**
+   `cargo run --release --features profiling -p cider-press -- bench \
+      --checkpoint <ckpt> --max-tokens 16`
+   Reports `prefill eval   encode (CPU) … us   wait (GPU) … us`. Compare the
+   GPU-wait figure to mlx's synchronous prefill (~7.82 ms): wait ≈ mlx ⇒ the
+   gap is CPU-encode; wait ≫ mlx ⇒ GPU bubbles.
+
+2. **GPU frame capture (.gputrace).**
+   `MTL_CAPTURE_ENABLED=1 cargo run --release --features profiling -p cider-press \
+      -- bench --checkpoint <ckpt> --gpu-capture /tmp/cider-prefill.gputrace`
+   Warms the prefill path twice (settles the Metal JIT), then records exactly
+   one synchronous prefill eval. Open in Xcode/Instruments. `--features
+   profiling` is required for the eval encode/wait phases to be labeled via
+   os_signpost (Points of Interest); without it the capture still records but
+   the phase markers are absent.
+
+3. **mlx comparison trace.** `scripts/profile_mlx_prefill.py` records mlx's
+   prefill via `mx.metal.start_capture` (also needs `MTL_CAPTURE_ENABLED=1`).
+
+Findings: see "Prefill encode/dispatch trace — findings" below.
+
+### Prefill encode/dispatch trace — findings (lever #2, 2026-06-11)
+
+Ran all three instruments on Qwen2.5-0.5B-Instruct-4bit (39-token prompt, M4
+Max). **The prefill gap is dispatch-count-induced GPU bubbles, not compute.**
+
+**Clean wall-clock (no capture), fresh on this machine:**
+
+| | prefill | note |
+| --- | ---: | --- |
+| cider (sync) | ~9.32 ms | step-1 mean |
+| mlx | ~7.27 ms | `profile_mlx_prefill.py`, no capture |
+| gap | ~2.05 ms (~1.28×) | cider slower |
+
+(The mlx ~7.27 confirms the historical ~7.82 figure. A *captured* mlx run reads
+~10.1 ms — capture perturbs timing ~30%, so `.gputrace` is for **structure**,
+never absolute time.)
+
+**Step 1 — encode/wait split (cider):** encode (CPU) ~0.85 ms · wait (GPU)
+~8.27 ms. cider's GPU-wait *alone* exceeds mlx's entire clean prefill (7.27 ms),
+so CPU-encode is **not** the dominant gap — it is GPU-side.
+
+**Step 2/3 — `.gputrace` (Xcode, Group by Pipeline State):**
+- **Dispatch count: cider 680 vs mlx 507 (+173).** Distinct kernels: 14 vs 10.
+- **Both replay to ~6.06 ms of GPU compute** — compute is at parity (qmm is
+  cider's 79.6% in one kernel; mlx's 51.8% + 28.4% across two qmm variants is the
+  same work, differently packaged).
+- So cider's real GPU-wait (8.27 ms) − actual compute (~6.06 ms) ≈ **~2.2 ms of
+  GPU bubbles** — the GPU idling at command-buffer commit boundaries (cider
+  splits prefill into ~14 command buffers at ~50 ops each vs mlx's ~10). That
+  ~2.2 ms is essentially the whole wall-clock gap.
+
+**Where the +173 dispatches live** (cider per-OpKind, `--gpu-profile-prefill`;
+counts exact, the perturbed-regime times are not):
+
+| OpKind | dispatches | % GPU compute |
+| --- | ---: | ---: |
+| quantized_matmul | 169 | 83% |
+| **binary** (add/mul) | **168** | 5% |
+| **copy** | **146** | 5% |
+| rms_norm | 49 | 1.5% |
+| rope | 48 | 1.6% |
+| slice_update (KV write) | 48 | 1.0% |
+| sdpa | 24 | 2.0% |
+| unary (sigmoid) | 24 | 0.7% |
+| gather / dequantize | 3 / 1 | ~0% |
+
+copy (146) + binary (168) = **46% of all dispatches but ~10% of GPU compute** —
+the bubble engine. The surplus vs mlx decomposes as: **copy 146** (mlx feeds
+lazy strided/permuted views into its kernels and materializes ~none) + **~72 of
+the binaries** (the Q/K/V bias-adds mlx folds into the matmul).
+
+**This reopens the copy lever that the "Strided prefill cache-read" section
+closed.** That close was correct *on compute share* (copies are <5% of prefill
+GPU, qmm-hidden) — which is exactly why eliminating one copy was a timing no-op.
+The trace shows the copies' real cost is **dispatch count → command-buffer count
+→ commit bubbles**, a different cost model the compute-share analysis could not
+see.
+
+**Recommended lever (follow-up branch), ranked:**
+1. **Eliminate the 146 prefill copies** — make RoPE, KV-cache-write, and
+   collapse-heads→o_proj operate on strided views (mirror mlx). The fused steel
+   attention already accepts strided K/V, so the machinery exists.
+2. **Fold Q/K/V bias into the qmm dispatch** (~72 fewer binaries; the qmm ABI
+   carries bias). 146 + 72 ≈ 218 removable → ~460 dispatches, below mlx's 507,
+   collapsing the command-buffer count and the bubble.
+
+**Caveat (honest):** the ~2.2 ms → bubbles attribution is strongly *inferred*
+(dispatch-count surplus + compute parity at 6.06 ms + the wait residual all
+agree), not yet *directly* observed. The confirming check before the engineering
+spend: in cider's `.gputrace` timeline, verify the GPU idle gaps land at the
+command-buffer commit boundaries.
+
 ## Async decode pipelining (detach-on-eval)
 
 Decode was synchronous: one `commit_and_wait` per token, and the next

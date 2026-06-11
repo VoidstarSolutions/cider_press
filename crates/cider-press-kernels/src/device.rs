@@ -13,10 +13,12 @@ use std::ptr::NonNull;
 use std::sync::Mutex;
 
 use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
+use objc2::runtime::{AnyObject, ProtocolObject};
+use objc2_foundation::{NSString, NSURL};
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandQueue, MTLCounterSamplingPoint,
-    MTLCreateSystemDefaultDevice, MTLDevice, MTLFence, MTLResourceOptions, MTLTimestamp,
+    MTLBuffer, MTLCaptureDescriptor, MTLCaptureDestination, MTLCaptureManager, MTLCommandBuffer,
+    MTLCommandQueue, MTLCounterSamplingPoint, MTLCreateSystemDefaultDevice, MTLDevice, MTLFence,
+    MTLResourceOptions, MTLTimestamp,
 };
 
 use crate::buffer::Buffer;
@@ -177,6 +179,63 @@ impl Device {
         &self.queue
     }
 
+    /// Record one GPU frame produced by `f` to a `.gputrace` document at
+    /// `path`, for inspection in Xcode / Instruments. The capture targets
+    /// this device's command queue.
+    ///
+    /// Requires `MTL_CAPTURE_ENABLED=1` in the environment — Apple gates
+    /// programmatic capture behind it; without it
+    /// [`MTLCaptureManager::supportsDestination`] returns `false` and this
+    /// returns an error naming the missing variable. `f`'s return value is
+    /// passed back unchanged on success, so a fallible `f` rides through as
+    /// `Ok(Result<…>)` (callers `??`). `stopCapture` runs even if `f` panics
+    /// (an RAII guard), so a panicking closure cannot leave Metal capture
+    /// enabled for the rest of the process.
+    pub fn capture_gpu_trace<T>(&self, path: &std::path::Path, f: impl FnOnce() -> T) -> Result<T> {
+        // RAII so `stopCapture` runs on unwind too — a panicking `f` must not
+        // leave capture armed for the rest of the process.
+        struct StopGuard<'a>(&'a MTLCaptureManager);
+        impl Drop for StopGuard<'_> {
+            fn drop(&mut self) {
+                self.0.stopCapture();
+            }
+        }
+        // SAFETY: sharedCaptureManager has no preconditions; the returned
+        // singleton lives for the process.
+        let manager = unsafe { MTLCaptureManager::sharedCaptureManager() };
+        if !manager.supportsDestination(MTLCaptureDestination::GPUTraceDocument) {
+            // `supportsDestination` is false both when MTL_CAPTURE_ENABLED is
+            // unset (the common, fixable case) and when the OS/hardware policy
+            // forbids capture (unfixable). Only tell the user to set the env
+            // var when it actually is unset, so we don't send them in circles.
+            let msg = if std::env::var_os("MTL_CAPTURE_ENABLED").is_none() {
+                "capture_gpu_trace: GPUTraceDocument capture unavailable — set \
+                 MTL_CAPTURE_ENABLED=1 in the environment before running"
+            } else {
+                "capture_gpu_trace: GPUTraceDocument capture unsupported despite \
+                 MTL_CAPTURE_ENABLED being set (OS/hardware capture policy)"
+            };
+            return Err(Error::InvalidArgument(msg.into()));
+        }
+        let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+        let desc = MTLCaptureDescriptor::new();
+        // SAFETY: the command queue outlives the descriptor (owned by `self`).
+        unsafe {
+            let obj: &AnyObject = self.queue.as_ref();
+            desc.setCaptureObject(Some(obj));
+        }
+        desc.setDestination(MTLCaptureDestination::GPUTraceDocument);
+        desc.setOutputURL(Some(&url));
+
+        manager
+            .startCaptureWithDescriptor_error(&desc)
+            .map_err(|e| {
+                Error::InvalidArgument(format!("capture_gpu_trace: startCapture failed: {e:?}"))
+            })?;
+        let _stop = StopGuard(&manager);
+        Ok(f())
+    }
+
     /// Whether this device can sample GPU counters at compute
     /// stage (encoder) boundaries. Apple Silicon supports this and only
     /// this — never `atDispatchBoundary` (TBDR architecture). The
@@ -231,5 +290,39 @@ impl Device {
             return 1.0;
         }
         cpu_delta / gpu_ticks
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_gpu_trace_writes_bundle() {
+        // Programmatic capture only works with MTL_CAPTURE_ENABLED=1 in the
+        // env (Apple gates it). Skip cleanly otherwise — same posture as the
+        // counter-sampling skips.
+        if std::env::var_os("MTL_CAPTURE_ENABLED").is_none() {
+            eprintln!("skipping: MTL_CAPTURE_ENABLED not set");
+            return;
+        }
+        let device = Device::system_default().expect("device");
+        // Unique per (pid, atomic seq) so parallel test threads don't race on
+        // the directory — see cider_press_test_utils::tempdir.
+        let dir = cider_press_test_utils::tempdir("capture-smoke");
+        let path = dir.join("prefill.gputrace");
+
+        let ran = device
+            .capture_gpu_trace(&path, || {
+                let buf = device.upload(&[1.0f32, 2.0, 3.0]).expect("upload");
+                let commands = device.commands().expect("commands");
+                commands.commit_and_wait().expect("commit");
+                drop(buf);
+                42u32
+            })
+            .expect("capture_gpu_trace");
+
+        assert_eq!(ran, 42);
+        assert!(path.exists(), "gputrace bundle not written: {path:?}");
     }
 }
