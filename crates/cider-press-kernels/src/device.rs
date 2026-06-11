@@ -13,10 +13,12 @@ use std::ptr::NonNull;
 use std::sync::Mutex;
 
 use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
+use objc2::runtime::{AnyObject, ProtocolObject};
+use objc2_foundation::{NSString, NSURL};
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandQueue, MTLCounterSamplingPoint,
-    MTLCreateSystemDefaultDevice, MTLDevice, MTLFence, MTLResourceOptions, MTLTimestamp,
+    MTLBuffer, MTLCaptureDescriptor, MTLCaptureDestination, MTLCaptureManager, MTLCommandBuffer,
+    MTLCommandQueue, MTLCounterSamplingPoint, MTLCreateSystemDefaultDevice, MTLDevice, MTLFence,
+    MTLResourceOptions, MTLTimestamp,
 };
 
 use crate::buffer::Buffer;
@@ -177,6 +179,48 @@ impl Device {
         &self.queue
     }
 
+    /// Record one GPU frame produced by `f` to a `.gputrace` document at
+    /// `path`, for inspection in Xcode / Instruments. The capture targets
+    /// this device's command queue.
+    ///
+    /// Requires `MTL_CAPTURE_ENABLED=1` in the environment — Apple gates
+    /// programmatic capture behind it; without it
+    /// [`MTLCaptureManager::supportsDestination`] returns `false` and this
+    /// returns an error naming the missing variable. `f`'s return value is
+    /// passed back unchanged on success, so a fallible `f` rides through as
+    /// `Ok(Result<…>)` (callers `??`). `f` must not panic mid-capture
+    /// (`stopCapture` would not run).
+    pub fn capture_gpu_trace<T>(&self, path: &std::path::Path, f: impl FnOnce() -> T) -> Result<T> {
+        // SAFETY: sharedCaptureManager has no preconditions; the returned
+        // singleton lives for the process.
+        let manager = unsafe { MTLCaptureManager::sharedCaptureManager() };
+        if !manager.supportsDestination(MTLCaptureDestination::GPUTraceDocument) {
+            return Err(Error::InvalidArgument(
+                "capture_gpu_trace: GPUTraceDocument capture unsupported — set \
+                 MTL_CAPTURE_ENABLED=1 in the environment before running"
+                    .into(),
+            ));
+        }
+        let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+        let desc = MTLCaptureDescriptor::new();
+        // SAFETY: the command queue outlives the descriptor (owned by `self`).
+        unsafe {
+            let obj: &AnyObject = self.queue.as_ref();
+            desc.setCaptureObject(Some(obj));
+        }
+        desc.setDestination(MTLCaptureDestination::GPUTraceDocument);
+        desc.setOutputURL(Some(&url));
+
+        manager
+            .startCaptureWithDescriptor_error(&desc)
+            .map_err(|e| {
+                Error::InvalidArgument(format!("capture_gpu_trace: startCapture failed: {e:?}"))
+            })?;
+        let out = f();
+        manager.stopCapture();
+        Ok(out)
+    }
+
     /// Whether this device can sample GPU counters at compute
     /// stage (encoder) boundaries. Apple Silicon supports this and only
     /// this — never `atDispatchBoundary` (TBDR architecture). The
@@ -231,5 +275,40 @@ impl Device {
             return 1.0;
         }
         cpu_delta / gpu_ticks
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_gpu_trace_writes_bundle() {
+        // Programmatic capture only works with MTL_CAPTURE_ENABLED=1 in the
+        // env (Apple gates it). Skip cleanly otherwise — same posture as the
+        // counter-sampling skips.
+        if std::env::var_os("MTL_CAPTURE_ENABLED").is_none() {
+            eprintln!("skipping: MTL_CAPTURE_ENABLED not set");
+            return;
+        }
+        let device = Device::system_default().expect("device");
+        let dir = std::env::temp_dir().join("cider-capture-smoke");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("prefill.gputrace");
+
+        let ran = device
+            .capture_gpu_trace(&path, || {
+                let buf = device.upload(&[1.0f32, 2.0, 3.0]).expect("upload");
+                let commands = device.commands().expect("commands");
+                commands.commit_and_wait().expect("commit");
+                drop(buf);
+                42u32
+            })
+            .expect("capture_gpu_trace");
+
+        assert_eq!(ran, 42);
+        assert!(path.exists(), "gputrace bundle not written: {path:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
