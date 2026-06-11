@@ -1814,6 +1814,16 @@ fn dispatch_rope(
     let head_dim = dims[3] as i32;
     let mat = i64::from(seq_len) * i64::from(head_dim);
 
+    // The input may be a strided (head/seq-permuted) view; read its real
+    // head/seq element strides for the kernel. The feature axis is
+    // unit-stride (enforced at construction). The output is allocated dense,
+    // so `out_strides` stays row-contiguous.
+    let in_strides = layout_strides(input)?; // &[isize], len 4 = [B, H, T, D]
+    let s_head = i64::try_from(in_strides[1])
+        .map_err(|_| Error::InvalidArgument("rope: head stride does not fit in i64".into()))?;
+    let s_seq = i64::try_from(in_strides[2])
+        .map_err(|_| Error::InvalidArgument("rope: seq stride does not fit in i64".into()))?;
+
     let args = cider_press_kernels::kernels::rope::RopeArgs {
         batch,
         n_head,
@@ -1822,10 +1832,9 @@ fn dispatch_rope(
         rotary_dims: rotary_dims as i32,
         scale,
         base_log2,
-        // Element strides for row-contiguous [B, H, T, D] over the
-        // (head, sequence, feature) axes; offset_stride=0 because we
-        // only accept a 1-element scalar offset today.
-        strides: [mat, i64::from(head_dim), 1],
+        // Real (head, sequence, feature) element strides of the input view;
+        // offset_stride=0 because we only accept a 1-element scalar offset.
+        strides: [s_head, s_seq, 1],
         out_strides: [mat, i64::from(head_dim), 1],
         offset_stride: 0,
     };

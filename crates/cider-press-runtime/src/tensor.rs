@@ -1442,24 +1442,13 @@ impl Tensor {
                 "rope: input and offset are on different devices".into(),
             ));
         }
-        // A contiguous view (canonical strides, e.g. a copy()-elided
-        // degenerate permute) is byte-equivalent to a dense leaf, so the
-        // eval-side resolver can read it from offset 0. A strided view
-        // (genuine reorder) is not — its kernel strides aren't wired yet
-        // (deferred to the prefill stage), so reject it.
+        // A strided view (head/seq-permuted, e.g. project_heads' [1,H,T,D])
+        // is accepted: the rope kernel binds the head/seq element strides via
+        // RopeArgs, and the eval-side resolver reads view inputs from byte
+        // offset 0. Only the byte-offset==0 requirement (matching copy()'s
+        // elision constraint) is enforced here; the feature-axis unit-stride
+        // requirement is checked below against the resolved layout strides.
         if self.inner.view.is_some() {
-            if !self.layout().is_dense_contiguous(self.shape()) {
-                return Err(Error::InvalidArgument(
-                    "rope: strided view inputs are not supported; copy() first to \
-                     materialise a dense version (the rope dispatch reads inputs as \
-                     contiguous bytes and does not yet pass view strides)"
-                        .into(),
-                ));
-            }
-            // The eval-side resolver reads view inputs from byte offset 0
-            // only (matching copy()'s elision constraint), so a contiguous
-            // view starting mid-buffer must be rejected here rather than
-            // failing later inside eval.
             let (_, byte_offset) = self.flatten_view();
             if byte_offset != 0 {
                 return Err(Error::InvalidArgument(format!(
@@ -1505,11 +1494,9 @@ impl Tensor {
                 ));
             }
         };
-        if !strides.is_contiguous(self.shape()) {
+        if *strides.as_slice().last().expect("rope input rank checked below") != 1 {
             return Err(Error::InvalidArgument(format!(
-                "rope: input must be contiguous (got shape {:?} strides {:?}); \
-                 copy() first to materialise a dense version",
-                self.shape().dims(),
+                "rope: feature (last) axis must be unit-stride (got strides {:?}); copy() first",
                 strides.as_slice(),
             )));
         }
@@ -4638,18 +4625,34 @@ mod tests {
     }
 
     #[test]
-    fn rope_still_rejects_strided_view() {
-        // A genuine transpose (both axes > 1) is NOT contiguous-mod-unit; rope
-        // must still reject it until S2 wires actual strides into the kernel.
+    fn rope_accepts_head_seq_permuted_view() {
+        // A head/seq transpose keeps the feature (last) axis unit-stride; rope
+        // now accepts it and threads the real head/seq strides into the kernel.
         let device = Device::shared().expect("system default device");
         let data: Vec<half::bf16> = (0..24_u8)
             .map(|i| half::bf16::from_f32(f32::from(i)))
             .collect();
-        // [1,2,3,4] -> permute([0,2,1,3]) -> [1,3,2,4] genuine reorder view.
+        // [1,2,3,4] -> permute([0,2,1,3]) -> [1,3,2,4] strided, feature unit.
         let base = Tensor::from_slice(&device, &data, [1usize, 2, 3, 4]).expect("from_slice");
         let view = base.permute(&[0, 2, 1, 3]).expect("permute");
         let offset = Tensor::from_slice(&device, &[0i32], [1usize]).expect("offset");
+        view.rope(&offset, 10000.0, 1.0, 4)
+            .expect("rope accepts a head/seq-permuted view");
+    }
+
+    #[test]
+    fn rope_rejects_non_unit_feature_stride() {
+        // A view whose last (feature) axis is non-unit-stride cannot be read
+        // by the kernel's unit-stride feature walk; rope must reject it.
+        let device = Device::shared().expect("system default device");
+        let data: Vec<half::bf16> = (0..24_u8)
+            .map(|i| half::bf16::from_f32(f32::from(i)))
+            .collect();
+        // [1,1,4,6] -> permute([0,1,3,2]) -> [1,1,6,4] with feature stride 6.
+        let base = Tensor::from_slice(&device, &data, [1usize, 1, 4, 6]).expect("from_slice");
+        let view = base.permute(&[0, 1, 3, 2]).expect("permute");
+        let offset = Tensor::from_slice(&device, &[0i32], [1usize]).expect("offset");
         let err = view.rope(&offset, 10000.0, 1.0, 4).unwrap_err();
-        assert!(format!("{err}").contains("view"));
+        assert!(format!("{err}").contains("unit-stride"));
     }
 }
