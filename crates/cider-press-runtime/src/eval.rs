@@ -796,36 +796,39 @@ fn dispatch_slice_update(
         Error::InvalidArgument("SliceUpdate: missing src input (inputs[1])".into())
     })?;
     let src_dims = src.shape().dims();
-    let row_elems = src_dims[1] * src_dims[2];
+    // `src` carries the logical `[T, H, D]` rows in its leading three dims;
+    // it may be a strided permuted view that retains a trailing size-1 axis.
+    let core_dims = &src_dims[..3];
+    let row_elems = core_dims[1] * core_dims[2];
     let dst_byte_offset = offset_rows * row_elems * DType::BF16.size_bytes();
 
-    // `src` is typically a contiguous reshape *view* of a copy op (the
-    // `k_upd`/`v_upd` produced by attention), so resolve through the view
-    // chain like the matmul path does — `dense_input_buffer` only handles
-    // direct op outputs / cached leaves and would reject a view. The
-    // contiguous-offset-0 assertion in `matmul_input_bytes` holds because
-    // the reshape just reinterprets a dense buffer's shape.
-    let src_bytes = matmul_input_bytes("slice_update", src, outputs, index_of)?;
+    // `src` may be a contiguous reshape *view* of a copy op or a strided
+    // permuted view (the no-copy attention K/V layout). Resolve through the
+    // view chain to the storage owner + byte offset, then feed the real
+    // source element strides into the strided-capable copy_g.
+    let (src_bytes, src_off) = resolve_view_storage(src, outputs, index_of)?;
     // SAFETY: the dtype guard above pinned this op to BF16; the buffers
     // were sized as `elem_count * size_bytes`, so the byte length divides
     // evenly into the bf16 element count. dst is the slab buffer; the
-    // copy writes only src.elem_count() elements starting at the offset.
+    // copy writes only the leading-3-dim element count starting at the offset.
     let src_typed = unsafe { src_bytes.reinterpret_as::<half::bf16>() };
     let mut dst_typed = unsafe { dst.reinterpret_as::<half::bf16>() };
 
-    let shape_i32 = shape_to_i32(src_dims)?;
-    let strides = contiguous_strides_i64(&shape_i32);
+    let shape_i32 = shape_to_i32(core_dims)?;
+    let src_el = layout_strides(src)?; // &[isize], len 3 or 4
+    let src_strides = strides_to_i64(&src_el[..3])?; // leading [T,H,D]
+    let dst_strides = contiguous_strides_i64(&shape_i32);
 
     let library = device.copy_library()?;
     copy::copy_g_bf16(
         commands,
         library,
         &src_typed,
-        0,
-        &strides,
+        src_off,
+        &src_strides,
         &mut dst_typed,
         dst_byte_offset,
-        &strides,
+        &dst_strides,
         &shape_i32,
     )?;
     Ok(())

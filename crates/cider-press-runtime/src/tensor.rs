@@ -766,10 +766,14 @@ impl Tensor {
     /// op tensor whose logical shape equals the slab's.
     ///
     /// `self` must be a dense bf16 rank-3 slab
-    /// (`[max_rows, n_kv_heads, head_dim]`); `src` must be dense bf16
-    /// rank-3 with the same trailing two dims. Preconditions (bf16,
-    /// rank-3 slab and src, matching row shape `[n_kv_heads, head_dim]`,
-    /// and an in-bounds `offset_rows`) are validated here at construction.
+    /// (`[max_rows, n_kv_heads, head_dim]`); `src` is bf16 with logical
+    /// `[T, n_kv_heads, head_dim]` rows in its leading three dims and may
+    /// carry a trailing size-1 axis (the no-copy attention layout
+    /// `[T, H, D, 1]`). `src` may be strided, but its head dimension
+    /// (axis 2) must be unit-stride. Preconditions (bf16, rank-3 slab,
+    /// rank-3-or-trailing-1 src, matching row shape `[n_kv_heads,
+    /// head_dim]`, unit-stride D, and an in-bounds `offset_rows`) are
+    /// validated here at construction.
     pub fn slice_update(&self, src: &Tensor, offset_rows: usize) -> Result<Self> {
         let device = self.inner.device.as_ref().ok_or_else(|| {
             Error::InvalidArgument("slice_update: slab is a placeholder (no device)".into())
@@ -803,16 +807,24 @@ impl Tensor {
         }
         let slab_dims = self.inner.shape.dims();
         let src_dims = src.inner.shape.dims();
-        if slab_dims.len() != 3 || src_dims.len() != 3 {
+        // The slab is rank-3 `[rows, n_kv_heads, head_dim]`. `src` carries
+        // the logical `[T, H, D]` rows in its leading three dims, but may be
+        // a strided permuted view that retains a trailing size-1 axis (the
+        // no-copy attention layout `[T,H,D,1]`); the dispatch copies over the
+        // leading three dims only.
+        if slab_dims.len() != 3
+            || !(src_dims.len() == 3 || (src_dims.len() == 4 && src_dims[3] == 1))
+        {
             return Err(Error::InvalidArgument(format!(
-                "slice_update: slab and src must be rank-3 \
-                 [rows, n_kv_heads, head_dim] (slab {slab_dims:?}, src {src_dims:?})"
+                "slice_update: slab must be rank-3 [rows, n_kv_heads, head_dim] and src rank-3 \
+                 (or rank-4 with a trailing size-1 axis) (slab {slab_dims:?}, src {src_dims:?})"
             )));
         }
-        if slab_dims[1..] != src_dims[1..] {
+        let src_core = &src_dims[..3]; // logical [T, H, D]
+        if slab_dims[1..] != src_core[1..] {
             return Err(Error::InvalidArgument(format!(
                 "slice_update: src row shape {:?} must match slab row shape {:?}",
-                &src_dims[1..],
+                &src_core[1..],
                 &slab_dims[1..]
             )));
         }
@@ -821,19 +833,33 @@ impl Tensor {
                 "slice_update: slab must be dense and contiguous".into(),
             ));
         }
-        if !src.layout().is_dense_contiguous(src.shape()) {
-            return Err(Error::InvalidArgument(
-                "slice_update: src must be dense and contiguous".into(),
-            ));
+        // `src` may be a strided (permuted) view, but the copy kernel reads
+        // each head's D elements with a unit-stride pointer walk, so the head
+        // axis (index 2) must be contiguous; a non-unit D stride would read
+        // the wrong elements.
+        let src_strides = match src.layout() {
+            Layout::Dense { strides } => strides,
+            Layout::Quantized(_) => {
+                return Err(Error::InvalidArgument(
+                    "slice_update: src must not be quantized".into(),
+                ));
+            }
+        };
+        if src_strides.as_slice()[2] != 1 {
+            return Err(Error::InvalidArgument(format!(
+                "slice_update: src head (D, axis 2) must be unit-stride (got strides {:?}); \
+                 copy() first",
+                src_strides.as_slice(),
+            )));
         }
-        let end = offset_rows.checked_add(src_dims[0]).ok_or_else(|| {
+        let end = offset_rows.checked_add(src_core[0]).ok_or_else(|| {
             Error::InvalidArgument("slice_update: offset_rows + src rows overflows usize".into())
         })?;
         if end > slab_dims[0] {
             return Err(Error::InvalidArgument(format!(
                 "slice_update: write of {} rows at offset {offset_rows} is out of bounds \
                  for a slab with {} rows",
-                src_dims[0], slab_dims[0]
+                src_core[0], slab_dims[0]
             )));
         }
         Ok(Self::op_tensor(

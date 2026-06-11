@@ -377,10 +377,13 @@ impl KvCache {
             )));
         }
         let dims = t.shape().dims();
-        if dims.len() != 3 || dims[1] != self.n_kv_heads || dims[2] != self.head_dim {
+        let core_ok = (dims.len() == 3 || (dims.len() == 4 && dims[3] == 1))
+            && dims[1] == self.n_kv_heads
+            && dims[2] == self.head_dim;
+        if !core_ok {
             return Err(Error::InvalidArgument(format!(
                 "KvCache::update: {name} shape {:?} does not match \
-                 [step_t, n_kv_heads={}, head_dim={}]",
+                 [step_t, n_kv_heads={}, head_dim={}] (optional trailing 1)",
                 dims, self.n_kv_heads, self.head_dim,
             )));
         }
