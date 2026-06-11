@@ -337,6 +337,29 @@ vs mlx 7.82 ms, ~1.21×) is **not in copies** — it is qmm (at parity) plus
 the **encode/dispatch residual (#2)**. The next prefill lever is the Metal
 System Trace of that residual, not more strided-copy work.
 
+### How to capture a prefill trace (lever #2 tooling, 2026-06-11)
+
+Three instruments, cheapest first:
+
+1. **CPU-encode vs GPU-wait split (no trace).**
+   `cargo run --release --features profiling -p cider-press -- bench \
+      --checkpoint <ckpt> --max-tokens 16`
+   Reports `prefill eval   encode (CPU) … us   wait (GPU) … us`. Compare the
+   GPU-wait figure to mlx's synchronous prefill (~7.82 ms): wait ≈ mlx ⇒ the
+   gap is CPU-encode; wait ≫ mlx ⇒ GPU bubbles.
+
+2. **GPU frame capture (.gputrace).**
+   `MTL_CAPTURE_ENABLED=1 cargo run --release -p cider-press -- bench \
+      --checkpoint <ckpt> --gpu-capture /tmp/cider-prefill.gputrace`
+   Warms one prefill (settles the Metal JIT), then records exactly one
+   synchronous prefill eval. Open in Xcode/Instruments. The eval encode/wait
+   phases are labeled via os_signpost (Points of Interest).
+
+3. **mlx comparison trace.** `scripts/profile_mlx_prefill.py` records mlx's
+   prefill via `mx.metal.start_capture` (also needs `MTL_CAPTURE_ENABLED=1`).
+
+Findings: see the Stage C writeup (added after the Instruments comparison).
+
 ## Async decode pipelining (detach-on-eval)
 
 Decode was synchronous: one `commit_and_wait` per token, and the next
