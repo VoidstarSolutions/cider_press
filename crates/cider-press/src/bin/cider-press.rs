@@ -117,6 +117,11 @@ struct BenchArgs {
     /// forward + eval-wait, warm). Mean is reported as "prefill (sync)".
     #[arg(long, default_value_t = 5)]
     prefill_iters: usize,
+    /// Capture ONE warm synchronous prefill eval to a .gputrace document at
+    /// this path (for Xcode / Instruments), then exit — skips the normal
+    /// bench flow. Requires `MTL_CAPTURE_ENABLED=1` in the environment.
+    #[arg(long, value_name = "PATH")]
+    gpu_capture: Option<PathBuf>,
 }
 
 /// Shared load result for both subcommands.
@@ -193,8 +198,38 @@ fn run_chat(args: &ChatArgs) -> Result<(), BoxError> {
     Ok(())
 }
 
+/// One-shot: load, warm one prefill (settle Metal JIT), then capture exactly
+/// one synchronous prefill eval to `path` as a .gputrace. Exits without the
+/// normal bench reporting. Requires `MTL_CAPTURE_ENABLED=1`.
+fn run_gpu_capture(args: &BenchArgs, path: &Path) -> Result<(), BoxError> {
+    let device = Device::shared()?;
+    let loaded = load(&args.checkpoint, &device)?;
+    let prompt = build_prompt(
+        &loaded.chat_template,
+        &args.prompt,
+        args.system.as_deref(),
+        args.no_chat_template,
+    )?;
+    let ids = loaded.tokenizer.encode(&prompt)?;
+
+    let mut generator = Generator::new(loaded.model, args.context_window, loaded.eos_ids)?;
+    // Warm: JIT-compile the Metal libraries off the captured frame.
+    generator.prefill_sync(&ids)?;
+    generator.prefill_sync(&ids)?;
+
+    device.capture_gpu_trace(path, || generator.prefill_sync(&ids))??;
+
+    println!("wrote prefill .gputrace to {}", path.display());
+    println!("open in Xcode/Instruments (MTL_CAPTURE_ENABLED=1 was required to record)");
+    Ok(())
+}
+
 #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
+    if let Some(path) = args.gpu_capture.clone() {
+        return run_gpu_capture(args, &path);
+    }
+
     let device = Device::shared()?;
 
     let rss_pre_load = cider_press::sys::resident_bytes();
