@@ -215,54 +215,65 @@ fn steel_attention_strided_kv_matches_dense() {
     let device = Device::system_default().expect("Metal device");
     let lib = KernelLibrary::steel_attention(&device).expect("lib");
     let q_buf: Buffer<bf16> = device.upload(&q).expect("q");
-    let k_buf: Buffer<bf16> = device.upload(&k_il).expect("k");
-    let v_buf: Buffer<bf16> = device.upload(&v_il).expect("v");
-    let mut out_buf: Buffer<bf16> = device.alloc_buffer(H_Q * T * D).expect("out");
 
-    let mut commands = device.commands().expect("commands");
-    sdpa::dispatch_sdpa_full_bf16(
-        &mut commands,
-        &lib,
-        &q_buf,
-        &k_buf,
-        &v_buf,
-        &mut out_buf,
-        sdpa::SdpaFullArgs {
-            batch: 1,
-            h_q: H_Q as i32,
-            h_kv: H_KV as i32,
-            head_dim: D as i32,
-            q_len: T as i32,
-            k_len: T as i32,
-            scale: 1.0 / (D as f32).sqrt(),
-            // Q/O stay dense `[H, T, D]`; only K/V carry the interleaved
-            // (head_stride = D, seq_stride = H_kv*D) view.
-            q_strides: [(H_Q * T * D) as i64, (T * D) as i64, D as i64],
-            k_strides: [(H_KV * T * D) as i64, D as i64, (H_KV * D) as i64],
-            v_strides: [(H_KV * T * D) as i64, D as i64, (H_KV * D) as i64],
-            o_strides: [(H_Q * T * D) as i64, (T * D) as i64, D as i64],
-            causal: true,
-        },
-    )
-    .expect("dispatch sdpa_full");
-    commands.commit_and_wait().expect("commit");
+    // Dispatch sdpa_full with the given K/V data + (head, seq) element
+    // strides; Q/O stay dense `[H, T, D]`. Returns the dense output buffer.
+    let run =
+        |k_data: &[bf16], v_data: &[bf16], kv_head_stride: i64, kv_seq_stride: i64| -> Vec<bf16> {
+            let k_buf: Buffer<bf16> = device.upload(k_data).expect("k");
+            let v_buf: Buffer<bf16> = device.upload(v_data).expect("v");
+            let mut out_buf: Buffer<bf16> = device.alloc_buffer(H_Q * T * D).expect("out");
+            let mut commands = device.commands().expect("commands");
+            sdpa::dispatch_sdpa_full_bf16(
+                &mut commands,
+                &lib,
+                &q_buf,
+                &k_buf,
+                &v_buf,
+                &mut out_buf,
+                sdpa::SdpaFullArgs {
+                    batch: 1,
+                    h_q: H_Q as i32,
+                    h_kv: H_KV as i32,
+                    head_dim: D as i32,
+                    q_len: T as i32,
+                    k_len: T as i32,
+                    scale: 1.0 / (D as f32).sqrt(),
+                    q_strides: [(H_Q * T * D) as i64, (T * D) as i64, D as i64],
+                    k_strides: [(H_KV * T * D) as i64, kv_head_stride, kv_seq_stride],
+                    v_strides: [(H_KV * T * D) as i64, kv_head_stride, kv_seq_stride],
+                    o_strides: [(H_Q * T * D) as i64, (T * D) as i64, D as i64],
+                    causal: true,
+                },
+            )
+            .expect("dispatch sdpa_full");
+            commands.commit_and_wait().expect("commit");
+            unsafe { out_buf.as_mut_slice() }.to_vec()
+        };
 
-    let out: Vec<bf16> = unsafe { out_buf.as_mut_slice() }.to_vec();
+    // Dense: original `[H_kv, T, D]` layout (head_stride = T*D, seq_stride = D).
+    let out_dense = run(&k, &v, (T * D) as i64, D as i64);
+    // Strided: head-interleaved `[T, H_kv, D]` (head_stride = D, seq_stride = H_kv*D).
+    let out_strided = run(&k_il, &v_il, D as i64, (H_KV * D) as i64);
+
+    // 1) The dense run is itself correct (matches the MLX oracle) — anchors
+    //    the comparison so a bug affecting both runs identically still trips.
     let (atol, rtol) = (0.03f32, 0.08f32);
-    let mut max_abs = 0.0f32;
-    let mut max_rel = 0.0f32;
-    assert_eq!(out.len(), out_ref.len(), "length mismatch");
-    for (i, (&a, &b)) in out.iter().zip(out_ref.iter()).enumerate() {
+    assert_eq!(out_dense.len(), out_ref.len(), "length mismatch");
+    for (i, (&a, &b)) in out_dense.iter().zip(out_ref.iter()).enumerate() {
         let (af, bf) = (a.to_f32(), b.to_f32());
         let abs = (af - bf).abs();
-        max_abs = max_abs.max(abs);
-        if bf.abs() > 1e-6 {
-            max_rel = max_rel.max(abs / bf.abs());
-        }
         assert!(
             abs <= atol + rtol * bf.abs(),
-            "steel_attention strided mismatch at {i}: got {af}, want {bf} (abs err {abs})"
+            "dense sdpa_full vs MLX mismatch at {i}: got {af}, want {bf} (abs err {abs})"
         );
     }
-    eprintln!("steel_attention strided parity: max abs err {max_abs}, max rel err {max_rel}");
+    // 2) The strided path is BIT-EXACT vs the dense path: identical logical
+    //    K/V, only the memory layout + strides differ, so any divergence is a
+    //    stride-handling bug — the exact regression this test guards (and what
+    //    the MLX-tolerance comparison alone could mask).
+    assert_eq!(
+        out_strided, out_dense,
+        "strided K/V output diverged from the dense run — stride-handling bug"
+    );
 }

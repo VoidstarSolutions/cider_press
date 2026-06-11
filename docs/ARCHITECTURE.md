@@ -115,8 +115,8 @@ priority:
    **closed**: decode is at 2 copies, and the prefill strided path (S2–S5)
    was **measured a no-op** — the KV-cache-read copies were eliminated
    (194 → 146 dispatches) with no wall-clock change, and the remaining
-   prefill copies are too small / qmm-hidden to be worth pursuing (see the
-   2026-06-10 note above and `QWEN_PERF.md` § "Strided prefill cache-read").
+   prefill copies are too small / qmm-hidden to be worth pursuing (see
+   `QWEN_PERF.md` § "Strided prefill cache-read" for the measured numbers).
 
    *(b) Faster `qmv` kernels — speeds each link. Fast-path padding (A1) DONE;
    small-N launch-config (A2) MEASURED + NO-GO.* The 4-bit `qmv` matvecs are
