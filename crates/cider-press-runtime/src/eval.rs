@@ -371,15 +371,14 @@ pub(crate) fn eval(root: &Tensor) -> Result<()> {
     let encode = crate::profile::span("tensor.eval.encode");
     let order = build_order(root);
     if order.is_empty() {
-        crate::profile::signpost::interval_end(sp_encode);
-        return Ok(()); // every reachable node is already terminal.
+        return Ok(()); // every reachable node is already terminal (sp_encode ends on drop).
     }
     let device = root.inner.device.as_ref().ok_or_else(|| {
         Error::InvalidArgument("eval: placeholder has no device to dispatch on".into())
     })?;
     let (outputs, tags, in_flight) = encode_ops(&order, device)?;
     drop(encode);
-    crate::profile::signpost::interval_end(sp_encode);
+    drop(sp_encode); // end the encode interval at the encode→wait boundary.
 
     let sp_wait = crate::profile::signpost::interval_begin(crate::profile::signpost::Region::Wait);
     let wait = crate::profile::span("tensor.eval.wait");
@@ -387,7 +386,7 @@ pub(crate) fn eval(root: &Tensor) -> Result<()> {
         chunk.wait()?;
     }
     drop(wait);
-    crate::profile::signpost::interval_end(sp_wait);
+    drop(sp_wait);
 
     populate_caches(&order, outputs, tags, device);
     detach_order(&order);

@@ -170,10 +170,21 @@ pub mod signpost {
         Wait = 2,
     }
 
-    /// Token returned by [`interval_begin`], consumed by [`interval_end`]
-    /// to close the same interval id with the same name.
+    /// RAII guard returned by [`interval_begin`]; its drop emits the matching
+    /// `END` marker, so a `?`/panic unwind still closes the interval balanced.
+    /// Drop it explicitly at a phase boundary to end the interval early.
     #[must_use]
     pub struct Marker(#[cfg_attr(not(feature = "profiling"), allow(dead_code))] Region);
+
+    impl Drop for Marker {
+        fn drop(&mut self) {
+            #[cfg(feature = "profiling")]
+            {
+                const INTERVAL_END: u8 = 2;
+                ffi::emit(INTERVAL_END, self.0 as u64, name_of(self.0).as_ptr());
+            }
+        }
+    }
 
     #[cfg(feature = "profiling")]
     mod ffi {
@@ -254,8 +265,8 @@ pub mod signpost {
         }
     }
 
-    /// Open an interval for `region`. Returns a [`Marker`] that
-    /// [`interval_end`] must consume to close it.
+    /// Open an interval for `region`, returning an RAII [`Marker`] whose drop
+    /// emits the matching end. Drop it at the phase boundary to end early.
     pub fn interval_begin(region: Region) -> Marker {
         #[cfg(feature = "profiling")]
         {
@@ -263,20 +274,6 @@ pub mod signpost {
             ffi::emit(INTERVAL_BEGIN, region as u64, name_of(region).as_ptr());
         }
         Marker(region)
-    }
-
-    /// Close the interval opened by [`interval_begin`]. Takes the
-    /// [`Marker`] by value (consuming the must-use token) so a closed
-    /// interval cannot be re-ended; the inner [`Region`] is `Copy`, hence
-    /// the `needless_pass_by_value` allow.
-    #[allow(clippy::needless_pass_by_value)]
-    pub fn interval_end(marker: Marker) {
-        #[cfg(feature = "profiling")]
-        {
-            const INTERVAL_END: u8 = 2;
-            ffi::emit(INTERVAL_END, marker.0 as u64, name_of(marker.0).as_ptr());
-        }
-        let _ = marker;
     }
 }
 
@@ -286,8 +283,9 @@ pub use imp::{Span, drain, drain_gpu, is_enabled, record_gpu, reset, span};
 mod tests {
     #[test]
     fn signpost_emit_does_not_panic() {
-        // No-op when profiling is off; FFI emit when on. Either way: no panic.
+        // No-op when profiling is off; FFI emit (begin + drop-end) when on.
+        // Either way: no panic.
         let s = super::signpost::interval_begin(super::signpost::Region::Encode);
-        super::signpost::interval_end(s);
+        drop(s);
     }
 }

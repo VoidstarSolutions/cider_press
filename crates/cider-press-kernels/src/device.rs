@@ -188,9 +188,18 @@ impl Device {
     /// [`MTLCaptureManager::supportsDestination`] returns `false` and this
     /// returns an error naming the missing variable. `f`'s return value is
     /// passed back unchanged on success, so a fallible `f` rides through as
-    /// `Ok(Result<…>)` (callers `??`). `f` must not panic mid-capture
-    /// (`stopCapture` would not run).
+    /// `Ok(Result<…>)` (callers `??`). `stopCapture` runs even if `f` panics
+    /// (an RAII guard), so a panicking closure cannot leave Metal capture
+    /// enabled for the rest of the process.
     pub fn capture_gpu_trace<T>(&self, path: &std::path::Path, f: impl FnOnce() -> T) -> Result<T> {
+        // RAII so `stopCapture` runs on unwind too — a panicking `f` must not
+        // leave capture armed for the rest of the process.
+        struct StopGuard<'a>(&'a MTLCaptureManager);
+        impl Drop for StopGuard<'_> {
+            fn drop(&mut self) {
+                self.0.stopCapture();
+            }
+        }
         // SAFETY: sharedCaptureManager has no preconditions; the returned
         // singleton lives for the process.
         let manager = unsafe { MTLCaptureManager::sharedCaptureManager() };
@@ -216,9 +225,8 @@ impl Device {
             .map_err(|e| {
                 Error::InvalidArgument(format!("capture_gpu_trace: startCapture failed: {e:?}"))
             })?;
-        let out = f();
-        manager.stopCapture();
-        Ok(out)
+        let _stop = StopGuard(&manager);
+        Ok(f())
     }
 
     /// Whether this device can sample GPU counters at compute
