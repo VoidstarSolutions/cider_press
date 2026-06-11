@@ -349,11 +349,13 @@ Three instruments, cheapest first:
    gap is CPU-encode; wait ≫ mlx ⇒ GPU bubbles.
 
 2. **GPU frame capture (.gputrace).**
-   `MTL_CAPTURE_ENABLED=1 cargo run --release -p cider-press -- bench \
-      --checkpoint <ckpt> --gpu-capture /tmp/cider-prefill.gputrace`
-   Warms one prefill (settles the Metal JIT), then records exactly one
-   synchronous prefill eval. Open in Xcode/Instruments. The eval encode/wait
-   phases are labeled via os_signpost (Points of Interest).
+   `MTL_CAPTURE_ENABLED=1 cargo run --release --features profiling -p cider-press \
+      -- bench --checkpoint <ckpt> --gpu-capture /tmp/cider-prefill.gputrace`
+   Warms the prefill path twice (settles the Metal JIT), then records exactly
+   one synchronous prefill eval. Open in Xcode/Instruments. `--features
+   profiling` is required for the eval encode/wait phases to be labeled via
+   os_signpost (Points of Interest); without it the capture still records but
+   the phase markers are absent.
 
 3. **mlx comparison trace.** `scripts/profile_mlx_prefill.py` records mlx's
    prefill via `mx.metal.start_capture` (also needs `MTL_CAPTURE_ENABLED=1`).

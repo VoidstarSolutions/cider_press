@@ -198,9 +198,9 @@ fn run_chat(args: &ChatArgs) -> Result<(), BoxError> {
     Ok(())
 }
 
-/// One-shot: load, warm one prefill (settle Metal JIT), then capture exactly
-/// one synchronous prefill eval to `path` as a .gputrace. Exits without the
-/// normal bench reporting. Requires `MTL_CAPTURE_ENABLED=1`.
+/// One-shot: load, warm the prefill path twice (settle Metal JIT), then
+/// capture exactly one synchronous prefill eval to `path` as a .gputrace.
+/// Exits without the normal bench reporting. Requires `MTL_CAPTURE_ENABLED=1`.
 fn run_gpu_capture(args: &BenchArgs, path: &Path) -> Result<(), BoxError> {
     let device = Device::shared()?;
     let loaded = load(&args.checkpoint, &device)?;
