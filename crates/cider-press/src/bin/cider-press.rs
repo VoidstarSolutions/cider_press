@@ -226,8 +226,8 @@ fn run_gpu_capture(args: &BenchArgs, path: &Path) -> Result<(), BoxError> {
 
 #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
-    if let Some(path) = args.gpu_capture.clone() {
-        return run_gpu_capture(args, &path);
+    if let Some(path) = args.gpu_capture.as_deref() {
+        return run_gpu_capture(args, path);
     }
 
     let device = Device::shared()?;

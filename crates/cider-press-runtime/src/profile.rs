@@ -161,27 +161,37 @@ mod imp {
 /// `os_signpost` interval markers for Instruments (Points of Interest /
 /// Metal System Trace). No-op unless the `profiling` feature is on.
 pub mod signpost {
-    /// The eval phase a marker brackets. The discriminant is the
-    /// `os_signpost_id_t` — distinct per region, stable across begin/end.
+    /// The eval phase a marker brackets; selects the interval name only.
     #[cfg_attr(not(feature = "profiling"), allow(dead_code))]
     #[derive(Clone, Copy)]
     pub enum Region {
-        Encode = 1,
-        Wait = 2,
+        Encode,
+        Wait,
     }
 
     /// RAII guard returned by [`interval_begin`]; its drop emits the matching
     /// `END` marker, so a `?`/panic unwind still closes the interval balanced.
     /// Drop it explicitly at a phase boundary to end the interval early.
+    ///
+    /// Carries a freshly-generated `os_signpost_id_t` (not the region
+    /// discriminant): Apple requires the id be unique among intervals that can
+    /// be simultaneously in-flight under the same (log, name), so a per-begin
+    /// id keeps Instruments from mis-pairing begin/end even if eval intervals
+    /// ever overlap.
     #[must_use]
-    pub struct Marker(#[cfg_attr(not(feature = "profiling"), allow(dead_code))] Region);
+    pub struct Marker {
+        #[cfg_attr(not(feature = "profiling"), allow(dead_code))]
+        region: Region,
+        #[cfg_attr(not(feature = "profiling"), allow(dead_code))]
+        spid: u64,
+    }
 
     impl Drop for Marker {
         fn drop(&mut self) {
             #[cfg(feature = "profiling")]
             {
                 const INTERVAL_END: u8 = 2;
-                ffi::emit(INTERVAL_END, self.0 as u64, name_of(self.0).as_ptr());
+                ffi::emit(INTERVAL_END, self.spid, name_of(self.region).as_ptr());
             }
         }
     }
@@ -265,15 +275,31 @@ pub mod signpost {
         }
     }
 
+    /// A fresh `os_signpost_id_t`, unique per call. Starts at 1 (0 is the
+    /// reserved NULL id) via a monotonic counter — uniqueness among in-flight
+    /// intervals is all Apple requires; the value is otherwise opaque.
+    #[cfg(feature = "profiling")]
+    fn next_spid() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    }
+
+    #[cfg(not(feature = "profiling"))]
+    fn next_spid() -> u64 {
+        0
+    }
+
     /// Open an interval for `region`, returning an RAII [`Marker`] whose drop
     /// emits the matching end. Drop it at the phase boundary to end early.
     pub fn interval_begin(region: Region) -> Marker {
+        let spid = next_spid();
         #[cfg(feature = "profiling")]
         {
             const INTERVAL_BEGIN: u8 = 1;
-            ffi::emit(INTERVAL_BEGIN, region as u64, name_of(region).as_ptr());
+            ffi::emit(INTERVAL_BEGIN, spid, name_of(region).as_ptr());
         }
-        Marker(region)
+        Marker { region, spid }
     }
 }
 

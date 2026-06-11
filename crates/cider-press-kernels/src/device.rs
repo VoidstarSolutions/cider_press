@@ -204,11 +204,18 @@ impl Device {
         // singleton lives for the process.
         let manager = unsafe { MTLCaptureManager::sharedCaptureManager() };
         if !manager.supportsDestination(MTLCaptureDestination::GPUTraceDocument) {
-            return Err(Error::InvalidArgument(
-                "capture_gpu_trace: GPUTraceDocument capture unsupported — set \
+            // `supportsDestination` is false both when MTL_CAPTURE_ENABLED is
+            // unset (the common, fixable case) and when the OS/hardware policy
+            // forbids capture (unfixable). Only tell the user to set the env
+            // var when it actually is unset, so we don't send them in circles.
+            let msg = if std::env::var_os("MTL_CAPTURE_ENABLED").is_none() {
+                "capture_gpu_trace: GPUTraceDocument capture unavailable — set \
                  MTL_CAPTURE_ENABLED=1 in the environment before running"
-                    .into(),
-            ));
+            } else {
+                "capture_gpu_trace: GPUTraceDocument capture unsupported despite \
+                 MTL_CAPTURE_ENABLED being set (OS/hardware capture policy)"
+            };
+            return Err(Error::InvalidArgument(msg.into()));
         }
         let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
         let desc = MTLCaptureDescriptor::new();
@@ -300,9 +307,9 @@ mod tests {
             return;
         }
         let device = Device::system_default().expect("device");
-        let dir = std::env::temp_dir().join("cider-capture-smoke");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        // Unique per (pid, atomic seq) so parallel test threads don't race on
+        // the directory — see cider_press_test_utils::tempdir.
+        let dir = cider_press_test_utils::tempdir("capture-smoke");
         let path = dir.join("prefill.gputrace");
 
         let ran = device
@@ -317,6 +324,5 @@ mod tests {
 
         assert_eq!(ran, 42);
         assert!(path.exists(), "gputrace bundle not written: {path:?}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
