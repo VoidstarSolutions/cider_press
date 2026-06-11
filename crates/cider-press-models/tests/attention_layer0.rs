@@ -196,9 +196,9 @@ fn run_layer0(checkpoint: &Path, seq_len: usize, offset: usize) {
     let offset_i32 = i32::try_from(offset).expect("offset fits in i32");
     let offset_t = Tensor::from_slice(&device, &[offset_i32], [1usize]).expect("offset tensor");
 
-    // ── 8. Full attention forward (mask=None mirrors Python mask=None) ────────
+    // ── 8. Full attention forward ────────────────────────────────────────────
     let out = attn
-        .forward(&hidden, None, &offset_t, &mut cache)
+        .forward(&hidden, &offset_t, &mut cache)
         .expect("Attention::forward");
 
     // ── 9. Eval and compare ───────────────────────────────────────────────────

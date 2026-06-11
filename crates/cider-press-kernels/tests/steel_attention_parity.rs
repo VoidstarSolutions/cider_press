@@ -146,3 +146,134 @@ fn steel_attention_prefill_causal_matches_mlx() {
     }
     eprintln!("steel_attention parity: max abs err {max_abs}, max rel err {max_rel}");
 }
+
+#[test]
+// Cast operands are compile-time consts (small, exact); the lints guard
+// against runtime truncation that cannot occur here.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss
+)]
+fn steel_attention_strided_kv_matches_dense() {
+    // Regression guard: the prefill KV-cache view is head-interleaved
+    // (a `[T, H_kv, D]` slab permuted to `[H_kv, T, D]`), so K/V reach the
+    // kernel with head_stride = D and seq_stride = H_kv*D — NOT the dense
+    // `[H_kv, T, D]` (head_stride = T*D, seq_stride = D). A later task feeds
+    // that strided view straight to the kernel; this proves the kernel honors
+    // the non-canonical H/L strides by re-laying identical logical K/V into the
+    // interleaved memory order with compensating strides and demanding the same
+    // result.
+    let tmp = tempdir("steel-attention-strided");
+    let fixture = tmp.join("sdpa.safetensors");
+    dump_mlx_op(
+        &fixture,
+        &[
+            "sdpa",
+            "--batch",
+            "1",
+            "--h-q",
+            &H_Q.to_string(),
+            "--h-kv",
+            &H_KV.to_string(),
+            "--seq-q",
+            &T.to_string(),
+            "--seq-kv",
+            &T.to_string(),
+            "--head-dim",
+            &D.to_string(),
+            "--dtype",
+            "bf16",
+            "--causal",
+        ],
+    );
+    let bytes = std::fs::read(&fixture).expect("read fixture");
+    let st = SafeTensors::deserialize(&bytes).expect("parse safetensors");
+    let q = read_bf16(&st, "q"); // [1, H_Q, T, D]
+    let k = read_bf16(&st, "k"); // [1, H_KV, T, D], row-major: h*T*D + s*D + e
+    let v = read_bf16(&st, "v");
+    let out_ref = read_bf16(&st, "out"); // [1, H_Q, T, D]
+
+    // Re-lay K/V from dense `[H_kv, T, D]` into head-interleaved
+    // `[T, H_kv, D]`: element (h, s, e) moves to s*H_kv*D + h*D + e. The
+    // strides passed below (head_stride = D, seq_stride = H_kv*D) make the
+    // kernel read this layout as the same logical `[H_kv, T, D]` tensor.
+    let interleave = |src: &[bf16]| -> Vec<bf16> {
+        let mut dst = vec![bf16::ZERO; H_KV * T * D];
+        for h in 0..H_KV {
+            for s in 0..T {
+                for e in 0..D {
+                    dst[s * H_KV * D + h * D + e] = src[h * T * D + s * D + e];
+                }
+            }
+        }
+        dst
+    };
+    let k_il = interleave(&k);
+    let v_il = interleave(&v);
+
+    let device = Device::system_default().expect("Metal device");
+    let lib = KernelLibrary::steel_attention(&device).expect("lib");
+    let q_buf: Buffer<bf16> = device.upload(&q).expect("q");
+
+    // Dispatch sdpa_full with the given K/V data + (head, seq) element
+    // strides; Q/O stay dense `[H, T, D]`. Returns the dense output buffer.
+    let run =
+        |k_data: &[bf16], v_data: &[bf16], kv_head_stride: i64, kv_seq_stride: i64| -> Vec<bf16> {
+            let k_buf: Buffer<bf16> = device.upload(k_data).expect("k");
+            let v_buf: Buffer<bf16> = device.upload(v_data).expect("v");
+            let mut out_buf: Buffer<bf16> = device.alloc_buffer(H_Q * T * D).expect("out");
+            let mut commands = device.commands().expect("commands");
+            sdpa::dispatch_sdpa_full_bf16(
+                &mut commands,
+                &lib,
+                &q_buf,
+                &k_buf,
+                &v_buf,
+                &mut out_buf,
+                sdpa::SdpaFullArgs {
+                    batch: 1,
+                    h_q: H_Q as i32,
+                    h_kv: H_KV as i32,
+                    head_dim: D as i32,
+                    q_len: T as i32,
+                    k_len: T as i32,
+                    scale: 1.0 / (D as f32).sqrt(),
+                    q_strides: [(H_Q * T * D) as i64, (T * D) as i64, D as i64],
+                    k_strides: [(H_KV * T * D) as i64, kv_head_stride, kv_seq_stride],
+                    v_strides: [(H_KV * T * D) as i64, kv_head_stride, kv_seq_stride],
+                    o_strides: [(H_Q * T * D) as i64, (T * D) as i64, D as i64],
+                    causal: true,
+                },
+            )
+            .expect("dispatch sdpa_full");
+            commands.commit_and_wait().expect("commit");
+            unsafe { out_buf.as_mut_slice() }.to_vec()
+        };
+
+    // Dense: original `[H_kv, T, D]` layout (head_stride = T*D, seq_stride = D).
+    let out_dense = run(&k, &v, (T * D) as i64, D as i64);
+    // Strided: head-interleaved `[T, H_kv, D]` (head_stride = D, seq_stride = H_kv*D).
+    let out_strided = run(&k_il, &v_il, D as i64, (H_KV * D) as i64);
+
+    // 1) The dense run is itself correct (matches the MLX oracle) — anchors
+    //    the comparison so a bug affecting both runs identically still trips.
+    let (atol, rtol) = (0.03f32, 0.08f32);
+    assert_eq!(out_dense.len(), out_ref.len(), "length mismatch");
+    for (i, (&a, &b)) in out_dense.iter().zip(out_ref.iter()).enumerate() {
+        let (af, bf) = (a.to_f32(), b.to_f32());
+        let abs = (af - bf).abs();
+        assert!(
+            abs <= atol + rtol * bf.abs(),
+            "dense sdpa_full vs MLX mismatch at {i}: got {af}, want {bf} (abs err {abs})"
+        );
+    }
+    // 2) The strided path is BIT-EXACT vs the dense path: identical logical
+    //    K/V, only the memory layout + strides differ, so any divergence is a
+    //    stride-handling bug — the exact regression this test guards (and what
+    //    the MLX-tolerance comparison alone could mask).
+    assert_eq!(
+        out_strided, out_dense,
+        "strided K/V output diverged from the dense run — stride-handling bug"
+    );
+}

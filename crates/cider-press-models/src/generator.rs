@@ -10,7 +10,6 @@ use std::collections::{HashSet, VecDeque};
 use cider_press_runtime::{DType, Device, KvCache, PendingEval, Tensor};
 
 use crate::error::{Error, Result};
-use crate::nn::causal_mask;
 use crate::qwen2::Qwen2Model;
 
 /// Owns a model + pre-allocated `KvCache`s + the EOS set. One instance
@@ -98,7 +97,7 @@ impl Generator {
         Ok(())
     }
 
-    /// Run one decode-step forward (`T = 1`, no mask, offset = the current
+    /// Run one decode-step forward (`T = 1`, offset = the current
     /// cache position) through the profiling-only [`Tensor::profiled_eval`],
     /// recording per-OpKind GPU time into the `profile` GPU store.
     ///
@@ -119,14 +118,14 @@ impl Generator {
         let pos_i32 = pos as i32;
         let ids = Tensor::from_slice(&device, &[last_id], [1, 1])?;
         let offset = Tensor::from_slice(&device, &[pos_i32], [1])?;
-        let logits = self.model.forward(&ids, None, &offset, &mut self.caches)?;
+        let logits = self.model.forward(&ids, &offset, &mut self.caches)?;
         logits.profiled_eval()?;
         Ok(())
     }
 
     /// Shared prefill graph builder for the profiling/timing entry points:
     /// resets the caches, then runs one forward at `T = input_ids.len()`,
-    /// offset 0, with an explicit causal mask. Returns the lazy logits
+    /// offset 0 (causal via the fused sdpa kernel). Returns the lazy logits
     /// (`[1, T, vocab]`); the caller chooses how to evaluate them. Advances
     /// the caches to `input_ids.len()` as a side effect.
     fn prefill_logits(&mut self, input_ids: &[u32]) -> Result<Tensor> {
@@ -140,13 +139,12 @@ impl Generator {
         let prefill_len = input_ids.len();
         let ids_tensor = Tensor::from_slice(&device, input_ids, [1, prefill_len])?;
         let offset = Tensor::from_slice(&device, &[0i32], [1])?;
-        let mask = causal_mask(&device, prefill_len)?;
-        self.model
-            .forward(&ids_tensor, Some(&mask), &offset, &mut self.caches)
+        self.model.forward(&ids_tensor, &offset, &mut self.caches)
     }
 
     /// Run one **prefill** forward (`T = input_ids.len()`, offset = 0,
-    /// causal mask) through the profiling-only [`Tensor::profiled_eval`],
+    /// causal via the fused sdpa kernel) through the profiling-only
+    /// [`Tensor::profiled_eval`],
     /// recording per-OpKind GPU time into the `profile` GPU store.
     ///
     /// The T>1 analog of [`Self::profiled_decode_step`]: it exercises the
@@ -165,8 +163,9 @@ impl Generator {
         Ok(())
     }
 
-    /// Run one prefill forward (`T = input_ids.len()`, offset 0, causal mask)
-    /// and **synchronously** `eval()` the full `[1, T, vocab]` logits, waiting
+    /// Run one prefill forward (`T = input_ids.len()`, offset 0, causal via
+    /// the fused sdpa kernel) and **synchronously** `eval()` the full
+    /// `[1, T, vocab]` logits, waiting
     /// for GPU completion. Mirrors `mlx_lm`'s `model(x); mx.eval(logits)` for
     /// an apples-to-apples prefill wall-clock measurement (the production
     /// `generate()` path uses `eval_async` and does not wait). Resets +
@@ -183,7 +182,8 @@ impl Generator {
     /// Greedy-decode up to `max_new_tokens` ids from `input_ids`.
     ///
     /// Runs prefill (one forward at `T = input_ids.len()`, offset=0,
-    /// causal mask) then yields sampled ids one at a time. Iterator
+    /// causal via the fused sdpa kernel) then yields sampled ids one at a
+    /// time. Iterator
     /// terminates on EOS or after `max_new_tokens` items.
     ///
     /// # Errors
@@ -237,13 +237,11 @@ impl Generator {
         let device = Device::shared()?;
         let prefill_len = input_ids.len();
 
-        // Prefill: [1, T] ids, offset=0, explicit causal mask.
+        // Prefill: [1, T] ids, offset=0. Causal via the fused sdpa kernel's
+        // do_causal — no materialized mask.
         let ids_tensor = Tensor::from_slice(&device, input_ids, [1, prefill_len])?;
         let offset = Tensor::from_slice(&device, &[0i32], [1])?;
-        let mask = causal_mask(&device, prefill_len)?;
-        let logits = self
-            .model
-            .forward(&ids_tensor, Some(&mask), &offset, &mut self.caches)?;
+        let logits = self.model.forward(&ids_tensor, &offset, &mut self.caches)?;
 
         let vocab = self.model.config().vocab_size;
         let idx0 = argmax_last_position_lazy(&logits, vocab)?;
@@ -382,7 +380,7 @@ impl GenerateIter<'_> {
         let logits = self
             .owner
             .model
-            .forward(feed, None, &offset, &mut self.owner.caches)?;
+            .forward(feed, &offset, &mut self.owner.caches)?;
         let vocab = self.owner.model.config().vocab_size;
         let idx = argmax_last_position_lazy(&logits, vocab)?;
         let pending = idx.eval_async()?;

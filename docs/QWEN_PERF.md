@@ -58,9 +58,10 @@ configuration paying both tracked-hazard and barrier costs). The
 chain + concurrent encoders + graph-level barrier elision in Kahn-wave order)
 closed it: decode **~473 → ~561 tok/s, ~1.00× of `mlx_lm`**. See
 **Dispatch-serialization gap** for the full measured story. The remaining
-levers are now kernel-side (small-N `qmv` launch config), prefill strided work
-(S2–S5), within-eval reuse for RSS, and `.metallib` precompile — not the
-dispatch model, which is done.
+levers are now kernel-side (small-N `qmv` launch config), within-eval reuse
+for RSS, and `.metallib` precompile — not the dispatch model, which is done.
+(Prefill strided work S2–S5 was later measured a no-op and closed — see
+§ "Strided prefill cache-read".)
 
 ## Environment
 
@@ -301,6 +302,40 @@ contiguous (the prefill analogue of the decode S1 copy-elision; backlog #9
 prefill strided work S2–S5); (b) the **encode/dispatch residual** (lever
 #2, ~0.7–0.9 ms; needs a Metal System Trace before a fix). qmm remains the
 dominant share (82.9%) and is at parity vs mlx (ruled out above).
+
+### Strided prefill cache-read (2026-06-10) — measured no-op, copy lever closed
+
+Eliminated the prefill **KV-cache-read** copies (2/layer, 48 total): the
+steel `sdpa_full` kernel reads K/V by stride (only the head dim must be
+contiguous, as MLX's full path requires — `is_matrix_contiguous` =
+`strides(-1)==1`), so the permuted cache view feeds it directly via
+`broadcast_to` instead of `copy()`. Both decode and prefill now take the
+same strided path; the collapsed branch retired `is_decode` and the
+`mask`/`causal_mask` plumbing (generator → model → block → attention) that
+only fed it. Kernel honors the non-canonical H/L strides bit-exact
+(`steel_attention_strided_kv_matches_dense`).
+
+| metric | before | after |
+|--------|-------:|------:|
+| `gpu.copy` dispatches | 194 | **146** (−48 = −2/layer) |
+| prefill (sync), warm median | ~9.3 ms | **~9.43 ms** (flat, within run-to-run noise) |
+| decode | unchanged | unchanged |
+
+**The copy count dropped as predicted; the wall-clock did not move.** These
+are tiny `[1, H_kv=2, T, 64]` K/V copies, off the qmm-bound critical path —
+all copies together are now **4.8%** of prefill GPU vs `quantized_matmul`'s
+**83.6%**, and they overlap the qmm rather than serializing behind it. So
+this is a **code** win (−48 dispatches, retired `is_decode` + the vestigial
+`causal_mask`, matches MLX's strided-input behavior) but a **perf no-op**.
+
+**Decision-gate conclusion: the copy lever is closed, NOT escalated.** The
+naïve next step would be stride-aware RoPE to also drop the bigger
+project-heads copies (#1, `[1,14,T,64]`), but the data rules it out: even
+eliminating *every* remaining copy caps at ~4.8% of prefill GPU (~0.45 ms)
+and most of that is hidden under the qmm. The remaining prefill gap (~9.4
+vs mlx 7.82 ms, ~1.21×) is **not in copies** — it is qmm (at parity) plus
+the **encode/dispatch residual (#2)**. The next prefill lever is the Metal
+System Trace of that residual, not more strided-copy work.
 
 ## Async decode pipelining (detach-on-eval)
 

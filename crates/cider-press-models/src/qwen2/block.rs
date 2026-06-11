@@ -13,7 +13,7 @@ use crate::nn::{Linear, Mlp, Module, RmsNormLayer};
 /// pre-norm `SwiGLU` MLP with a residual.
 ///
 /// `forward` mirrors [`Attention::forward`]'s signature
-/// (`hidden, mask, offset, cache`) — auxiliary state flows through
+/// (`hidden, offset, cache`) — auxiliary state flows through
 /// the signature, so this type does not implement [`crate::nn::Module`].
 #[derive(Debug)]
 pub struct TransformerBlock {
@@ -51,18 +51,12 @@ impl TransformerBlock {
     /// Forward through the block.
     ///
     /// - `hidden`: `[1, T, hidden_size]` dense BF16.
-    /// - `mask`, `offset`, `cache`: forwarded to [`Attention::forward`].
+    /// - `offset`, `cache`: forwarded to [`Attention::forward`].
     ///
     /// Returns `[1, T, hidden_size]`, lazy.
-    pub fn forward(
-        &self,
-        hidden: &Tensor,
-        mask: Option<&Tensor>,
-        offset: &Tensor,
-        cache: &mut KvCache,
-    ) -> Result<Tensor> {
+    pub fn forward(&self, hidden: &Tensor, offset: &Tensor, cache: &mut KvCache) -> Result<Tensor> {
         let normed = self.input_layernorm.forward(hidden)?;
-        let attn_out = self.attention.forward(&normed, mask, offset, cache)?;
+        let attn_out = self.attention.forward(&normed, offset, cache)?;
         let after_attn = hidden.add(&attn_out)?;
 
         let mlp_input = self.post_attention_layernorm.forward(&after_attn)?;
