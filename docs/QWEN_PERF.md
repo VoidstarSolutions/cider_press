@@ -522,6 +522,56 @@ command buffers stop draining the GPU at every seam; (2) make the hazard key
 allocation/offset-aware so pool aliasing stops firing false barriers. Both let
 cider's already-concurrent encoders actually run concurrently.
 
+### Per-output fence map — measured no-op, landed as the MLX-faithful mechanism (2026-06-11)
+
+Follow-up to the trace above, testing the most structural candidate for the
+~2.2 ms bubble. cider ordered command-buffer chunks with a **strict single-fence
+chain**: every ~50-op chunk waited the *immediately-prior* chunk's whole-buffer
+fence, unconditionally. MLX instead keeps a **per-output-buffer fence map** and
+waits only the fences of buffers a chunk actually reads/writes that a prior chunk
+produced (`../mlx/.../device.cpp:376-443`). Hypothesis: cider's chain drains the
+GPU at every seam where MLX lets independent chunks overlap.
+
+**Ported the map** — cider's `Device::prev_outputs` + `fence_waits` /
+`publish_outputs` / `restore_outputs`; the wait moved from encoder *open* to
+*close* (the full input set is known only there); outputs are waited as inputs
+(the pool-recycling WAW guard). Simpler than MLX: cider's single-threaded encode
++ pooled buffers make the map self-bounding, so **no completion-handler
+retirement**.
+
+**A/B (same release binary via a flag, 39-token prompt, M4 Max, 4 runs each):**
+
+| | prefill sync | GPU-wait | decode |
+| --- | ---: | ---: | ---: |
+| fence map | 9.28–9.40 ms | ~8.30 ms | ~575 tok/s |
+| strict chain | 9.25–9.42 ms | ~8.26 ms | ~576 tok/s |
+
+**No-op.** The distributions overlap; the between-mode difference is smaller than
+run-to-run noise. GPU-wait sits at ~8.3 ms either way; decode is unchanged.
+
+**Why:** the prefill chunks are **genuinely chain-dependent** — a 50-op chunk
+spans ~3–4 transformer layers, which are a linear chain, so the map waits the
+*same* fences the chain did. The ~2.2 ms bubble is real data-dependency latency
+(synchronous per-eval, <50% occupancy), **not** the fence scheme over-serializing
+independent work. This **refutes the "cider over-serializes what MLX overlaps"**
+reading of the dispatch gap: both schedulers serialize identically because the
+dependencies are real.
+
+**Correction to an earlier framing.** A prior note cast cider's "coarse
+pool-aliased hazard key" as a second lever vs "MLX's per-array RAW check." That
+was wrong: MLX keys every hazard/fence on the **whole `MTLBuffer` pointer**
+(`device.cpp:304,308-309,324,404,413-414`); the `a.offset()` at `:311` is the
+`setBuffer` binding offset, never a sync key. cider's whole-buffer key is the
+**same granularity** as MLX, and (verified) fires no false barriers in this
+forward pass. There is no hazard-key lever.
+
+**Landed anyway, as the sole mechanism** (the chain + the `CIDER_PRESS_FENCE_MAP`
+flag are deleted): the map *is* MLX's scheduler design and is strictly more
+precise than cider's home-grown chain, so it's the right baseline even at perf
+parity — and it permanently answers "is cider's fence scheme the bottleneck?"
+(no). The remaining prefill gap needs a **structural** lever (overlapping evals /
+larger batched work), not a smarter fence.
+
 ## Async decode pipelining (detach-on-eval)
 
 Decode was synchronous: one `commit_and_wait` per token, and the next
