@@ -1807,11 +1807,12 @@ fn dispatch_rope(
         .ok_or_else(|| Error::InvalidArgument("Rope: missing offset (inputs[1])".into()))?;
 
     // `input` may be a strided head/seq-permuted view from attention;
-    // resolve through the view chain and assert byte offset 0, exactly like
-    // the qmv/slice_update activation paths. `Tensor::rope` enforces a
+    // resolve through the view chain and assert byte offset 0, like the qmv
+    // activation path (`matmul_input_bytes`). `Tensor::rope` enforces a
     // unit-stride feature axis and a byte-offset-0 view at construction, so
     // the bytes read here start at offset 0 and the real head/seq strides
-    // (read below) place every element correctly.
+    // (read below) place every element correctly. (slice_update, by contrast,
+    // now resolves non-zero view offsets through copy_g.)
     let in_bytes = matmul_input_bytes("rope", input, outputs, index_of)?;
     let off_bytes = dense_input_buffer(offset, outputs, index_of)?;
 
