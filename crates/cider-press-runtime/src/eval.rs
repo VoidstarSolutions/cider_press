@@ -266,7 +266,7 @@ fn encode_ops(
         let mut unresolved = false;
         for input in op.lock_inputs().iter() {
             match input_buffer_key(input, &outputs, &index_of) {
-                None => {}                       // quantized weight: never written
+                None => {} // quantized weight: never written
                 Some(HAZARD_KEY) => unresolved = true,
                 Some(key) => in_keys.push(key),
             }

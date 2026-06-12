@@ -90,15 +90,14 @@ impl Device {
         let map = self.prev_outputs.lock().expect("prev_outputs poisoned");
         let mut seen: HashSet<usize> = HashSet::new();
         let mut out: Vec<Retained<ProtocolObject<dyn MTLFence>>> = Vec::new();
-        let push_unique =
-            |fence: &Retained<ProtocolObject<dyn MTLFence>>,
-             out: &mut Vec<Retained<ProtocolObject<dyn MTLFence>>>,
-             seen: &mut HashSet<usize>| {
-                let id = Retained::as_ptr(fence).cast::<()>() as usize;
-                if seen.insert(id) {
-                    out.push(fence.clone());
-                }
-            };
+        let push_unique = |fence: &Retained<ProtocolObject<dyn MTLFence>>,
+                           out: &mut Vec<Retained<ProtocolObject<dyn MTLFence>>>,
+                           seen: &mut HashSet<usize>| {
+            let id = Retained::as_ptr(fence).cast::<()>() as usize;
+            if seen.insert(id) {
+                out.push(fence.clone());
+            }
+        };
         if unresolved {
             for fence in map.values() {
                 push_unique(fence, &mut out, &mut seen);
@@ -131,10 +130,7 @@ impl Device {
     /// fence will never signal). Restores in REVERSE publish order so the
     /// earliest displaced value wins when a key was published twice in one
     /// session (the profiling path); `None` removes a freshly-added key.
-    pub(crate) fn restore_outputs(
-        &self,
-        displaced: Vec<DisplacedOutput>,
-    ) {
+    pub(crate) fn restore_outputs(&self, displaced: Vec<DisplacedOutput>) {
         let mut map = self.prev_outputs.lock().expect("prev_outputs poisoned");
         for (k, old) in displaced.into_iter().rev() {
             match old {
