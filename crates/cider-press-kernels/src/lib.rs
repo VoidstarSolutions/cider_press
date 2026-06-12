@@ -33,7 +33,7 @@ pub mod kernels;
 mod library;
 
 pub use buffer::Buffer;
-pub use commands::{Commands, CommandsInFlight};
+pub use commands::{fence_map_enabled, Commands, CommandsInFlight};
 pub use device::Device;
 pub use error::{Error, Result};
 pub use gpu_sampler::{GpuSampler, GpuSegment};

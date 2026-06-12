@@ -67,9 +67,6 @@ pub struct Device {
     /// retirement is needed. Used only when `fence_map_enabled()`; the chain
     /// (`last_fence`) is the `CIDER_PRESS_FENCE_MAP=0` fallback. Mutex only for
     /// `Sync`, as with `last_fence`.
-    // Not yet read by the encoder — wiring lands in a later task; the methods
-    // below are exercised by the unit tests until then.
-    #[allow(dead_code)]
     prev_outputs: Mutex<HashMap<usize, Retained<ProtocolObject<dyn MTLFence>>>>,
 }
 
@@ -105,8 +102,6 @@ impl Device {
     /// to a key), wait the whole current frontier instead — every distinct
     /// fence in the map — recovering the chain's transitive ordering against
     /// all still-live prior writers.
-    // Not yet called by the encoder — see `prev_outputs`.
-    #[allow(dead_code)]
     pub(crate) fn fence_waits(
         &self,
         keys: &[usize],
@@ -141,7 +136,6 @@ impl Device {
     /// Record `fence` as the last writer of each `key`. Returns the displaced
     /// prior values (`(key, old)`) in publish order so an abandoned session can
     /// undo them via [`Device::restore_outputs`].
-    #[allow(dead_code)]
     pub(crate) fn publish_outputs(
         &self,
         keys: &[usize],
@@ -157,7 +151,6 @@ impl Device {
     /// fence will never signal). Restores in REVERSE publish order so the
     /// earliest displaced value wins when a key was published twice in one
     /// session (the profiling path); `None` removes a freshly-added key.
-    #[allow(dead_code)]
     pub(crate) fn restore_outputs(
         &self,
         displaced: Vec<DisplacedOutput>,
