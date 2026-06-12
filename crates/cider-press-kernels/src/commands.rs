@@ -563,4 +563,46 @@ mod tests {
             "abandoned map session left a never-signaling fence under its output key"
         );
     }
+
+    /// End-to-end: a real committed session that reads the same buffer key an
+    /// earlier ABANDONED session published must run to completion, not deadlock
+    /// on the abandoned session's never-signaling fence. This is the hang-class
+    /// regression the (removed) chain-era `abandoned_session_restores_fence_chain`
+    /// covered — restated for the map: if Drop's `restore_outputs` failed to
+    /// remove the stale entry, session C below would `waitForFence` on a fence
+    /// whose update died with the uncommitted buffer and `commit_and_wait` would
+    /// block forever (CI surfaces it as a timeout).
+    #[test]
+    fn committed_session_completes_after_abandoned_publish() {
+        let device = Device::system_default().expect("device");
+        let key = 0x5EED_usize;
+
+        // Session B: open, publish `key`, then abandon uncommitted. Restore must
+        // strip the entry — its fence will never signal.
+        let mut cmds_b = super::Commands::new(&device).expect("commands B");
+        cmds_b.encoder().expect("open encoder B");
+        cmds_b.record_output(key);
+        cmds_b.close_encoder();
+        drop(cmds_b);
+
+        // Session C: a real dispatch that also waits `key`. If the stale fence
+        // survived, this hangs; otherwise it completes with the known argmax.
+        let library = KernelLibrary::arg_reduce(&device).expect("arg_reduce lib");
+        let host: Vec<bf16> = [0.1f32, 0.5, 0.3, 0.9, 0.2]
+            .iter()
+            .map(|&x| bf16::from_f32(x))
+            .collect();
+        let src: Buffer<bf16> = device.upload(&host).expect("upload");
+        let mut dst: Buffer<u32> = device.alloc_buffer(1).expect("alloc dst");
+
+        let mut cmds_c = device.commands().expect("commands C");
+        argmax_bf16(&mut cmds_c, &library, &src, &mut dst, host.len()).expect("dispatch C");
+        cmds_c.record_input(key); // force the close-time wait set to include `key`
+        cmds_c
+            .commit_and_wait()
+            .expect("commit C must not deadlock");
+
+        // SAFETY: commit_and_wait blocked; the GPU is done writing dst.
+        assert_eq!(unsafe { dst.as_slice()[0] }, 3, "session C result");
+    }
 }
