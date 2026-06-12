@@ -401,20 +401,22 @@ fn id_is_terminal(id: u32, eos_ids: &HashSet<u32>) -> bool {
     eos_ids.contains(&id)
 }
 
-/// Build the lazy argmax over the last position of a `[1, T, vocab]` BF16
-/// logits tensor, returning a `[1, 1]` U32 index tensor **without**
-/// evaluating it — the caller commits it via `eval_async` and reads it back
-/// after waiting.
+/// Build the lazy argmax over a single-position `[1, 1, vocab]` BF16 logits
+/// tensor, returning a `[1, 1]` U32 index tensor **without** evaluating it —
+/// the caller commits it via `eval_async` and reads it back after waiting.
+///
+/// Both callers feed last-position-only logits: decode runs `forward` on a
+/// `T = 1` token and prefill projects the LM head for the final position alone
+/// (`Qwen2Model::forward_last`). `vocab` is accepted to validate that shape.
 fn argmax_last_position_lazy(logits: &Tensor, vocab: usize) -> Result<Tensor> {
-    let t = logits.shape().dims()[1];
-    let last = if t == 1 {
-        logits.clone()
-    } else {
-        logits.slice(&[0..1, t - 1..t, 0..vocab])?.copy()?
-    };
+    debug_assert_eq!(
+        logits.shape().dims(),
+        &[1, 1, vocab],
+        "argmax_last_position_lazy expects last-position-only logits",
+    );
     // argmax(2) over [1, 1, vocab] removes the axis -> [1, 1] U32, which is
     // exactly forward()'s [1, T] input-ids shape for the next token.
-    Ok(last.argmax(2)?)
+    Ok(logits.argmax(2)?)
 }
 
 /// Read a single token id from an argmax tensor whose `PendingEval` has
