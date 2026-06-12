@@ -834,9 +834,9 @@ impl Tensor {
             ));
         }
         // `src` may be a strided (permuted) view, but the copy kernel reads
-        // each head's D elements with a unit-stride pointer walk, so the head
-        // axis (index 2) must be contiguous; a non-unit D stride would read
-        // the wrong elements.
+        // each row's D elements with a unit-stride pointer walk, so the
+        // feature (D, index 2) axis must be contiguous; a non-unit D stride
+        // would read the wrong elements.
         let src_strides = match src.layout() {
             Layout::Dense { strides } => strides,
             Layout::Quantized(_) => {
@@ -847,7 +847,7 @@ impl Tensor {
         };
         if src_strides.as_slice()[2] != 1 {
             return Err(Error::InvalidArgument(format!(
-                "slice_update: src head (D, axis 2) must be unit-stride (got strides {:?}); \
+                "slice_update: src feature (D, axis 2) must be unit-stride (got strides {:?}); \
                  copy() first",
                 src_strides.as_slice(),
             )));
