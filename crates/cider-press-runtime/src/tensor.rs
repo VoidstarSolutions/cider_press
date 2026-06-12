@@ -1545,13 +1545,18 @@ impl Tensor {
         // or `B == 1` satisfies this trivially; a strided view with `B > 1`
         // whose batch stride differs would silently read the wrong batch, so
         // reject it rather than return garbage.
-        let n_head = isize::try_from(dims[1])
-            .map_err(|_| Error::InvalidArgument("rope: n_head overflows isize".into()))?;
-        if dims[0] > 1 && stride_slice[0] != n_head * stride_slice[1] {
-            return Err(Error::InvalidArgument(format!(
-                "rope: B > 1 requires the batch axis to advance by n_head * head_stride \
-                 (got dims {dims:?}, strides {stride_slice:?}); copy() first",
-            )));
+        if dims[0] > 1 {
+            let n_head = isize::try_from(dims[1])
+                .map_err(|_| Error::InvalidArgument("rope: n_head overflows isize".into()))?;
+            let batch_stride = n_head.checked_mul(stride_slice[1]).ok_or_else(|| {
+                Error::InvalidArgument("rope: n_head * head_stride overflows isize".into())
+            })?;
+            if stride_slice[0] != batch_stride {
+                return Err(Error::InvalidArgument(format!(
+                    "rope: B > 1 requires the batch axis to advance by n_head * head_stride \
+                     (got dims {dims:?}, strides {stride_slice:?}); copy() first",
+                )));
+            }
         }
         let head_dim = dims[3];
         if head_dim == 0 || head_dim % 2 != 0 {

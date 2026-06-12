@@ -799,8 +799,15 @@ fn dispatch_slice_update(
     // `src` carries the logical `[T, H, D]` rows in its leading three dims;
     // it may be a strided permuted view that retains a trailing size-1 axis.
     let core_dims = &src_dims[..3];
-    let row_elems = core_dims[1] * core_dims[2];
-    let dst_byte_offset = offset_rows * row_elems * DType::BF16.size_bytes();
+    let row_elems = core_dims[1].checked_mul(core_dims[2]).ok_or_else(|| {
+        Error::InvalidArgument("slice_update: row element count overflows usize".into())
+    })?;
+    let dst_byte_offset = offset_rows
+        .checked_mul(row_elems)
+        .and_then(|x| x.checked_mul(DType::BF16.size_bytes()))
+        .ok_or_else(|| {
+            Error::InvalidArgument("slice_update: dst byte offset overflows usize".into())
+        })?;
 
     // `src` may be a contiguous reshape *view* of a copy op or a strided
     // permuted view (the no-copy attention K/V layout). Resolve through the
