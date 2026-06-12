@@ -160,29 +160,25 @@ impl<'d> Commands<'d> {
 
     /// Whether this session records per-op IO for the fence map (map mode). eval
     /// gates its key computation on this so the chain path pays nothing.
-    // Wired into eval in a later task (Task 3); the close_encoder/Drop map path
-    // already consumes the keys these record.
-    #[allow(dead_code)]
-    pub(crate) fn records_io(&self) -> bool {
+    // The close_encoder/Drop map path consumes the keys these record.
+    #[must_use]
+    pub fn records_io(&self) -> bool {
         self.fence_map
     }
 
     /// Record a buffer key written by the next dispatch (map mode).
-    #[allow(dead_code)]
-    pub(crate) fn record_output(&mut self, key: usize) {
+    pub fn record_output(&mut self, key: usize) {
         self.output_keys.push(key);
     }
 
     /// Record a buffer key read by the next dispatch (map mode).
-    #[allow(dead_code)]
-    pub(crate) fn record_input(&mut self, key: usize) {
+    pub fn record_input(&mut self, key: usize) {
         self.input_keys.push(key);
     }
 
     /// Mark that the next dispatch reads a buffer that could not be resolved to
     /// a key — forces a whole-frontier wait when this encoder closes.
-    #[allow(dead_code)]
-    pub(crate) fn record_unresolved_input(&mut self) {
+    pub fn record_unresolved_input(&mut self) {
         self.unresolved_input = true;
     }
 
