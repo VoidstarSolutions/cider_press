@@ -1439,8 +1439,11 @@ impl Tensor {
     /// Preconditions (mirroring the kernels-crate scope; broader
     /// instantiations land alongside their first consumer):
     ///
-    /// - `self` is dense, contiguous, [`DType::BF16`], rank 4
-    ///   (`[B, H, T, D]`).
+    /// - `self` is [`DType::BF16`], rank 4 (`[B, H, T, D]`), with a
+    ///   unit-stride feature (last) axis. A strided head/seq-permuted view
+    ///   is accepted as long as its view byte offset is 0 — the kernel
+    ///   binds the real head/seq element strides. (`B > 1` additionally
+    ///   requires the batch axis to advance by `n_head * head_stride`.)
     /// - `offset` is dense, contiguous, [`DType::I32`], length 1.
     /// - Both tensors are on the same [`Device`].
     /// - `rotary_dims` is even and ≤ `D`. Equals `D` for full-rotation
@@ -1512,6 +1515,13 @@ impl Tensor {
                 offset.inner.dtype,
             )));
         }
+        let dims = self.shape().dims();
+        if dims.len() != 4 {
+            return Err(Error::InvalidArgument(format!(
+                "rope: input must be rank 4 [B, H, T, D] (got rank {})",
+                dims.len(),
+            )));
+        }
         let strides = match self.layout() {
             Layout::Dense { strides } => strides,
             Layout::Quantized(_) => {
@@ -1520,22 +1530,27 @@ impl Tensor {
                 ));
             }
         };
-        if *strides
-            .as_slice()
-            .last()
-            .expect("rope input rank checked below")
-            != 1
-        {
+        // Rank is checked above, so the feature (last) axis is index 3.
+        let stride_slice = strides.as_slice();
+        if stride_slice[3] != 1 {
             return Err(Error::InvalidArgument(format!(
-                "rope: feature (last) axis must be unit-stride (got strides {:?}); copy() first",
-                strides.as_slice(),
+                "rope: feature (last) axis must be unit-stride (got strides {stride_slice:?}); \
+                 copy() first",
             )));
         }
-        let dims = self.shape().dims();
-        if dims.len() != 4 {
+        // The rope kernel derives each element's batch position as
+        // `mat_idx = batch_idx * n_head + head_idx` walked at the head
+        // stride (`strides[0]`), which is only correct when the batch axis
+        // advances by exactly `n_head * head_stride`. A row-contiguous input
+        // or `B == 1` satisfies this trivially; a strided view with `B > 1`
+        // whose batch stride differs would silently read the wrong batch, so
+        // reject it rather than return garbage.
+        let n_head = isize::try_from(dims[1])
+            .map_err(|_| Error::InvalidArgument("rope: n_head overflows isize".into()))?;
+        if dims[0] > 1 && stride_slice[0] != n_head * stride_slice[1] {
             return Err(Error::InvalidArgument(format!(
-                "rope: input must be rank 4 [B, H, T, D] (got rank {})",
-                dims.len(),
+                "rope: B > 1 requires the batch axis to advance by n_head * head_stride \
+                 (got dims {dims:?}, strides {stride_slice:?}); copy() first",
             )));
         }
         let head_dim = dims[3];

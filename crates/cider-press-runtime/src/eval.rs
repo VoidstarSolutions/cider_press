@@ -1768,10 +1768,11 @@ fn dispatch_dequantize(
 }
 
 /// Dispatch a rotary positional embedding. Preconditions enforced by
-/// [`Tensor::rope`]: input is rank-4 dense contiguous BF16, offset is
-/// length-1 contiguous I32, both on the same device. We pass the strides
-/// directly from the input's row-major layout — `Tensor::rope` rejects
-/// non-contiguous inputs precisely so this is sound.
+/// [`Tensor::rope`]: input is rank-4 BF16 with a unit-stride feature axis
+/// (a strided head/seq-permuted view is allowed), offset is length-1
+/// contiguous I32, both on the same device. We read the input's real
+/// head/seq element strides and bind them to the kernel, so a permuted
+/// view dispatches correctly without a materialising copy.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
 fn dispatch_rope(
@@ -1798,11 +1799,12 @@ fn dispatch_rope(
         .get(1)
         .ok_or_else(|| Error::InvalidArgument("Rope: missing offset (inputs[1])".into()))?;
 
-    // `input` may be a contiguous view (a copy()-elided degenerate permute
-    // from attention); resolve through the view chain and assert offset 0,
-    // exactly like the qmv/slice_update activation paths. `Tensor::rope`
-    // rejects non-contiguous views at construction, so the bytes read here
-    // are contiguous-from-offset-0.
+    // `input` may be a strided head/seq-permuted view from attention;
+    // resolve through the view chain and assert byte offset 0, exactly like
+    // the qmv/slice_update activation paths. `Tensor::rope` enforces a
+    // unit-stride feature axis and a byte-offset-0 view at construction, so
+    // the bytes read here start at offset 0 and the real head/seq strides
+    // (read below) place every element correctly.
     let in_bytes = matmul_input_bytes("rope", input, outputs, index_of)?;
     let off_bytes = dense_input_buffer(offset, outputs, index_of)?;
 

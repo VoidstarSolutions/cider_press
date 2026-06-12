@@ -96,6 +96,22 @@ fn rope_strided_view_matches_contiguous() {
     );
 }
 
+#[test]
+fn rope_rejects_non_rank4_without_panicking() {
+    // A rank-0 (scalar) input must return InvalidArgument, not panic on the
+    // last-axis stride probe (which runs only after the rank check).
+    let device = Device::system_default().expect("device");
+    let scalar = Tensor::from_slice(&device, &[bf16::from_f32(1.0)], []).expect("scalar");
+    let offset = Tensor::from_slice(&device, &[0i32], [1]).expect("offset");
+    let err = scalar
+        .rope(&offset, BASE, 1.0, D)
+        .expect_err("rank-0 rope must be rejected");
+    assert!(
+        err.to_string().contains("rank 4"),
+        "expected a rank-4 error, got: {err}"
+    );
+}
+
 fn assert_within_tolerance(
     label: &str,
     got: &[bf16],
