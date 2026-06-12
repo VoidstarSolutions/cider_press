@@ -15,8 +15,10 @@
 //! eval loop commits a fresh session every ~50 ops). Encoders open with
 //! concurrent dispatch; ordering is explicit — a buffer-scope
 //! `memoryBarrier` between dispatches (elidable via
-//! [`Commands::elide_next_barrier`]) inside an encoder, and an
-//! `MTLFence` chain across encoders (wait at open, update at close).
+//! [`Commands::elide_next_barrier`]) inside an encoder, and a per-output
+//! fence map on the [`Device`] across encoders: a closing encoder waits
+//! only the prior-writer fences of the buffers it reads or overwrites,
+//! then updates its own fence (wait + update at close).
 //!
 //! If a `Commands` is dropped without being committed, its work is
 //! discarded — the GPU never sees the encoded commands. This is the
@@ -35,16 +37,6 @@ use crate::device::Device;
 use crate::error::{Error, Result};
 use crate::gpu_sampler::{GpuSampler, GpuSegment};
 
-/// Whether the per-output fence map drives cross-encoder ordering. ON unless
-/// `CIDER_PRESS_FENCE_MAP` is exactly `"0"`, which restores the strict
-/// `last_fence` chain (a bisection / A-B escape hatch, like
-/// `CIDER_PRESS_TRACKED_BUFFERS` and `CIDER_PRESS_NO_BARRIER_ELISION`). Read
-/// once and cached.
-pub fn fence_map_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("CIDER_PRESS_FENCE_MAP").as_deref() != Ok("0"))
-}
-
 /// In-progress command-buffer session.
 ///
 /// Hold onto this across multiple kernel dispatches to batch them into
@@ -54,13 +46,13 @@ pub fn fence_map_enabled() -> bool {
 /// # Concurrency contract
 ///
 /// **One open session per device, one thread driving dispatch.** The
-/// cross-encoder fence chain lives on the [`Device`], and concurrent
-/// sessions interleave its take/set pairing — ordering edges between
-/// encoders are silently lost (the per-call mutex on the chain tail
-/// exists only for `Sync`; it cannot make overlapping sessions sound).
-/// This is a documented contract, not a type-enforced one: callers that
-/// need parallel dispatch must use separate [`Device`]s, each with its
-/// own queue and fence chain.
+/// per-output fence map lives on the [`Device`], and concurrent sessions
+/// interleave its publish/wait pairing — ordering edges between encoders
+/// are silently lost (the mutex on the map exists only for `Sync`; it
+/// cannot make overlapping sessions sound). This is a documented
+/// contract, not a type-enforced one: callers that need parallel
+/// dispatch must use separate [`Device`]s, each with its own queue and
+/// fence map.
 pub struct Commands<'d> {
     device: &'d Device,
     cmd: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
@@ -88,14 +80,10 @@ pub struct Commands<'d> {
     /// the caller has proven the next dispatch reads nothing written since
     /// the last barrier in this encoder.
     elide_next_barrier: bool,
-    /// `true` when the per-output fence map drives ordering (captured from
-    /// [`fence_map_enabled`] at construction). `false` uses the `last_fence`
-    /// chain. Stored so a single process can A/B both paths.
-    fence_map: bool,
-    /// Buffer keys read by ops in the current open encoder (map mode). Fed by
+    /// Buffer keys read by ops in the current open encoder. Fed by
     /// eval's resolver; consumed at `close_encoder`.
     input_keys: Vec<usize>,
-    /// Buffer keys written by ops in the current open encoder (map mode). Waited
+    /// Buffer keys written by ops in the current open encoder. Waited
     /// as inputs (WAW / pool-recycling guard) and published at `close_encoder`.
     output_keys: Vec<usize>,
     /// Set when an op input could not be resolved to a key — forces a
@@ -115,12 +103,9 @@ type DisplacedOutput = (usize, Option<Retained<ProtocolObject<dyn MTLFence>>>);
 enum AbandonRestore {
     /// No encoder opened yet, or the session committed — leave device state.
     Untouched,
-    /// Chain mode: the first encoder displaced this `last_fence` tail
-    /// (`None` on a fresh device). Drop puts it back.
-    Chain(Option<Retained<ProtocolObject<dyn MTLFence>>>),
-    /// Map mode: closed encoders in this session published these outputs (and
-    /// displaced these prior values). Drop restores them, clearing the
-    /// never-signaling fences this uncommitted session published.
+    /// Closed encoders in this session published these outputs (and displaced
+    /// these prior values). Drop restores them, clearing the never-signaling
+    /// fences this uncommitted session published.
     Map(Vec<DisplacedOutput>),
 }
 
@@ -129,12 +114,6 @@ impl<'d> Commands<'d> {
     ///
     /// Use [`Device::commands`] in normal code.
     pub fn new(device: &'d Device) -> Result<Self> {
-        Self::new_with_mode(device, fence_map_enabled())
-    }
-
-    /// `new`, but with the ordering mode forced — used by tests to exercise the
-    /// map path regardless of the process-wide env flag.
-    pub(crate) fn new_with_mode(device: &'d Device, fence_map: bool) -> Result<Self> {
         let cmd = device
             .metal_queue()
             .commandBuffer()
@@ -151,27 +130,18 @@ impl<'d> Commands<'d> {
             restore: AbandonRestore::Untouched,
             dispatched_in_encoder: 0,
             elide_next_barrier: false,
-            fence_map,
             input_keys: Vec::new(),
             output_keys: Vec::new(),
             unresolved_input: false,
         })
     }
 
-    /// Whether this session records per-op IO for the fence map (map mode). eval
-    /// gates its key computation on this so the chain path pays nothing.
-    // The close_encoder/Drop map path consumes the keys these record.
-    #[must_use]
-    pub fn records_io(&self) -> bool {
-        self.fence_map
-    }
-
-    /// Record a buffer key written by the next dispatch (map mode).
+    /// Record a buffer key written by the next dispatch.
     pub fn record_output(&mut self, key: usize) {
         self.output_keys.push(key);
     }
 
-    /// Record a buffer key read by the next dispatch (map mode).
+    /// Record a buffer key read by the next dispatch.
     pub fn record_input(&mut self, key: usize) {
         self.input_keys.push(key);
     }
@@ -266,23 +236,13 @@ impl<'d> Commands<'d> {
             // no-op there but could mask a real first-dispatch barrier in a
             // future regime — clear it so the flag never crosses encoders.
             self.elide_next_barrier = false;
-            if self.fence_map {
-                // Map mode: no open-time wait — the wait set is known only at
-                // close, from the accumulated input/output keys.
-                if matches!(self.restore, AbandonRestore::Untouched) {
-                    self.restore = AbandonRestore::Map(Vec::new());
-                }
-            } else {
-                let prev = self.device.take_last_fence();
-                if let Some(prev) = &prev {
-                    enc.waitForFence(prev);
-                }
-                if matches!(self.restore, AbandonRestore::Untouched) {
-                    self.restore = AbandonRestore::Chain(prev);
-                }
+            // No open-time wait — the wait set is known only at close, from the
+            // accumulated input/output keys.
+            if matches!(self.restore, AbandonRestore::Untouched) {
+                self.restore = AbandonRestore::Map(Vec::new());
             }
             // `restore` is already set: if this `?` aborts the open, Drop still
-            // restores the displaced ordering state instead of losing the chain.
+            // restores the displaced ordering state.
             let own = self.device.new_fence()?;
             // NOTE: updateFence is NOT called here. At encoder open it would
             // capture no commands and signal immediately — the cross-encoder
@@ -294,34 +254,29 @@ impl<'d> Commands<'d> {
         Ok(self.encoder.as_ref().expect("just inserted"))
     }
 
-    /// Close any open encoder, publishing its fence. In chain mode the fence
-    /// becomes the device tail; in map mode it is recorded under each output
-    /// key (after the encoder waits its read/overwrite prior writers).
+    /// Close any open encoder, publishing its fence under each output key in
+    /// the device fence map (after the encoder waits its read/overwrite prior
+    /// writers).
     ///
     /// `updateFence` must be encoded after all dispatches — it signals once
     /// all commands encoded before it complete. At encoder open it would
     /// capture nothing and fire immediately.
     fn close_encoder(&mut self) {
         if let Some(enc) = self.encoder.take() {
-            if self.fence_map {
-                // Wait only the prior-writer fences of buffers this encoder reads
-                // or overwrites (outputs-as-inputs = the pool-recycling guard).
-                // Read the map BEFORE publishing our own outputs.
-                let mut wait_keys = self.input_keys.clone();
-                wait_keys.extend(self.output_keys.iter().copied());
-                for fence in self.device.fence_waits(&wait_keys, self.unresolved_input) {
-                    enc.waitForFence(&fence);
-                }
-                if let Some(fence) = self.fence.take() {
-                    enc.updateFence(&fence);
-                    let displaced = self.device.publish_outputs(&self.output_keys, &fence);
-                    if let AbandonRestore::Map(v) = &mut self.restore {
-                        v.extend(displaced);
-                    }
-                }
-            } else if let Some(fence) = self.fence.take() {
+            // Wait only the prior-writer fences of buffers this encoder reads or
+            // overwrites (outputs-as-inputs = the pool-recycling guard). Read the
+            // map BEFORE publishing our own outputs.
+            let mut wait_keys = self.input_keys.clone();
+            wait_keys.extend(self.output_keys.iter().copied());
+            for fence in self.device.fence_waits(&wait_keys, self.unresolved_input) {
+                enc.waitForFence(&fence);
+            }
+            if let Some(fence) = self.fence.take() {
                 enc.updateFence(&fence);
-                self.device.set_last_fence(Some(fence));
+                let displaced = self.device.publish_outputs(&self.output_keys, &fence);
+                if let AbandonRestore::Map(v) = &mut self.restore {
+                    v.extend(displaced);
+                }
             }
             enc.endEncoding();
             self.dispatched_in_encoder = 0;
@@ -487,11 +442,8 @@ impl Drop for Commands<'_> {
             enc.endEncoding();
         }
         match std::mem::replace(&mut self.restore, AbandonRestore::Untouched) {
-            // Chain: restore the displaced tail (a `None` clears a fence this
-            // session published on a fresh device).
-            AbandonRestore::Chain(prev) => self.device.set_last_fence(prev),
-            // Map: undo every output this session published — those fences die
-            // with the uncommitted buffer.
+            // Undo every output this session published — those fences die with
+            // the uncommitted buffer.
             AbandonRestore::Map(displaced) => self.device.restore_outputs(displaced),
             AbandonRestore::Untouched => {}
         }
@@ -589,79 +541,6 @@ mod tests {
         assert_eq!(unsafe { dst.as_slice()[0] }, 1);
     }
 
-    /// An abandoned (uncommitted) Commands session must restore the fence
-    /// chain tail it displaced, so the next session's encoder does not wait
-    /// on a fence whose `updateFence` died with the uncommitted buffer.
-    ///
-    /// Failure mode without `chain_restore`: session C's `encoder()` calls
-    /// `waitForFence` on B's never-signaled fence and hangs forever. CI
-    /// surfaces this as a test timeout.
-    #[test]
-    fn abandoned_session_restores_fence_chain() {
-        let device = Device::system_default().expect("device");
-        let library = KernelLibrary::arg_reduce(&device).expect("arg_reduce lib");
-
-        let host: Vec<bf16> = [0.1f32, 0.5, 0.3, 0.9, 0.2]
-            .iter()
-            .map(|&x| bf16::from_f32(x))
-            .collect();
-        let src: Buffer<bf16> = device.upload(&host).expect("upload src");
-        let mut dst_a: Buffer<u32> = device.alloc_buffer(1).expect("alloc dst_a");
-        let mut dst_c: Buffer<u32> = device.alloc_buffer(1).expect("alloc dst_c");
-
-        // Session A: committed — publishes a real fence tail.
-        let mut cmds_a = device.commands().expect("commands A");
-        argmax_bf16(&mut cmds_a, &library, &src, &mut dst_a, host.len()).expect("dispatch A");
-        cmds_a.commit_and_wait().expect("commit A");
-
-        // Session B: abandoned (dropped uncommitted). Without chain_restore
-        // this would leave B's never-signaling fence as the chain tail.
-        let mut cmds_b = device.commands().expect("commands B");
-        cmds_b.encoder().expect("open encoder B");
-        drop(cmds_b);
-
-        // Session C: must complete — would hang if B's fence is the tail.
-        let mut cmds_c = device.commands().expect("commands C");
-        argmax_bf16(&mut cmds_c, &library, &src, &mut dst_c, host.len()).expect("dispatch C");
-        cmds_c.commit_and_wait().expect("commit C");
-
-        // SAFETY: commit_and_wait blocked; GPU is done writing dst_a / dst_c.
-        assert_eq!(unsafe { dst_a.as_slice()[0] }, 3, "session A result");
-        assert_eq!(unsafe { dst_c.as_slice()[0] }, 3, "session C result");
-    }
-
-    /// An abandoned session on a FRESH device (no prior fence tail) must
-    /// clear any fence it published, not just restore a displaced one.
-    /// Closing an encoder publishes the session's own fence as the
-    /// device tail; if the session is then dropped uncommitted, that
-    /// fence never signals. Calls the private `close_encoder` directly —
-    /// the public route is `begin_profiled_op`, but GPU counter sampling
-    /// is unavailable on virtualized CI runners. Asserts the tail state
-    /// directly — the hang-based variant of this failure would stall the
-    /// suite instead of failing.
-    #[test]
-    fn abandoned_session_on_fresh_device_clears_fence_tail() {
-        let device = Device::system_default().expect("device");
-        let library = KernelLibrary::arg_reduce(&device).expect("arg_reduce lib");
-        let host: Vec<bf16> = [0.1f32, 0.5, 0.3, 0.9, 0.2]
-            .iter()
-            .map(|&x| bf16::from_f32(x))
-            .collect();
-        let src: Buffer<bf16> = device.upload(&host).expect("upload");
-        let mut dst: Buffer<u32> = device.alloc_buffer(1).expect("alloc dst");
-
-        let mut cmds = device.commands().expect("commands");
-        argmax_bf16(&mut cmds, &library, &src, &mut dst, host.len()).expect("dispatch");
-        // Closes the open encoder, publishing this session's fence.
-        cmds.close_encoder();
-        drop(cmds); // abandoned uncommitted — the published fence never signals
-
-        assert!(
-            device.take_last_fence().is_none(),
-            "abandoned session left its never-signaling fence as the chain tail"
-        );
-    }
-
     /// An abandoned map-mode session that already closed an encoder (publishing
     /// its outputs) must remove those entries on Drop — their fence will never
     /// signal, and a later reader of the same buffer key would hang on it.
@@ -670,7 +549,7 @@ mod tests {
         let device = Device::system_default().expect("device");
         let key = 0xABCD_usize;
 
-        let mut cmds = super::Commands::new_with_mode(&device, true).expect("map commands");
+        let mut cmds = super::Commands::new(&device).expect("map commands");
         cmds.encoder().expect("open encoder"); // creates own fence, restore = Map([])
         cmds.record_output(key);
         cmds.close_encoder(); // publishes map[key] = own fence (never committed)

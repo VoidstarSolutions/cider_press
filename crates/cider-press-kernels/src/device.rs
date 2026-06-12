@@ -49,24 +49,15 @@ type DisplacedOutput = (usize, Option<Retained<ProtocolObject<dyn MTLFence>>>);
 pub struct Device {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
-    /// Fence signaled by the most recently closed compute encoder.
-    /// Each new encoder waits on it, forming a strict execution chain
-    /// across encoders, command buffers, and eval calls — the explicit
-    /// replacement for Metal's automatic hazard tracking once buffers
-    /// go untracked (redundant until then — buffers are still tracked).
-    /// Mutex only for `Sync`: the chain's take/set pairing assumes ONE
-    /// thread drives dispatch — concurrent sessions would interleave
-    /// take/set and silently corrupt the ordering, lock notwithstanding.
-    last_fence: Mutex<Option<Retained<ProtocolObject<dyn MTLFence>>>>,
     /// Per-output-buffer fence map (the MLX `prev_ce_outputs_` port): maps a
     /// written buffer's identity key to the fence of the encoder that last
     /// wrote it. A new encoder waits only the fences of buffers it reads OR
     /// overwrites (outputs are waited as inputs — the pool-recycling WAW
     /// guard). Single-threaded encode + pooled buffers keep this self-bounding
     /// (a key is overwritten in submission order), so no completion-handler
-    /// retirement is needed. Used only when `fence_map_enabled()`; the chain
-    /// (`last_fence`) is the `CIDER_PRESS_FENCE_MAP=0` fallback. Mutex only for
-    /// `Sync`, as with `last_fence`.
+    /// retirement is needed. The map is the sole cross-encoder ordering
+    /// mechanism. Mutex only for `Sync`: the publish/wait pairing assumes ONE
+    /// thread drives dispatch.
     prev_outputs: Mutex<HashMap<usize, Retained<ProtocolObject<dyn MTLFence>>>>,
 }
 
@@ -81,27 +72,16 @@ impl Device {
         Ok(Self {
             device,
             queue,
-            last_fence: Mutex::new(None),
             prev_outputs: Mutex::new(HashMap::new()),
         })
-    }
-
-    pub(crate) fn take_last_fence(&self) -> Option<Retained<ProtocolObject<dyn MTLFence>>> {
-        self.last_fence.lock().expect("fence mutex poisoned").take()
-    }
-
-    /// Takes an `Option` so an abandoned session can restore a `None`
-    /// tail (fresh device) as well as a displaced fence.
-    pub(crate) fn set_last_fence(&self, fence: Option<Retained<ProtocolObject<dyn MTLFence>>>) {
-        *self.last_fence.lock().expect("fence mutex poisoned") = fence;
     }
 
     /// Fences a closing encoder must wait on: the prior-writer fence of every
     /// `key` it reads or overwrites that is still live in the map, deduped by
     /// fence identity. When `unresolved` is set (an input could not be resolved
     /// to a key), wait the whole current frontier instead — every distinct
-    /// fence in the map — recovering the chain's transitive ordering against
-    /// all still-live prior writers.
+    /// fence in the map — conservatively ordering against all still-live prior
+    /// writers.
     pub(crate) fn fence_waits(
         &self,
         keys: &[usize],
