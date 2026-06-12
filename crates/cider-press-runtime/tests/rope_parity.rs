@@ -60,6 +60,58 @@ fn run(start_pos: i32) {
     }
 }
 
+#[test]
+fn rope_strided_view_matches_contiguous() {
+    // [1, T, H, D] dense source; permute to [1, H, T, D] (strided, feature
+    // axis stays contiguous) vs the same permuted-then-copied (contiguous).
+    let (batch, seq, heads, dim) = (1usize, 6usize, 4usize, 64usize);
+    let device = Device::system_default().expect("device");
+
+    let len = batch * seq * heads * dim;
+    let host: Vec<bf16> = (0..len)
+        .map(|i| {
+            // Deterministic spread in [-0.5, 0.5) without an int->float cast.
+            let f = f32::from(u16::try_from(i % 1000).expect("0..1000")) * 0.001 - 0.5;
+            bf16::from_f32(f)
+        })
+        .collect();
+    let base = Tensor::from_slice(&device, &host, [batch, seq, heads, dim]).expect("base");
+    let offset = Tensor::from_slice(&device, &[0i32], [1]).expect("offset");
+
+    let strided = base.permute(&[0, 2, 1, 3]).expect("permute"); // [1,H,T,D] strided
+    let contiguous = strided.copy().expect("copy");
+
+    let out_strided = strided.rope(&offset, BASE, 1.0, dim).expect("rope strided");
+    let out_contig = contiguous
+        .rope(&offset, BASE, 1.0, dim)
+        .expect("rope contig");
+    out_strided.eval().expect("eval s");
+    out_contig.eval().expect("eval c");
+
+    let got_strided: Vec<bf16> = out_strided.cpu_to_vec().expect("dense strided out");
+    let got_contig: Vec<bf16> = out_contig.cpu_to_vec().expect("dense contig out");
+    assert_eq!(
+        got_strided, got_contig,
+        "rope on a strided permuted view must match rope on its contiguous copy",
+    );
+}
+
+#[test]
+fn rope_rejects_non_rank4_without_panicking() {
+    // A rank-0 (scalar) input must return InvalidArgument, not panic on the
+    // last-axis stride probe (which runs only after the rank check).
+    let device = Device::system_default().expect("device");
+    let scalar = Tensor::from_slice(&device, &[bf16::from_f32(1.0)], []).expect("scalar");
+    let offset = Tensor::from_slice(&device, &[0i32], [1]).expect("offset");
+    let err = scalar
+        .rope(&offset, BASE, 1.0, D)
+        .expect_err("rank-0 rope must be rejected");
+    assert!(
+        err.to_string().contains("rank 4"),
+        "expected a rank-4 error, got: {err}"
+    );
+}
+
 fn assert_within_tolerance(
     label: &str,
     got: &[bf16],

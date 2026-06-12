@@ -99,8 +99,9 @@ impl KvCache {
     /// zeroed slab keeps a premature read of an unwritten row benign rather
     /// than garbage (see the module-level aliasing-contract note).
     ///
-    /// `dtype` must be a float type (`f32`, `f16`, or `bf16`);
-    /// quantized K/V caches are out of scope.
+    /// `dtype` must be [`DType::BF16`] — the only dtype the slab write path
+    /// ([`Tensor::slice_update`]) supports. Other floats and quantized K/V
+    /// caches are out of scope.
     pub fn new(
         device: &Device,
         max_tokens: usize,
@@ -114,13 +115,14 @@ impl KvCache {
                  n_kv_heads={n_kv_heads}, head_dim={head_dim})"
             )));
         }
-        match dtype {
-            DType::F32 | DType::F16 | DType::BF16 => {}
-            DType::I32 | DType::U32 => {
-                return Err(Error::InvalidArgument(format!(
-                    "KvCache::new: dtype {dtype:?} is not supported (float dtypes only)"
-                )));
-            }
+        // BF16-only: the slab write path (`Tensor::slice_update`) rejects
+        // every other dtype, so accepting F16/F32 here would construct a
+        // cache that fails on its first `update()`.
+        if dtype != DType::BF16 {
+            return Err(Error::InvalidArgument(format!(
+                "KvCache::new: only BF16 is supported (got {dtype:?}); \
+                 the slab write path is BF16-only"
+            )));
         }
         let elem_count = max_tokens
             .checked_mul(n_kv_heads)
@@ -377,10 +379,13 @@ impl KvCache {
             )));
         }
         let dims = t.shape().dims();
-        if dims.len() != 3 || dims[1] != self.n_kv_heads || dims[2] != self.head_dim {
+        let core_ok = (dims.len() == 3 || (dims.len() == 4 && dims[3] == 1))
+            && dims[1] == self.n_kv_heads
+            && dims[2] == self.head_dim;
+        if !core_ok {
             return Err(Error::InvalidArgument(format!(
                 "KvCache::update: {name} shape {:?} does not match \
-                 [step_t, n_kv_heads={}, head_dim={}]",
+                 [step_t, n_kv_heads={}, head_dim={}] (optional trailing 1)",
                 dims, self.n_kv_heads, self.head_dim,
             )));
         }
@@ -417,6 +422,21 @@ mod tests {
     use super::*;
     use crate::Device;
     use crate::dtype::DType;
+
+    #[test]
+    fn new_rejects_non_bf16_dtype() {
+        // The slab write path is BF16-only; F16/F32 caches would construct
+        // here and then fail on their first update(), so reject up front.
+        let device = Device::shared().expect("device");
+        for dtype in [DType::F32, DType::F16, DType::I32, DType::U32] {
+            let err =
+                KvCache::new(&device, 4, 2, 3, dtype).expect_err("non-BF16 cache must be rejected");
+            assert!(
+                err.to_string().contains("only BF16"),
+                "expected a BF16-only error for {dtype:?}, got: {err}"
+            );
+        }
+    }
 
     #[test]
     fn new_cache_zeroes_full_slabs() {

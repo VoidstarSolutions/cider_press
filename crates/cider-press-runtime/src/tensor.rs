@@ -766,10 +766,14 @@ impl Tensor {
     /// op tensor whose logical shape equals the slab's.
     ///
     /// `self` must be a dense bf16 rank-3 slab
-    /// (`[max_rows, n_kv_heads, head_dim]`); `src` must be dense bf16
-    /// rank-3 with the same trailing two dims. Preconditions (bf16,
-    /// rank-3 slab and src, matching row shape `[n_kv_heads, head_dim]`,
-    /// and an in-bounds `offset_rows`) are validated here at construction.
+    /// (`[max_rows, n_kv_heads, head_dim]`); `src` is bf16 with logical
+    /// `[T, n_kv_heads, head_dim]` rows in its leading three dims and may
+    /// carry a trailing size-1 axis (the no-copy attention layout
+    /// `[T, H, D, 1]`). `src` may be strided, but its head dimension
+    /// (axis 2) must be unit-stride. Preconditions (bf16, rank-3 slab,
+    /// rank-3-or-trailing-1 src, matching row shape `[n_kv_heads,
+    /// head_dim]`, unit-stride D, and an in-bounds `offset_rows`) are
+    /// validated here at construction.
     pub fn slice_update(&self, src: &Tensor, offset_rows: usize) -> Result<Self> {
         let device = self.inner.device.as_ref().ok_or_else(|| {
             Error::InvalidArgument("slice_update: slab is a placeholder (no device)".into())
@@ -803,16 +807,24 @@ impl Tensor {
         }
         let slab_dims = self.inner.shape.dims();
         let src_dims = src.inner.shape.dims();
-        if slab_dims.len() != 3 || src_dims.len() != 3 {
+        // The slab is rank-3 `[rows, n_kv_heads, head_dim]`. `src` carries
+        // the logical `[T, H, D]` rows in its leading three dims, but may be
+        // a strided permuted view that retains a trailing size-1 axis (the
+        // no-copy attention layout `[T,H,D,1]`); the dispatch copies over the
+        // leading three dims only.
+        if slab_dims.len() != 3
+            || !(src_dims.len() == 3 || (src_dims.len() == 4 && src_dims[3] == 1))
+        {
             return Err(Error::InvalidArgument(format!(
-                "slice_update: slab and src must be rank-3 \
-                 [rows, n_kv_heads, head_dim] (slab {slab_dims:?}, src {src_dims:?})"
+                "slice_update: slab must be rank-3 [rows, n_kv_heads, head_dim] and src rank-3 \
+                 (or rank-4 with a trailing size-1 axis) (slab {slab_dims:?}, src {src_dims:?})"
             )));
         }
-        if slab_dims[1..] != src_dims[1..] {
+        let src_core = &src_dims[..3]; // logical [T, H, D]
+        if slab_dims[1..] != src_core[1..] {
             return Err(Error::InvalidArgument(format!(
                 "slice_update: src row shape {:?} must match slab row shape {:?}",
-                &src_dims[1..],
+                &src_core[1..],
                 &slab_dims[1..]
             )));
         }
@@ -821,19 +833,33 @@ impl Tensor {
                 "slice_update: slab must be dense and contiguous".into(),
             ));
         }
-        if !src.layout().is_dense_contiguous(src.shape()) {
-            return Err(Error::InvalidArgument(
-                "slice_update: src must be dense and contiguous".into(),
-            ));
+        // `src` may be a strided (permuted) view, but the copy kernel reads
+        // each row's D elements with a unit-stride pointer walk, so the
+        // feature (D, index 2) axis must be contiguous; a non-unit D stride
+        // would read the wrong elements.
+        let src_strides = match src.layout() {
+            Layout::Dense { strides } => strides,
+            Layout::Quantized(_) => {
+                return Err(Error::InvalidArgument(
+                    "slice_update: src must not be quantized".into(),
+                ));
+            }
+        };
+        if src_strides.as_slice()[2] != 1 {
+            return Err(Error::InvalidArgument(format!(
+                "slice_update: src feature (D, axis 2) must be unit-stride (got strides {:?}); \
+                 copy() first",
+                src_strides.as_slice(),
+            )));
         }
-        let end = offset_rows.checked_add(src_dims[0]).ok_or_else(|| {
+        let end = offset_rows.checked_add(src_core[0]).ok_or_else(|| {
             Error::InvalidArgument("slice_update: offset_rows + src rows overflows usize".into())
         })?;
         if end > slab_dims[0] {
             return Err(Error::InvalidArgument(format!(
                 "slice_update: write of {} rows at offset {offset_rows} is out of bounds \
                  for a slab with {} rows",
-                src_dims[0], slab_dims[0]
+                src_core[0], slab_dims[0]
             )));
         }
         Ok(Self::op_tensor(
@@ -1413,8 +1439,11 @@ impl Tensor {
     /// Preconditions (mirroring the kernels-crate scope; broader
     /// instantiations land alongside their first consumer):
     ///
-    /// - `self` is dense, contiguous, [`DType::BF16`], rank 4
-    ///   (`[B, H, T, D]`).
+    /// - `self` is [`DType::BF16`], rank 4 (`[B, H, T, D]`), with a
+    ///   unit-stride feature (last) axis. A strided head/seq-permuted view
+    ///   is accepted as long as its view byte offset is 0 — the kernel
+    ///   binds the real head/seq element strides. (`B > 1` additionally
+    ///   requires the batch axis to advance by `n_head * head_stride`.)
     /// - `offset` is dense, contiguous, [`DType::I32`], length 1.
     /// - Both tensors are on the same [`Device`].
     /// - `rotary_dims` is even and ≤ `D`. Equals `D` for full-rotation
@@ -1442,24 +1471,13 @@ impl Tensor {
                 "rope: input and offset are on different devices".into(),
             ));
         }
-        // A contiguous view (canonical strides, e.g. a copy()-elided
-        // degenerate permute) is byte-equivalent to a dense leaf, so the
-        // eval-side resolver can read it from offset 0. A strided view
-        // (genuine reorder) is not — its kernel strides aren't wired yet
-        // (deferred to the prefill stage), so reject it.
+        // A strided view (head/seq-permuted, e.g. project_heads' [1,H,T,D])
+        // is accepted: the rope kernel binds the head/seq element strides via
+        // RopeArgs, and the eval-side resolver reads view inputs from byte
+        // offset 0. Only the byte-offset==0 requirement (matching copy()'s
+        // elision constraint) is enforced here; the feature-axis unit-stride
+        // requirement is checked below against the resolved layout strides.
         if self.inner.view.is_some() {
-            if !self.layout().is_dense_contiguous(self.shape()) {
-                return Err(Error::InvalidArgument(
-                    "rope: strided view inputs are not supported; copy() first to \
-                     materialise a dense version (the rope dispatch reads inputs as \
-                     contiguous bytes and does not yet pass view strides)"
-                        .into(),
-                ));
-            }
-            // The eval-side resolver reads view inputs from byte offset 0
-            // only (matching copy()'s elision constraint), so a contiguous
-            // view starting mid-buffer must be rejected here rather than
-            // failing later inside eval.
             let (_, byte_offset) = self.flatten_view();
             if byte_offset != 0 {
                 return Err(Error::InvalidArgument(format!(
@@ -1497,6 +1515,13 @@ impl Tensor {
                 offset.inner.dtype,
             )));
         }
+        let dims = self.shape().dims();
+        if dims.len() != 4 {
+            return Err(Error::InvalidArgument(format!(
+                "rope: input must be rank 4 [B, H, T, D] (got rank {})",
+                dims.len(),
+            )));
+        }
         let strides = match self.layout() {
             Layout::Dense { strides } => strides,
             Layout::Quantized(_) => {
@@ -1505,20 +1530,33 @@ impl Tensor {
                 ));
             }
         };
-        if !strides.is_contiguous(self.shape()) {
+        // Rank is checked above, so the feature (last) axis is index 3.
+        let stride_slice = strides.as_slice();
+        if stride_slice[3] != 1 {
             return Err(Error::InvalidArgument(format!(
-                "rope: input must be contiguous (got shape {:?} strides {:?}); \
-                 copy() first to materialise a dense version",
-                self.shape().dims(),
-                strides.as_slice(),
+                "rope: feature (last) axis must be unit-stride (got strides {stride_slice:?}); \
+                 copy() first",
             )));
         }
-        let dims = self.shape().dims();
-        if dims.len() != 4 {
-            return Err(Error::InvalidArgument(format!(
-                "rope: input must be rank 4 [B, H, T, D] (got rank {})",
-                dims.len(),
-            )));
+        // The rope kernel derives each element's batch position as
+        // `mat_idx = batch_idx * n_head + head_idx` walked at the head
+        // stride (`strides[0]`), which is only correct when the batch axis
+        // advances by exactly `n_head * head_stride`. A row-contiguous input
+        // or `B == 1` satisfies this trivially; a strided view with `B > 1`
+        // whose batch stride differs would silently read the wrong batch, so
+        // reject it rather than return garbage.
+        if dims[0] > 1 {
+            let n_head = isize::try_from(dims[1])
+                .map_err(|_| Error::InvalidArgument("rope: n_head overflows isize".into()))?;
+            let batch_stride = n_head.checked_mul(stride_slice[1]).ok_or_else(|| {
+                Error::InvalidArgument("rope: n_head * head_stride overflows isize".into())
+            })?;
+            if stride_slice[0] != batch_stride {
+                return Err(Error::InvalidArgument(format!(
+                    "rope: B > 1 requires the batch axis to advance by n_head * head_stride \
+                     (got dims {dims:?}, strides {stride_slice:?}); copy() first",
+                )));
+            }
         }
         let head_dim = dims[3];
         if head_dim == 0 || head_dim % 2 != 0 {
@@ -4638,18 +4676,34 @@ mod tests {
     }
 
     #[test]
-    fn rope_still_rejects_strided_view() {
-        // A genuine transpose (both axes > 1) is NOT contiguous-mod-unit; rope
-        // must still reject it until S2 wires actual strides into the kernel.
+    fn rope_accepts_head_seq_permuted_view() {
+        // A head/seq transpose keeps the feature (last) axis unit-stride; rope
+        // now accepts it and threads the real head/seq strides into the kernel.
         let device = Device::shared().expect("system default device");
         let data: Vec<half::bf16> = (0..24_u8)
             .map(|i| half::bf16::from_f32(f32::from(i)))
             .collect();
-        // [1,2,3,4] -> permute([0,2,1,3]) -> [1,3,2,4] genuine reorder view.
+        // [1,2,3,4] -> permute([0,2,1,3]) -> [1,3,2,4] strided, feature unit.
         let base = Tensor::from_slice(&device, &data, [1usize, 2, 3, 4]).expect("from_slice");
         let view = base.permute(&[0, 2, 1, 3]).expect("permute");
         let offset = Tensor::from_slice(&device, &[0i32], [1usize]).expect("offset");
+        view.rope(&offset, 10000.0, 1.0, 4)
+            .expect("rope accepts a head/seq-permuted view");
+    }
+
+    #[test]
+    fn rope_rejects_non_unit_feature_stride() {
+        // A view whose last (feature) axis is non-unit-stride cannot be read
+        // by the kernel's unit-stride feature walk; rope must reject it.
+        let device = Device::shared().expect("system default device");
+        let data: Vec<half::bf16> = (0..24_u8)
+            .map(|i| half::bf16::from_f32(f32::from(i)))
+            .collect();
+        // [1,1,4,6] -> permute([0,1,3,2]) -> [1,1,6,4] with feature stride 6.
+        let base = Tensor::from_slice(&device, &data, [1usize, 1, 4, 6]).expect("from_slice");
+        let view = base.permute(&[0, 1, 3, 2]).expect("permute");
+        let offset = Tensor::from_slice(&device, &[0i32], [1usize]).expect("offset");
         let err = view.rope(&offset, 10000.0, 1.0, 4).unwrap_err();
-        assert!(format!("{err}").contains("view"));
+        assert!(format!("{err}").contains("unit-stride"));
     }
 }

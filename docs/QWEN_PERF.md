@@ -434,6 +434,94 @@ agree), not yet *directly* observed. The confirming check before the engineering
 spend: in cider's `.gputrace` timeline, verify the GPU idle gaps land at the
 command-buffer commit boundaries.
 
+### Copy elimination measured — dispatch-count hypothesis REFUTED (2026-06-11)
+
+Acted on the lever: eliminated 120 of the 146 prefill copies (Sites 1+2 — the
+Q/K/V project-heads + K/V rope→cache materializations) by feeding strided views
+to RoPE and the KV-cache write (`copy_g`), both already strided-capable in
+vendored code. Site 3 (o_proj, 24 copies) and the Q/K/V bias-adds were kept —
+the qmm kernel needs contiguous input and has no bias epilogue, and **mlx faces
+the same kernels**, so eliminating them would mean owning a kernel mlx isn't
+modifying either. End-to-end `qwen2_logits` parity unchanged (bit-exact data
+movers; bf16-ULP RoPE).
+
+The copies vanished as designed — **the bubble did not**:
+
+| | before | after |
+| --- | ---: | ---: |
+| `gpu.copy` dispatches | 146 | **26** |
+| total dispatches | ~680 | ~560 |
+| GPU-wait (the bubble) | ~8.27 ms | **~8.35 ms (flat)** |
+| CPU-encode | ~0.85 ms | ~0.67 ms |
+| prefill (sync) | ~9.32 ms | **~9.18 ms** |
+
+**The dispatch-count → bubble hypothesis is refuted.** Removing 120 dispatches
+left GPU-wait flat; the only wall-clock movement (~0.14 ms) is the smaller CPU
+encode (fewer ops to build). The copies were off the qmm-bound critical path —
+cheap (~3.8 µs each), overlapped, hidden — exactly the PR #37 outcome reproduced
+at 5× the scale. The ~2.2 ms bubble is **not** caused by the copy *count*.
+
+The change is kept regardless: it's correct, parity-clean, removes 120 copies of
+memory traffic, matches mlx's lazy-view design, and rules out a hypothesis. But
+the prefill gap to mlx (~1.28× → ~1.26×) is essentially unchanged.
+
+**Open, re-prioritized:** the real bubble is still unlocalized and is *not*
+dispatch count. Next diagnostic — the **`OPS_PER_COMMAND_BUFFER` cadence probe**
+(`eval.rs:206`): directly vary the ~14-command-buffer count. If the gaps are at
+commit boundaries (as the trace suggested), the cadence moves the bubble; if not,
+prefill is near its floor and the residual is structural — the synchronous
+per-eval model and the <50%-occupancy under-utilization seen in the trace, which
+needs *concurrency* (overlapping independent dispatches), not fewer dispatches.
+
+### Cadence probe + dispatch-model comparison — the bubble is SERIALIZATION (2026-06-11)
+
+**Cadence probe (refuted too).** Swept `OPS_PER_COMMAND_BUFFER` 50→1000 (env-gated,
+uncommitted). Fewer/bigger buffers made GPU-wait **worse**, not better:
+
+| OPS_PER_CB | ~buffers | prefill (sync) | GPU-wait |
+| ---: | ---: | ---: | ---: |
+| 50 (default) | ~11 | 9.14 ms | 8185 µs |
+| 200 | ~3 | 9.10 ms | 8341 µs |
+| 1000 | 1 | 9.43 ms | 8782 µs |
+
+Consolidating loses CPU-encode/GPU-execute pipelining (the GPU can't start until
+the whole buffer is encoded). So buffer *count* isn't the bubble either — both
+count-reduction levers (copies, buffers) are refuted.
+
+**Then read both schedulers side-by-side** (cider `eval.rs`/`commands.rs`/
+`device.rs` vs `../mlx/mlx/backend/metal/device.cpp`). The gap is **not** dispatch
+count — **cider over-serializes work mlx overlaps** (same ~6.06 ms compute, cider
+8.2 ms wall; the <50% occupancy is the symptom). Identical on both sides (ruled
+out): one **concurrent** compute encoder per buffer, ~50 ops/buffer,
+commit-chain + one wait, same per-op dispatches (mlx fuses neither the dense bias
+nor SwiGLU), same kernels/launch dims. Two material differences:
+
+1. **Strict per-buffer fence chain (biggest).** cider chains ONE fence per command
+   buffer — `waitForFence(prev)` at encoder open + `updateFence` at close
+   *capturing the whole buffer* (`commands.rs:204-232`; `device.rs:46-54` calls it
+   a "strict execution chain"). Buffer N+1's first dispatch waits buffer N's last
+   ⇒ the GPU hard-drains at every one of the ~11-14 seams. mlx keeps a
+   **per-output-buffer fence map** (`device.cpp:404-415`): it waits a prior
+   encoder's fence only for inputs actually read, and retires fences as buffers
+   complete ⇒ independent buffer tails pipeline. (cider's buffers are
+   `HazardTrackingModeUntracked`, `device.rs:119-123`, so the single chained fence
+   is the *only* cross-buffer ordering — maximally conservative.)
+
+2. **Spurious barriers from a coarse, pool-aliased hazard key.** cider's
+   barrier-elision keys on the whole `MTLBuffer` pointer (`eval.rs:498-502`) and
+   outputs are pool-allocated (`alloc_pooled`). Pool reuse aliases a later op's dst
+   onto an earlier output's buffer ⇒ a false hazard ⇒ a barrier on the concurrent
+   encoder that mlx's per-array RAW check (`device.cpp:307-309`) would not insert.
+   This serializes the genuinely-independent q/k/v and gate/up dispatches — the
+   <50% occupancy.
+
+This explains why both prior levers missed: they cut dispatch/buffer *count*, but
+the bubble is **serialization**. **Next lever (the real "#2"):** (1) replace the
+single fence-chain tail with mlx's per-output-buffer fence map so non-dependent
+command buffers stop draining the GPU at every seam; (2) make the hazard key
+allocation/offset-aware so pool aliasing stops firing false barriers. Both let
+cider's already-concurrent encoders actually run concurrently.
+
 ## Async decode pipelining (detach-on-eval)
 
 Decode was synchronous: one `commit_and_wait` per token, and the next

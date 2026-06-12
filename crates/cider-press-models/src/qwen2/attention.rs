@@ -217,17 +217,11 @@ impl Attention {
         let k = rope(&k, offset, config)?;
 
         // KvCache stores [step_t, n_kv_heads, head_dim]. K/V are
-        // [1, H_kv, T, D_h]; permute (2,1,3,0) -> [T, H_kv, D_h, 1],
-        // reshape to [T, H_kv, D_h] (safe: B==1). copy() lands the
-        // contiguous bytes the lazy `SliceUpdate` write reads from.
-        let k_upd = k
-            .permute(&[2, 1, 3, 0])?
-            .copy()?
-            .reshape([t, h_kv, head_dim])?;
-        let v_upd = v
-            .permute(&[2, 1, 3, 0])?
-            .copy()?
-            .reshape([t, h_kv, head_dim])?;
+        // [1, H_kv, T, D_h]; permute (2,1,3,0) -> [T, H_kv, D_h, 1] strided
+        // cache-write source (D axis unit-stride). No copy: slice_update reads
+        // the strides; the trailing unit axis is dropped at dispatch.
+        let k_upd = k.permute(&[2, 1, 3, 0])?;
+        let v_upd = v.permute(&[2, 1, 3, 0])?;
         cache.update(&k_upd, &v_upd)?;
 
         // Read the populated prefix. keys_view()/values_view() are
@@ -256,9 +250,9 @@ impl Attention {
 }
 
 /// Project `hidden` through `proj` and lay the result out per head:
-/// `[1, T, H*D_h] -> [1, H, T, D_h]`. The `copy()` materializes the
-/// permuted view into contiguous bytes for the downstream matmul /
-/// `RoPE` kernels.
+/// `[1, T, H*D_h] -> [1, H, T, D_h]`. Returns a strided view (no copy):
+/// the feature axis stays unit-stride, and `RoPE` (Q/K), the steel SDPA,
+/// and the strided cache write all consume the permuted strides directly.
 fn project_heads(
     proj: &dyn Module,
     hidden: &Tensor,
@@ -269,6 +263,5 @@ fn project_heads(
     let out = proj.forward(hidden)?; // [1, T, H*D_h]
     Ok(out
         .reshape([1usize, t, h, head_dim])?
-        .permute(&[0, 2, 1, 3])?
-        .copy()?)
+        .permute(&[0, 2, 1, 3])?)
 }

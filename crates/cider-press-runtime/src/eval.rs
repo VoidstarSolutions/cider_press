@@ -796,36 +796,46 @@ fn dispatch_slice_update(
         Error::InvalidArgument("SliceUpdate: missing src input (inputs[1])".into())
     })?;
     let src_dims = src.shape().dims();
-    let row_elems = src_dims[1] * src_dims[2];
-    let dst_byte_offset = offset_rows * row_elems * DType::BF16.size_bytes();
+    // `src` carries the logical `[T, H, D]` rows in its leading three dims;
+    // it may be a strided permuted view that retains a trailing size-1 axis.
+    let core_dims = &src_dims[..3];
+    let row_elems = core_dims[1].checked_mul(core_dims[2]).ok_or_else(|| {
+        Error::InvalidArgument("slice_update: row element count overflows usize".into())
+    })?;
+    let dst_byte_offset = offset_rows
+        .checked_mul(row_elems)
+        .and_then(|x| x.checked_mul(DType::BF16.size_bytes()))
+        .ok_or_else(|| {
+            Error::InvalidArgument("slice_update: dst byte offset overflows usize".into())
+        })?;
 
-    // `src` is typically a contiguous reshape *view* of a copy op (the
-    // `k_upd`/`v_upd` produced by attention), so resolve through the view
-    // chain like the matmul path does — `dense_input_buffer` only handles
-    // direct op outputs / cached leaves and would reject a view. The
-    // contiguous-offset-0 assertion in `matmul_input_bytes` holds because
-    // the reshape just reinterprets a dense buffer's shape.
-    let src_bytes = matmul_input_bytes("slice_update", src, outputs, index_of)?;
+    // `src` may be a contiguous reshape *view* of a copy op or a strided
+    // permuted view (the no-copy attention K/V layout). Resolve through the
+    // view chain to the storage owner + byte offset, then feed the real
+    // source element strides into the strided-capable copy_g.
+    let (src_bytes, src_off) = resolve_view_storage(src, outputs, index_of)?;
     // SAFETY: the dtype guard above pinned this op to BF16; the buffers
     // were sized as `elem_count * size_bytes`, so the byte length divides
     // evenly into the bf16 element count. dst is the slab buffer; the
-    // copy writes only src.elem_count() elements starting at the offset.
+    // copy writes only the leading-3-dim element count starting at the offset.
     let src_typed = unsafe { src_bytes.reinterpret_as::<half::bf16>() };
     let mut dst_typed = unsafe { dst.reinterpret_as::<half::bf16>() };
 
-    let shape_i32 = shape_to_i32(src_dims)?;
-    let strides = contiguous_strides_i64(&shape_i32);
+    let shape_i32 = shape_to_i32(core_dims)?;
+    let src_el = layout_strides(src)?; // &[isize], len 3 or 4
+    let src_strides = strides_to_i64(&src_el[..3])?; // leading [T,H,D]
+    let dst_strides = contiguous_strides_i64(&shape_i32);
 
     let library = device.copy_library()?;
     copy::copy_g_bf16(
         commands,
         library,
         &src_typed,
-        0,
-        &strides,
+        src_off,
+        &src_strides,
         &mut dst_typed,
         dst_byte_offset,
-        &strides,
+        &dst_strides,
         &shape_i32,
     )?;
     Ok(())
@@ -1765,10 +1775,11 @@ fn dispatch_dequantize(
 }
 
 /// Dispatch a rotary positional embedding. Preconditions enforced by
-/// [`Tensor::rope`]: input is rank-4 dense contiguous BF16, offset is
-/// length-1 contiguous I32, both on the same device. We pass the strides
-/// directly from the input's row-major layout — `Tensor::rope` rejects
-/// non-contiguous inputs precisely so this is sound.
+/// [`Tensor::rope`]: input is rank-4 BF16 with a unit-stride feature axis
+/// (a strided head/seq-permuted view is allowed), offset is length-1
+/// contiguous I32, both on the same device. We read the input's real
+/// head/seq element strides and bind them to the kernel, so a permuted
+/// view dispatches correctly without a materialising copy.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
 fn dispatch_rope(
@@ -1795,11 +1806,13 @@ fn dispatch_rope(
         .get(1)
         .ok_or_else(|| Error::InvalidArgument("Rope: missing offset (inputs[1])".into()))?;
 
-    // `input` may be a contiguous view (a copy()-elided degenerate permute
-    // from attention); resolve through the view chain and assert offset 0,
-    // exactly like the qmv/slice_update activation paths. `Tensor::rope`
-    // rejects non-contiguous views at construction, so the bytes read here
-    // are contiguous-from-offset-0.
+    // `input` may be a strided head/seq-permuted view from attention;
+    // resolve through the view chain and assert byte offset 0, like the qmv
+    // activation path (`matmul_input_bytes`). `Tensor::rope` enforces a
+    // unit-stride feature axis and a byte-offset-0 view at construction, so
+    // the bytes read here start at offset 0 and the real head/seq strides
+    // (read below) place every element correctly. (slice_update, by contrast,
+    // now resolves non-zero view offsets through copy_g.)
     let in_bytes = matmul_input_bytes("rope", input, outputs, index_of)?;
     let off_bytes = dense_input_buffer(offset, outputs, index_of)?;
 
@@ -1814,6 +1827,16 @@ fn dispatch_rope(
     let head_dim = dims[3] as i32;
     let mat = i64::from(seq_len) * i64::from(head_dim);
 
+    // The input may be a strided (head/seq-permuted) view; read its real
+    // head/seq element strides for the kernel. The feature axis is
+    // unit-stride (enforced at construction). The output is allocated dense,
+    // so `out_strides` stays row-contiguous.
+    let in_strides = layout_strides(input)?; // &[isize], len 4 = [B, H, T, D]
+    let s_head = i64::try_from(in_strides[1])
+        .map_err(|_| Error::InvalidArgument("rope: head stride does not fit in i64".into()))?;
+    let s_seq = i64::try_from(in_strides[2])
+        .map_err(|_| Error::InvalidArgument("rope: seq stride does not fit in i64".into()))?;
+
     let args = cider_press_kernels::kernels::rope::RopeArgs {
         batch,
         n_head,
@@ -1822,10 +1845,9 @@ fn dispatch_rope(
         rotary_dims: rotary_dims as i32,
         scale,
         base_log2,
-        // Element strides for row-contiguous [B, H, T, D] over the
-        // (head, sequence, feature) axes; offset_stride=0 because we
-        // only accept a 1-element scalar offset today.
-        strides: [mat, i64::from(head_dim), 1],
+        // Real (head, sequence, feature) element strides of the input view;
+        // offset_stride=0 because we only accept a 1-element scalar offset.
+        strides: [s_head, s_seq, 1],
         out_strides: [mat, i64::from(head_dim), 1],
         offset_stride: 0,
     };

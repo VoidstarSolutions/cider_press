@@ -240,6 +240,56 @@ fn new_rejects_integer_dtype() {
     assert!(format!("{err}").contains("I32"));
 }
 
+#[test]
+fn kv_cache_update_from_strided_source_matches_contiguous() {
+    // The real attention layout: a dense [1,H,T,D] tensor permuted to a
+    // strided [T,H,D,1] view (D unit-stride, trailing size-1 axis). The
+    // cache write must accept that strided source and produce bytes
+    // bit-identical to writing the .copy()-contiguous equivalent.
+    let device = Device::system_default().expect("device");
+    let (h, t, d) = (2usize, 5usize, 64usize);
+
+    // Build dense [1,H,T,D] with distinguishable values.
+    let mut data: Vec<bf16> = Vec::with_capacity(h * t * d);
+    for head in 0..h {
+        for row in 0..t {
+            for dd in 0..d {
+                data.push(bf16::from_f32((head * 100_000 + row * 1000 + dd) as f32));
+            }
+        }
+    }
+    let dense = Tensor::from_slice(&device, &data, [1, h, t, d]).expect("from_slice");
+
+    let strided = dense.permute(&[2, 1, 3, 0]).expect("permute"); // [T,H,D,1]
+    assert_eq!(strided.shape().dims(), &[t, h, d, 1]);
+    let contiguous = strided.copy().expect("copy");
+
+    let mut cache_a = KvCache::new(&device, t, h, d, DType::BF16).expect("alloc a");
+    let mut cache_b = KvCache::new(&device, t, h, d, DType::BF16).expect("alloc b");
+
+    cache_a.update(&strided, &strided).expect("update strided");
+    cache_b
+        .update(&contiguous, &contiguous)
+        .expect("update contig");
+
+    let a_keys = cache_a.keys_view();
+    let a_vals = cache_a.values_view();
+    let b_keys = cache_b.keys_view();
+    let b_vals = cache_b.values_view();
+    a_keys.eval().expect("eval a keys");
+    a_vals.eval().expect("eval a values");
+    b_keys.eval().expect("eval b keys");
+    b_vals.eval().expect("eval b values");
+
+    let a_k: Vec<bf16> = a_keys.cpu_to_vec().expect("a keys vec");
+    let b_k: Vec<bf16> = b_keys.cpu_to_vec().expect("b keys vec");
+    let a_v: Vec<bf16> = a_vals.cpu_to_vec().expect("a values vec");
+    let b_v: Vec<bf16> = b_vals.cpu_to_vec().expect("b values vec");
+
+    assert_eq!(a_k, b_k, "strided vs contiguous keys mismatch");
+    assert_eq!(a_v, b_v, "strided vs contiguous values mismatch");
+}
+
 // ---------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------
