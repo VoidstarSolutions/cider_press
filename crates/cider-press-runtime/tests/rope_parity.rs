@@ -82,7 +82,9 @@ fn rope_strided_view_matches_contiguous() {
     let contiguous = strided.copy().expect("copy");
 
     let out_strided = strided.rope(&offset, BASE, 1.0, dim).expect("rope strided");
-    let out_contig = contiguous.rope(&offset, BASE, 1.0, dim).expect("rope contig");
+    let out_contig = contiguous
+        .rope(&offset, BASE, 1.0, dim)
+        .expect("rope contig");
     out_strided.eval().expect("eval s");
     out_contig.eval().expect("eval c");
 

@@ -1520,7 +1520,12 @@ impl Tensor {
                 ));
             }
         };
-        if *strides.as_slice().last().expect("rope input rank checked below") != 1 {
+        if *strides
+            .as_slice()
+            .last()
+            .expect("rope input rank checked below")
+            != 1
+        {
             return Err(Error::InvalidArgument(format!(
                 "rope: feature (last) axis must be unit-stride (got strides {:?}); copy() first",
                 strides.as_slice(),

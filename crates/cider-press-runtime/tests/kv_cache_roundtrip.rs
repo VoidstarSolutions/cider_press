@@ -254,9 +254,7 @@ fn kv_cache_update_from_strided_source_matches_contiguous() {
     for head in 0..h {
         for row in 0..t {
             for dd in 0..d {
-                data.push(bf16::from_f32(
-                    (head * 100_000 + row * 1000 + dd) as f32,
-                ));
+                data.push(bf16::from_f32((head * 100_000 + row * 1000 + dd) as f32));
             }
         }
     }
@@ -266,10 +264,8 @@ fn kv_cache_update_from_strided_source_matches_contiguous() {
     assert_eq!(strided.shape().dims(), &[t, h, d, 1]);
     let contiguous = strided.copy().expect("copy");
 
-    let mut cache_a =
-        KvCache::new(&device, t, h, d, DType::BF16).expect("alloc a");
-    let mut cache_b =
-        KvCache::new(&device, t, h, d, DType::BF16).expect("alloc b");
+    let mut cache_a = KvCache::new(&device, t, h, d, DType::BF16).expect("alloc a");
+    let mut cache_b = KvCache::new(&device, t, h, d, DType::BF16).expect("alloc b");
 
     cache_a.update(&strided, &strided).expect("update strided");
     cache_b

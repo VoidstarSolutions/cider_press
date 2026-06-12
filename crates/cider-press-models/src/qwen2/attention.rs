@@ -261,5 +261,7 @@ fn project_heads(
     head_dim: usize,
 ) -> Result<Tensor> {
     let out = proj.forward(hidden)?; // [1, T, H*D_h]
-    Ok(out.reshape([1usize, t, h, head_dim])?.permute(&[0, 2, 1, 3])?)
+    Ok(out
+        .reshape([1usize, t, h, head_dim])?
+        .permute(&[0, 2, 1, 3])?)
 }
