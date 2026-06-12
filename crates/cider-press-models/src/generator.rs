@@ -125,9 +125,12 @@ impl Generator {
 
     /// Shared prefill graph builder for the profiling/timing entry points:
     /// resets the caches, then runs one forward at `T = input_ids.len()`,
-    /// offset 0 (causal via the fused sdpa kernel). Returns the lazy logits
-    /// (`[1, T, vocab]`); the caller chooses how to evaluate them. Advances
-    /// the caches to `input_ids.len()` as a side effect.
+    /// offset 0 (causal via the fused sdpa kernel). Returns the lazy
+    /// **last-position** logits (`[1, 1, vocab]`) via
+    /// [`Qwen2Model::forward_last`] — the blocks still run over all `T`
+    /// tokens, but only the final token is projected through the LM head, as
+    /// greedy generation (and `mlx_lm`'s prefill) does. Advances the caches to
+    /// `input_ids.len()` as a side effect.
     fn prefill_logits(&mut self, input_ids: &[u32]) -> Result<Tensor> {
         if input_ids.is_empty() {
             return Err(Error::InvalidArgument(
@@ -139,7 +142,8 @@ impl Generator {
         let prefill_len = input_ids.len();
         let ids_tensor = Tensor::from_slice(&device, input_ids, [1, prefill_len])?;
         let offset = Tensor::from_slice(&device, &[0i32], [1])?;
-        self.model.forward(&ids_tensor, &offset, &mut self.caches)
+        self.model
+            .forward_last(&ids_tensor, &offset, &mut self.caches)
     }
 
     /// Run one **prefill** forward (`T = input_ids.len()`, offset = 0,
@@ -164,12 +168,13 @@ impl Generator {
     }
 
     /// Run one prefill forward (`T = input_ids.len()`, offset 0, causal via
-    /// the fused sdpa kernel) and **synchronously** `eval()` the full
-    /// `[1, T, vocab]` logits, waiting
-    /// for GPU completion. Mirrors `mlx_lm`'s `model(x); mx.eval(logits)` for
-    /// an apples-to-apples prefill wall-clock measurement (the production
-    /// `generate()` path uses `eval_async` and does not wait). Resets +
-    /// advances the caches as a side effect — one-shot, not resumable.
+    /// the fused sdpa kernel) and **synchronously** `eval()` the
+    /// last-position `[1, 1, vocab]` logits (see [`Self::prefill_logits`]),
+    /// waiting for GPU completion. Mirrors `mlx_lm`'s prefill, which evals
+    /// only the KV cache for the prompt and projects the LM head for a single
+    /// token — so this is an apples-to-apples prefill wall-clock measurement
+    /// (the production `generate()` path uses `eval_async` and does not wait).
+    /// Resets + advances the caches as a side effect — one-shot, not resumable.
     ///
     /// # Errors
     /// `input_ids` empty, or device / forward / eval failure.
@@ -241,7 +246,11 @@ impl Generator {
         // do_causal — no materialized mask.
         let ids_tensor = Tensor::from_slice(&device, input_ids, [1, prefill_len])?;
         let offset = Tensor::from_slice(&device, &[0i32], [1])?;
-        let logits = self.model.forward(&ids_tensor, &offset, &mut self.caches)?;
+        // Only the last token's logits drive the first sampled id; project the
+        // LM head for that position alone (the blocks still cache all T K/V).
+        let logits = self
+            .model
+            .forward_last(&ids_tensor, &offset, &mut self.caches)?;
 
         let vocab = self.model.config().vocab_size;
         let idx0 = argmax_last_position_lazy(&logits, vocab)?;

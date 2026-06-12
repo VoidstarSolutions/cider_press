@@ -77,6 +77,50 @@ impl Qwen2Model {
         offset: &Tensor,
         caches: &mut [KvCache],
     ) -> Result<Tensor> {
+        let hidden = self.hidden_states(input_ids, offset, caches)?;
+        self.project_logits(&hidden)
+    }
+
+    /// Like [`forward`](Self::forward), but projects **only the last
+    /// position** to logits: returns `[1, 1, vocab_size]`.
+    ///
+    /// The transformer blocks still run over all `T` tokens (writing every
+    /// layer's K/V for all positions into `caches`); only the final norm and
+    /// the tied LM head are computed, for the final position alone. That is
+    /// the single logits row greedy generation consumes — projecting the
+    /// whole `[1, T, vocab]` is wasted work. `mlx_lm`'s prefill does the same:
+    /// it evals only the KV cache during prompt processing and runs the head
+    /// on one token. Numerically identical to `forward(..)[:, -1, :]` because
+    /// `RMSNorm` and the LM head are per-position.
+    pub fn forward_last(
+        &self,
+        input_ids: &Tensor,
+        offset: &Tensor,
+        caches: &mut [KvCache],
+    ) -> Result<Tensor> {
+        let hidden = self.hidden_states(input_ids, offset, caches)?;
+        let t = input_ids.elem_count();
+        let last = if t == 1 {
+            hidden
+        } else {
+            // Slice to the last token before norm/head; copy() materialises
+            // the strided view dense (the head reads inputs as dense leaves).
+            hidden
+                .slice(&[0..1, t - 1..t, 0..self.config.hidden_size])?
+                .copy()?
+        };
+        self.project_logits(&last)
+    }
+
+    /// Embed `input_ids` and run every transformer block, returning the final
+    /// hidden states `[1, T, hidden_size]` (before the final norm / LM head).
+    /// Writes each layer's K/V for all `T` positions into `caches`.
+    fn hidden_states(
+        &self,
+        input_ids: &Tensor,
+        offset: &Tensor,
+        caches: &mut [KvCache],
+    ) -> Result<Tensor> {
         if caches.len() != self.layers.len() {
             return Err(Error::InvalidArgument(format!(
                 "Qwen2Model::forward: got {} caches, expected one per layer ({})",
@@ -100,7 +144,13 @@ impl Qwen2Model {
         for (block, cache) in self.layers.iter().zip(caches.iter_mut()) {
             hidden = block.forward(&hidden, offset, cache)?;
         }
-        let normed = self.final_norm.forward(&hidden)?;
+        Ok(hidden)
+    }
+
+    /// Final norm + tied LM head over `hidden` (`[1, S, hidden_size]`),
+    /// returning `[1, S, vocab_size]` BF16, lazy.
+    fn project_logits(&self, hidden: &Tensor) -> Result<Tensor> {
+        let normed = self.final_norm.forward(hidden)?;
         // Tied LM head: the embedding table is [vocab, D], so the standard
         // y = x @ W^T direction (transpose=true) projects hidden states to
         // vocab-size logits without a separate weight.
