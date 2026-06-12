@@ -134,14 +134,29 @@ impl BufferPool {
 /// reference at that point, its `PooledBuffer` may return to the pool while
 /// the just-committed command buffer still references its `MTLBuffer` on the
 /// GPU. A subsequent `eval_async` may then `alloc_pooled` that same buffer
-/// and bind it as a write target. Ordering is guaranteed by the encoder fence
-/// chain (`cider_press_kernels::Commands`): every encoder waits the previous
-/// encoder's fence, so a re-use dispatch — necessarily encoded in a later
-/// encoder — executes strictly after the in-flight reader finishes. A
-/// committed command buffer retains its bound `MTLBuffer`s until the GPU
-/// completes, so the underlying Metal allocation is never freed while the GPU
-/// reads it. (Previously this rested on Metal's automatic hazard tracking;
-/// buffers are now allocated untracked.)
+/// and bind it as a write target.
+///
+/// Two distinct guarantees keep this sound. *Allocation lifetime*: a committed
+/// command buffer retains its bound `MTLBuffer`s until the GPU completes, so
+/// the underlying Metal allocation is never freed while the GPU reads it.
+/// *Write ordering* (the per-output fence map, `Device::prev_outputs`): the
+/// re-use dispatch records the recycled buffer's key as an output, and an
+/// encoder waits the prior-writer fence of every key it reads *or* writes
+/// before closing — so a recycling write is ordered after the buffer's prior
+/// writer (WAW) and after any reader that also wrote it (RAW).
+///
+/// The map orders against prior *writers* only, not in-flight *readers*, so it
+/// does **not** by itself order a recycling write after a purely read-only
+/// in-flight use (a true WAR hazard). That case is currently unreachable: the
+/// only buffers that survive read-only across evals are the `SliceUpdate` slab
+/// and host/constant leaves (minted [`PooledBuffer::unpooled`], never recycled)
+/// and quantized weights (never written, never in the map); every *pooled*
+/// buffer a recycling eval could clobber was produced — and thus published as a
+/// writer — within an eval still ordered ahead of it. A future architecture
+/// that introduced a pooled, read-only, cross-eval input would reopen the WAR
+/// hazard and require the recycling write to also wait the reader (publish read
+/// keys, or fall back to a recycle barrier). (The prior strict fence chain hid
+/// this by serializing every eval boundary; the map deliberately does not.)
 ///
 /// The `SliceUpdate` slab and host/constant leaves are minted
 /// [`PooledBuffer::unpooled`] (`pool: None`) and therefore never return to

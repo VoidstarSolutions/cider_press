@@ -53,11 +53,21 @@ pub struct Device {
     /// written buffer's identity key to the fence of the encoder that last
     /// wrote it. A new encoder waits only the fences of buffers it reads OR
     /// overwrites (outputs are waited as inputs — the pool-recycling WAW
-    /// guard). Single-threaded encode + pooled buffers keep this self-bounding
-    /// (a key is overwritten in submission order), so no completion-handler
-    /// retirement is needed. The map is the sole cross-encoder ordering
-    /// mechanism. Mutex only for `Sync`: the publish/wait pairing assumes ONE
-    /// thread drives dispatch.
+    /// guard). The map is the sole cross-encoder ordering mechanism. Mutex only
+    /// for `Sync`: the publish/wait pairing assumes ONE thread drives dispatch.
+    ///
+    /// Unlike MLX (which retires entries from a command-buffer completion
+    /// handler), entries are removed only on overwrite or abandon-restore —
+    /// never on completion. For a hot pool whose size classes are stable this
+    /// self-bounds: every live key is rewritten in submission order. It is NOT
+    /// strictly bounded, though: an `MTLBuffer` that is written once and then
+    /// dropped (a one-off size class, or a free-list entry evicted by
+    /// `BufferPool::set_cap`) leaves a stale entry forever. If Metal later
+    /// reuses that pointer for an unrelated allocation, the key collides (ABA)
+    /// and `fence_waits` returns the stale — already-signaled — fence,
+    /// effectively no wait. Harmless today because keys are buffer pointers held
+    /// live by the pool across a generation and eviction is rare; a workload
+    /// that churns size classes mid-flight would want MLX-style retirement.
     prev_outputs: Mutex<HashMap<usize, Retained<ProtocolObject<dyn MTLFence>>>>,
 }
 
