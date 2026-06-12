@@ -444,6 +444,20 @@ pub(crate) fn profiled_eval(root: &Tensor) -> Result<()> {
             let (buf, pool_key_bytes) = device.alloc_pooled(byte_count)?;
             (buf, Some(pool_key_bytes))
         };
+        // Feed the per-op buffer keys to the fence map exactly as the
+        // production path (`encode_ops`) does. Each profiled op is its own
+        // encoder, so without these the encoder closes with an empty wait set
+        // and the profiler would measure a regime with NO cross-encoder
+        // ordering (dependent ops free to overlap) — both racy and unlike
+        // production.
+        commands.record_output(buffer_key(&dst));
+        for input in op.lock_inputs().iter() {
+            match input_buffer_key(input, &outputs, &index_of) {
+                None => {} // quantized weight: never written
+                Some(HAZARD_KEY) => commands.record_unresolved_input(),
+                Some(key) => commands.record_input(key),
+            }
+        }
         dispatch(inner, &mut commands, &outputs, &mut dst, &index_of)?;
         outputs.push(dst);
         tags.push(tag);
