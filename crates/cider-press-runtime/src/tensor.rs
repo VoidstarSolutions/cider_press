@@ -328,10 +328,11 @@ pub enum OpKind {
     /// `[..., M, N]`.
     ///
     /// Dispatches to cider-press's own naive `gemm_bfloat16` kernel
-    /// (not MLX-derived); steel-tiled GEMM is deferred (see
-    /// `docs/inference/quantized-matmul.md`). Non-contiguous inputs (transposed
-    /// views) materialize via [`Tensor::copy`] first — same
-    /// contract as `softmax` / `rope` / reductions.
+    /// (not MLX-derived); steel-tiled GEMM is deferred. This dense op is
+    /// production-unused — the model's projections go through
+    /// [`Tensor::quantized_matmul`] (see `docs/inference/quantized-matmul.md`).
+    /// Non-contiguous inputs (transposed views) materialize via
+    /// [`Tensor::copy`] first — same contract as `softmax` / `rope` / reductions.
     MatMul,
     /// In-place write of `src`'s rows into a persistent,
     /// caller-owned slab buffer at row `offset_rows`. Inputs (in

@@ -12,7 +12,7 @@
 //! function constants are pinned false; masked / 2-pass paths land
 //! later).
 //!
-//! Explained in the inference guide: [`docs/inference/attention.md`](../../../../docs/inference/attention.md).
+//! Explained in the inference guide: `docs/inference/attention.md`.
 
 use std::ffi::c_void;
 use std::ptr::NonNull;

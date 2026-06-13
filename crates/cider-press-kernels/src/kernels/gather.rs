@@ -37,7 +37,7 @@
 //! | 10   | `idx_ndim` (constant int&) |
 //! | 20+i | `idx_i` (device `IdxT*`) |
 //!
-//! Explained in the inference guide: [`docs/inference/embedding.md`](../../../../docs/inference/embedding.md).
+//! Explained in the inference guide: `docs/inference/embedding.md`.
 
 use std::ffi::c_void;
 use std::ptr::NonNull;

@@ -133,5 +133,5 @@ names Qwen2.5's choice and what else exists. The detail lives in the
 - **Tied LM head** — `tie_word_embeddings = true`, so there is no separate
   output weight: the head re-projects through the (quantized) embedding
   table with `quantized_matmul(.., transpose=true)`. Untied models carry a
-  distinct `lm_head` weight; Qwen2.5-0.5B saves it. See
+  distinct `lm_head` weight; Qwen2.5-0.5B ships none, saving that memory. See
   [sampling](../sampling.md).

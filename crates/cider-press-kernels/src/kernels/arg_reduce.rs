@@ -6,7 +6,7 @@
 //! producing a `u32` index. Wraps MLX's `argmax_bfloat16`
 //! (`arg_reduce.metal`). The decode hot path's next-token selection.
 //!
-//! Explained in the inference guide: [`docs/inference/sampling.md`](../../../../docs/inference/sampling.md).
+//! Explained in the inference guide: `docs/inference/sampling.md`.
 
 use half::bf16;
 use objc2_metal::{MTLComputeCommandEncoder, MTLSize};

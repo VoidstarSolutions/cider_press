@@ -14,7 +14,7 @@
 //! (`affine_qmv_fast`) when `K % 512 == 0 && N % bn == 0`, generic
 //! (`affine_qmv`) otherwise, matching MLX's dispatcher.
 //!
-//! Explained in the inference guide: [`docs/inference/quantized-matmul.md`](../../../../docs/inference/quantized-matmul.md).
+//! Explained in the inference guide: `docs/inference/quantized-matmul.md`.
 
 #![allow(
     clippy::too_many_arguments,

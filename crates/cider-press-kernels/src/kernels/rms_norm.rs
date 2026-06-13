@@ -7,7 +7,7 @@
 //! collapsing the composed square→mean→rsqrt→mul→mul chain into one
 //! dispatch. Mirrors `mlx/backend/metal/normalization.cpp`'s `RMSNorm::eval_gpu`.
 //!
-//! Explained in the inference guide: [`docs/inference/rmsnorm.md`](../../../../docs/inference/rmsnorm.md).
+//! Explained in the inference guide: `docs/inference/rmsnorm.md`.
 
 use half::bf16;
 use objc2_metal::{MTLComputeCommandEncoder, MTLSize};

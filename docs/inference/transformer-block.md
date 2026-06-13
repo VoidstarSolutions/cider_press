@@ -130,7 +130,7 @@ See [models/qwen2.5.md](./models/qwen2.5.md) for Qwen2.5's concrete choices.
 
 The block is not separately profiled — it has no kernels of its own. Its cost
 *is* the cost of its sub-layers, repeated `N = 24` times, and that per-layer
-cost is dominated by the six quantized matmuls inside it: the four attention
+cost is dominated by the seven quantized matmuls inside it: the four attention
 projections (q, k, v, o) and the three FFN projections (gate, up, down). In
 decode these are memory-bandwidth-bound — each one streams its whole weight
 matrix through memory to project a single activation vector — so the block's

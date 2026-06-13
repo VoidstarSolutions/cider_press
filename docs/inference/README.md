@@ -37,14 +37,15 @@ loop, in reading order:
 5. Project to vocabulary logits via the [LM head](./quantized-matmul.md)
    (often the embedding table transposed — Qwen2.5 ties them).
 6. [Sample](./sampling.md) the next token from the logits.
-7. Append it to the sequence and loop back to step 3 until a stop token or
-   length limit.
+7. Append it to the sequence and loop back to step 2 (embed the new token)
+   until a stop token or length limit.
 
-Steps 1–2 and 4–6 run once per generated token (in decode; in prefill
-steps 1–2 run once over the whole prompt and the head only over the last
-position — see the [execution model](./execution-model.md)); the per-layer
-body of step 3 runs `N` times. The diagram below traces a single forward
-pass:
+Step 1 (tokenize) runs once, for the prompt. In decode, steps 2–6 run once
+per generated token — embedding only the newest token, then the blocks, the
+final norm, the head, and the sample. In prefill they run once over the whole
+prompt, with the head (steps 4–5) computed only at the last position — see the
+[execution model](./execution-model.md). The per-layer body of step 3 runs `N`
+times on every pass. The diagram below traces a single forward pass:
 
 ```text
 tokens [B, T]

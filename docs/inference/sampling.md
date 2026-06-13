@@ -70,12 +70,14 @@ single `argmax` op over the vocab axis, which dispatches MLX's
 via
 [`arg_reduce.rs`](../../crates/cider-press-kernels/src/kernels/arg_reduce.rs) —
 inside the **same command buffer as the LM head**. The GPU reduces the vocab
-row to a single `u32` index; only that 4-byte index is read back to the CPU.
-[`generator.rs`](../../crates/cider-press-models/src/generator.rs) drives the
-loop: the argmax tensor is kept on-GPU and fed straight into the next forward's
-embedding gather (it is already in the `[1, 1]` U32 shape the next step's input
-ids want), so the per-token next-id never round-trips the CPU. The tie-break is
-locked to the lower index, matching MLX's `ArgMax`.
+row to a single `u32` index. That index stays on-GPU and is fed straight into
+the next forward's embedding gather (it is already in the `[1, 1]` U32 shape the
+next step's input ids want), so on the hot path the next-id never round-trips
+the CPU. [`generator.rs`](../../crates/cider-press-models/src/generator.rs)
+drives the loop; it reads the index back only as a cheap 4-byte copy when it
+needs the actual token value — to emit/detokenize it and to check for a stop
+token — which is off the critical feed path. The tie-break is locked to the
+lower index, matching MLX's `ArgMax`.
 
 **Model variations.**
 
