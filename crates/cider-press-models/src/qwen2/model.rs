@@ -98,8 +98,13 @@ impl Qwen2Model {
         offset: &Tensor,
         caches: &mut [KvCache],
     ) -> Result<Tensor> {
-        let hidden = self.hidden_states(input_ids, offset, caches)?;
         let t = input_ids.elem_count();
+        if t == 0 {
+            return Err(Error::InvalidArgument(
+                "Qwen2Model::forward_last: empty input_ids (need at least one token)".into(),
+            ));
+        }
+        let hidden = self.hidden_states(input_ids, offset, caches)?;
         let last = if t == 1 {
             hidden
         } else {
@@ -123,7 +128,7 @@ impl Qwen2Model {
     ) -> Result<Tensor> {
         if caches.len() != self.layers.len() {
             return Err(Error::InvalidArgument(format!(
-                "Qwen2Model::forward: got {} caches, expected one per layer ({})",
+                "Qwen2Model::hidden_states: got {} caches, expected one per layer ({})",
                 caches.len(),
                 self.layers.len()
             )));
