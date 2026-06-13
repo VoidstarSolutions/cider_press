@@ -409,11 +409,15 @@ fn id_is_terminal(id: u32, eos_ids: &HashSet<u32>) -> bool {
 /// `T = 1` token and prefill projects the LM head for the final position alone
 /// (`Qwen2Model::forward_last`). `vocab` is accepted to validate that shape.
 fn argmax_last_position_lazy(logits: &Tensor, vocab: usize) -> Result<Tensor> {
-    debug_assert_eq!(
-        logits.shape().dims(),
-        &[1, 1, vocab],
-        "argmax_last_position_lazy expects last-position-only logits",
-    );
+    // A real runtime check, not `debug_assert_eq!`: release builds (the perf
+    // test/bench path) compile that out, which would let a non-`[1,1,vocab]`
+    // tensor silently argmax the wrong position instead of failing cleanly.
+    if logits.shape().dims() != [1, 1, vocab] {
+        return Err(Error::InvalidArgument(format!(
+            "argmax_last_position_lazy expects last-position-only logits [1, 1, {vocab}], got {:?}",
+            logits.shape().dims(),
+        )));
+    }
     // argmax(2) over [1, 1, vocab] removes the axis -> [1, 1] U32, which is
     // exactly forward()'s [1, T] input-ids shape for the next token.
     Ok(logits.argmax(2)?)
