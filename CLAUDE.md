@@ -90,10 +90,22 @@ identically because the deps are real. Also corrected: MLX keys every
 hazard/fence on the **whole `MTLBuffer` ptr** (`device.cpp`), the same
 granularity as cider's key — there is no hazard-key lever. **Landed the map as
 the sole mechanism** (chain + flag deleted): it *is* MLX's design and is strictly
-more precise, the right baseline even at parity. The remaining prefill gap needs
-a **structural** lever (overlapping evals / larger batched work), not a smarter
-fence. See `docs/QWEN_PERF.md` (§ "Copy elimination measured" and "Per-output
-fence map") and `docs/ARCHITECTURE.md`.
+more precise, the right baseline even at parity. **The prefill-gap investigation
+is now CLOSED — there was no real gap** (2026-06-13). The last-position LM-head
+lever (cider had projected the norm+head over *all* `T` prompt rows; now sliced
+to the last, `forward_last`) cut prefill-sync to **~7.76 ms**, and a same-session
+`mlx` re-measure exposed the historical "~1.09×" as a **stale single-forward
+proxy** (7.27 ms, faster machine-day): structure-for-structure, cider's prefill
+(7.76) already **leads** `mlx`'s real prefill (7.84–7.99 single-forward; **8.98**
+for the actual `generate_step` split). The `mlx_lm`-faithful T−1-fill + T=1-step
+split was implemented and measured a **pessimization for both** (cider +1.80 ms,
+`mlx` +1.14 ms — a synchronized command-buffer boundary before an isolated `T=1`
+step, exposing cider's per-isolated-commit CPU-encode, hidden in every
+production path), so it was **reverted**; `fill_cache` + its equivalence test are
+kept as the building block for **chunked prefill** (the only regime `mlx`'s split
+helps — long prompts, bounded memory). See `docs/QWEN_PERF.md` (§ "Prefill parity
+resolved", "Copy elimination measured", "Per-output fence map") and
+`docs/ARCHITECTURE.md`.
 
 ### Non-goals
 
@@ -210,9 +222,13 @@ commit boundaries, prefill is near its floor (structural: synchronous per-eval
   source is tens of seconds; subsequent processes are sub-100 ms. Cold
   first-token latency is a JIT artifact; a `.metallib` precompile is a
   shipping concern, not a dev-loop one.
-- **KvCache** writes are eager host `memcpy`s into pre-allocated slabs
-  (Apple Silicon shared storage — no Metal dispatch). Callers drop K/V
-  views before the next `update` (aliasing contract, enforced at runtime).
+- **KvCache** writes are **lazy in-graph `slice_update`** ops into
+  pre-allocated slabs (`kv_cache.rs`), landing in the same command buffer as
+  the consuming attention — *not* eager host `memcpy`s. An un-committed prior
+  write is dropped by the next `update`, so a producer→consumer pair split
+  across two evals (e.g. a cache-fill forward followed by a dependent step)
+  must `eval` between them to commit the first write. Callers drop K/V views
+  before the next `update` (aliasing contract, enforced at runtime).
 - **Loader footgun.** `q_proj.bias` (singular, dense bf16, additive
   Linear bias) is distinct from `q_proj.biases` (plural, per-group
   quantization bias on the qmv ABI). Only Q/K/V have `.bias`; O has only

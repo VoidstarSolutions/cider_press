@@ -585,6 +585,75 @@ parity — and it permanently answers "is cider's fence scheme the bottleneck?"
 (no). The remaining prefill gap needs a **structural** lever (overlapping evals /
 larger batched work), not a smarter fence.
 
+### Prefill parity resolved — there was no real gap; the T−1/T=1 split is a short-T pessimization (2026-06-13)
+
+The "structural lever" pointed at above was chased to its end, and it
+**dissolves** the gap rather than closing it. Two changes set it up:
+
+1. The **last-position LM-head lever** (parent branch
+   `perf/prefill-last-position-head`): cider had been projecting the final
+   norm + tied LM head over **all `T`** prompt positions; it now slices to the
+   last position (`forward_last`, bit-identical to `forward[:, -1, :]`), since
+   greedy generation (and `mlx_lm`'s prefill) consume only that row. Prefill-sync
+   9.17 → 7.95 ms.
+
+2. The **`mlx_lm`-faithful split experiment** (this branch): mirror
+   `generate_step` exactly — cache-fill the first `T-1` tokens (eval cache
+   state, head pruned) then run the final token as a `T=1` step (`fill_cache` +
+   a `T=1` `forward`, routed through `sdpa_vector` + the qmv decode twin via the
+   existing T-length dispatch selection). Bit-equivalent first token (gated:
+   `qwen2_split_prefill_matches_forward_last`).
+
+The discriminating measurement (same session, M4 Max, T=39, warm, median of 5):
+
+| structure | cider | mlx |
+|---|---:|---:|
+| single-forward (last-row / `forward_last`) | **7.76 ms** | 7.84 (`model(x)`) / 7.99 (`[:,-1,:]`) |
+| split (`generate_step`) | 9.56 ms | 8.98 ms |
+
+**Finding 1 — there was no real prefill gap.** The historical "7.95 vs 7.27 →
+~1.09×" compared cider's `forward_last` against a **stale single-forward `mlx`
+proxy** (7.27 ms, measured a faster machine-day; the old `profile_mlx_prefill.py`
+ran one `model(x)` + eval, *not* `mlx_lm`'s real prefill). Same-session,
+same-structure, cider's prefill (7.76) is **at or ahead of** `mlx`'s equivalent
+(7.84–7.99). The ~600 µs was baseline / scheduling variance (~7% run-to-run on
+this prompt), **not** op-sequence, **not** encode overhead, **not** chunking
+(chunking never engages below `prefill_step_size`=2048, and when it does it is a
+memory-bounding mechanism, never a per-token speed win). `profile_mlx_prefill.py`
+was corrected to mirror `generate_step` so the reference now reflects `mlx`'s
+real prefill (~8.98 ms).
+
+**Finding 2 — the split is a pessimization for both runtimes.** cider
+7.76 → 9.56 (+1.80 ms), `mlx` 7.84 → 8.98 (+1.14 ms). The split inserts a
+synchronized command-buffer boundary (`eval` cache state) before an **isolated**
+`T=1` step, serializing that step's CPU-encode (~240 dispatches across 24
+layers) *after* the fill's GPU drains — no GPU work left to hide it behind.
+cider pays **0.66 ms more than `mlx`** for that boundary (≈ the "580 µs
+split-regime gap"): its per-isolated-commit Rust encode is heavier than `mlx`'s
+C++ path. The clincher that it is **encode, not compute**: cider's *warm
+steady-state* decode step is **faster** than `mlx`'s (596 vs 568 tok/s); the
+split merely forces that step to run cold and un-pipelined. That cost is hidden
+in **every path production uses** — decode commit-ahead pipelining, and
+single-forward prefill's GPU overlap — so the split is the *only* structure that
+exposes it, and it is optional.
+
+**Resolution.** Reverted the production prefill to `forward_last` (cider stays
+at 7.76, ahead of `mlx`'s real 8.98, async decode pipeline intact). `fill_cache`
++ the equivalence test are **retained** as the building block for **chunked
+prefill** — the one regime where `mlx`'s split structure earns its keep (prompts
+longer than one chunk; bounded peak memory), a separate future lever. This
+**closes the prefill-gap line of investigation**: the gap was an artifact,
+cider's prefill already leads, and the only residual (per-isolated-commit encode
+overhead) is hidden everywhere production runs.
+
+**Open caveat (CPU-encode).** Whether leaner CPU-side encode could lift *decode*
+throughput is unproven and out of scope here. No evidence of it: decode leads
+and behaves GPU/bandwidth-bound (qmv roofline), and the commit-ahead pipeline
+keeps the GPU fed. The test, if decode ever becomes the target, is "is the
+pipeline encode-bound?" (CPU saturation during decode / does deeper
+`inflight_depth` help?). See spec
+`docs/superpowers/specs/2026-06-13-prefill-tminus1-fill-t1-step-design.md`.
+
 ## Async decode pipelining (detach-on-eval)
 
 Decode was synchronous: one `commit_and_wait` per token, and the next
