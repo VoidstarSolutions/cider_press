@@ -16,6 +16,8 @@
 //! [`QuantizedWeight::tensor`] returns the inner handle for callers
 //! that need to mix it into generic-tensor APIs.
 
+#![doc = include_str!("../../../docs/inference/quantized-matmul.md")]
+
 use crate::Device;
 use crate::Layout;
 use crate::Quantization;
