@@ -409,9 +409,14 @@ counts exact, the perturbed-regime times are not):
 | gather / dequantize | 3 / 1 | ~0% |
 
 copy (146) + binary (168) = **46% of all dispatches but ~10% of GPU compute** —
-the bubble engine. The surplus vs mlx decomposes as: **copy 146** (mlx feeds
-lazy strided/permuted views into its kernels and materializes ~none) + **~72 of
-the binaries** (the Q/K/V bias-adds mlx folds into the matmul).
+the bubble engine. The surplus vs mlx is the **146 copies** (mlx feeds lazy
+strided/permuted views into its kernels and materializes ~none). The ~72 Q/K/V
+bias-adds are **not** a cider surplus — mlx issues the *same* separate `x + bias`
+op (`../mlx/python/mlx/nn/layers/quantized.py:276`; the model path runs no
+`mx.compile`, so nothing folds the add into the qmm), so both schedulers pay
+them. (Corrected: an earlier draft of this section claimed mlx folds the bias
+into the matmul — it does not; see the side-by-side read below, "mlx fuses
+neither the dense bias nor SwiGLU".)
 
 **This reopens the copy lever that the "Strided prefill cache-read" section
 closed.** That close was correct *on compute share* (copies are <5% of prefill
@@ -424,9 +429,11 @@ see.
 1. **Eliminate the 146 prefill copies** — make RoPE, KV-cache-write, and
    collapse-heads→o_proj operate on strided views (mirror mlx). The fused steel
    attention already accepts strided K/V, so the machinery exists.
-2. **Fold Q/K/V bias into the qmm dispatch** (~72 fewer binaries; the qmm ABI
-   carries bias). 146 + 72 ≈ 218 removable → ~460 dispatches, below mlx's 507,
-   collapsing the command-buffer count and the bubble.
+2. ~~**Fold Q/K/V bias into the qmm dispatch**~~ (refuted premise). This was
+   listed assuming mlx folds the bias and so the ~72 adds were a cider surplus.
+   They are not — mlx issues the same separate add (`quantized.py:276`), so
+   folding them would *diverge* from mlx (own a kernel mlx doesn't), not close a
+   gap to it. The only real surplus here is the **146 copies** (lever 1).
 
 **Caveat (honest):** the ~2.2 ms → bubbles attribution is strongly *inferred*
 (dispatch-count surplus + compute parity at 6.06 ms + the wait residual all

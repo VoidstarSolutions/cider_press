@@ -52,9 +52,11 @@ os_signpost, PR #38) and **reopened it**: the prefill gap (~9.32 vs mlx
 cider issues **680 dispatches vs mlx's 507**, yet both replay to **~6.06 ms
 of GPU compute** (qmm at parity) — so cider's GPU-wait (8.27 ms) − compute
 (6.06) ≈ **~2.2 ms of bubbles** at command-buffer commit boundaries (~14
-buffers vs ~10). The surplus is **146 copies + ~72 Q/K/V bias-adds** (46% of
-dispatches, ~10% of compute) that mlx avoids via lazy strided views + fused
-bias. The copy lever was then **acted on and measured** (branch
+buffers vs ~10). The real surplus is the **146 copies** (mlx avoids them via
+lazy strided views); the **~72 Q/K/V bias-adds are NOT a surplus** — mlx issues
+the same separate `x + bias` op (`quantized.py:276`, no `mx.compile` fold), so
+both pay them (the earlier "mlx fuses the bias" claim was wrong). The copy lever
+was then **acted on and measured** (branch
 `perf/prefill-dispatch-reduction`): the 120 runtime-only copies (Q/K/V
 project-heads + K/V rope→cache) were eliminated via strided RoPE + strided
 KV-cache write (`gpu.copy` **146 → 26**, dispatch ~680 → ~560, `qwen2_logits`

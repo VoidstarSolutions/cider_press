@@ -163,3 +163,78 @@ fn qwen2_logits_prefill() {
     };
     run_qwen2_logits(&checkpoint);
 }
+
+/// `forward_last` must equal `forward(..)[:, -1, :]`: production prefill now
+/// projects only the final position through the LM head, so a regression that
+/// sliced the wrong row (or made the norm/head position-dependent) would ship
+/// a wrong first sampled token while `qwen2_logits_prefill` — which calls the
+/// full `forward` — stays green. Self-consistency, no MLX fixture needed:
+/// both paths share `hidden_states` + `project_logits` and differ only by the
+/// last-position slice, so they agree to within the LM-head matmul's
+/// `M = T` vs `M = 1` ULP drift (the loose composed-chain tolerance).
+fn run_forward_last_matches_full(checkpoint: &Path) {
+    let config_bytes = fs::read(checkpoint.join("config.json")).expect("read config.json");
+    let config = Qwen2Config::from_json_bytes(&config_bytes).expect("parse config.json");
+    let head_dim = config.head_dim().expect("head_dim");
+    let num_layers = config.num_hidden_layers;
+    let n_kv_heads = config.num_key_value_heads;
+    let vocab_size = config.vocab_size;
+
+    let archive_bytes =
+        fs::read(checkpoint.join("model.safetensors")).expect("read model.safetensors");
+    let archive = SafeTensors::deserialize(&archive_bytes).expect("deserialize safetensors");
+
+    let device = Device::shared().expect("system default device");
+    let weights = load_qwen2_weights(&archive, &config, &device).expect("load weights");
+    let model = Qwen2Model::from_weights(weights, config.clone()).expect("build Qwen2Model");
+
+    // Synthetic prompt — any valid token ids exercise the same graph.
+    let input_ids_ref: Vec<u32> = (0..5).collect();
+    let t = input_ids_ref.len();
+    let input_ids = Tensor::from_slice(&device, &input_ids_ref, [1usize, t]).expect("input_ids");
+    let offset_t = Tensor::from_slice(&device, &[0i32], [1usize]).expect("offset tensor");
+
+    let max_tokens = t + 4;
+    let new_caches = || -> Vec<KvCache> {
+        (0..num_layers)
+            .map(|_| {
+                KvCache::new(&device, max_tokens, n_kv_heads, head_dim, DType::BF16)
+                    .expect("kv cache")
+            })
+            .collect()
+    };
+
+    let mut full_caches = new_caches();
+    let full = model
+        .forward(&input_ids, &offset_t, &mut full_caches)
+        .expect("forward");
+    full.eval().expect("eval full logits");
+    let full_v: Vec<bf16> = full.cpu_to_vec().expect("cpu_to_vec full");
+    let last_row = &full_v[(t - 1) * vocab_size..t * vocab_size];
+
+    let mut last_caches = new_caches();
+    let last = model
+        .forward_last(&input_ids, &offset_t, &mut last_caches)
+        .expect("forward_last");
+    last.eval().expect("eval last logits");
+    let last_v: Vec<bf16> = last.cpu_to_vec().expect("cpu_to_vec last");
+
+    assert_eq!(
+        last.shape().dims(),
+        &[1, 1, vocab_size],
+        "forward_last should project a single position",
+    );
+    assert_close("forward_last vs forward[:, -1, :]", &last_v, last_row);
+}
+
+#[test]
+fn qwen2_forward_last_matches_full() {
+    let Some(checkpoint) = checkpoint_path() else {
+        eprintln!(
+            "skipped: set CIDER_QWEN_CHECKPOINT_PATH to a local \
+             Qwen2.5-0.5B-Instruct-4bit MLX checkout to run this test"
+        );
+        return;
+    };
+    run_forward_last_matches_full(&checkpoint);
+}

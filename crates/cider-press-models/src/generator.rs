@@ -125,9 +125,12 @@ impl Generator {
 
     /// Shared prefill graph builder for the profiling/timing entry points:
     /// resets the caches, then runs one forward at `T = input_ids.len()`,
-    /// offset 0 (causal via the fused sdpa kernel). Returns the lazy logits
-    /// (`[1, T, vocab]`); the caller chooses how to evaluate them. Advances
-    /// the caches to `input_ids.len()` as a side effect.
+    /// offset 0 (causal via the fused sdpa kernel). Returns the lazy
+    /// **last-position** logits (`[1, 1, vocab]`) via
+    /// [`Qwen2Model::forward_last`] — the blocks still run over all `T`
+    /// tokens, but only the final token is projected through the LM head, as
+    /// greedy generation (and `mlx_lm`'s prefill) does. Advances the caches to
+    /// `input_ids.len()` as a side effect.
     fn prefill_logits(&mut self, input_ids: &[u32]) -> Result<Tensor> {
         if input_ids.is_empty() {
             return Err(Error::InvalidArgument(
@@ -139,7 +142,8 @@ impl Generator {
         let prefill_len = input_ids.len();
         let ids_tensor = Tensor::from_slice(&device, input_ids, [1, prefill_len])?;
         let offset = Tensor::from_slice(&device, &[0i32], [1])?;
-        self.model.forward(&ids_tensor, &offset, &mut self.caches)
+        self.model
+            .forward_last(&ids_tensor, &offset, &mut self.caches)
     }
 
     /// Run one **prefill** forward (`T = input_ids.len()`, offset = 0,
@@ -164,12 +168,13 @@ impl Generator {
     }
 
     /// Run one prefill forward (`T = input_ids.len()`, offset 0, causal via
-    /// the fused sdpa kernel) and **synchronously** `eval()` the full
-    /// `[1, T, vocab]` logits, waiting
-    /// for GPU completion. Mirrors `mlx_lm`'s `model(x); mx.eval(logits)` for
-    /// an apples-to-apples prefill wall-clock measurement (the production
-    /// `generate()` path uses `eval_async` and does not wait). Resets +
-    /// advances the caches as a side effect — one-shot, not resumable.
+    /// the fused sdpa kernel) and **synchronously** `eval()` the
+    /// last-position `[1, 1, vocab]` logits (via the private `prefill_logits`),
+    /// waiting for GPU completion. Mirrors `mlx_lm`'s prefill, which evals
+    /// only the KV cache for the prompt and projects the LM head for a single
+    /// token — so this is an apples-to-apples prefill wall-clock measurement
+    /// (the production `generate()` path uses `eval_async` and does not wait).
+    /// Resets + advances the caches as a side effect — one-shot, not resumable.
     ///
     /// # Errors
     /// `input_ids` empty, or device / forward / eval failure.
@@ -241,7 +246,11 @@ impl Generator {
         // do_causal — no materialized mask.
         let ids_tensor = Tensor::from_slice(&device, input_ids, [1, prefill_len])?;
         let offset = Tensor::from_slice(&device, &[0i32], [1])?;
-        let logits = self.model.forward(&ids_tensor, &offset, &mut self.caches)?;
+        // Only the last token's logits drive the first sampled id; project the
+        // LM head for that position alone (the blocks still cache all T K/V).
+        let logits = self
+            .model
+            .forward_last(&ids_tensor, &offset, &mut self.caches)?;
 
         let vocab = self.model.config().vocab_size;
         let idx0 = argmax_last_position_lazy(&logits, vocab)?;
@@ -392,20 +401,26 @@ fn id_is_terminal(id: u32, eos_ids: &HashSet<u32>) -> bool {
     eos_ids.contains(&id)
 }
 
-/// Build the lazy argmax over the last position of a `[1, T, vocab]` BF16
-/// logits tensor, returning a `[1, 1]` U32 index tensor **without**
-/// evaluating it — the caller commits it via `eval_async` and reads it back
-/// after waiting.
+/// Build the lazy argmax over a single-position `[1, 1, vocab]` BF16 logits
+/// tensor, returning a `[1, 1]` U32 index tensor **without** evaluating it —
+/// the caller commits it via `eval_async` and reads it back after waiting.
+///
+/// Both callers feed last-position-only logits: decode runs `forward` on a
+/// `T = 1` token and prefill projects the LM head for the final position alone
+/// (`Qwen2Model::forward_last`). `vocab` is accepted to validate that shape.
 fn argmax_last_position_lazy(logits: &Tensor, vocab: usize) -> Result<Tensor> {
-    let t = logits.shape().dims()[1];
-    let last = if t == 1 {
-        logits.clone()
-    } else {
-        logits.slice(&[0..1, t - 1..t, 0..vocab])?.copy()?
-    };
+    // A real runtime check, not `debug_assert_eq!`: release builds (the perf
+    // test/bench path) compile that out, which would let a non-`[1,1,vocab]`
+    // tensor silently argmax the wrong position instead of failing cleanly.
+    if logits.shape().dims() != [1, 1, vocab] {
+        return Err(Error::InvalidArgument(format!(
+            "argmax_last_position_lazy expects last-position-only logits [1, 1, {vocab}], got {:?}",
+            logits.shape().dims(),
+        )));
+    }
     // argmax(2) over [1, 1, vocab] removes the axis -> [1, 1] U32, which is
     // exactly forward()'s [1, T] input-ids shape for the next token.
-    Ok(last.argmax(2)?)
+    Ok(logits.argmax(2)?)
 }
 
 /// Read a single token id from an argmax tensor whose `PendingEval` has
