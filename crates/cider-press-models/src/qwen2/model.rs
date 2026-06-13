@@ -117,6 +117,27 @@ impl Qwen2Model {
         self.project_logits(&last)
     }
 
+    /// Cache-fill half of mlx_lm's prefill: run every transformer block over
+    /// `input_ids`, writing all `T` positions' K/V into `caches`, **without**
+    /// projecting logits (the LM head is pruned). Returns the final hidden
+    /// states only so the caller has a handle to `eval` — the value itself is
+    /// discarded. The caller MUST `eval` the result before issuing the
+    /// following T=1 step, both to force the GPU work and to commit the
+    /// `slice_update` cache writes (`KvCache::update` is a lazy in-graph op;
+    /// an un-committed prior write would be dropped by the next `update`).
+    ///
+    /// Mirrors `mlx_lm.generate_step`'s `_model_call(prompt[:n])` +
+    /// `mx.eval([c.state for c in cache])`. See `forward_last` for the unified
+    /// (single-forward) variant retained as the test oracle.
+    pub fn fill_cache(
+        &self,
+        input_ids: &Tensor,
+        offset: &Tensor,
+        caches: &mut [KvCache],
+    ) -> Result<Tensor> {
+        self.hidden_states(input_ids, offset, caches)
+    }
+
     /// Embed `input_ids` and run every transformer block, returning the final
     /// hidden states `[1, T, hidden_size]` (before the final norm / LM head).
     /// Writes each layer's K/V for all `T` positions into `caches`.
