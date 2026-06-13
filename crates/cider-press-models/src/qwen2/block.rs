@@ -1,6 +1,8 @@
 //! Qwen2 transformer block: pre-norm + attention + residual,
 //! pre-norm + MLP + residual.
 
+#![doc = include_str!("../../../../docs/inference/transformer-block.md")]
+
 use cider_press_runtime::{KvCache, Tensor};
 
 use super::attention::Attention;
