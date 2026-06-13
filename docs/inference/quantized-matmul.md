@@ -120,11 +120,11 @@ warm steady-state floor):
 
 | shape (K×N) | linear       | cider GPU-counter eff BW |
 |-------------|--------------|-------------------------:|
-| 896×4864    | gate/up_proj | ~306 GB/s |
-| 4864×896    | down_proj    | ~272 GB/s |
-| 896×151936  | lm_head      | ~464 GB/s |
-| 896×896     | q/o_proj     | ~85 GB/s  |
-| 896×128     | k/v_proj     | ~13 GB/s  |
+| 896×4864    | `gate/up_proj` | ~306 GB/s |
+| 4864×896    | `down_proj`    | ~272 GB/s |
+| 896×151936  | `lm_head`      | ~464 GB/s |
+| 896×896     | `q/o_proj`     | ~85 GB/s  |
+| 896×128     | `k/v_proj`     | ~13 GB/s  |
 
 The large-N linears (the FFN projections and the LM head) run **near the
 roofline** — ~464 GB/s at the LM head is the empirical kernel ceiling, against

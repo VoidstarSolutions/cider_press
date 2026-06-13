@@ -119,7 +119,7 @@ block bar the LM head). Unlike the small attention K/V projections, they are
 measures `gate`/`up` at **~306 GB/s** and `down` at **~272 GB/s** in decode,
 approaching the ~464 GB/s empirical kernel ceiling (and the M4 Max
 ~410–546 GB/s spec roofline). That is the opposite end of the spectrum from the
-occupancy-starved small-N projections (k/v_proj ~13 GB/s), so there is little
+occupancy-starved small-N projections (`k/v_proj` ~13 GB/s), so there is little
 kernel-side headroom here — the FFN matmuls are essentially doing as well as the
 hardware allows. The full bandwidth story, and why large-N saturates while
 small-N starves, lives in [quantized matmul](./quantized-matmul.md); the
