@@ -66,19 +66,32 @@ the qmm-bound critical path (PR #37 outcome at 5× scale). The change is kept
 (~1.28× → ~1.26×). A `OPS_PER_COMMAND_BUFFER` cadence sweep then also failed
 (fewer/bigger buffers made GPU-wait *worse* — loses CPU/GPU pipelining), so both
 count-reduction levers are refuted. **Reading BOTH schedulers side-by-side then
-found the MATERIAL difference (the real next direction): cider OVER-SERIALIZES
-what mlx OVERLAPS** — same ~6.06 ms compute, cider 8.2 ms wall, the <50%
-occupancy is the symptom. (1) cider's **strict per-buffer fence chain**
-(`commands.rs:204-232`; one fence/buffer, captures the whole buffer) drains the
-GPU at every ~50-op seam, where mlx uses a **per-output-buffer fence map**
-(`../mlx/.../device.cpp:404-415`) that waits only real cross-buffer edges; (2)
-cider's **coarse pool-aliased hazard key** (`eval.rs:498-502`, whole-MTLBuffer
-ptr + pooled outputs) fires false barriers on the concurrent encoder that mlx's
-per-array RAW check (`device.cpp:307-309`) does not. **Next lever: port mlx's
-per-output fence map + make the hazard key allocation-aware** so cider's
-already-concurrent encoders actually run concurrently. Both are IDENTICAL to mlx
-otherwise (1 concurrent encoder/buffer, ~50 ops, commit-chain+1-wait, no fusion).
-See `docs/QWEN_PERF.md` (§ "Copy elimination measured") and `docs/ARCHITECTURE.md`.
+found a candidate next direction: cider's strict per-buffer fence chain**
+(`commands.rs`; one fence/buffer, captures the whole buffer) drains the GPU at
+every ~50-op seam, where mlx uses a **per-output-buffer fence map**
+(`../mlx/.../device.cpp`) that waits only real cross-buffer edges — **but the
+follow-up (`perf/prefill-fence-map`) measured it a NO-OP and landed it anyway
+as the MLX-faithful mechanism.** Ported the map (`Device::prev_outputs`; wait
+moved to encoder *close*; outputs waited as inputs for the pool-recycling guard;
+no completion-handler retirement — cider's single-threaded pooled encode
+*practically* self-bounds it, though not strictly: a churned/evicted size class
+leaves a stale fence that a later pointer reuse could collide into a no-wait
+(ABA), harmless for today's stable pool — see `Device::prev_outputs`). **A/B in
+one binary: no-op** — prefill ~9.3 ms and GPU-wait
+~8.3 ms either way, decode ~575 tok/s either way, all below run-to-run noise.
+**Why:** prefill chunks are genuinely chain-dependent (a 50-op chunk spans ~3–4
+sequential layers), so the map waits the *same* fences the chain did — the
+~2.2 ms bubble is real data-dependency latency (synchronous per-eval, <50%
+occupancy), **not** the fence scheme over-serializing independent work. This
+**refutes "cider over-serializes what MLX overlaps"**: both serialize
+identically because the deps are real. Also corrected: MLX keys every
+hazard/fence on the **whole `MTLBuffer` ptr** (`device.cpp`), the same
+granularity as cider's key — there is no hazard-key lever. **Landed the map as
+the sole mechanism** (chain + flag deleted): it *is* MLX's design and is strictly
+more precise, the right baseline even at parity. The remaining prefill gap needs
+a **structural** lever (overlapping evals / larger batched work), not a smarter
+fence. See `docs/QWEN_PERF.md` (§ "Copy elimination measured" and "Per-output
+fence map") and `docs/ARCHITECTURE.md`.
 
 ### Non-goals
 

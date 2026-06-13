@@ -195,14 +195,15 @@ fn resolve_to_op(inner: &Arc<TensorInner>) -> Option<Arc<TensorInner>> {
 /// nothing). MLX commits every ~50 ops on M-class for the same reason
 /// (`get_max_ops_mb_per_buffer`); a sweep of {25, 50, 100} here is flat
 /// within run-to-run variance, so we hold MLX's 50. Cross-chunk ordering is
-/// carried by the encoder fence chain (`cider_press_kernels::Commands`): the
-/// first encoder of each new chunk waits the last fence published by the
-/// prior chunk. This is load-bearing — buffers are allocated
-/// hazard-untracked (no automatic command-buffer seam analysis), so the
-/// fence chain is the *only* thing ordering one chunk against the next and
-/// against the prior token's still-in-flight tail. Chunk size therefore
-/// trades CPU encode granularity against how finely the GPU can pipeline
-/// seams across tokens.
+/// carried by the per-output fence map
+/// (`Device::prev_outputs`): a closing chunk waits only the prior-writer
+/// fences of the buffers it reads or overwrites, so non-dependent chunks
+/// overlap on the GPU instead of draining at the seam. This is load-bearing —
+/// buffers are allocated hazard-untracked (no automatic command-buffer seam
+/// analysis), so the fence map is the *only* thing ordering one
+/// chunk against the next, against the prior token's still-in-flight tail, and
+/// against prior evals' writes to recycled pool buffers. Chunk size trades CPU
+/// encode granularity against how finely the GPU can pipeline seams.
 const OPS_PER_COMMAND_BUFFER: usize = 50;
 
 /// Steps 3–4: index the nodes, then allocate each op's output and encode
@@ -235,7 +236,7 @@ fn encode_ops(
     // elided and its dst joins `unsynced`. A hazard keeps the barrier, which
     // syncs everything before it ⇒ `unsynced` collapses to just this op's
     // dst. The set is cleared at each chunk boundary: a fresh encoder's first
-    // dispatch has no barrier and the fence chain orders prior chunks.
+    // dispatch has no barrier and the fence map orders prior chunks.
     let mut unsynced: HashSet<usize> = HashSet::new();
     for (i, inner) in order.iter().enumerate() {
         if i > 0 && i % OPS_PER_COMMAND_BUFFER == 0 {
@@ -258,32 +259,36 @@ fn encode_ops(
             let (buf, pool_key_bytes) = device.alloc_pooled(byte_count)?;
             (buf, Some(pool_key_bytes))
         };
-        if elide {
-            let dst_key = buffer_key(&dst);
-            let mut hazard = unsynced.contains(&dst_key);
-            if !hazard {
-                for input in op.lock_inputs().iter() {
-                    if let Some(key) = input_buffer_key(input, &outputs, &index_of) {
-                        // HAZARD_KEY is an unresolvable input: force a barrier
-                        // (it is never a real, elidable buffer key). A resolved
-                        // key is a hazard only if it was written since the last
-                        // barrier (in `unsynced`).
-                        if key == HAZARD_KEY || unsynced.contains(&key) {
-                            hazard = true;
-                            break;
-                        }
-                    }
-                }
+        // Resolve this op's read/written buffer keys once: the fence map needs
+        // them every op; barrier elision (when enabled) reuses them.
+        let dst_key = buffer_key(&dst);
+        let mut in_keys: Vec<usize> = Vec::new();
+        let mut unresolved = false;
+        for input in op.lock_inputs().iter() {
+            match input_buffer_key(input, &outputs, &index_of) {
+                None => {} // quantized weight: never written
+                Some(HAZARD_KEY) => unresolved = true,
+                Some(key) => in_keys.push(key),
             }
+        }
+        if elide {
+            let hazard = unresolved
+                || unsynced.contains(&dst_key)
+                || in_keys.iter().any(|k| unsynced.contains(k));
             if hazard {
-                // Barrier stays. It syncs everything encoded before it; only
-                // this op's own (about-to-be-written) output is unsynced after.
                 unsynced.clear();
                 unsynced.insert(dst_key);
             } else {
                 commands.elide_next_barrier();
                 unsynced.insert(dst_key);
             }
+        }
+        commands.record_output(dst_key);
+        for &k in &in_keys {
+            commands.record_input(k);
+        }
+        if unresolved {
+            commands.record_unresolved_input();
         }
         dispatch(inner, &mut commands, &outputs, &mut dst, &index_of)?;
         outputs.push(dst);
@@ -439,6 +444,20 @@ pub(crate) fn profiled_eval(root: &Tensor) -> Result<()> {
             let (buf, pool_key_bytes) = device.alloc_pooled(byte_count)?;
             (buf, Some(pool_key_bytes))
         };
+        // Feed the per-op buffer keys to the fence map exactly as the
+        // production path (`encode_ops`) does. Each profiled op is its own
+        // encoder, so without these the encoder closes with an empty wait set
+        // and the profiler would measure a regime with NO cross-encoder
+        // ordering (dependent ops free to overlap) — both racy and unlike
+        // production.
+        commands.record_output(buffer_key(&dst));
+        for input in op.lock_inputs().iter() {
+            match input_buffer_key(input, &outputs, &index_of) {
+                None => {} // quantized weight: never written
+                Some(HAZARD_KEY) => commands.record_unresolved_input(),
+                Some(key) => commands.record_input(key),
+            }
+        }
         dispatch(inner, &mut commands, &outputs, &mut dst, &index_of)?;
         outputs.push(dst);
         tags.push(tag);

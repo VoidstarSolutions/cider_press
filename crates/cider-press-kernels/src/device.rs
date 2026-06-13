@@ -9,6 +9,7 @@
 //! allocation needs the underlying [`MTLDevice`]; keeping it on
 //! [`Device`] avoids leaking the raw handle for routine work.
 
+use std::collections::{HashMap, HashSet};
 use std::ptr::NonNull;
 use std::sync::Mutex;
 
@@ -38,20 +39,36 @@ fn tracked_buffers_requested() -> bool {
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {}
 
+/// A fence map entry displaced by a publish: `(key, prior_fence)`, where
+/// `None` means the key was freshly added. Returned in publish order so a
+/// session can undo it in reverse.
+type DisplacedOutput = (usize, Option<Retained<ProtocolObject<dyn MTLFence>>>);
+
 /// Owns the system default Metal device and a single command queue.
 #[allow(clippy::struct_field_names)]
 pub struct Device {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
-    /// Fence signaled by the most recently closed compute encoder.
-    /// Each new encoder waits on it, forming a strict execution chain
-    /// across encoders, command buffers, and eval calls — the explicit
-    /// replacement for Metal's automatic hazard tracking once buffers
-    /// go untracked (redundant until then — buffers are still tracked).
-    /// Mutex only for `Sync`: the chain's take/set pairing assumes ONE
-    /// thread drives dispatch — concurrent sessions would interleave
-    /// take/set and silently corrupt the ordering, lock notwithstanding.
-    last_fence: Mutex<Option<Retained<ProtocolObject<dyn MTLFence>>>>,
+    /// Per-output-buffer fence map (the MLX `prev_ce_outputs_` port): maps a
+    /// written buffer's identity key to the fence of the encoder that last
+    /// wrote it. A new encoder waits only the fences of buffers it reads OR
+    /// overwrites (outputs are waited as inputs — the pool-recycling WAW
+    /// guard). The map is the sole cross-encoder ordering mechanism. Mutex only
+    /// for `Sync`: the publish/wait pairing assumes ONE thread drives dispatch.
+    ///
+    /// Unlike MLX (which retires entries from a command-buffer completion
+    /// handler), entries are removed only on overwrite or abandon-restore —
+    /// never on completion. For a hot pool whose size classes are stable this
+    /// self-bounds: every live key is rewritten in submission order. It is NOT
+    /// strictly bounded, though: an `MTLBuffer` that is written once and then
+    /// dropped (a one-off size class, or a free-list entry evicted by
+    /// `BufferPool::set_cap`) leaves a stale entry forever. If Metal later
+    /// reuses that pointer for an unrelated allocation, the key collides (ABA)
+    /// and `fence_waits` returns the stale — already-signaled — fence,
+    /// effectively no wait. Harmless today because keys are buffer pointers held
+    /// live by the pool across a generation and eviction is rare; a workload
+    /// that churns size classes mid-flight would want MLX-style retirement.
+    prev_outputs: Mutex<HashMap<usize, Retained<ProtocolObject<dyn MTLFence>>>>,
 }
 
 impl Device {
@@ -65,18 +82,76 @@ impl Device {
         Ok(Self {
             device,
             queue,
-            last_fence: Mutex::new(None),
+            prev_outputs: Mutex::new(HashMap::new()),
         })
     }
 
-    pub(crate) fn take_last_fence(&self) -> Option<Retained<ProtocolObject<dyn MTLFence>>> {
-        self.last_fence.lock().expect("fence mutex poisoned").take()
+    /// Fences a closing encoder must wait on: the prior-writer fence of every
+    /// `key` it reads or overwrites that is still live in the map, deduped by
+    /// fence identity. When `unresolved` is set (an input could not be resolved
+    /// to a key), wait the whole current frontier instead — every distinct
+    /// fence in the map — conservatively ordering against all still-live prior
+    /// writers.
+    pub(crate) fn fence_waits(
+        &self,
+        keys: &[usize],
+        unresolved: bool,
+    ) -> Vec<Retained<ProtocolObject<dyn MTLFence>>> {
+        let map = self.prev_outputs.lock().expect("prev_outputs poisoned");
+        let mut seen: HashSet<usize> = HashSet::new();
+        let mut out: Vec<Retained<ProtocolObject<dyn MTLFence>>> = Vec::new();
+        let push_unique = |fence: &Retained<ProtocolObject<dyn MTLFence>>,
+                           out: &mut Vec<Retained<ProtocolObject<dyn MTLFence>>>,
+                           seen: &mut HashSet<usize>| {
+            let id = Retained::as_ptr(fence).cast::<()>() as usize;
+            if seen.insert(id) {
+                out.push(fence.clone());
+            }
+        };
+        if unresolved {
+            for fence in map.values() {
+                push_unique(fence, &mut out, &mut seen);
+            }
+            return out;
+        }
+        for &k in keys {
+            if let Some(fence) = map.get(&k) {
+                push_unique(fence, &mut out, &mut seen);
+            }
+        }
+        out
     }
 
-    /// Takes an `Option` so an abandoned session can restore a `None`
-    /// tail (fresh device) as well as a displaced fence.
-    pub(crate) fn set_last_fence(&self, fence: Option<Retained<ProtocolObject<dyn MTLFence>>>) {
-        *self.last_fence.lock().expect("fence mutex poisoned") = fence;
+    /// Record `fence` as the last writer of each `key`. Returns the displaced
+    /// prior values (`(key, old)`) in publish order so an abandoned session can
+    /// undo them via [`Device::restore_outputs`].
+    pub(crate) fn publish_outputs(
+        &self,
+        keys: &[usize],
+        fence: &Retained<ProtocolObject<dyn MTLFence>>,
+    ) -> Vec<DisplacedOutput> {
+        let mut map = self.prev_outputs.lock().expect("prev_outputs poisoned");
+        keys.iter()
+            .map(|&k| (k, map.insert(k, fence.clone())))
+            .collect()
+    }
+
+    /// Undo a [`Device::publish_outputs`] (abandoned, uncommitted session whose
+    /// fence will never signal). Restores in REVERSE publish order so the
+    /// earliest displaced value wins when a key was published twice in one
+    /// session (the profiling path); `None` removes a freshly-added key.
+    pub(crate) fn restore_outputs(&self, displaced: Vec<DisplacedOutput>) {
+        let mut map = self.prev_outputs.lock().expect("prev_outputs poisoned");
+        for (k, old) in displaced.into_iter().rev() {
+            match old {
+                Some(f) => {
+                    map.insert(k, f);
+                }
+                None => {
+                    map.remove(&k);
+                }
+            }
+        }
     }
 
     pub(crate) fn new_fence(&self) -> Result<Retained<ProtocolObject<dyn MTLFence>>> {
@@ -324,5 +399,51 @@ mod tests {
 
         assert_eq!(ran, 42);
         assert!(path.exists(), "gputrace bundle not written: {path:?}");
+    }
+
+    #[test]
+    fn fence_map_publish_and_wait_dedup() {
+        let device = Device::system_default().expect("device");
+        let f1 = device.new_fence().expect("fence");
+        // Publish one fence under two keys; a wait over both must dedup to one.
+        let displaced = device.publish_outputs(&[10, 20], &f1);
+        assert_eq!(displaced, vec![(10usize, None), (20usize, None)]);
+        let waits = device.fence_waits(&[20, 10], false);
+        assert_eq!(waits.len(), 1, "same fence under two keys must dedup");
+        assert_eq!(Retained::as_ptr(&waits[0]), Retained::as_ptr(&f1));
+        // A key never published yields no wait.
+        assert!(device.fence_waits(&[99], false).is_empty());
+    }
+
+    #[test]
+    fn fence_map_unresolved_waits_whole_frontier() {
+        let device = Device::system_default().expect("device");
+        let f1 = device.new_fence().expect("f1");
+        let f2 = device.new_fence().expect("f2");
+        device.publish_outputs(&[1], &f1);
+        device.publish_outputs(&[2], &f2);
+        // Unresolved input => wait every distinct fence in the map, regardless of keys.
+        let waits = device.fence_waits(&[], true);
+        assert_eq!(waits.len(), 2, "unresolved must wait the whole frontier");
+    }
+
+    #[test]
+    fn fence_map_restore_roundtrip() {
+        let device = Device::system_default().expect("device");
+        let f1 = device.new_fence().expect("f1");
+        let f2 = device.new_fence().expect("f2");
+        device.publish_outputs(&[7], &f1);
+        // Overwrite key 7 (f1 -> f2) and add a fresh key 8, then undo both.
+        let d1 = device.publish_outputs(&[7], &f2);
+        let d2 = device.publish_outputs(&[8], &f1);
+        assert_eq!(d1, vec![(7usize, Some(f1.clone()))]);
+        assert_eq!(d2, vec![(8usize, None)]);
+        device.restore_outputs(d2);
+        device.restore_outputs(d1);
+        // Key 7 is back to f1; key 8 is gone.
+        let w7 = device.fence_waits(&[7], false);
+        assert_eq!(w7.len(), 1);
+        assert_eq!(Retained::as_ptr(&w7[0]), Retained::as_ptr(&f1));
+        assert!(device.fence_waits(&[8], false).is_empty());
     }
 }
