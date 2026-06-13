@@ -217,9 +217,21 @@ priority:
    4.8% of prefill GPU). **The copy lever is closed, not escalated** — even
    eliminating every remaining copy (incl. the project-heads `[1,14,T,64]`
    via stride-aware RoPE) caps at ~0.45 ms, mostly hidden under qmm; the
-   data rules out S2–S5 as worthwhile. **The only open prefill lever is #2**,
-   the ~0.7–0.9 ms encode/dispatch residual (size with a Metal System Trace
-   first). See `QWEN_PERF.md` § "Strided prefill cache-read".
+   data rules out S2–S5 as worthwhile. **The prefill-gap investigation is now
+   CLOSED — there was no real gap** (2026-06-13). The last-position LM-head
+   lever (parent branch) cut prefill-sync to ~7.76 ms, and a same-session
+   `mlx` re-measure shows the historical "~1.09×" was a **stale single-forward
+   proxy** (7.27 ms, faster machine-day): structure-for-structure, cider's
+   prefill (7.76) already **leads** `mlx`'s real prefill (7.84–7.99
+   single-forward; **8.98 split**). The `mlx_lm`-faithful T−1-fill + T=1-step
+   split was implemented and measured a **pessimization for both runtimes**
+   (cider +1.80 ms, `mlx` +1.14 ms — a synchronized command-buffer boundary
+   before an isolated T=1 step), so it was **reverted**; `fill_cache` + its
+   equivalence test are retained as the building block for **chunked prefill**
+   (the only regime `mlx`'s split helps — long prompts, bounded memory). The
+   residual per-isolated-commit CPU-encode overhead (~0.66 ms vs `mlx`) is
+   hidden in every production path (decode pipelining, single-forward GPU
+   overlap). See `QWEN_PERF.md` § "Prefill parity resolved".
 
 ## Carry-forward items
 

@@ -169,7 +169,7 @@ impl Generator {
 
     /// Run one prefill forward (`T = input_ids.len()`, offset 0, causal via
     /// the fused sdpa kernel) and **synchronously** `eval()` the
-    /// last-position `[1, 1, vocab]` logits (via the private `prefill_logits`),
+    /// last-position `[1, 1, vocab]` logits (see `prefill_logits`),
     /// waiting for GPU completion. Mirrors `mlx_lm`'s prefill, which evals
     /// only the KV cache for the prompt and projects the LM head for a single
     /// token — so this is an apples-to-apples prefill wall-clock measurement

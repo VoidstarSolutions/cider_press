@@ -238,3 +238,94 @@ fn qwen2_forward_last_matches_full() {
     };
     run_forward_last_matches_full(&checkpoint);
 }
+
+/// The mlx_lm-faithful split (cache-fill over the first `T-1` tokens, then a
+/// `T=1` step over the last) must select the **same first token** as the
+/// unified `forward_last`. The last token's path differs — `sdpa_vector` + qmv
+/// (split) vs `sdpa_full[last]` + qmm row (unified) — so the logits drift by a
+/// few bf16 ULPs (both carry softmax); the argmax is the invariant that must
+/// hold, since it is the sampled id production ships.
+fn run_split_prefill_matches_forward_last(checkpoint: &Path) {
+    let config_bytes = fs::read(checkpoint.join("config.json")).expect("read config.json");
+    let config = Qwen2Config::from_json_bytes(&config_bytes).expect("parse config.json");
+    let head_dim = config.head_dim().expect("head_dim");
+    let num_layers = config.num_hidden_layers;
+    let n_kv_heads = config.num_key_value_heads;
+    let vocab_size = config.vocab_size;
+
+    let archive_bytes =
+        fs::read(checkpoint.join("model.safetensors")).expect("read model.safetensors");
+    let archive = SafeTensors::deserialize(&archive_bytes).expect("deserialize safetensors");
+    let device = Device::shared().expect("system default device");
+    let weights = load_qwen2_weights(&archive, &config, &device).expect("load weights");
+    let model = Qwen2Model::from_weights(weights, config.clone()).expect("build Qwen2Model");
+
+    let ids: Vec<u32> = (0..5).collect();
+    let t = ids.len();
+    let max_tokens = t + 4;
+    let new_caches = || -> Vec<KvCache> {
+        (0..num_layers)
+            .map(|_| {
+                KvCache::new(&device, max_tokens, n_kv_heads, head_dim, DType::BF16)
+                    .expect("kv cache")
+            })
+            .collect()
+    };
+    let argmax = |v: &[bf16]| -> usize {
+        v.iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(i, _)| i)
+            .expect("non-empty logits")
+    };
+
+    // Unified path.
+    let unified_ids = Tensor::from_slice(&device, &ids, [1usize, t]).expect("ids");
+    let zero = Tensor::from_slice(&device, &[0i32], [1usize]).expect("offset");
+    let mut unified_caches = new_caches();
+    let unified = model
+        .forward_last(&unified_ids, &zero, &mut unified_caches)
+        .expect("forward_last");
+    unified.eval().expect("eval unified");
+    let unified_v: Vec<bf16> = unified.cpu_to_vec().expect("cpu_to_vec unified");
+
+    // Split path: cache-fill over T-1, eval, then T=1 step at offset T-1.
+    let mut split_caches = new_caches();
+    let fill_ids = Tensor::from_slice(&device, &ids[..t - 1], [1usize, t - 1]).expect("fill ids");
+    let fill_hidden = model
+        .fill_cache(&fill_ids, &zero, &mut split_caches)
+        .expect("fill_cache");
+    fill_hidden.eval().expect("eval fill");
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let last_offset = (t - 1) as i32;
+    let step_ids = Tensor::from_slice(&device, &[ids[t - 1]], [1usize, 1]).expect("step id");
+    let step_off = Tensor::from_slice(&device, &[last_offset], [1usize]).expect("step offset");
+    let step = model
+        .forward(&step_ids, &step_off, &mut split_caches)
+        .expect("step forward");
+    step.eval().expect("eval step");
+    let split_v: Vec<bf16> = step.cpu_to_vec().expect("cpu_to_vec split");
+
+    assert_eq!(
+        step.shape().dims(),
+        &[1, 1, vocab_size],
+        "split step should project a single position",
+    );
+    assert_eq!(
+        argmax(&unified_v),
+        argmax(&split_v),
+        "split prefill and forward_last must pick the same first token",
+    );
+}
+
+#[test]
+fn qwen2_split_prefill_matches_forward_last() {
+    let Some(checkpoint) = checkpoint_path() else {
+        eprintln!(
+            "skipped: set CIDER_QWEN_CHECKPOINT_PATH to a local \
+             Qwen2.5-0.5B-Instruct-4bit MLX checkout to run this test"
+        );
+        return;
+    };
+    run_split_prefill_matches_forward_last(&checkpoint);
+}

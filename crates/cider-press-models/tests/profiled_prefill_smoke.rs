@@ -180,3 +180,19 @@ fn prefill_sync_rejects_empty_ids() {
         cider_press_models::generator::Generator::new(model, 64, eos).expect("generator");
     assert!(generator.prefill_sync(&[]).is_err());
 }
+
+#[test]
+fn fill_cache_rejects_empty_ids() {
+    // `fill_cache` is a public chunked-prefill entry point; empty input must be
+    // rejected up front (mirroring `forward_last`) rather than producing a
+    // confusing 0-row `KvCache::update` downstream. The guard fires before the
+    // caches are touched, so an empty cache slice is never reached.
+    let device = Device::shared().expect("device");
+    let model = synthetic_model(&device);
+    // A 0-element tensor isn't constructible via `from_slice` (0-byte alloc),
+    // but a 0-length slice of a real tensor is — the shape the guard defends.
+    let one = Tensor::from_slice(&device, &[1u32], [1usize, 1]).expect("one id");
+    let empty = one.slice(&[0..1, 0..0]).expect("empty slice");
+    let offset = Tensor::from_slice(&device, &[0i32], [1usize]).expect("offset");
+    assert!(model.fill_cache(&empty, &offset, &mut []).is_err());
+}

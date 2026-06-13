@@ -8,10 +8,25 @@
 # ///
 """Profile mlx_lm PREFILL (prompt eval): wall-clock timing and optional Metal GPU capture.
 
-Runs one full forward pass over the whole prompt as the prefill unit, measures
-warm wall-clock ms and tok/s (mean over --iters runs after --warmup warm-up
-passes), and optionally writes a Metal GPU trace via mx.metal.start_capture /
-stop_capture for interactive analysis in Xcode Instruments.
+Mirrors mlx_lm.generate_step's prefill structure (for a prompt below one
+prefill_step_size chunk): a cache-fill forward over the first T-1 tokens with
+only the KV-cache state eval'd (the head is pruned via the lazily-unused
+output), then the final token as a T=1 step whose logits are eval'd. Two evals
+= two command-buffer commits — mlx_lm's *real* prefill, the reference number
+for it (~8.98 ms at T=39; see docs/QWEN_PERF.md § "Prefill parity resolved").
+
+This split is the structural twin of cider's split-prefill *experiment*
+(`Qwen2Model::fill_cache` over T-1 + a T=1 `forward`, gated by the
+`qwen2_split_prefill_matches_forward_last` test), NOT of production
+`Generator::prefill_sync`: the split was measured a pessimization, so prefill_sync
+reverted to the single-forward `forward_last` path. Compare this script's number
+against cider's split-experiment timing for an apples-to-apples split-vs-split
+read, or against prefill_sync only to show the single-forward path wins.
+
+Measures warm wall-clock ms and tok/s (mean over --iters runs after --warmup
+warm-up passes), and optionally writes a Metal GPU trace via
+mx.metal.start_capture / stop_capture for interactive analysis in Xcode
+Instruments.
 
 The checkpoint is expected to be a 4-bit affine group_size=64 MLX-format
 checkpoint loadable by mlx_lm.load directly.
@@ -34,6 +49,7 @@ import time
 
 import mlx.core as mx
 from mlx_lm import load
+from mlx_lm.models.cache import make_prompt_cache
 
 
 def main() -> None:
@@ -65,12 +81,20 @@ def main() -> None:
     prompt_ids = tokenizer.apply_chat_template(
         messages, add_generation_prompt=True
     )
-    x = mx.array(prompt_ids)[None]
-    T = x.shape[1]
+    x = mx.array(prompt_ids)
+    T = x.shape[0]
     print(f"prompt tokens: {T}")
 
     def prefill() -> mx.array:
-        logits = model(x)
+        # Mirror mlx_lm.generate_step: cache-fill the first T-1 tokens (eval
+        # only the cache state, head pruned via the lazily-unused output), then
+        # run the final token as a T=1 step and eval its logits. Two evals =
+        # two command-buffer commits, matching cider's fill_cache + T=1 step.
+        cache = make_prompt_cache(model)
+        if T > 1:
+            model(x[:-1][None], cache=cache)
+            mx.eval([c.state for c in cache])
+        logits = model(x[-1:][None], cache=cache)
         mx.eval(logits)
         return logits
 
