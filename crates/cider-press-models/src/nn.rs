@@ -15,6 +15,7 @@
 //! building blocks land as their underlying ops are added.
 
 #![doc = include_str!("../../../docs/inference/rmsnorm.md")]
+#![doc = include_str!("../../../docs/inference/feed-forward.md")]
 
 use cider_press_runtime::{DType, Device, QuantizedWeight, Tensor};
 use half::{bf16, f16};
