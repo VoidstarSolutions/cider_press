@@ -117,7 +117,7 @@ impl Qwen2Model {
         self.project_logits(&last)
     }
 
-    /// Cache-fill half of mlx_lm's prefill: run every transformer block over
+    /// Cache-fill half of `mlx_lm`'s prefill: run every transformer block over
     /// `input_ids`, writing all `T` positions' K/V into `caches`, **without**
     /// projecting logits (the LM head is pruned). Returns the final hidden
     /// states only so the caller has a handle to `eval` — the value itself is

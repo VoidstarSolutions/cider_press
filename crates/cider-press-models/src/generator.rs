@@ -123,15 +123,18 @@ impl Generator {
         Ok(())
     }
 
-    /// Shared prefill graph builder for the profiling/timing entry points:
-    /// resets the caches, then runs one forward at `T = input_ids.len()`,
-    /// offset 0 (causal via the fused sdpa kernel). Returns the lazy
-    /// **last-position** logits (`[1, 1, vocab]`) via
-    /// [`Qwen2Model::forward_last`] — the blocks still run over all `T`
-    /// tokens, but only the final token is projected through the LM head, as
-    /// greedy generation (and `mlx_lm`'s prefill) does. Advances the caches to
+    /// mlx_lm-faithful prefill: fill the cache with the first `T-1` tokens
+    /// (eval'd to commit the KV writes), then build and return the **lazy**
+    /// last-position logits (`[1, 1, vocab]`) from a `T=1` decode-style step
+    /// over the final token. Resets the caches first; advances them to
     /// `input_ids.len()` as a side effect.
-    fn prefill_logits(&mut self, input_ids: &[u32]) -> Result<Tensor> {
+    ///
+    /// `T == 1`: no cache-fill — the lone `T=1` `forward` is already the step.
+    ///
+    /// The `T=1` step routes through `sdpa_vector` + the qmv decode twin via
+    /// the existing T-length dispatch selection, exactly as `mlx_lm`'s `_step`
+    /// runs the final prompt token through the M=1 quantized matvec path.
+    fn prefill_step_logits(&mut self, input_ids: &[u32]) -> Result<Tensor> {
         if input_ids.is_empty() {
             return Err(Error::InvalidArgument(
                 "Generator prefill: input_ids must be non-empty".into(),
@@ -139,47 +142,70 @@ impl Generator {
         }
         self.reset()?;
         let device = Device::shared()?;
-        let prefill_len = input_ids.len();
-        let ids_tensor = Tensor::from_slice(&device, input_ids, [1, prefill_len])?;
-        let offset = Tensor::from_slice(&device, &[0i32], [1])?;
-        self.model
-            .forward_last(&ids_tensor, &offset, &mut self.caches)
+        let t = input_ids.len();
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let last_offset = if t > 1 {
+            // Cache-fill over the first T-1 tokens at offset 0; eval to commit
+            // the slice_update KV writes before the T=1 step reads them.
+            let fill_ids = Tensor::from_slice(&device, &input_ids[..t - 1], [1, t - 1])?;
+            let zero = Tensor::from_slice(&device, &[0i32], [1])?;
+            let hidden = self.model.fill_cache(&fill_ids, &zero, &mut self.caches)?;
+            hidden.eval()?;
+            (t - 1) as i32
+        } else {
+            0
+        };
+
+        // Final token as a T=1 step at offset = number of cached tokens.
+        let ids = Tensor::from_slice(&device, &[input_ids[t - 1]], [1, 1])?;
+        let offset = Tensor::from_slice(&device, &[last_offset], [1])?;
+        self.model.forward(&ids, &offset, &mut self.caches)
     }
 
-    /// Run one **prefill** forward (`T = input_ids.len()`, offset = 0,
-    /// causal via the fused sdpa kernel) through the profiling-only
-    /// [`Tensor::profiled_eval`],
-    /// recording per-OpKind GPU time into the `profile` GPU store.
-    ///
-    /// The T>1 analog of [`Self::profiled_decode_step`]: it exercises the
-    /// **composed** attention path (the fused vector kernel is T=1 only), so
-    /// the recorded breakdown surfaces the prefill copy / score-matmul /
-    /// softmax dispatches. Resets the caches first; advances them to
-    /// `input_ids.len()` as a side effect — intended for one-shot profiling,
-    /// not resumable generation.
+    /// Profile the **prefill-path** forward: the cache-fill over the first
+    /// `T-1` tokens (the composed/qmm + `sdpa_full` dispatches). The final
+    /// `T=1` token is a decode step — see [`Self::profiled_decode_step`]. For a
+    /// 1-token prompt there is no cache-fill, so the lone `T=1` step is
+    /// profiled instead. Resets the caches; advances them as a side effect.
     ///
     /// # Errors
     /// `input_ids` empty, or device / forward / `profiled_eval` failure.
     #[doc(hidden)]
     pub fn profiled_prefill(&mut self, input_ids: &[u32]) -> Result<()> {
-        let logits = self.prefill_logits(input_ids)?;
-        logits.profiled_eval()?;
+        if input_ids.is_empty() {
+            return Err(Error::InvalidArgument(
+                "Generator prefill: input_ids must be non-empty".into(),
+            ));
+        }
+        self.reset()?;
+        let device = Device::shared()?;
+        let t = input_ids.len();
+        let n = if t > 1 { t - 1 } else { 1 };
+        let ids = Tensor::from_slice(&device, &input_ids[..n], [1, n])?;
+        let offset = Tensor::from_slice(&device, &[0i32], [1])?;
+        if t > 1 {
+            let hidden = self.model.fill_cache(&ids, &offset, &mut self.caches)?;
+            hidden.profiled_eval()?;
+        } else {
+            let logits = self.model.forward(&ids, &offset, &mut self.caches)?;
+            logits.profiled_eval()?;
+        }
         Ok(())
     }
 
-    /// Run one prefill forward (`T = input_ids.len()`, offset 0, causal via
-    /// the fused sdpa kernel) and **synchronously** `eval()` the
-    /// last-position `[1, 1, vocab]` logits (via the private `prefill_logits`),
-    /// waiting for GPU completion. Mirrors `mlx_lm`'s prefill, which evals
-    /// only the KV cache for the prompt and projects the LM head for a single
-    /// token — so this is an apples-to-apples prefill wall-clock measurement
-    /// (the production `generate()` path uses `eval_async` and does not wait).
-    /// Resets + advances the caches as a side effect — one-shot, not resumable.
+    /// Run mlx_lm-faithful prefill — `fill_cache` over the first `T-1` tokens
+    /// (eval'd) then a `T=1` step over the last token — and **synchronously**
+    /// `eval()` the last-position `[1, 1, vocab]` logits, waiting for GPU
+    /// completion. Two command-buffer commits, matching `mlx_lm`'s
+    /// `mx.eval([c.state])` + `_step`. Apples-to-apples prefill wall-clock vs
+    /// `scripts/profile_mlx_prefill.py`. Resets + advances the caches as a
+    /// side effect — one-shot, not resumable.
     ///
     /// # Errors
     /// `input_ids` empty, or device / forward / eval failure.
     pub fn prefill_sync(&mut self, input_ids: &[u32]) -> Result<()> {
-        let logits = self.prefill_logits(input_ids)?;
+        let logits = self.prefill_step_logits(input_ids)?;
         logits.eval()?;
         Ok(())
     }
@@ -238,19 +264,12 @@ impl Generator {
                 self.context_window,
             )));
         }
-        self.reset()?;
-        let device = Device::shared()?;
+        // mlx_lm-faithful prefill: cache-fill over the first T-1 tokens
+        // (eval'd inside the helper), then the last token as a T=1 step.
+        // Only the last token's logits drive the first sampled id.
         let prefill_len = input_ids.len();
-
-        // Prefill: [1, T] ids, offset=0. Causal via the fused sdpa kernel's
-        // do_causal — no materialized mask.
-        let ids_tensor = Tensor::from_slice(&device, input_ids, [1, prefill_len])?;
-        let offset = Tensor::from_slice(&device, &[0i32], [1])?;
-        // Only the last token's logits drive the first sampled id; project the
-        // LM head for that position alone (the blocks still cache all T K/V).
-        let logits = self
-            .model
-            .forward_last(&ids_tensor, &offset, &mut self.caches)?;
+        let logits = self.prefill_step_logits(input_ids)?;
+        let device = Device::shared()?;
 
         let vocab = self.model.config().vocab_size;
         let idx0 = argmax_last_position_lazy(&logits, vocab)?;
