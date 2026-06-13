@@ -536,8 +536,14 @@ GPU at every seam where MLX lets independent chunks overlap.
 `publish_outputs` / `restore_outputs`; the wait moved from encoder *open* to
 *close* (the full input set is known only there); outputs are waited as inputs
 (the pool-recycling WAW guard). Simpler than MLX: cider's single-threaded encode
-+ pooled buffers make the map self-bounding, so **no completion-handler
-retirement**.
++ a hot pool of stable size classes make the map **practically** self-bounding
+(every live key is rewritten in submission order), so **no completion-handler
+retirement**. This is not strictly bounded, though — a buffer written once and
+then dropped (a one-off size class, or a free-list entry evicted by
+`BufferPool::set_cap`) leaves a stale, already-signaled fence forever, and a
+later pointer reuse would collide (ABA) into an effective no-wait. Harmless for
+today's stable-pool workload; a size-class-churning workload would want MLX's
+completion-handler retirement. See `Device::prev_outputs` for the full caveat.
 
 **A/B (same release binary via a flag, 39-token prompt, M4 Max, 4 runs each):**
 

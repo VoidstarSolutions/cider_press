@@ -74,7 +74,10 @@ follow-up (`perf/prefill-fence-map`) measured it a NO-OP and landed it anyway
 as the MLX-faithful mechanism.** Ported the map (`Device::prev_outputs`; wait
 moved to encoder *close*; outputs waited as inputs for the pool-recycling guard;
 no completion-handler retirement — cider's single-threaded pooled encode
-self-bounds it). **A/B in one binary: no-op** — prefill ~9.3 ms and GPU-wait
+*practically* self-bounds it, though not strictly: a churned/evicted size class
+leaves a stale fence that a later pointer reuse could collide into a no-wait
+(ABA), harmless for today's stable pool — see `Device::prev_outputs`). **A/B in
+one binary: no-op** — prefill ~9.3 ms and GPU-wait
 ~8.3 ms either way, decode ~575 tok/s either way, all below run-to-run noise.
 **Why:** prefill chunks are genuinely chain-dependent (a 50-op chunk spans ~3–4
 sequential layers), so the map waits the *same* fences the chain did — the
