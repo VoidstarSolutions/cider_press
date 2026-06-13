@@ -16,6 +16,7 @@
 //!
 //! Matches MLX's `Qwen2Attention.__call__` rope step in
 //! `mlx-lm/models/qwen2.py`.
+#![doc = include_str!("../../../../docs/inference/attention.md")]
 
 use cider_press_runtime::{DType, KvCache, Tensor};
 
