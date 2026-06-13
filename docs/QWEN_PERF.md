@@ -88,7 +88,9 @@ for RSS, and `.metallib` precompile — not the dispatch model, which is done.
 | decode  | ~599 tok/s  | ~568 tok/s  | **~0.95× (cider ahead)** |
 
 (Decode reflects **qmv fast-path padding (A1)**; the pre-A1 encoder/sync-model
-parity point was ~561 vs ~564, ~1.00×.)
+parity point was ~561 vs ~564, ~1.00×. These are the **small-workload** figures
+— T=39 prompt, 128-token decode. The ~1.05× decode lead and the prefill residual
+both hold on a realistic large workload too — see § "Large-workload validation".)
 
 † **These prefill figures are not comparable** — see **Prefill gap
 analysis** below. cider's ~917 was wall-clock around `generate()`, which
@@ -653,6 +655,88 @@ keeps the GPU fed. The test, if decode ever becomes the target, is "is the
 pipeline encode-bound?" (CPU saturation during decode / does deeper
 `inflight_depth` help?). See spec
 `docs/superpowers/specs/2026-06-13-prefill-tminus1-fill-t1-step-design.md`.
+
+## Large-workload validation — decode lead holds at scale; pool churn closed (2026-06-13)
+
+Every prior number on this page is a **small** workload: a T=39 prompt and a
+128-token decode window. To confirm the decode lead and the prefill parity are
+not artifacts of that scale, both runtimes were re-measured on a **realistic
+large workload** — a **724-token prompt** (a technical-essay instruction) and
+**1024 generated tokens** — loading the **same** `qwen2.5-0.5b-instruct-4bit-bf16`
+checkpoint (the bf16-scales local copy; cider's loader rejects the F16 scales in
+the stock `mlx-community` checkpoint) with an **identical** rendered prompt on
+both sides (724 prompt tokens after the chat template, confirmed equal). cider
+via `cider-press bench`; `mlx_lm` via `scripts/measure_qwen_mlx.py` (decode,
+`generation_tps`) and `scripts/profile_mlx_prefill.py` (warm sync prefill,
+mean-of-5, which mirrors `Generator::prefill_sync`'s T−1-fill + T=1-step exactly).
+
+| phase | cider-press | mlx_lm | ratio |
+|---|---:|---:|---:|
+| decode (1024 tok, growing KV) | **~513 tok/s** (517.7 / 509.3) | ~488 tok/s (486.0 / 490.6) | **~1.05× (cider ahead)** |
+| prefill (warm sync, T=724, mean of 5) | 53.6 ms (13 513 tok/s) | 49.6 ms (14 603 tok/s) | ~1.08× (mlx ahead) |
+| peak RSS | ~916 MiB | 819 MiB | — |
+
+**The ~1.05× decode lead survives at scale**, and the ~1.08× prefill gap matches
+the small-T residual (§ "Prefill parity resolved") — both structural, both
+stable. Note decode throughput here (~513) is **below** the short-prompt headline
+(~599) for **both** runtimes (`mlx_lm` likewise ~568 → ~488): per-step attention
+cost grows with the KV cache over ~1000 steps. That degradation hits both engines
+proportionally, so cider's *relative* lead is preserved. The generate-path
+prefill line in `bench` is **not** used here — it swung 127 → 38 ms between two
+runs (cold-JIT noise on the first forward); only the warm `prefill (sync)`
+microbench is stable enough to compare.
+
+### Buffer-pool churn — measured, off the critical path, CLOSED
+
+The large workload exposed a **6.3% pool hit-rate** (vs 98% on the short bench),
+which looked alarming. It was dug out fully and is a **no-op lever** on both
+speed and memory — joining A2, copy-elimination, the cadence probe, and the
+fence map as measured-and-closed.
+
+**Mechanism (confirmed).** The pool keys by exact requested byte length with a
+256 MiB cap and a **keep-oldest** eviction policy: `BufferPool::give` drops the
+*incoming* buffer when over cap, never evicting a stale one. Prefill (T=724)
+mints a few hundred MiB of large, **one-shot** buffers and returns them to the
+pool *first*; T=1 decode never requests those sizes again, so they squat on the
+byte budget permanently and every subsequent decode `give` is over-cap → dropped
+→ the next token re-allocates and misses. The high-water sat **exactly at the
+256 MiB cap** even at 56 generated tokens, the tell that it is the **prefill**
+seeding (not decode-context growth) that saturates it.
+
+**It is cap saturation, not unique-per-token sizes.** A cap sweep (env probe,
+reverted) settles it — decode buffer sizes *are* stable and reusable, they just
+cannot get a slot:
+
+| pool cap | hit rate | high-water | decode tok/s | peak RSS |
+|---:|---:|---:|---:|---:|
+| 64 MiB | 4.5% | 64 (clamped) | 525 | 918 MiB |
+| 256 MiB (default) | 6.4% | 256 (clamped) | 531 | 918 MiB |
+| 4096 MiB | **99.4%** (misses → warmup only) | 1160 MiB | 512 | 916 MiB |
+
+**Verdict — no-op on both levers it could move.** Decode throughput is flat
+(512–531 tok/s, ±noise) across a 64×-cap range: the CPU `newBufferWithLength:`
+churn is hidden behind the async GPU pipeline, exactly like copy-elimination and
+the fence map. Peak RSS is flat too (916–918 MiB): retained-but-unused
+shared-MTLBuffer pages do not fault resident, and freed buffers release whether
+or not the pool keeps a slot. So the 256 MiB cap, tuned for the short-decode
+~94 MiB working set, is fine — the churn it causes at scale is invisible. If a
+much larger model ever makes allocation pressure surface, the principled fix is
+**LRU-by-take eviction** (evict the least-recently-*taken* size, so dead
+prefill-sized buffers leave first) rather than keep-oldest — but there is no
+evidence it pays on Qwen2.5-0.5B today.
+
+**The memory gap vs `mlx_lm` is not the pool.** At this workload cider peaks
+~916 MiB vs `mlx_lm`'s 819 (a far narrower gap than the short-prompt 913 vs 329,
+because `mlx_lm`'s peak grows with the workload while cider's is dominated by the
+fixed load-time overhead — the 278 MB safetensors host `Vec` + dequant buffers —
+so the *relative* gap shrinks as the workload grows). Of the ~97 MiB residual,
+~30 MiB is the **KvCache slab pre-allocated to `context_window=4096`** regardless
+of use (shrinking the window to 1280 to just fit the workload recovers 917 → 887
+MiB, matching the 48 → 15 MiB slab math); `mlx_lm` only looks leaner here because
+it grows its cache lazily, and would allocate the same for a genuinely long
+session. The rest is transient working set + Metal runtime overhead. Neither is a
+real production win on a 0.5B model. (Within-eval reuse, § "Memory", remains the
+only memory lever with a plausible payoff, and only for peak working set.)
 
 ## Async decode pipelining (detach-on-eval)
 
