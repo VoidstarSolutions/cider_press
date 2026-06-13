@@ -121,20 +121,30 @@ impl Qwen2Model {
     /// `input_ids`, writing all `T` positions' K/V into `caches`, **without**
     /// projecting logits (the LM head is pruned). Returns the final hidden
     /// states only so the caller has a handle to `eval` — the value itself is
-    /// discarded. The caller MUST `eval` the result before issuing the
-    /// following T=1 step, both to force the GPU work and to commit the
-    /// `slice_update` cache writes (`KvCache::update` is a lazy in-graph op;
-    /// an un-committed prior write would be dropped by the next `update`).
+    /// discarded. The caller MUST `eval` the result before issuing **any**
+    /// subsequent cache update — whether the following T=1 step or a further
+    /// `fill_cache` chunk in chunked prefill — both to force the GPU work and to
+    /// commit the `slice_update` cache writes (`KvCache::update` is a lazy
+    /// in-graph op; an un-committed prior write would be dropped by the next
+    /// `update`).
     ///
     /// Mirrors `mlx_lm.generate_step`'s `_model_call(prompt[:n])` +
     /// `mx.eval([c.state for c in cache])`. See `forward_last` for the unified
     /// (single-forward) variant retained as the test oracle.
+    ///
+    /// # Errors
+    /// `input_ids` empty, or device / forward failure.
     pub fn fill_cache(
         &self,
         input_ids: &Tensor,
         offset: &Tensor,
         caches: &mut [KvCache],
     ) -> Result<Tensor> {
+        if input_ids.elem_count() == 0 {
+            return Err(Error::InvalidArgument(
+                "Qwen2Model::fill_cache: empty input_ids (need at least one token)".into(),
+            ));
+        }
         self.hidden_states(input_ids, offset, caches)
     }
 

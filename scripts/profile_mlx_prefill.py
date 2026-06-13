@@ -12,11 +12,21 @@ Mirrors mlx_lm.generate_step's prefill structure (for a prompt below one
 prefill_step_size chunk): a cache-fill forward over the first T-1 tokens with
 only the KV-cache state eval'd (the head is pruned via the lazily-unused
 output), then the final token as a T=1 step whose logits are eval'd. Two evals
-= two command-buffer commits, matching cider's `fill_cache` + T=1 step
-(`Generator::prefill_sync`) for an apples-to-apples comparison. Measures warm
-wall-clock ms and tok/s (mean over --iters runs after --warmup warm-up passes),
-and optionally writes a Metal GPU trace via mx.metal.start_capture /
-stop_capture for interactive analysis in Xcode Instruments.
+= two command-buffer commits — mlx_lm's *real* prefill, the reference number
+for it (~8.98 ms at T=39; see docs/QWEN_PERF.md § "Prefill parity resolved").
+
+This split is the structural twin of cider's split-prefill *experiment*
+(`Qwen2Model::fill_cache` over T-1 + a T=1 `forward`, gated by the
+`qwen2_split_prefill_matches_forward_last` test), NOT of production
+`Generator::prefill_sync`: the split was measured a pessimization, so prefill_sync
+reverted to the single-forward `forward_last` path. Compare this script's number
+against cider's split-experiment timing for an apples-to-apples split-vs-split
+read, or against prefill_sync only to show the single-forward path wins.
+
+Measures warm wall-clock ms and tok/s (mean over --iters runs after --warmup
+warm-up passes), and optionally writes a Metal GPU trace via
+mx.metal.start_capture / stop_capture for interactive analysis in Xcode
+Instruments.
 
 The checkpoint is expected to be a 4-bit affine group_size=64 MLX-format
 checkpoint loadable by mlx_lm.load directly.
