@@ -21,6 +21,8 @@
 //! their first consumer arrives.
 //!
 //! Analogue of MLX's `RoPE::eval_gpu` (`backend/metal/rope.cpp`).
+//!
+//! Explained in the inference guide: [`docs/inference/rope.md`](../../../../docs/inference/rope.md).
 
 #![allow(clippy::cast_sign_loss)]
 
