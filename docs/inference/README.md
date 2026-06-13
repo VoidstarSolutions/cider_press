@@ -32,7 +32,7 @@ loop, in reading order:
    5. Compute [attention](./attention.md) — scaled dot-product attention
       over the cached keys/values.
    6. [RMSNorm](./rmsnorm.md) again (pre-FFN norm).
-   7. Run the [feed-forward](./feed-forward.md) network (gated MLP).
+   7. Run the [feed-forward](./feed-forward.md) network (gated MLP — SwiGLU).
 4. [RMSNorm](./rmsnorm.md) the final block output.
 5. Project to vocabulary logits via the [LM head](./quantized-matmul.md)
    (often the embedding table transposed — Qwen2.5 ties them).
