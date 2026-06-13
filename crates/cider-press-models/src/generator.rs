@@ -212,8 +212,8 @@ impl Generator {
 
     /// Greedy-decode up to `max_new_tokens` ids from `input_ids`.
     ///
-    /// Runs prefill (one forward at `T = input_ids.len()`, offset=0,
-    /// causal via the fused sdpa kernel) then yields sampled ids one at a
+    /// Runs mlx_lm-faithful prefill (cache-fill over the first `T-1` tokens,
+    /// then a `T=1` forward for the final token) then yields sampled ids one at a
     /// time. Iterator
     /// terminates on EOS or after `max_new_tokens` items.
     ///
