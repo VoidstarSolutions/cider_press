@@ -23,6 +23,8 @@
 //! window-reset hazard tracker (`unsynced`) confirms no overlap since the
 //! last barrier.
 
+#![doc = include_str!("../../../docs/inference/execution-model.md")]
+
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
