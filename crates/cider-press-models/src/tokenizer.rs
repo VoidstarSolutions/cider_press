@@ -5,6 +5,8 @@
 //! `encode` / `decode`. Special-token handling and chat-template
 //! rendering belong to the caller (the CLI / decode loop).
 
+#![doc = include_str!("../../../docs/inference/tokenization.md")]
+
 use std::path::Path;
 
 use crate::error::{Error, Result};
