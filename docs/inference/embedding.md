@@ -66,7 +66,7 @@ would gather the rows directly and skip the dequantize.
 ## Performance
 
 Embedding is negligible, and the measurements bear that out. The prefill
-GPU-compute trace in `docs/QWEN_PERF.md` records the three gathers and the
+GPU-compute trace records the three gathers and the
 single dequantize at **~0%** of GPU compute. A (perturbed) decode trace puts
 the three gathers at **~0.01 ms** and the dequantize at **~0.003 ms** —
 together well under half a percent of the step. The conclusion holds either

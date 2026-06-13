@@ -55,7 +55,7 @@ its own scale and bias.
 
 ## The forward pass
 
-One forward pass, Qwen2.5-specific (adapted from `ARCHITECTURE.md`). Each
+One forward pass, Qwen2.5-specific. Each
 named operation links to its step doc:
 
 ```text

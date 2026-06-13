@@ -94,7 +94,7 @@ locked to the lower index, matching MLX's `ArgMax`.
 
 Two perf results converge on this step.
 
-**GPU argmax** (`docs/QWEN_PERF.md` § "GPU argmax") moved next-token selection
+**GPU argmax** moved next-token selection
 off the CPU. Greedy decode used to `eval()` the logits, read back the full
 302 kB `[vocab]` row, and scan ~151 k entries on the CPU to find the max —
 ~444 µs of serial CPU work per token (~9.5% of the decode step). That is
@@ -109,8 +109,7 @@ eliminating the per-token CPU↔GPU sync (see the
 decode pipeline). Greedy output is unchanged: the kernel is MLX's own, so it
 matches `mlx_lm` by construction.
 
-**Last-position LM-head** (`docs/QWEN_PERF.md` § "Prefill parity resolved")
-addresses the prefill side. Projecting only the last prompt row through the
+**Last-position LM-head** addresses the prefill side. Projecting only the last prompt row through the
 norm + head, rather than all `T`, cut synchronous prefill to **~7.76 ms** — at
 or ahead of `mlx_lm`'s equivalent real prefill (~7.84–7.99 ms single-forward,
 ~8.98 ms for the actual `generate_step` split). That measurement is what closed

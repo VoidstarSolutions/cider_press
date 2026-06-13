@@ -140,8 +140,8 @@ arithmetic approximation is the offline one baked into the checkpoint, and
 the dequant kernels reproduce MLX's reconstruction bit-exactly (the qmv/qmm
 parity tests are the canary).
 
-The memory footprint, from `docs/QWEN_PERF.md` § "Memory" (process RSS via
-mach `task_info`):
+The memory footprint (process RSS via mach `task_info`; see the
+[execution-model](./execution-model.md) page's memory section):
 
 | mark        | cider-press RSS |
 |-------------|----------------:|

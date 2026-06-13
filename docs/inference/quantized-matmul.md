@@ -91,7 +91,7 @@ matmul as a separate `x + bias` elementwise op, **not** folded into the kernel.
 This matches MLX exactly — `mlx.nn.QuantizedLinear` issues the same separate add
 (`quantized.py:276`, with no `mx.compile` fold in the model path), so both
 runtimes pay it identically. (An earlier doc claim that "mlx fuses the bias" was
-**wrong** and has been corrected — see `docs/QWEN_PERF.md`.)
+**wrong** and has been corrected.)
 
 **Model variations.**
 
@@ -115,7 +115,7 @@ runtimes pay it identically. (An earlier doc claim that "mlx fuses the bias" was
 The bandwidth a `qmv` dispatch attains is strongly **N-dependent** (output
 dimension), because the generic grid launches `(1, ceil(N/8), 1)` threadgroups —
 small `N` simply doesn't launch enough threadgroups to fill the GPU. From the
-`qmv audit` in `docs/QWEN_PERF.md` (GPU-counter effective bandwidth, M4 Max,
+`qmv audit` (GPU-counter effective bandwidth, M4 Max,
 warm steady-state floor):
 
 | shape (K×N) | linear       | cider GPU-counter eff BW |
@@ -133,8 +133,7 @@ headroom. The small-N decode projections are the opposite: **occupancy-starved**
 by the generic grid (q/o at ~85, k/v at ~13 GB/s), launching only a handful of
 threadgroups.
 
-**A1: fast-path padding** (`docs/QWEN_PERF.md` § "qmv fast-path padding (A1)")
-attacks that starvation the cheap, parity-preserving way. It pads the q/k/v/o
+**A1: fast-path padding** attacks that starvation the cheap, parity-preserving way. It pads the q/k/v/o
 decode weights from `K = 896` to `K = 1024` so `K % 512 == 0` and the faster
 `qmv_fast` variant becomes selectable — with **no edits to the vendored
 `quantized.metal`**. The 128 pad columns carry **zero packed weights, zero
@@ -169,8 +168,7 @@ near-roofline.
   the deferred idea of writing a new MIT-attributed kernel that splits the
   output dim across more threadgroups to fix the k/v occupancy starvation (k/v
   still sits at ~22 GB/s even padded, ~7× below what the *same* `qmv_fast`
-  reaches at N=1024). The **zero-cost-k/v ceiling experiment**
-  (`docs/QWEN_PERF.md` § "A2 measured — NO-GO") settled it: an env-gated build
+  reaches at N=1024). The **zero-cost-k/v ceiling experiment** settled it: an env-gated build
   that skips the k/v qmv dispatches entirely (substituting zeros, leaving the
   rest of the chain intact) measured a decode upper bound of
   **600.1 → 606.5 tok/s, just +1.07%** — *smaller* than the run-to-run variance

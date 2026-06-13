@@ -107,13 +107,14 @@ reassigns those fields. The pool was inert on its own (~3% hit) until this fix
 landed; **together they hit ~98% pool hit-rate**, and the cross-token pool took
 decode **~120 → ~210 tok/s** (~1.75×), cutting the `tensor.eval` CPU-encode share
 from ~38% to ~11% and resolving a +32% peak-RSS regression (~1192 → ~900 MiB)
-(QWEN_PERF § "Async decode pipelining", § "Buffer-pool churn").
+(see the [execution model](./execution-model.md) page's decode-pipelining and
+buffer-pool notes).
 
 The lazy in-graph write itself — landing the K/V `SliceUpdate` in the same
 command buffer as the consuming SDPA read, rather than an eager host `memcpy` +
 forced `eval` — is the change that first collapsed each decode step to **one
 command buffer per token** (~1.6×), the foundation the later pipelining built on
-(QWEN_PERF § "Async decode pipelining"). The zero-filled slabs cost one host
+(see the [execution model](./execution-model.md) page). The zero-filled slabs cost one host
 memset at construction over shared storage, and buy deterministic-rather-than-
 garbage reads under the concurrent dispatch the async pipeline relies on.
 
@@ -131,5 +132,6 @@ garbage reads under the concurrent dispatch the async pipeline relies on.
 - **Quantized KV cache** for longer contexts — storing the slab at lower
   precision so a given memory budget holds more tokens. The slab is dense BF16
   today (the ~30 MiB pre-allocated to the full context window is the main
-  cache-side memory cost at scale, QWEN_PERF § "Buffer-pool churn"); quantizing
+  cache-side memory cost at scale, see the [execution model](./execution-model.md)
+  page's buffer-pool note); quantizing
   it is the lever for genuinely long sessions.

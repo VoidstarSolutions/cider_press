@@ -19,7 +19,7 @@
 //! the tensor; the result cache ([`OnceLock<Buffer>`](std::sync::OnceLock))
 //! transitions empty → populated exactly once, monotonically. This
 //! is intentionally simpler than the `Mutex<Source>` alternative
-//! sketched in `docs/RUNTIME_DESIGN.md`: no lock on the read path,
+//! sketched in `docs/inference/execution-model.md`: no lock on the read path,
 //! no race window between mutations, and [`Tensor::cpu_bytes`] can
 //! return `&[u8]` directly.
 //!
@@ -329,7 +329,7 @@ pub enum OpKind {
     ///
     /// Dispatches to cider-press's own naive `gemm_bfloat16` kernel
     /// (not MLX-derived); steel-tiled GEMM is deferred (see
-    /// `docs/ARCHITECTURE.md`). Non-contiguous inputs (transposed
+    /// `docs/inference/quantized-matmul.md`). Non-contiguous inputs (transposed
     /// views) materialize via [`Tensor::copy`] first — same
     /// contract as `softmax` / `rope` / reductions.
     MatMul,
@@ -2420,7 +2420,7 @@ impl Tensor {
     /// `eval()` on an already-evaluated graph is a no-op.
     ///
     /// Synchronous by design (sync public API; see
-    /// `docs/RUNTIME_DESIGN.md`). Internal command-buffer pipelining
+    /// `docs/inference/execution-model.md`). Internal command-buffer pipelining
     /// to close the perf gap to MLX is a future implementation detail
     /// that does not change this signature.
     pub fn eval(&self) -> Result<()> {

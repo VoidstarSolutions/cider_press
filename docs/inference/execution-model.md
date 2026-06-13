@@ -180,8 +180,7 @@ would attach.
 
 ## Performance
 
-**Async decode pipelining** (`docs/QWEN_PERF.md` § "Async decode pipelining
-(detach-on-eval)"). Decode was synchronous — one `commit_and_wait` per token —
+**Async decode pipelining (detach-on-eval).** Decode was synchronous — one `commit_and_wait` per token —
 so token *N+1*'s CPU work could not overlap token *N*'s GPU work. Making `eval`
 non-blocking (`eval_async` + a `PendingEval` waited later) and chaining the
 argmax id on-GPU (no readback) lets the generator run a depth-1 lookahead: token
@@ -204,7 +203,7 @@ relies on — basing each `slice_update` on the slab leaf rather than the prior
 step's op-tensor — to keep the cache from pinning per-step graphs; together they
 reached **~98% pool hit-rate**.
 
-**Decode-step breakdown** (`docs/QWEN_PERF.md` § "Decode-step breakdown").
+**Decode-step breakdown.**
 `tensor.eval` is ~90% of the decode step and is **GPU-bound**: the encode/wait
 split is ~14% CPU encode, ~86% GPU wait (was ~38%/62% before the pool). The
 ~0.51 ms/token CPU encode is small because per-op allocation is a pool hit ~98%
@@ -215,7 +214,7 @@ matvecs. The **GPU op-kind breakdown** (counter-sampled, within-table shares):
 attention copy/score-matmul chain collapsed into the single ~4% `sdpa` bucket
 after the fused decode kernel landed (see [attention](./attention.md)).
 
-**Memory** (`docs/QWEN_PERF.md` § "Memory"). Peak process RSS is **~900–916 MiB**
+**Memory.** Peak process RSS is **~900–916 MiB**
 (vs `mlx_lm`'s ~329 MiB Metal high-water — these measure different things; cider
 samples process RSS including the host safetensors `Vec`). The peak had
 *regressed* to ~1192 MiB when the `SliceUpdate` collapse held all 24 layers'
@@ -225,9 +224,8 @@ byte cap (free-list high-water is only ~94 MiB) but by the
 pinned. The remaining gap to `mlx_lm` is **within-eval reuse** (see Open
 levers).
 
-**The decode dependent chain is *not* removable serialization**
-(`docs/QWEN_PERF.md` §§ "Concurrent-encoder spike", "Dispatch-serialization
-gap", "Measured result (post-port)"). Decode is ~92% a sequential dependency
+**The decode dependent chain is *not* removable serialization.**
+Decode is ~92% a sequential dependency
 chain (the residual stream plus each layer's q→rope→slice-update→sdpa→o-proj and
 rms→gate→silu→mul→down). The concurrent-encoder spike measured this directly:
 **concurrent dispatch with correct hazard barriers is byte-identical to serial
@@ -242,8 +240,7 @@ vs `mlx_lm` ~564, ~1.00×), on top of which [qmv fast-path
 padding](./quantized-matmul.md) (A1) put decode **~1.05× ahead** (~599 vs ~568
 tok/s). The **large-workload validation** (724-token prompt, 1024 generated
 tokens) confirms the lead holds at scale: **~513 vs ~488 tok/s, ~1.05×** (both
-runtimes degrade proportionally as the KV cache grows) (`docs/QWEN_PERF.md`
-§ "Large-workload validation").
+runtimes degrade proportionally as the KV cache grows).
 
 ## Open levers
 
@@ -258,8 +255,7 @@ the step doc that owns its detail.
   across its command-buffer chunks. Mid-eval freeing is the gap. (Note the
   large-workload **pool-churn** finding closed as a no-op: a 6.3% hit-rate under
   the large workload was prefill one-shot buffers squatting the byte cap, off the
-  critical path — decode tok/s and peak RSS unmoved across a cap sweep;
-  `docs/QWEN_PERF.md` § "Buffer-pool churn".)
+  critical path — decode tok/s and peak RSS unmoved across a cap sweep.)
 - **`.metallib` precompilation** — removes the cold-start JIT cost (the first
   compile of the flattened kernel source is tens of seconds, ~43 s) from
   first-token latency. A shipping concern, not a dev-loop one (the JIT result is

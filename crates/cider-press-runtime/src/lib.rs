@@ -20,8 +20,8 @@
 //! [`Tensor::eval`] is the synchronous boundary that walks the
 //! graph, dispatches MLX kernels via [`cider_press_kernels`], blocks
 //! on completion, and populates each op's result cache. See
-//! `docs/RUNTIME_DESIGN.md` for the staged plan and remaining
-//! follow-ups (buffer pool, attention, command-buffer pipelining).
+//! `docs/inference/execution-model.md` for how eval, the buffer pool,
+//! and command-buffer pipelining fit together.
 //!
 //! Quantized layouts are first-class from day one so the API design
 //! gets stress-tested by the awkward case before it accumulates

@@ -122,7 +122,7 @@ That whole chain is deleted, replaced by one `sdpa` dispatch per layer (the new
 **1.30× → ~1.19×**; decode unchanged. The realized **~0.86 ms** win tracks the
 eliminated **copy traffic** (the 3/layer score-chain copies, `gpu.copy`
 266 → 194) — the `QKᵀ`/softmax/`·V` *compute* did not vanish, it moved *into*
-the kernel (QWEN_PERF § "Fused prefill attention landed").
+the kernel.
 
 The next lever, eliminating the **KV-cache-read copies** (the strided cache view
 fed straight to the kernel instead of `copy()`-ing it contiguous, `gpu.copy`
@@ -130,8 +130,7 @@ fed straight to the kernel instead of `copy()`-ing it contiguous, `gpu.copy`
 are off the qmm-bound critical path (all copies together ~4.8% of prefill GPU vs
 quantized matmul's ~83%) and overlap the qmm rather than serializing behind it.
 The change was kept (correct, less traffic, matches MLX's strided-input
-behavior) but the wall-clock did not move — the copy lever is **closed**
-(QWEN_PERF § "Strided prefill cache-read").
+behavior) but the wall-clock did not move — the copy lever is **closed**.
 
 **There was no real prefill gap.** Chased to its end, the "gap" dissolved rather
 than closing: after the last-position LM-head fix, cider's structure-for-
@@ -140,14 +139,14 @@ MLX "~7.27 ms" reference as a stale single-forward proxy. Against MLX's *real*
 `generate_step` prefill — which evals the KV-cache state and defers the head —
 MLX measures **8.98 ms**, so cider's prefill already **leads**. The residual was
 baseline scheduling variance (~7% run-to-run on this prompt), not op sequence,
-encode overhead, or chunking (QWEN_PERF § "Prefill parity resolved").
+encode overhead, or chunking.
 
 On the decode side, the T=1 attention permutes (per-head layout, cache read,
 head collapse) are **zero-copy views**: the S1 copy-elimination recognized that
 at `T_q = 1` every permute only moves the size-1 `T` axis, so the result is
 already contiguous modulo unit dims and needs no materialization. That dropped
 `gpu.copy` from **146 → 2 dispatches per token**, contributing to the decode
-lead over `mlx_lm` (QWEN_PERF § "Decode copy elimination (S1)").
+lead over `mlx_lm`.
 
 ## Open levers
 

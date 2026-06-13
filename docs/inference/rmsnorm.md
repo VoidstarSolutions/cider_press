@@ -127,8 +127,8 @@ to wait through.
 
 Collapsing that composition into one `rms_single_row` dispatch per call cut
 decode from **~975 → ~730 dispatches per token** and lifted throughput from
-**~240 → ~302 tok/s (~1.26×)** (numbers from
-[`ARCHITECTURE.md`](../../docs/ARCHITECTURE.md), the decode-dispatch lever). The
+**~240 → ~302 tok/s (~1.26×)** (the decode-dispatch lever; see the
+[execution model](./execution-model.md) page). The
 win is almost entirely the shorter chain — five fewer dependent dispatches × 49
 calls — not faster math; the arithmetic was always trivial relative to the
 per-dispatch latency it sat behind. It also realigned the path with

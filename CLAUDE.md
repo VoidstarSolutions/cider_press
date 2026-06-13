@@ -103,9 +103,8 @@ split was implemented and measured a **pessimization for both** (cider +1.80 ms,
 step, exposing cider's per-isolated-commit CPU-encode, hidden in every
 production path), so it was **reverted**; `fill_cache` + its equivalence test are
 kept as the building block for **chunked prefill** (the only regime `mlx`'s split
-helps — long prompts, bounded memory). See `docs/QWEN_PERF.md` (§ "Prefill parity
-resolved", "Copy elimination measured", "Per-output fence map") and
-`docs/ARCHITECTURE.md`.
+helps — long prompts, bounded memory). See `docs/inference/attention.md`,
+`docs/inference/execution-model.md`, and `docs/inference/models/qwen2.5.md`.
 
 ### Non-goals
 
@@ -139,7 +138,7 @@ cider-press/
 │   ├── cider-press-test-utils/         # dev-only: shared MLX-parity test helpers
 │   └── cider-press/                    # facade + CLI (chat / bench)
 ├── scripts/                            # one-shot uv scripts (fixtures, MLX sync, perf)
-└── docs/                               # ARCHITECTURE.md, QWEN_PERF.md, RUNTIME_DESIGN.md
+└── docs/                               # inference/ — step-by-step guide (also rustdoc); superpowers/
 ```
 
 Dependencies flow strictly upward: `cider-press-models` →
@@ -159,15 +158,15 @@ kernels, with `eval()` as the synchronous dispatch boundary; the models
 crate composes Qwen2 from runtime ops. Performance is measured and decode
 now **leads `mlx_lm`** (~599 vs ~568 tok/s, ~1.05×) after qmv fast-path
 padding (A1), built on the encoder/sync-model port that first reached
-parity (~561 vs ~564, ~1.00×) (`docs/QWEN_PERF.md`). Prefill now runs the
+parity (~561 vs ~564, ~1.00×) (`docs/inference/execution-model.md`). Prefill now runs the
 **fused steel `sdpa_full` attention** kernel (the composed prefill chain is
 deleted): synchronous prefill **~9.3 ms** (was 10.19), gap vs mlx **~1.19×**
 (was 1.30×); decode unchanged.
 
 **Remaining perf work is prefill- and memory-side**, not decode kernels: A2
 (small-N `qmv` for k/v, backlog #4) was measured and **closed as a no-go**
-(+1.07% ceiling, hidden by the decode pipeline — see `docs/QWEN_PERF.md`
-§ "A2 measured — NO-GO"). The encode/dispatch trace (#2, PR #38 tooling)
+(+1.07% ceiling, hidden by the decode pipeline — see
+`docs/inference/quantized-matmul.md`). The encode/dispatch trace (#2, PR #38 tooling)
 localized the prefill gap to a ~2.2 ms GPU bubble and the **copy elimination
 then ran** (`perf/prefill-dispatch-reduction`): 120 copies removed via strided
 RoPE + KV-cache write (`gpu.copy` 146 → 26), parity unchanged — **but the
@@ -177,8 +176,10 @@ PR #37 redux); the change is kept but the gap is ~unchanged. **Next prefill
 diagnostic: the `OPS_PER_COMMAND_BUFFER` cadence probe** — if the gaps aren't at
 commit boundaries, prefill is near its floor (structural: synchronous per-eval
 + <50% occupancy → needs concurrency). Also open: within-eval reuse for RSS and
-`.metallib` precompile. See `docs/QWEN_PERF.md` § "Copy elimination measured".
-`docs/ARCHITECTURE.md` holds the forward pass and the prioritized backlog.
+`.metallib` precompile. See `docs/inference/execution-model.md` for the
+copy-elimination measurement, `docs/inference/models/qwen2.5.md` for the forward
+pass, and the **"Open levers"** sections of the step docs under `docs/inference/`
+for what was the prioritized backlog.
 
 ---
 
@@ -271,6 +272,9 @@ Pre-commit hooks run fmt, clippy, tests, and docs. Install once with
 
 ## Reference paths
 
+- **Inference guide (canonical entry point):** `docs/inference/README.md` —
+  the step-by-step walkthrough of the forward pass; each step doc is also a
+  module's rustdoc.
 - **Vendored MLX kernels (canonical, used at build time):**
   `kernels-mlx/mlx/backend/metal/kernels/`
 - **Local MLX checkout (reference only):** sibling at `../mlx` — its

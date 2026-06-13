@@ -135,7 +135,7 @@ wall-clock** — the copies it removed were off the qmm-bound critical path
 and overlapped the matmuls rather than serializing behind them — but the
 change was **kept** because it is correct, moves less memory traffic, and
 matches MLX's strided-input behavior (see the [attention](./attention.md)
-page's copy-elimination note and QWEN_PERF § "Copy elimination measured").
+page's copy-elimination note).
 
 ## Open levers
 
