@@ -4,7 +4,7 @@
 //! Decode is a ~530-dispatch dependent chain per token. cider-press encodes
 //! it as ONE serial compute encoder; MLX encodes ~10 concurrent-dispatch
 //! encoders with explicit `memoryBarrier(BarrierScopeBuffers)` between
-//! hazarded dispatches. The xctrace comparison (`docs/QWEN_PERF.md` follow-up)
+//! hazarded dispatches. The xctrace comparison (`docs/inference/execution-model.md` follow-up)
 //! shows both runtimes GPU-dense running the same kernels, with cider ~300 µs
 //! slower per token — i.e. ~0.5–1 µs/dispatch of extra serialization. This
 //! bench isolates that per-link cost with identical kernels and a strictly

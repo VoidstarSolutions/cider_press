@@ -11,6 +11,8 @@
 //! Decode-only: no mask/causal/sinks, query not transposed (those
 //! function constants are pinned false; masked / 2-pass paths land
 //! later).
+//!
+//! Explained in the inference guide: `docs/inference/attention.md`.
 
 use std::ffi::c_void;
 use std::ptr::NonNull;

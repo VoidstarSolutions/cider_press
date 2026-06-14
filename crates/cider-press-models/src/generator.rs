@@ -5,6 +5,8 @@
 //! yields `Result<u32>` ids; UTF-8 detokenization is the caller's
 //! problem (compose `Tokenizer::decode_stream` on top).
 
+#![doc = include_str!("../../../docs/inference/sampling.md")]
+
 use std::collections::{HashSet, VecDeque};
 
 use cider_press_runtime::{DType, Device, KvCache, PendingEval, Tensor};

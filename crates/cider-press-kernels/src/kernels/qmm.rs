@@ -12,6 +12,8 @@
 //! Analogue of `mlx::core::metal::qmm()` in
 //! `mlx/backend/metal/quantized.cpp`. This module covers the
 //! `transpose=true, aligned=true (N % 32 == 0), batched=false (B=1)` case.
+//!
+//! Explained in the inference guide: `docs/inference/quantized-matmul.md`.
 
 #![allow(
     clippy::too_many_arguments,

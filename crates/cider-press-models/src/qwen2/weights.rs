@@ -36,6 +36,8 @@
 //! variant; the quantization biases ride along inside each
 //! [`QuantizedWeight`].
 
+#![doc = include_str!("../../../../docs/inference/weights-and-quantization.md")]
+
 use cider_press_runtime::{DType, Device, Layout, Quantization, QuantizedWeight, Tensor};
 use safetensors::SafeTensors;
 

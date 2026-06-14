@@ -5,8 +5,8 @@
 //! K/V rows per step into a pre-allocated slab and immediately reads
 //! the populated prefix back through SDPA — semantics that don't fit
 //! the `OnceLock<LeafStorage>` "set once" model used by [`Tensor`].
-//! See `docs/RUNTIME_DESIGN.md`'s framework-gap analysis for the
-//! motivation behind separating this from [`Tensor`].
+//! See `docs/inference/execution-model.md` for why this is separate from
+//! [`Tensor`].
 //!
 //! ## Shape convention
 //!
@@ -49,6 +49,7 @@
 //! produced is materialized, so any outstanding view short-circuits on
 //! `eval` (a materialized node is never re-dispatched) and cannot replay a
 //! stale write into the reused slab.
+#![doc = include_str!("../../../docs/inference/kv-cache.md")]
 
 use std::fmt;
 use std::sync::Arc;

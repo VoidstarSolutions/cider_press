@@ -32,6 +32,12 @@ with a tight, inference-only scope.
 - Windows, Linux
 - Generic tensor library — this exists to run LLMs, not to be a numpy.
 
+## Documentation
+
+A step-by-step guide to how inference works in this codebase lives in
+[`docs/inference/`](docs/inference/README.md) — one file per stage of the
+forward pass, each also serving as the rustdoc for its module.
+
 ## Acknowledgments
 
 The Metal kernels and many design decisions here derive from

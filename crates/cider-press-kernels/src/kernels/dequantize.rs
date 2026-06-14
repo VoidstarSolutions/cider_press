@@ -26,6 +26,8 @@
 //! `pack_factor = 8 / bits` (2 for bits=4). Each thread reads one
 //! packed byte from `w`, looks up the matching `scale`/`bias` for its
 //! group, and writes `pack_factor` dequantized values to `out`.
+//!
+//! Explained in the inference guide: `docs/inference/weights-and-quantization.md`.
 
 use half::bf16;
 use objc2_metal::{MTLComputeCommandEncoder, MTLSize};

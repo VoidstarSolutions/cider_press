@@ -3,9 +3,12 @@
 //! This is the **first kernel that is not MLX-derived**: a naive
 //! one-thread-per-output GEMM, float accumulator, contiguous bf16
 //! inputs. The MLX kernels (`steel_gemm_*.metal`) are tiled and
-//! register-blocked; we deliberately skip that complexity for now (see
-//! `docs/ARCHITECTURE.md`). SDPA shapes (Q @ K^T and attn @ V at Qwen2.5-0.5B
-//! head sizes) keep this kernel inside the budget even unoptimized.
+//! register-blocked; we skip that complexity because this dense GEMM is now
+//! production-unused scaffolding. The model's projections are *quantized*
+//! matmul (`qmv`/`qmm`) and its attention is the fused steel SDPA — neither
+//! routes here. Those are the matmuls that matter for inference; see
+//! `docs/inference/quantized-matmul.md` and `docs/inference/attention.md`.
+//! This kernel survives only as a parity-tested general bf16 GEMM.
 //!
 //! Inputs: `A [Batch, M, K]`, `B [Batch, K, N]`, both contiguous bf16.
 //! Output: `C [Batch, M, N]`, contiguous bf16. Leading-dim batching
@@ -33,7 +36,7 @@ use crate::library::KernelLibrary;
 /// Threadgroup tile: one thread per output element. 8 × 8 is a safe
 /// default well under Apple Silicon's max-threads-per-threadgroup
 /// (1024 on every M-series we target) and aligns naturally to the
-/// 32-wide SIMD width. Tuning is deferred (see `docs/ARCHITECTURE.md`).
+/// 32-wide SIMD width. Tuning is deferred — this kernel is production-unused.
 const TG_M: usize = 8;
 const TG_N: usize = 8;
 

@@ -13,6 +13,8 @@
 //! gated integration test verifies against the real checkpoint at the
 //! revision pinned in [`HF_REVISION`].
 
+#![doc = include_str!("../../../../docs/inference/models/qwen2.5.md")]
+
 pub mod attention;
 pub mod block;
 mod config;

@@ -27,15 +27,17 @@
 //! | 0    | `src` (device) |
 //! | 1    | `out` (device) |
 //! | 2    | `src_shape` (constant int*) |
-//! | 3    | `src_strides` (constant int64_t*) |
-//! | 4    | `src_ndim` (constant size_t&) |
+//! | 3    | `src_strides` (constant `int64_t*`) |
+//! | 4    | `src_ndim` (constant `size_t&`) |
 //! | 5    | `slice_sizes` (constant int*) |
 //! | 6    | `axes` (constant int*) |
 //! | 7    | `idx_shapes` (constant int*) |
-//! | 8    | `idx_strides` (constant int64_t*) |
+//! | 8    | `idx_strides` (constant `int64_t*`) |
 //! | 9    | `idx_contigs` (constant bool*) |
 //! | 10   | `idx_ndim` (constant int&) |
-//! | 20+i | `idx_i` (device IdxT*) |
+//! | 20+i | `idx_i` (device `IdxT*`) |
+//!
+//! Explained in the inference guide: `docs/inference/embedding.md`.
 
 use std::ffi::c_void;
 use std::ptr::NonNull;

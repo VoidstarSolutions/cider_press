@@ -24,6 +24,8 @@
 //!   non-last consumers permute first.
 //!
 //! Analogue of MLX's `Softmax::eval_gpu` (`backend/metal/softmax.cpp`).
+//!
+//! Explained in the inference guide: `docs/inference/attention.md`.
 
 #![allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 

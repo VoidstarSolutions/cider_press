@@ -1,6 +1,8 @@
 //! Full Qwen2 model: embed → N transformer blocks → final norm →
 //! tied LM head.
 
+#![doc = include_str!("../../../../docs/inference/embedding.md")]
+
 use cider_press_runtime::{KvCache, QuantizedWeight, Tensor};
 
 use super::block::TransformerBlock;

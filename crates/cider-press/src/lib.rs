@@ -14,6 +14,7 @@
 //! See `CLAUDE.md` at the workspace root for project context, the
 //! completed spike findings, and the next-step recommendation.
 
+#![doc = include_str!("../../../docs/inference/README.md")]
 #![cfg_attr(not(target_os = "macos"), allow(unused))]
 
 #[cfg(not(target_os = "macos"))]
