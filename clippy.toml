@@ -1,6 +1,6 @@
 doc-valid-idents = [
     "..",
-    "RoPE", "RMSNorm", "LayerNorm", "SwiGLU", "GeGLU", "GeLU", "SiLU", "ReLU",
+    "RoPE", "RMSNorm", "LayerNorm", "SwiGLU", "GeGLU", "SiLU", "ReLU",
     "MoE", "GQA", "MQA", "MHA", "ALiBi", "YaRN", "NTK", "ChatML",
     "HuggingFace", "KvCache",
 ]

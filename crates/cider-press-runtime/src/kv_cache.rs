@@ -5,8 +5,8 @@
 //! K/V rows per step into a pre-allocated slab and immediately reads
 //! the populated prefix back through SDPA — semantics that don't fit
 //! the `OnceLock<LeafStorage>` "set once" model used by [`Tensor`].
-//! See [`the execution model`](../../../docs/inference/execution-model.md)
-//! for why this is separate from [`Tensor`].
+//! See `docs/inference/execution-model.md` for why this is separate from
+//! [`Tensor`].
 //!
 //! ## Shape convention
 //!
