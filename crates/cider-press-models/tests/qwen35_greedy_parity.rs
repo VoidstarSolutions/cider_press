@@ -1,0 +1,129 @@
+//! End-to-end greedy token-stream parity gate (Phase-4 Task C3).
+//!
+//! Asserts cider's `Generator<Qwen35Model>` greedy (argmax) continuation
+//! is identical, token-for-token, to mlx-lm's argmax stream on the same
+//! RAW prompt (no chat template) + same tokenizer. Greedy is
+//! deterministic, so an exact per-step match is the robust correctness
+//! gate (B2 confirmed the first-token argmax matches; this extends it to
+//! the full N-token stream).
+//!
+//! Gated on `CIDER_QWEN35_CHECKPOINT_PATH` AND the reference JSON written
+//! by `scripts/dump_qwen35_greedy.py` at `/tmp/qwen3_5_4b_greedy.json`.
+//! Both missing → the test skips with a message (clean in CI).
+
+#![cfg(target_os = "macos")]
+
+use std::collections::HashSet;
+use std::{fs, path::PathBuf};
+
+use cider_press_models::generator::Generator;
+use cider_press_models::qwen3_5::{Qwen35Config, Qwen35Model, load_qwen35_weights};
+use cider_press_models::tokenizer::Tokenizer;
+use cider_press_runtime::Device;
+use safetensors::SafeTensors;
+
+const REFERENCE_JSON: &str = "/tmp/qwen3_5_4b_greedy.json";
+
+fn checkpoint_path() -> Option<PathBuf> {
+    std::env::var_os("CIDER_QWEN35_CHECKPOINT_PATH").map(PathBuf::from)
+}
+
+/// Minimal reader for the reference JSON produced by
+/// `scripts/dump_qwen35_greedy.py`. Pulls one flat integer array out by
+/// hand — the two keys we need are simple `"key": [1, 2, 3]` lists, so a
+/// `serde_json` dev-dep would be overkill.
+fn read_u32_array(json: &str, key: &str) -> Vec<u32> {
+    let needle = format!("\"{key}\"");
+    let start = json
+        .find(&needle)
+        .unwrap_or_else(|| panic!("reference JSON missing key {key}"));
+    let bracket = json[start..]
+        .find('[')
+        .map(|i| start + i + 1)
+        .expect("array open bracket");
+    let end = json[bracket..]
+        .find(']')
+        .map(|i| bracket + i)
+        .expect("array close bracket");
+    json[bracket..end]
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<u32>().expect("u32 token id"))
+        .collect()
+}
+
+#[test]
+#[ignore = "requires CIDER_QWEN35_CHECKPOINT_PATH + /tmp/qwen3_5_4b_greedy.json"]
+fn qwen35_greedy_stream_matches_mlx() {
+    let Some(dir) = checkpoint_path() else {
+        eprintln!("skipping: CIDER_QWEN35_CHECKPOINT_PATH unset");
+        return;
+    };
+    let Ok(json) = fs::read_to_string(REFERENCE_JSON) else {
+        eprintln!(
+            "skipping: reference {REFERENCE_JSON} missing — run \
+             `uv run scripts/dump_qwen35_greedy.py` first"
+        );
+        return;
+    };
+
+    let prompt_ids = read_u32_array(&json, "prompt_ids");
+    let reference = read_u32_array(&json, "continuation_ids");
+    let n = reference.len();
+    assert!(!prompt_ids.is_empty(), "reference prompt_ids empty");
+    assert!(n > 0, "reference continuation_ids empty");
+
+    // Load model.
+    let config =
+        Qwen35Config::from_json_bytes(&fs::read(dir.join("config.json")).unwrap()).unwrap();
+    let bytes = fs::read(dir.join("model.safetensors")).unwrap();
+    let archive = SafeTensors::deserialize(&bytes).unwrap();
+    let device = Device::shared().unwrap();
+    let weights = load_qwen35_weights(&archive, &config, &device).unwrap();
+    let model = Qwen35Model::from_weights(weights, config).expect("build Qwen35Model");
+
+    // Tokenizer — only used to decode mismatches for diagnostics. The
+    // prompt ids come from the reference JSON so tokenization is shared.
+    let tokenizer = Tokenizer::from_file(&dir.join("tokenizer.json")).expect("load tokenizer");
+    let decode = |id: u32| tokenizer.decode(&[id]).unwrap_or_else(|_| "<?>".into());
+
+    // u32::MAX is an unreachable EOS so the loop runs the full N budget,
+    // matching the fixed-N (no early-stop) reference dump.
+    let context_window = prompt_ids.len() + n + 8;
+    let mut generator =
+        Generator::<Qwen35Model>::new(model, context_window, HashSet::from([u32::MAX]))
+            .expect("Generator::new");
+
+    let cider: Vec<u32> = generator
+        .generate(&prompt_ids, n)
+        .expect("generate")
+        .map(|r| r.expect("decode step"))
+        .collect();
+
+    assert_eq!(
+        cider.len(),
+        n,
+        "cider yielded {} tokens, expected {n}",
+        cider.len()
+    );
+
+    // First-mismatch diagnostics: report index, both ids, both decoded.
+    if let Some(i) = (0..n).find(|&i| cider[i] != reference[i]) {
+        let matched = i;
+        panic!(
+            "greedy stream diverged at continuation index {i} \
+             ({matched}/{n} tokens matched)\n  \
+             cider id = {} ({:?})\n  mlx   id = {} ({:?})\n  \
+             cider stream: {:?}\n  mlx   stream: {:?}",
+            cider[i],
+            decode(cider[i]),
+            reference[i],
+            decode(reference[i]),
+            cider,
+            reference,
+        );
+    }
+
+    eprintln!("greedy stream parity: all {n} continuation tokens match mlx-lm");
+}
