@@ -1834,12 +1834,8 @@ fn dispatch_rope(
     // the bytes read here start at offset 0 and the real head/seq strides
     // (read below) place every element correctly. (slice_update, by contrast,
     // now resolves non-zero view offsets through copy_g.)
-    let in_bytes = matmul_input_bytes("rope", input, outputs, index_of)?;
     let off_bytes = dense_input_buffer(offset, outputs, index_of)?;
-
-    let in_typed = unsafe { in_bytes.reinterpret_as::<half::bf16>() };
     let off_typed = unsafe { off_bytes.reinterpret_as::<i32>() };
-    let mut dst_typed = unsafe { dst.reinterpret_as::<half::bf16>() };
 
     let dims = input.shape().dims();
     let batch = dims[0] as i32;
@@ -1848,15 +1844,61 @@ fn dispatch_rope(
     let head_dim = dims[3] as i32;
     let mat = i64::from(seq_len) * i64::from(head_dim);
 
-    // The input may be a strided (head/seq-permuted) view; read its real
-    // head/seq element strides for the kernel. The feature axis is
-    // unit-stride (enforced at construction). The output is allocated dense,
-    // so `out_strides` stays row-contiguous.
-    let in_strides = layout_strides(input)?; // &[isize], len 4 = [B, H, T, D]
-    let s_head = i64::try_from(in_strides[1])
-        .map_err(|_| Error::InvalidArgument("rope: head stride does not fit in i64".into()))?;
-    let s_seq = i64::try_from(in_strides[2])
-        .map_err(|_| Error::InvalidArgument("rope: seq stride does not fit in i64".into()))?;
+    // Partial rope (`rotary_dims < head_dim`) rotates only the leading
+    // `rotary_dims` of each head; the kernel never touches the trailing
+    // pass-through dims, so a freshly-allocated `dst` would leave them
+    // uninitialized. MLX handles this by copying the input into the output
+    // first and then rotating in place (`mlx/backend/metal/rope.cpp` — the
+    // `dims_ < D` branch `copy_gpu(in, out)`). Mirror that: materialize the
+    // (possibly strided) input densely into `dst`, then run the kernel reading
+    // and writing `dst` with dense unit strides. (When `rotary_dims ==
+    // head_dim`, every element is written, so no pre-copy is needed and the
+    // kernel reads the strided input view directly.)
+    // Both branches start the kernel read at byte offset 0; they differ only in
+    // the (head, seq) input strides and whether a pre-copy into `dst` is needed.
+    let partial = (rotary_dims as i32) < head_dim;
+    let (in_typed, s_head, s_seq) = if partial {
+        let copy_lib = device.copy_library()?;
+        let (src_bytes, src_byte_offset) = resolve_view_storage(input, outputs, index_of)?;
+        let src_strides = match input.layout() {
+            Layout::Dense { strides } => strides_to_i64(strides.as_slice())?,
+            Layout::Quantized(_) => {
+                return Err(Error::InvalidArgument(
+                    "rope: quantized input is not supported".into(),
+                ));
+            }
+        };
+        let shape_i32 = shape_to_i32(input.shape().dims())?;
+        let dst_strides = contiguous_strides_i64(&shape_i32);
+        let src = unsafe { src_bytes.reinterpret_as::<half::bf16>() };
+        let mut dst_pre = unsafe { dst.reinterpret_as::<half::bf16>() };
+        copy::copy_g_bf16(
+            commands,
+            copy_lib,
+            &src,
+            src_byte_offset,
+            &src_strides,
+            &mut dst_pre,
+            0,
+            &dst_strides,
+            &shape_i32,
+        )?;
+        // Kernel now reads `dst` in place (dense, row-contiguous unit strides).
+        (dst_pre, mat, i64::from(head_dim))
+    } else {
+        // Full rotation: the kernel writes every element, so it can read the
+        // strided input view directly (feature axis unit-stride enforced at
+        // construction; byte offset 0).
+        let in_strides = layout_strides(input)?; // &[isize], len 4 = [B, H, T, D]
+        let s_head = i64::try_from(in_strides[1])
+            .map_err(|_| Error::InvalidArgument("rope: head stride does not fit in i64".into()))?;
+        let s_seq = i64::try_from(in_strides[2])
+            .map_err(|_| Error::InvalidArgument("rope: seq stride does not fit in i64".into()))?;
+        let in_bytes = matmul_input_bytes("rope", input, outputs, index_of)?;
+        let in_typed = unsafe { in_bytes.reinterpret_as::<half::bf16>() };
+        (in_typed, s_head, s_seq)
+    };
+    let mut dst_typed = unsafe { dst.reinterpret_as::<half::bf16>() };
 
     let args = cider_press_kernels::kernels::rope::RopeArgs {
         batch,
