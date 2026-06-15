@@ -22,11 +22,10 @@
 //!   are no additive q/k/v biases on disk.
 
 use cider_press_runtime::{DType, Device, Layout, Quantization, QuantizedWeight, Tensor};
-use safetensors::SafeTensors;
 
 use crate::error::{Error, Result};
 use crate::qwen3_5::config::{LayerType, Qwen35Config};
-use crate::safetensors_io::{read_dense_tensor, read_quantized_weight};
+use crate::safetensors_io::{TensorLookup, read_dense_tensor, read_quantized_weight};
 
 /// On-disk key prefix for every text-model tensor. The `model.`-only form is
 /// mlx-lm's in-memory remap and is *not* what the checkpoint stores.
@@ -133,7 +132,7 @@ pub struct Qwen35FullAttnWeights {
 /// [`Error::UnsupportedDtype`] with the offending key. Vision tensors are
 /// never referenced.
 pub fn load_qwen35_weights(
-    archive: &SafeTensors<'_>,
+    archive: &impl TensorLookup,
     config: &Qwen35Config,
     device: &Device,
 ) -> Result<Qwen35Weights> {
@@ -174,7 +173,7 @@ pub fn load_qwen35_weights(
 }
 
 fn load_layer(
-    archive: &SafeTensors<'_>,
+    archive: &impl TensorLookup,
     config: &Qwen35Config,
     quant: Quantization,
     device: &Device,
@@ -232,7 +231,7 @@ fn load_layer(
 }
 
 fn load_mlp(
-    archive: &SafeTensors<'_>,
+    archive: &impl TensorLookup,
     config: &Qwen35Config,
     quant: Quantization,
     device: &Device,
@@ -266,7 +265,7 @@ fn load_mlp(
 }
 
 fn load_linear_attn(
-    archive: &SafeTensors<'_>,
+    archive: &impl TensorLookup,
     config: &Qwen35Config,
     quant: Quantization,
     device: &Device,
@@ -360,7 +359,7 @@ fn load_linear_attn(
 }
 
 fn load_full_attn(
-    archive: &SafeTensors<'_>,
+    archive: &impl TensorLookup,
     config: &Qwen35Config,
     quant: Quantization,
     device: &Device,
