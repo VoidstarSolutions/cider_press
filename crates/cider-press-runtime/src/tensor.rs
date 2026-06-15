@@ -4656,6 +4656,60 @@ mod tests {
     }
 
     #[test]
+    fn rope_partial_passes_through_tail_dims() {
+        // Partial rope (`rotary_dims < head_dim`) must rotate only the leading
+        // `rotary_dims` of each head and copy the trailing dims through
+        // unchanged (mirrors MLX's `dims_ < D` copy-then-rotate in rope.cpp).
+        // Regression for the bug where a freshly-allocated output left the
+        // pass-through tail uninitialized.
+        let device = Device::shared().expect("system default device");
+        // [1, 1, 1, 8]: head_dim 8, rotate the leading 4, pass through 5..8.
+        let data: Vec<half::bf16> = (0..8_u8)
+            .map(|i| half::bf16::from_f32(f32::from(i) + 1.0))
+            .collect();
+        let x = Tensor::from_slice(&device, &data, [1usize, 1, 1, 8]).expect("from_slice");
+        let offset = Tensor::from_slice(&device, &[0i32], [1usize]).expect("offset");
+
+        // offset 0 → theta 0 → cos=1, sin=0 → the rotated dims are identity too,
+        // so the whole output must equal the input (every dim preserved).
+        let r = x
+            .rope(&offset, 10000.0, 1.0, 4)
+            .expect("partial rope at pos 0");
+        r.eval().expect("eval");
+        // Bit-exact comparison on the bf16 bit patterns (no float epsilon).
+        let got = r.cpu_slice::<half::bf16>().unwrap();
+        for (g, d) in got.iter().zip(data.iter()) {
+            assert_eq!(
+                g.to_bits(),
+                d.to_bits(),
+                "partial rope at offset 0 must be identity"
+            );
+        }
+
+        // At a non-zero offset the tail (dims 4..8) must still pass through
+        // unchanged while the leading dims rotate.
+        let offset5 = Tensor::from_slice(&device, &[5i32], [1usize]).expect("offset");
+        let r5 = x
+            .rope(&offset5, 10000.0, 1.0, 4)
+            .expect("partial rope at pos 5");
+        r5.eval().expect("eval");
+        let got5 = r5.cpu_slice::<half::bf16>().unwrap();
+        for i in 4..8 {
+            assert_eq!(
+                got5[i].to_bits(),
+                data[i].to_bits(),
+                "tail dim {i} must pass through unchanged"
+            );
+        }
+        // And the leading dims must actually have changed (rotation applied).
+        let leading_changed = (0..4).any(|i| got5[i].to_bits() != data[i].to_bits());
+        assert!(
+            leading_changed,
+            "leading rotary dims must be rotated at pos 5"
+        );
+    }
+
+    #[test]
     fn rope_rejects_contiguous_view_with_byte_offset() {
         // A leading-axis slice stays dense-contiguous but starts mid-buffer.
         // The eval-side resolver only reads views from byte offset 0, so rope

@@ -153,7 +153,16 @@ Incumbent baseline to beat (mlx-lm, this machine): 27B decode **~33 tok/s** at
   nested `text_config` and maps every text tensor under `language_model.model.*`
   (vision skipped), shape-validated against config and byte-round-tripped vs the
   4B archive. No forward yet — Phases 2–3 add the mixers.
-- mRoPE interleave layout for text (sections `[11,11,10]` = 32 rotary pairs) —
-  confirm 1-D collapse during Phase 2.
+- **Phase 2 (gated-attention layer) landed:** `qwen3_5/attention.rs` + `block.rs` —
+  per-head query‖gate split, weighted QK-norm, partial RoPE, GQA SDPA (composed
+  head_dim-256 prefill / vector decode), sigmoid output gate; full decoder-layer
+  parity vs mlx-lm on the 4B layer-3 fixture. Deferred follow-ups: a steel `bd256`
+  prefill kernel (composed SDPA is correctness-first); a hermetic (regenerated)
+  fixture flow (vs the current `/tmp` path); and fp32 score accumulation in the
+  composed SDPA (it accumulates in bf16 today — within the combined bound, but a
+  lever if parity is ever tightened).
+- mRoPE interleave layout for text (sections `[11,11,10]` = 32 rotary pairs):
+  **confirmed during Phase 2** — `rope_type=default` collapses mRoPE to plain 1-D
+  partial RoPE for text, so no multi-section position handling is needed.
 - See [`ROADMAP.md`](../../../ROADMAP.md) §4 for the phased build and §5 for the
   remaining gates.
