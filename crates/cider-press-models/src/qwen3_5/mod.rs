@@ -12,12 +12,14 @@
 
 mod attention;
 mod block;
+mod cache;
 mod config;
 mod gated_deltanet;
 mod weights;
 
 pub use attention::GatedAttention;
 pub use block::Qwen35DecoderLayer;
+pub use cache::{LinearState, Qwen35LayerCache};
 pub use config::{
     HF_REPO, HF_REVISION, LayerType, Qwen35Config, Qwen35QuantizationConfig, RopeParameters,
 };
