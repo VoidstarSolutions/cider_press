@@ -15,6 +15,7 @@ the incumbent. Granularity matches the roadmap phase gates:
   - embed              : embedding output            (loader / embed step)
   - layer0_in/out      : one **GDN** layer (linear)  (Phase 3 gate)
   - layer3_in/out      : one **gated-attention** layer (Phase 2 gate)
+  - layer3_attn_out    : isolated gated-attn mixer    (Phase 2 mixer gate)
   - final_hidden       : post final-norm             (assembly)
   - logits             : lm_head output (tied on 4B, separate on 27B) (Phase 4 gate)
 
@@ -61,6 +62,12 @@ def main() -> None:
         mask = ssm_mask if layer.is_linear else fa_mask
         if i in (0, 3):
             caps[f"layer{i}_in"] = x
+        if i == 3:
+            # Isolated gated-attention mixer (Phase-2 parity gate): pre-residual.
+            # cache=None => prefill; same fa_mask the full layer uses. Mirrors
+            # DecoderLayer.__call__: r = self.self_attn(input_layernorm(x), mask, cache).
+            normed = layer.input_layernorm(x)
+            caps["layer3_attn_out"] = layer.self_attn(normed, fa_mask, None)
         x = layer(x, mask=mask, cache=None)
         if i in (0, 3):
             caps[f"layer{i}_out"] = x
