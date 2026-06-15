@@ -63,6 +63,7 @@ pub(crate) fn op_kind_label(kind: &OpKind) -> &'static str {
         OpKind::SliceUpdate { .. } => "slice_update",
         OpKind::Sdpa { .. } => "sdpa",
         OpKind::ArgReduce { .. } => "arg_reduce",
+        OpKind::Concat { .. } => "concat",
     }
 }
 
@@ -717,6 +718,9 @@ fn dispatch(
         OpKind::ArgReduce { kind, axis } => {
             dispatch_arg_reduce(inner, op, commands, outputs, dst, index_of, kind, axis)
         }
+        OpKind::Concat { axis } => {
+            dispatch_concat(inner, op, commands, outputs, dst, index_of, axis)
+        }
     }
 }
 
@@ -973,6 +977,124 @@ fn dispatch_slice_update(
         &dst_strides,
         &shape_i32,
     )?;
+    Ok(())
+}
+
+/// Dispatch an [`OpKind::Concat`]: join the input parts along `axis`
+/// into the fresh dense `dst`. Copy-to-region mover — each part is
+/// written into its own contiguous byte range of `dst` at a running
+/// offset via MLX's strided `copy_g_*`, which takes a destination byte
+/// offset (the same mechanism `dispatch_slice_update` uses).
+///
+/// The contiguous-block precondition (leading dims before `axis` product
+/// to 1) is validated at construction by [`Tensor::concat`], so each
+/// part's `elem_count` bytes land in one contiguous run. A part that is
+/// a strided view is materialised through the view chain (its source
+/// element strides feed `copy_g_*`); a dense part copies with contiguous
+/// source strides over its own shape. Wired dtypes are `BF16` and `F32`.
+fn dispatch_concat(
+    inner: &Arc<TensorInner>,
+    op: &OpNode,
+    commands: &mut Commands<'_>,
+    outputs: &[Buffer<u8>],
+    dst: &mut Buffer<u8>,
+    index_of: &HashMap<*const TensorInner, usize>,
+    _axis: usize,
+) -> Result<()> {
+    let device = inner
+        .device
+        .as_ref()
+        .expect("op nodes are always constructed with a device");
+    let library = device.copy_library()?;
+    let inputs = op.lock_inputs();
+
+    let elem_bytes = match inner.dtype {
+        DType::BF16 | DType::F32 => inner.dtype.size_bytes(),
+        other => {
+            return Err(Error::InvalidArgument(format!(
+                "concat: unsupported dtype {other:?} (only BF16 and F32 are wired)",
+            )));
+        }
+    };
+
+    let mut dst_byte_offset: usize = 0;
+    for part in inputs.iter() {
+        let part_dims = part.shape().dims();
+        let shape_i32 = shape_to_i32(part_dims)?;
+        let dst_strides = contiguous_strides_i64(&shape_i32);
+
+        // A view resolves to its storage owner + source element strides;
+        // a dense part copies from its own buffer with contiguous strides.
+        let (src_bytes, src_byte_offset, src_strides) = if part.inner.view.is_some() {
+            let (bytes, off) = resolve_view_storage(part, outputs, index_of)?;
+            let strides = match part.layout() {
+                Layout::Dense { strides } => strides_to_i64(strides.as_slice())?,
+                Layout::Quantized(_) => {
+                    return Err(Error::InvalidArgument(
+                        "concat: quantized view part is not supported".into(),
+                    ));
+                }
+            };
+            (bytes, off, strides)
+        } else {
+            let bytes = dense_input_buffer(part, outputs, index_of)?;
+            (bytes, 0usize, contiguous_strides_i64(&shape_i32))
+        };
+
+        // SAFETY: `inner.dtype` is the source of truth for the byte
+        // contents of every part (all share this dtype, validated at
+        // construction); reinterpreting each `Buffer<u8>` as the typed
+        // view matches the kernel's MSL scalar type. Buffers were sized as
+        // `elem_count * size_bytes`, so byte length divides evenly. The
+        // copy writes only this part's element count starting at
+        // `dst_byte_offset`; the precondition guarantees that range is the
+        // part's contiguous block in `dst`.
+        match inner.dtype {
+            DType::BF16 => {
+                let src = unsafe { src_bytes.reinterpret_as::<half::bf16>() };
+                let mut dst_typed = unsafe { dst.reinterpret_as::<half::bf16>() };
+                copy::copy_g_bf16(
+                    commands,
+                    library,
+                    &src,
+                    src_byte_offset,
+                    &src_strides,
+                    &mut dst_typed,
+                    dst_byte_offset,
+                    &dst_strides,
+                    &shape_i32,
+                )?;
+            }
+            DType::F32 => {
+                let src = unsafe { src_bytes.reinterpret_as::<f32>() };
+                let mut dst_typed = unsafe { dst.reinterpret_as::<f32>() };
+                copy::copy_g_f32(
+                    commands,
+                    library,
+                    &src,
+                    src_byte_offset,
+                    &src_strides,
+                    &mut dst_typed,
+                    dst_byte_offset,
+                    &dst_strides,
+                    &shape_i32,
+                )?;
+            }
+            _ => unreachable!("dtype guarded above"),
+        }
+
+        let part_bytes = part
+            .shape()
+            .elem_count()
+            .checked_mul(elem_bytes)
+            .ok_or_else(|| {
+                Error::InvalidArgument("concat: part byte size overflows usize".into())
+            })?;
+        dst_byte_offset = dst_byte_offset.checked_add(part_bytes).ok_or_else(|| {
+            Error::InvalidArgument("concat: running dst byte offset overflows usize".into())
+        })?;
+    }
+
     Ok(())
 }
 
