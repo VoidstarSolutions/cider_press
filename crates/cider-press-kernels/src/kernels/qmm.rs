@@ -11,7 +11,9 @@
 //!
 //! Analogue of `mlx::core::metal::qmm()` in
 //! `mlx/backend/metal/quantized.cpp`. This module covers the
-//! `transpose=true, aligned=true (N % 32 == 0), batched=false (B=1)` case.
+//! `transpose=true, batched=false (B=1)` case, picking the aligned
+//! (`alN_true`) or non-aligned (`alN_false`) kernel variant by
+//! `N % BN == 0` (the `BN=32` output tile), exactly as MLX's `qmm()` does.
 //!
 //! Explained in the inference guide: `docs/inference/quantized-matmul.md`.
 
@@ -52,7 +54,7 @@ const BN: usize = 32;
 /// - `biases.len() == N * K / group_size`
 /// - `x.len()      == M * K`
 /// - `y.len()      == M * N`
-/// - `N % 32 == 0` (aligned variant only; generic deferred)
+/// - `N > 0` (any N; the `BN=32` tail is bounds-checked by `alN_false`)
 ///
 /// `group_size` must be in `{32, 64, 128}` and `bits` must be in
 /// `{2, 3, 4, 5, 6, 8}` — these are the combinations MLX's
@@ -60,9 +62,13 @@ const BN: usize = 32;
 ///
 /// # Notes
 ///
-/// - Only `transpose=true, aligned=true (N % 32 == 0), batched=false (B=1)`
-///   is wired. The `_qmm_n_` (non-transposed) and `_alN_false` variants land
-///   when a consumer needs them.
+/// - Picks the aligned (`alN_true`) variant when `N % BN == 0` (`BN=32`) and
+///   the non-aligned (`alN_false`) variant otherwise — the latter bounds-checks
+///   the `< BN` output-column tail. Matches MLX's `qmm()` (`aligned = N % 32 ==
+///   0` for this `BN=32` kernel). The grid is identical for both (`N` rounded up
+///   to `BN` threadgroups; the kernel handles the tail). Only `transpose=true,
+///   batched=false (B=1)` is wired; the `_qmm_n_` (non-transposed) variant lands
+///   when a consumer needs it.
 pub fn affine_qmm_t_bf16(
     commands: &mut Commands<'_>,
     library: &KernelLibrary,
@@ -98,13 +104,6 @@ pub fn affine_qmm_t_bf16(
             "affine_qmm_t: K ({k}) must be a multiple of group_size ({group_size})"
         )));
     }
-    // Aligned variant only; generic (_alN_false) deferred.
-    if n % 32 != 0 {
-        return Err(Error::InvalidArgument(format!(
-            "affine_qmm_t: N ({n}) must be a multiple of 32 (aligned variant only)"
-        )));
-    }
-
     validate_qmm_buffer_lens(
         w_q.len(),
         scales.len(),
@@ -118,8 +117,13 @@ pub fn affine_qmm_t_bf16(
         bits,
     )?;
 
-    // transpose=true, aligned=true (N % 32 == 0), batched=false (B=1).
-    let kernel_name = format!("affine_qmm_t_bfloat16_t_gs_{group_size}_b_{bits}_alN_true_batch_0");
+    // transpose=true, batched=false (B=1). Pick aligned vs non-aligned by
+    // N % BN, matching MLX's qmm() (BN=32 for this kernel). The non-aligned
+    // variant bounds-checks the final < BN output-column tile.
+    let aligned = n % BN == 0;
+    let aligned_suffix = if aligned { "true" } else { "false" };
+    let kernel_name =
+        format!("affine_qmm_t_bfloat16_t_gs_{group_size}_b_{bits}_alN_{aligned_suffix}_batch_0");
     let pipeline = library.pipeline(&kernel_name)?;
 
     {

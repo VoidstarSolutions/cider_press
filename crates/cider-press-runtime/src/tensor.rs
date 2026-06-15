@@ -2130,22 +2130,10 @@ impl Tensor {
                 "quantized_matmul: inner dim mismatch: activation last dim {x_k} != weight K {k_logical}",
             )));
         }
-        // The M>1 prefill path dispatches `affine_qmm_t`, whose wired
-        // instantiation is aligned-only (N % 32 == 0). Reject the
-        // unaligned M>1 case here rather than letting eval fail late;
-        // M=1 decode routes to the generic `affine_qmv`, which has no
-        // such constraint.
-        let m: usize = if x_dims.len() == 1 {
-            1
-        } else {
-            x_dims[..x_dims.len() - 1].iter().product::<usize>()
-        };
-        if m > 1 && n % 32 != 0 {
-            return Err(Error::InvalidArgument(format!(
-                "quantized_matmul: weight N ({n}) must be a multiple of 32 for the M>1 \
-                 (prefill) path; only the aligned affine_qmm_t variant is wired",
-            )));
-        }
+        // The M>1 prefill path dispatches `affine_qmm_t`, which now picks the
+        // aligned (`alN_true`, N % 32 == 0) or non-aligned (`alN_false`, any N)
+        // kernel variant per `qmm.rs`, so any N > 0 is accepted; M=1 decode
+        // routes to the generic `affine_qmv`, which is likewise unconstrained.
         let q = weight.quantization();
         // Build output shape: leading dims of self (all but last), then N.
         // For rank-1 activation [K] the leading dims are empty → output is [N].
@@ -4868,22 +4856,22 @@ mod tests {
     }
 
     #[test]
-    fn quantized_matmul_rejects_unaligned_n_for_prefill() {
+    fn quantized_matmul_accepts_unaligned_n_for_prefill() {
         let device = Device::shared().expect("device");
-        // make_test_qw has N=4, which is not a multiple of 32.
+        // make_test_qw has N=4, which is not a multiple of BN=32. The M>1
+        // prefill path now dispatches the non-aligned `affine_qmm_t` variant
+        // (`alN_false`), so the graph build must succeed (no N-alignment reject).
         let qw = make_test_qw(&device);
 
-        // M=2 (>1) prefill path, K matches — only N alignment is wrong.
         let m = 2;
         let x_bytes = m * QMM_K * 2; // bf16
         let x = Tensor::from_bytes(&device, &vec![0u8; x_bytes], [m, QMM_K], DType::BF16)
             .expect("build prefill activation");
 
-        let err = x.quantized_matmul(&qw, true).unwrap_err();
-        assert!(
-            matches!(&err, Error::InvalidArgument(msg) if msg.contains("multiple of 32")),
-            "expected aligned-N rejection, got {err:?}"
-        );
+        let out = x
+            .quantized_matmul(&qw, true)
+            .expect("unaligned-N M>1 qmm must build");
+        assert_eq!(out.shape().dims(), [m, 4]);
     }
 
     #[test]

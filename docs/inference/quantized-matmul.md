@@ -186,9 +186,12 @@ near-roofline.
   ([`tensor.rs`](../../crates/cider-press-runtime/src/tensor.rs)). The tied head
   reuses the embedding table *transposed*, so the existing direction covers the
   whole Qwen2.5 forward pass — this is deferred to its first real consumer.
-- **The generic non-aligned `affine_qmm` is unimplemented.** `qmm.rs` wires only
-  the `transpose=true, aligned (N % 32 == 0), B=1` variant; the `_alN_false` and
-  non-transposed variants land when a consumer needs them.
+- **`affine_qmm` non-aligned (`_alN_false`) is now wired; non-transposed is not.**
+  `qmm.rs` picks `_alN_true` when `N % 32 == 0` (the aligned hot path) and
+  `_alN_false` otherwise — the Qwen3.6-27B's GDN `in_proj_a`/`in_proj_b` (N = 48)
+  exercise the non-aligned variant in the M>1 prefill path (bit-exact vs
+  `mx.quantized_matmul`). The non-transposed (`transpose=false`) variant lands
+  when a consumer needs it.
 - **Dense `matmul` is now production-unused** — every projection routes through
   the quantized path, so the dense `Tensor::matmul` is retained only as
   scaffolding plus its parity test, not on any live forward path.
