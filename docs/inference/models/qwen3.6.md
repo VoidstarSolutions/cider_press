@@ -149,6 +149,10 @@ Incumbent baseline to beat (mlx-lm, this machine): 27B decode **~33 tok/s** at
 
 ## Open items
 
+- **Phase 1 (loader) landed:** `crates/cider-press-models/src/qwen3_5/` parses the
+  nested `text_config` and maps every text tensor under `language_model.model.*`
+  (vision skipped), shape-validated against config and byte-round-tripped vs the
+  4B archive. No forward yet — Phases 2–3 add the mixers.
 - mRoPE interleave layout for text (sections `[11,11,10]` = 32 rotary pairs) —
   confirm 1-D collapse during Phase 2.
 - See [`ROADMAP.md`](../../../ROADMAP.md) §4 for the phased build and §5 for the
