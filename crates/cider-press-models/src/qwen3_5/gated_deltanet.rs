@@ -18,7 +18,7 @@ use cider_press_runtime::{DType, Tensor};
 use half::bf16;
 
 use crate::error::{Error, Result};
-use crate::nn::{Linear, Module, silu};
+use crate::nn::{Linear, Module, repeat_axis_interleaved, scalar_tensor, silu};
 use crate::qwen3_5::config::Qwen35Config;
 use crate::qwen3_5::weights::Qwen35LinearAttnWeights;
 
@@ -174,7 +174,7 @@ pub(crate) fn compute_g(a: &Tensor, a_log: &Tensor, dt_bias: &Tensor) -> Result<
         .copy()?;
 
     // softplus(u) = log(1 + exp(u)); `ones` is a scalar that broadcasts.
-    let ones = Tensor::from_slice(device, &[1.0f32], [1usize])?;
+    let ones = scalar_tensor(device, DType::F32, 1.0)?;
     let u = a_f32.add(&dt_bias_b)?;
     let sp = u.exp()?.add(&ones)?.log()?;
 
@@ -186,7 +186,7 @@ pub(crate) fn compute_g(a: &Tensor, a_log: &Tensor, dt_bias: &Tensor) -> Result<
     let prod = ea.mul(&sp)?;
 
     // g = exp(-prod): negate via multiply by a broadcast scalar -1.
-    let neg_one = Tensor::from_slice(device, &[-1.0f32], [1usize])?;
+    let neg_one = scalar_tensor(device, DType::F32, -1.0)?;
     Ok(prod.mul(&neg_one)?.exp()?)
 }
 
@@ -291,7 +291,7 @@ pub(crate) fn qk_norm_scale(x: &Tensor, scale: f32) -> Result<Tensor> {
     // Broadcast scalar scale. The binary op's strided dispatch is only wired up
     // to rank 3, so flatten the contiguous rms_norm output to rank-1, multiply
     // by the broadcast scalar, then restore the [1, T, H, D] shape.
-    let scale_t = Tensor::from_slice(device, &[bf16::from_f32(scale)], [1usize])?;
+    let scale_t = scalar_tensor(device, DType::BF16, scale)?;
     let scaled = normed.reshape([t * heads * dim])?.copy()?.mul(&scale_t)?;
     Ok(scaled.reshape([1usize, t, heads, dim])?)
 }
@@ -313,22 +313,16 @@ pub(crate) fn gqa_repeat(x: &Tensor, hv: usize) -> Result<Tensor> {
             "gqa_repeat: x must be rank-4 [1, T, Hk, D]; got {dims:?}",
         )));
     }
-    let (t, hk, d) = (dims[1], dims[2], dims[3]);
+    let hk = dims[2];
     if hk == 0 || hv % hk != 0 {
         return Err(Error::InvalidArgument(format!(
             "gqa_repeat: Hv ({hv}) must be a nonzero multiple of Hk ({hk})",
         )));
     }
-    let factor = hv / hk;
 
-    // Interleaved replication: insert a unit factor axis, broadcast it, then
-    // fold it back into the head axis. copy() the broadcast view to a dense
-    // leaf before the final reshape (view chains aren't reshaped lazily).
-    Ok(x.copy()?
-        .reshape([1usize, t, hk, 1, d])?
-        .broadcast_to([1usize, t, hk, factor, d])?
-        .copy()?
-        .reshape([1usize, t, hv, d])?)
+    // Interleaved replication over the head axis (2): out head i*factor..(i+1)*
+    // factor each equal in head i.
+    repeat_axis_interleaved(x, 2, hv / hk)
 }
 
 /// Gated-DeltaNet per-token recurrence (fp32 state). `q`, `k`, `v`
@@ -405,22 +399,11 @@ pub(crate) fn recurrence(
         Error::InvalidArgument("recurrence: q has no device (placeholder)".into())
     })?;
 
-    // Cast q/k/v to f32 (the whole recurrence runs in fp32).
-    let to_f32 = |x: &Tensor| -> Result<Tensor> {
-        if x.dtype() == DType::F32 {
-            Ok(x.copy()?)
-        } else if x.dtype() == DType::BF16 {
-            Ok(x.cast(DType::F32)?)
-        } else {
-            Err(Error::InvalidArgument(format!(
-                "recurrence: q/k/v must be F32 or BF16; got {:?}",
-                x.dtype()
-            )))
-        }
-    };
-    let qf = to_f32(q)?;
-    let kf = to_f32(k)?;
-    let vf = to_f32(v)?;
+    // Cast q/k/v to f32 (the whole recurrence runs in fp32). `cast` clones on a
+    // matching dtype and converts BF16; an unsupported dtype surfaces its error.
+    let qf = q.cast(DType::F32)?;
+    let kf = k.cast(DType::F32)?;
+    let vf = v.cast(DType::F32)?;
 
     // State M [Hv, Dv, Dk] f32 (rank-3 to stay within wired strided binaries).
     let mut m = match state0 {
@@ -442,7 +425,7 @@ pub(crate) fn recurrence(
         None => Tensor::zeros(device, [hv, dv, dk], DType::F32)?,
     };
 
-    let neg_one = Tensor::from_slice(device, &[-1.0f32], [1usize])?;
+    let neg_one = scalar_tensor(device, DType::F32, -1.0)?;
 
     let mut ys: Vec<Tensor> = Vec::with_capacity(t);
     for ti in 0..t {

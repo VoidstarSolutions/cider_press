@@ -9,7 +9,7 @@ use cider_press_runtime::{DType, Device, KvCache, Tensor};
 use half::bf16;
 
 use crate::error::{Error, Result};
-use crate::nn::{Linear, Module, rms_norm};
+use crate::nn::{Linear, Module, repeat_axis_interleaved, rms_norm};
 use crate::qwen3_5::config::Qwen35Config;
 use crate::qwen3_5::weights::Qwen35FullAttnWeights;
 
@@ -32,33 +32,6 @@ pub(crate) fn partial_rope(x: &Tensor, offset: &Tensor, config: &Qwen35Config) -
     #[allow(clippy::cast_possible_truncation)]
     let base = config.rope.rope_theta as f32;
     Ok(x.rope(offset, base, 1.0, rotary_dims(config))?)
-}
-
-/// Reshape `[B, H_kv, T_c, D_h]` to `[B, H_q, T_c, D_h]` by fanning the `H_kv`
-/// axis out by `ratio = H_q / H_kv`. Zero-copy through `broadcast_to`, then
-/// `copy()` to land a contiguous buffer that the matmul kernel can read.
-#[allow(clippy::many_single_char_names)]
-fn broadcast_kv_heads(
-    x: &Tensor,
-    b: usize,
-    h_kv: usize,
-    ratio: usize,
-    t_cache: usize,
-    head_dim: usize,
-    h_q: usize,
-) -> Result<Tensor> {
-    if ratio == 1 {
-        return Ok(x.copy()?);
-    }
-    // x may arrive as a strided cache view (batch axis broadcast, stride 0);
-    // reshape requires a contiguous leaf, so materialize first.
-    let expanded = x
-        .copy()?
-        .reshape([b, h_kv, 1, t_cache, head_dim])?
-        .broadcast_to([b, h_kv, ratio, t_cache, head_dim])?
-        .copy()?
-        .reshape([b, h_q, t_cache, head_dim])?;
-    Ok(expanded)
 }
 
 /// Composed scaled-dot-product attention for `head_dim` the fused steel kernel
@@ -107,9 +80,10 @@ pub(crate) fn composed_sdpa(
     }
     let ratio = h_q / h_kv;
 
-    // GQA broadcast: fan K, V from H_kv to H_q so head hq reads kv head hq/ratio.
-    let k_full = broadcast_kv_heads(k, b, h_kv, ratio, t_cache, head_dim, h_q)?;
-    let v_full = broadcast_kv_heads(v, b, h_kv, ratio, t_cache, head_dim, h_q)?;
+    // GQA broadcast: fan K, V from H_kv to H_q (head axis 1) so head hq reads kv
+    // head hq/ratio. K/V may arrive as strided cache views; the helper copies.
+    let k_full = repeat_axis_interleaved(k, 1, ratio)?;
+    let v_full = repeat_axis_interleaved(v, 1, ratio)?;
 
     // Q @ K^T: permute K_full's last two dims to [B, H_q, D_h, T_cache]; copy
     // materializes the permuted view contiguous for the matmul kernel.
