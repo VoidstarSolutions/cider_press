@@ -149,7 +149,15 @@ pub(crate) fn composed_sdpa(
 /// (`j <= i + (t_cache - t)`), -inf above. For prefill-from-scratch `t_cache == t`
 /// → lower-triangular. Each row keeps at least its diagonal, so no all-masked row.
 fn causal_mask(device: &Device, t: usize, t_cache: usize) -> Result<Tensor> {
-    let offset = t_cache - t;
+    // The cache must already hold this step's keys, so `t_cache >= t`. The sole
+    // caller (`sdpa`'s prefill branch) guarantees it, but reject rather than
+    // underflow-panic if that invariant is ever broken upstream.
+    let Some(offset) = t_cache.checked_sub(t) else {
+        return Err(Error::InvalidArgument(format!(
+            "qwen3_5::attention::causal_mask: t_cache ({t_cache}) < t ({t}); the cache must \
+             already hold the current step's keys",
+        )));
+    };
     let mut data = Vec::with_capacity(t * t_cache);
     for i in 0..t {
         for j in 0..t_cache {
