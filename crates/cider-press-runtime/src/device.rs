@@ -91,6 +91,10 @@ struct DeviceInner {
     arg_reduce_library: OnceLock<kernels::KernelLibrary>,
     /// Cross-token scratch recycling. See [`crate::buffer_pool`].
     pool: Arc<Mutex<crate::buffer_pool::BufferPool>>,
+    /// One-element `[1.0]` BF16 weight, uploaded once and reused as the
+    /// stride-0 scalar gamma for weightless `rms_norm` (mlx's `weight=None`).
+    /// See [`Device::scalar_one_bf16`].
+    scalar_one_bf16: OnceLock<Buffer<u8>>,
 }
 
 /// Refcounted handle to the system's default Metal device.
@@ -128,6 +132,7 @@ impl Device {
                 pool: Arc::new(Mutex::new(crate::buffer_pool::BufferPool::new(
                     crate::buffer_pool::DEFAULT_POOL_CAP_BYTES,
                 ))),
+                scalar_one_bf16: OnceLock::new(),
             }),
         })
     }
@@ -165,6 +170,7 @@ impl Device {
             pool: Arc::new(Mutex::new(crate::buffer_pool::BufferPool::new(
                 crate::buffer_pool::DEFAULT_POOL_CAP_BYTES,
             ))),
+            scalar_one_bf16: OnceLock::new(),
         });
         let stored = SHARED.get_or_init(|| fresh);
         Ok(Self {
@@ -184,6 +190,30 @@ impl Device {
     /// callers outside the crate should stay at the [`Device`] level.
     pub(crate) fn kernels(&self) -> &kernels::Device {
         &self.inner.kernels
+    }
+
+    /// A one-element `[1.0]` BF16 buffer, cached after first use and shared
+    /// via a `Retained` handle clone on every call. Used as the stride-0
+    /// scalar gamma for weightless `rms_norm` (mlx's `weight=None`): the
+    /// forward kernel always multiplies by `w[w_stride * i]`, so a
+    /// `w_stride = 0` scalar `1.0` is an identity gamma without uploading a
+    /// `[hidden]` ones-vector per call. See [`crate::Tensor::rms_norm`].
+    ///
+    /// A concurrent first-call race could upload the 2-byte buffer more than
+    /// once; `get_or_init` keeps the first and drops the rest, so the cached
+    /// handle is always consistent (the redundant upload is harmless, and
+    /// `get_or_try_init` — which would avoid it — is still unstable).
+    pub(crate) fn scalar_one_bf16(&self) -> Result<Buffer<u8>> {
+        if let Some(buf) = self.inner.scalar_one_bf16.get() {
+            return Ok(buf.clone_handle());
+        }
+        let bytes = half::bf16::ONE.to_le_bytes();
+        let buf = self.inner.kernels.upload::<u8>(&bytes)?;
+        Ok(self
+            .inner
+            .scalar_one_bf16
+            .get_or_init(|| buf)
+            .clone_handle())
     }
 
     /// Capture one GPU frame produced by `f` to a `.gputrace` at `path`.

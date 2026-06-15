@@ -66,7 +66,7 @@ per row, reducing the sum of squares in fp32 regardless of the bf16 input:
 
 ```text,ignore
 pub fn rms_norm(x: &Tensor, gamma: &Tensor, eps: f32) -> Result<Tensor> {
-    Ok(x.rms_norm(gamma, eps)?)   // → fused Tensor::rms_norm → rms_single_row
+    Ok(x.rms_norm(Some(gamma), eps)?)   // → fused Tensor::rms_norm → rms_single_row
 }
 ```
 
@@ -89,9 +89,19 @@ Apple-Silicon GPU generations, so RMSNorm output is checked against MLX within
 qmv/qmm/dequantize kernels *are* bit-exact; the transcendental-bearing ones are
 not — see [weights and quantization](./weights-and-quantization.md).)
 
+`Tensor::rms_norm` takes the gamma as `Option<&Tensor>`. `Some(gamma)` is the
+affine path checked above. `None` is the **weightless** path — mlx's
+`mx.fast.rms_norm(x, weight=None)` — used by Qwen3.5's Gated-DeltaNet q/k norm,
+which normalizes each head row without a learned scale. The forward kernel has
+no separate weightless branch (it always multiplies by `w[w_stride * i]`; the
+`has_w` function-constant only drives the unused VJP variants), so `None` binds
+a device-cached one-element `[1.0]` scalar with `w_stride = 0` — every lane
+reads `w[0]`, an identity gamma — instead of uploading a `[hidden]` ones-vector
+per call. Same math, fewer bytes, mlx-faithful.
+
 `Tensor::rms_norm` carries the precondition checks: `x` dense, contiguous, and
-bf16 with the hidden dimension last; `gamma` a rank-1 bf16 vector matching that
-last axis; `eps` finite and non-negative. The single fused kernel handles
+bf16 with the hidden dimension last; a `Some` `gamma` a rank-1 bf16 vector
+matching that last axis; `eps` finite and non-negative. The single fused kernel handles
 Qwen2.5-0.5B's `hidden = 896` comfortably — it is well within the single-row
 regime (`rms_single_row` handles axes up to 4096; wider axes would need the
 looped variant, which is not wired because no supported model needs it).

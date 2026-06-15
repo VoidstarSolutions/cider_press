@@ -14,13 +14,11 @@
 //! output norm → `out_proj`). See `docs/inference/models/qwen3.6.md` and
 //! `ROADMAP.md`.
 
-use cider_press_runtime::{DType, Tensor};
-use half::bf16;
-
 use crate::error::{Error, Result};
 use crate::nn::{Linear, Module, repeat_axis_interleaved, scalar_tensor, silu};
 use crate::qwen3_5::config::Qwen35Config;
 use crate::qwen3_5::weights::Qwen35LinearAttnWeights;
+use cider_press_runtime::{DType, Tensor};
 
 /// Depthwise causal Conv1d (kernel 4, groups = channels, no bias) + SiLU,
 /// for the Gated-DeltaNet mixer. `qkv` `[1, T, C]`, `conv_state` `[1, 3, C]`
@@ -252,10 +250,9 @@ pub(crate) fn split_qkv(
 //
 // mlx-lm: q = (inv**2) * rms_norm(q, None, 1e-6); k = inv * rms_norm(k, None,
 // 1e-6) with inv = Dk**-0.5 — so the caller passes scale = 1/Dk for q and
-// 1/sqrt(Dk) for k. The fused `Tensor::rms_norm` requires a gamma, so the
-// weightless variant is a ones-tensor [D]; rms_norm reduces the trailing axis
-// in fp32 and returns BF16, matching mlx's fused weightless rms_norm. The
-// reshaped/sliced input is a view, so copy() it to a dense leaf first.
+// 1/sqrt(Dk) for k. `rms_norm(None)` is the weightless path: a stride-0 scalar
+// `1.0` gamma read by every lane (mlx's `weight=None`), no `[D]` ones upload.
+// The reshaped/sliced input is a view, so copy() it to a dense leaf first.
 pub(crate) fn qk_norm_scale(x: &Tensor, scale: f32) -> Result<Tensor> {
     let dims = x.shape().dims();
     if dims.len() != 4 || dims[0] != 1 {
@@ -274,10 +271,9 @@ pub(crate) fn qk_norm_scale(x: &Tensor, scale: f32) -> Result<Tensor> {
         Error::InvalidArgument("qk_norm_scale: x has no device (placeholder)".into())
     })?;
 
-    // Weightless RMSNorm: gamma = 1. rms_norm requires a contiguous, non-view
-    // input — copy() the (possibly reshaped) x to a dense leaf.
-    let ones = Tensor::from_slice(device, &vec![bf16::ONE; dim], [dim])?;
-    let normed = x.copy()?.rms_norm(&ones, 1e-6)?;
+    // Weightless RMSNorm (gamma = 1). rms_norm rejects view inputs — copy()
+    // the (possibly reshaped) x to a dense leaf first.
+    let normed = x.copy()?.rms_norm(None, 1e-6)?;
 
     // Broadcast scalar scale. The binary op's strided dispatch is only wired up
     // to rank 3, so flatten the contiguous rms_norm output to rank-1, multiply
@@ -603,7 +599,7 @@ impl GatedDeltaNet {
         // 8. Gated output norm + out_proj. The gated-output `norm` gamma is
         //    WEIGHTED (loaded as-is). Then `_precise_swiglu` in fp32:
         //    out = silu(z_f32) * nrm_f32, cast back to bf16.
-        let nrm = y.copy()?.rms_norm(&self.norm, eps)?; // [1, T, Hv, Dv] bf16
+        let nrm = y.copy()?.rms_norm(Some(&self.norm), eps)?; // [1, T, Hv, Dv] bf16
         // `_precise_swiglu` in fp32: out = silu(z_f32) * nrm_f32. Flatten both to
         // rank-2 [T*Hv, Dv] before casting — the cross-dtype strided copy that
         // backs `cast` only supports rank <= 3, and a contiguous flatten keeps
@@ -623,6 +619,7 @@ impl GatedDeltaNet {
 mod tests {
     use super::*;
     use cider_press_runtime::{Device, Tensor};
+    use half::bf16;
 
     #[test]
     #[allow(clippy::cast_precision_loss)]
