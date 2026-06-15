@@ -321,15 +321,32 @@ fn load_linear_attn(
         hidden,
     )?;
 
-    let a_log = read_dense_tensor(archive, &format!("{prefix}.A_log"), device)?;
-    // The 4B dev vehicle stores `A_log` as f32; the 27B target stores it bf16
-    // (both upcast to fp32 in `compute_g`). TODO(27B): accept BF16 here too.
-    expect_dense(
-        &format!("{prefix}.A_log"),
-        &a_log,
-        DType::F32,
-        &[value_heads],
-    )?;
+    let a_log_raw = read_dense_tensor(archive, &format!("{prefix}.A_log"), device)?;
+    // The 4B dev vehicle stores `A_log` as f32; the 27B target stores it bf16.
+    // `compute_g` requires f32, so upcast bf16 -> f32 at load (exact widening;
+    // identical to mlx-lm's `A_log.astype(float32)`).
+    if !matches!(a_log_raw.layout(), Layout::Dense { .. }) {
+        return Err(Error::InvalidArgument(format!(
+            "{prefix}.A_log: expected dense layout, got quantized"
+        )));
+    }
+    if a_log_raw.shape().dims() != [value_heads] {
+        return Err(Error::ShapeMismatch {
+            key: format!("{prefix}.A_log"),
+            expected: vec![value_heads],
+            actual: a_log_raw.shape().dims().to_vec(),
+        });
+    }
+    let a_log = match a_log_raw.dtype() {
+        DType::F32 => a_log_raw,
+        DType::BF16 => a_log_raw.cast(DType::F32)?,
+        other => {
+            return Err(Error::UnsupportedDtype {
+                key: format!("{prefix}.A_log"),
+                dtype: format!("{other:?}"),
+            });
+        }
+    };
     let dt_bias = read_dense_tensor(archive, &format!("{prefix}.dt_bias"), device)?;
     expect_dense(
         &format!("{prefix}.dt_bias"),
@@ -547,15 +564,15 @@ mod tests {
         synthesize_archive_bytes_with(cfg, false, |_, _| None)
     }
 
-    /// Same, but `with_lm_head` adds the untied `language_model.lm_head`
-    /// quantized triple (`[vocab, hidden]`), and `override_shape(key, default)`
-    /// may return a replacement logical shape for a dense tensor (used by the
-    /// negative test).
+    /// `with_lm_head` adds the untied `language_model.lm_head` quantized triple
+    /// (`[vocab, hidden]`); `override_dense(key, default_shape)` may return a
+    /// full replacement `(dtype, shape, bytes)` for a dense tensor (used by the
+    /// wrong-shape negative test and the bf16-`A_log` test).
     #[allow(clippy::too_many_lines)]
     fn synthesize_archive_bytes_with(
         cfg: &Qwen35Config,
         with_lm_head: bool,
-        override_shape: impl Fn(&str, &[usize]) -> Option<Vec<usize>>,
+        override_dense: impl Fn(&str, &[usize]) -> Option<(StDtype, Vec<usize>, Vec<u8>)>,
     ) -> Vec<u8> {
         let hidden = cfg.hidden_size;
         let intermediate = cfg.intermediate_size;
@@ -564,8 +581,10 @@ mod tests {
 
         let mut entries: Vec<Entry> = Vec::new();
         let dense = |entries: &mut Vec<Entry>, key: &str, dtype: StDtype, shape: Vec<usize>| {
-            let shape = override_shape(key, &shape).unwrap_or(shape);
-            entries.push(dense_entry(key, dtype, shape));
+            match override_dense(key, &shape) {
+                Some((dt, sh, bytes)) => entries.push((key.into(), dt, sh, bytes)),
+                None => entries.push(dense_entry(key, dtype, shape)),
+            }
         };
 
         push_quantized(
@@ -755,7 +774,7 @@ mod tests {
         // Synthesize the same archive but with `norm.weight` at [63] instead of [64].
         let bad_key = format!("{TEXT_PREFIX}.norm.weight");
         let archive_bytes = synthesize_archive_bytes_with(&config, false, |key, _default| {
-            (key == bad_key).then(|| vec![63])
+            (key == bad_key).then(|| (StDtype::BF16, vec![63], vec![0u8; 63 * 2]))
         });
         let archive = SafeTensors::deserialize(&archive_bytes).expect("deserialize");
 
@@ -802,6 +821,81 @@ mod tests {
         let err = load_qwen35_weights(&archive, &config, &device)
             .expect_err("untied config without lm_head must error");
         assert!(matches!(err, Error::MissingKey { ref key } if key.contains("lm_head")));
+    }
+
+    /// Truncate an f32 to bf16 (drop the low 16 mantissa bits), returning the
+    /// little-endian bf16 bytes and the value widened back to f32. The widened
+    /// value is exactly the bf16 (low 16 bits zero), so an `A_log` built from
+    /// these bytes must load bit-identically to `widened` after the upcast.
+    fn f32_to_bf16_le(v: f32) -> ([u8; 2], f32) {
+        let bits = v.to_bits();
+        let hi = (bits >> 16) as u16;
+        let widened = f32::from_bits(u32::from(hi) << 16);
+        (hi.to_le_bytes(), widened)
+    }
+
+    /// The 27B stores `A_log` bf16; the loader must accept it and upcast to f32
+    /// (`compute_g`'s invariant). Build an archive whose `A_log` is bf16 with
+    /// known values and assert it loads as f32 with the exactly-widened values.
+    #[test]
+    fn bf16_a_log_upcasts_to_f32() {
+        let device = Device::shared().expect("device");
+        let config = Qwen35Config::from_json_bytes(TINY_CONFIG_JSON.as_bytes()).expect("config");
+        let value_heads = config.linear_num_value_heads;
+        // Layer 0 is LinearAttention in the tiny config.
+        let a_log_key = format!("{TEXT_PREFIX}.layers.0.linear_attn.A_log");
+
+        // Distinct, exactly-bf16-representable-after-truncation source values.
+        let src: Vec<f32> = (0..u16::try_from(value_heads).unwrap())
+            .map(|i| -1.5 - f32::from(i))
+            .collect();
+        let mut bf16_bytes = Vec::with_capacity(value_heads * 2);
+        let mut widened = Vec::with_capacity(value_heads);
+        for &v in &src {
+            let (le, w) = f32_to_bf16_le(v);
+            bf16_bytes.extend_from_slice(&le);
+            widened.push(w);
+        }
+
+        let key = a_log_key.clone();
+        let bytes = bf16_bytes.clone();
+        let archive_bytes = synthesize_archive_bytes_with(&config, false, |k, _default| {
+            (k == key).then(|| (StDtype::BF16, vec![value_heads], bytes.clone()))
+        });
+        let archive = SafeTensors::deserialize(&archive_bytes).expect("deserialize");
+
+        let weights = load_qwen35_weights(&archive, &config, &device).expect("load bf16 A_log");
+
+        let Qwen35MixerWeights::LinearAttn(lin) = &weights.layers[0].mixer else {
+            panic!("layer 0 must be LinearAttn");
+        };
+        assert_eq!(
+            lin.a_log.dtype(),
+            DType::F32,
+            "bf16 A_log must be upcast to f32 at load"
+        );
+        assert_eq!(lin.a_log.shape().dims(), &[value_heads]);
+        lin.a_log.eval().expect("eval a_log");
+        let host = lin.a_log.cpu_to_vec::<f32>().expect("pull a_log to host");
+        assert_eq!(
+            host, widened,
+            "upcast values must equal the bf16 source widened to f32 (exact)"
+        );
+    }
+
+    /// The 4B path (f32 `A_log`) stays byte-identical: loaded as-is, no cast.
+    #[test]
+    fn f32_a_log_loads_as_f32() {
+        let device = Device::shared().expect("device");
+        let config = Qwen35Config::from_json_bytes(TINY_CONFIG_JSON.as_bytes()).expect("config");
+        let archive_bytes = synthesize_archive_bytes(&config);
+        let archive = SafeTensors::deserialize(&archive_bytes).expect("deserialize");
+
+        let weights = load_qwen35_weights(&archive, &config, &device).expect("load");
+        let Qwen35MixerWeights::LinearAttn(lin) = &weights.layers[0].mixer else {
+            panic!("layer 0 must be LinearAttn");
+        };
+        assert_eq!(lin.a_log.dtype(), DType::F32);
     }
 
     fn checkpoint_path() -> Option<PathBuf> {
