@@ -25,6 +25,7 @@ mod error;
 pub mod generator;
 pub mod nn;
 pub mod qwen2;
+pub mod qwen3_5;
 pub mod safetensors_io;
 pub mod tokenizer;
 
