@@ -3464,7 +3464,11 @@ mod tests {
         let half_bits = bf16::from_f32(0.5).to_bits();
         let oneandhalf_bits = bf16::from_f32(1.5).to_bits();
         assert!(out[..3 * 8192].iter().all(|&x| x.to_bits() == half_bits));
-        assert!(out[3 * 8192..].iter().all(|&x| x.to_bits() == oneandhalf_bits));
+        assert!(
+            out[3 * 8192..]
+                .iter()
+                .all(|&x| x.to_bits() == oneandhalf_bits)
+        );
     }
 
     #[test]
