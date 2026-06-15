@@ -4,7 +4,8 @@ use std::{fs, path::PathBuf};
 
 use cider_press_models::nn::rms_norm;
 use cider_press_models::qwen3_5::{
-    GatedAttention, Qwen35Config, Qwen35DecoderLayer, Qwen35MixerWeights, load_qwen35_weights,
+    GatedAttention, Qwen35Config, Qwen35DecoderLayer, Qwen35LayerCache, Qwen35MixerWeights,
+    load_qwen35_weights,
 };
 use cider_press_runtime::{DType, Device, KvCache, Tensor};
 use cider_press_test_utils::read_bf16;
@@ -113,14 +114,16 @@ fn decoder_layer3_matches_mlx() {
 
     let x = Tensor::from_slice(&device, &layer3_in, [1usize, t, config.hidden_size]).unwrap();
     let layer = Qwen35DecoderLayer::from_weights(&weights.layers[3], &config).unwrap();
-    let mut cache = KvCache::new(
-        &device,
-        t,
-        config.num_key_value_heads,
-        config.head_dim,
-        DType::BF16,
-    )
-    .unwrap();
+    let mut cache = Qwen35LayerCache::Full(
+        KvCache::new(
+            &device,
+            t,
+            config.num_key_value_heads,
+            config.head_dim,
+            DType::BF16,
+        )
+        .unwrap(),
+    );
     let offset = Tensor::from_slice(&device, &[0i32], [1usize]).unwrap();
 
     let out = layer.forward(&x, &offset, &mut cache).unwrap();

@@ -4,19 +4,23 @@
 //! mixer ([`GatedDeltaNet`]) — selected per layer by the loaded weights.
 //!
 //! The two mixers carry different state needs: the full mixer threads a RoPE
-//! `offset` and a [`KvCache`]; the linear (GDN) mixer (Phase 3) prefills from a
-//! zero recurrent state and needs neither. The layer therefore exposes two
-//! entry points — [`Qwen35DecoderLayer::forward`] (full attention, needs the
-//! cache) and [`Qwen35DecoderLayer::forward_linear`] (GDN prefill, no cache) —
-//! each erroring if the layer's mixer is the other variant. Phase 4 unifies
-//! cache handling across the full model (a per-layer cache enum threaded
-//! through one `forward`); until then the caller dispatches on layer type.
+//! `offset` and a [`KvCache`](cider_press_runtime::KvCache); the linear (GDN)
+//! mixer threads a depthwise-conv window plus an fp32 recurrent state. Phase 4
+//! unifies both behind one [`Qwen35DecoderLayer::forward`] that dispatches on a
+//! per-layer [`Qwen35LayerCache`] enum: a [`Full`](Qwen35LayerCache::Full)
+//! mixer pairs with a [`Full`](Qwen35LayerCache::Full) cache, a
+//! [`Linear`](Qwen35LayerCache::Linear) mixer with a
+//! [`Linear`](Qwen35LayerCache::Linear) cache; a mismatched pair errors. The
+//! `offset` is threaded for the full path's RoPE; the linear (GDN) mixer
+//! carries no position and ignores it (matching mlx-lm, where the GDN layer
+//! takes no offset).
 
-use cider_press_runtime::{KvCache, Tensor};
+use cider_press_runtime::Tensor;
 
 use crate::error::{Error, Result};
 use crate::nn::{Linear, Mlp, Module, RmsNormLayer};
 use crate::qwen3_5::attention::GatedAttention;
+use crate::qwen3_5::cache::Qwen35LayerCache;
 use crate::qwen3_5::config::Qwen35Config;
 use crate::qwen3_5::gated_deltanet::GatedDeltaNet;
 use crate::qwen3_5::weights::{Qwen35LayerWeights, Qwen35MixerWeights};
@@ -70,44 +74,38 @@ impl Qwen35DecoderLayer {
         })
     }
 
-    /// Forward for a FULL-attention layer: pre-norm gated attention + residual,
-    /// pre-norm SwiGLU MLP + residual.
+    /// Forward over either mixer, dispatching on the per-layer cache: pre-norm
+    /// mixer + residual, pre-norm SwiGLU MLP + residual.
     ///
     /// - `hidden`: `[1, T, hidden_size]` dense BF16.
-    /// - `offset`, `cache`: forwarded to [`GatedAttention::forward`].
+    /// - `offset`: RoPE offset, forwarded to [`GatedAttention::forward`] on the
+    ///   full path. The linear (Gated-DeltaNet) mixer carries no position and
+    ///   ignores it (matching mlx-lm, where the GDN layer takes no offset).
+    /// - `cache`: the [`Qwen35LayerCache`] whose variant must match the layer's
+    ///   mixer — [`Full`](Qwen35LayerCache::Full) threads the [`KvCache`](cider_press_runtime::KvCache);
+    ///   [`Linear`](Qwen35LayerCache::Linear) threads the GDN conv-window +
+    ///   recurrent state.
     ///
-    /// Returns `[1, T, hidden_size]`, lazy. Errors if the layer's mixer is the
-    /// linear (Gated-DeltaNet) variant — call [`Self::forward_linear`] for that.
-    pub fn forward(&self, hidden: &Tensor, offset: &Tensor, cache: &mut KvCache) -> Result<Tensor> {
-        let Mixer::Full(attn) = &self.mixer else {
-            return Err(Error::InvalidArgument(
-                "Qwen35DecoderLayer::forward: this is a linear (Gated-DeltaNet) layer; call \
-                 forward_linear"
-                    .into(),
-            ));
-        };
+    /// Returns `[1, T, hidden_size]`, lazy. Errors on a mixer/cache type
+    /// mismatch (a full mixer needs a full cache; linear needs linear).
+    pub fn forward(
+        &self,
+        hidden: &Tensor,
+        offset: &Tensor,
+        cache: &mut Qwen35LayerCache,
+    ) -> Result<Tensor> {
         let normed = self.input_layernorm.forward(hidden)?;
-        let mixer_out = attn.forward(&normed, offset, cache)?;
-        self.mlp_residual(hidden, &mixer_out)
-    }
-
-    /// Forward for a LINEAR (Gated-DeltaNet) layer: pre-norm GDN mixer +
-    /// residual, pre-norm SwiGLU MLP + residual. Prefills from a zero recurrent
-    /// state (no KV cache, no RoPE offset).
-    ///
-    /// - `hidden`: `[1, T, hidden_size]` dense BF16.
-    ///
-    /// Returns `[1, T, hidden_size]`, lazy. Errors if the layer's mixer is the
-    /// full-attention variant — call [`Self::forward`] for that.
-    pub fn forward_linear(&self, hidden: &Tensor) -> Result<Tensor> {
-        let Mixer::Linear(gdn) = &self.mixer else {
-            return Err(Error::InvalidArgument(
-                "Qwen35DecoderLayer::forward_linear: this is a full-attention layer; call forward"
-                    .into(),
-            ));
+        let mixer_out = match (&self.mixer, cache) {
+            (Mixer::Full(attn), Qwen35LayerCache::Full(kv)) => attn.forward(&normed, offset, kv)?,
+            (Mixer::Linear(gdn), Qwen35LayerCache::Linear(st)) => gdn.forward(&normed, Some(st))?,
+            _ => {
+                return Err(Error::InvalidArgument(
+                    "Qwen35DecoderLayer::forward: mixer/cache type mismatch (Full mixer needs \
+                     Full cache, Linear needs Linear)"
+                        .into(),
+                ));
+            }
         };
-        let normed = self.input_layernorm.forward(hidden)?;
-        let mixer_out = gdn.forward(&normed, None)?;
         self.mlp_residual(hidden, &mixer_out)
     }
 

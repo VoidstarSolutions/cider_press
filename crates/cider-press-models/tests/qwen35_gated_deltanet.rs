@@ -4,8 +4,8 @@ use std::{fs, path::PathBuf};
 
 use cider_press_models::nn::rms_norm;
 use cider_press_models::qwen3_5::{
-    GatedDeltaNet, LinearState, Qwen35Config, Qwen35DecoderLayer, Qwen35MixerWeights,
-    load_qwen35_weights,
+    GatedDeltaNet, LinearState, Qwen35Config, Qwen35DecoderLayer, Qwen35LayerCache,
+    Qwen35MixerWeights, load_qwen35_weights,
 };
 use cider_press_runtime::{DType, Device, Tensor};
 use cider_press_test_utils::read_bf16;
@@ -83,9 +83,10 @@ fn gated_deltanet_layer0_matches_mlx() {
 }
 
 /// Whole linear (GDN) decoder layer parity vs mlx-lm. Layer 0 is a linear
-/// mixer; `forward_linear` runs pre-norm GDN + residual, then pre-norm SwiGLU
-/// MLP + residual (prefill from zero state, no KV cache). The fixture taps the
-/// full decoder layer output `layer0_out`.
+/// mixer; the unified `forward` dispatches on a `Linear` cache, running
+/// pre-norm GDN + residual, then pre-norm SwiGLU MLP + residual (prefill from
+/// zero state). The `offset` is ignored on the linear path. The fixture taps
+/// the full decoder layer output `layer0_out`.
 #[test]
 fn decoder_layer0_matches_mlx() {
     let Some(dir) = checkpoint_path() else {
@@ -111,7 +112,9 @@ fn decoder_layer0_matches_mlx() {
 
     let x = Tensor::from_slice(&device, &layer0_in, [1usize, t, config.hidden_size]).unwrap();
     let layer = Qwen35DecoderLayer::from_weights(&weights.layers[0], &config).unwrap();
-    let out = layer.forward_linear(&x).unwrap();
+    let mut cache = Qwen35LayerCache::for_layer(&config, 0, &device, t).unwrap();
+    let offset = Tensor::from_slice(&device, &[0i32], [1usize]).unwrap();
+    let out = layer.forward(&x, &offset, &mut cache).unwrap();
     out.eval().unwrap();
     let got: Vec<bf16> = out.cpu_to_vec().unwrap();
     assert_close("decoder layer0", &got, &expected);
