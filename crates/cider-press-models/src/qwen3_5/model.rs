@@ -1,5 +1,6 @@
 //! Full Qwen3.5 / Qwen3.6 text model: embed → N mixed decoder layers →
-//! final norm → tied LM head.
+//! final norm → LM head (tied embedding on the 4B, separate untied head on
+//! the 27B).
 //!
 //! Structurally identical to [`Qwen2Model`](crate::qwen2::Qwen2Model); the two
 //! differences are (1) the layers are [`Qwen35DecoderLayer`]s whose `forward`
@@ -20,18 +21,23 @@ use crate::nn::{Module, RmsNormLayer, embed_tokens};
 ///
 /// Owns the embedding weight, all (mixed full-attention / Gated-DeltaNet)
 /// decoder layers, and the final `RMSNorm`. The embedding is a plain lookup
-/// (no `√hidden` scale). The LM head is **tied**: `forward` re-projects the
-/// final hidden states through the embedding weight via
-/// `Tensor::quantized_matmul(.., transpose=true)`. The 4B dev vehicle ships
-/// `tie_word_embeddings=true`; the untied 27B `lm_head` is deferred to Phase 5
-/// ([`from_weights`](Self::from_weights) errors if `tie_word_embeddings` is
-/// false).
+/// (no `√hidden` scale). The LM head selection depends on the config:
+///
+/// - **Tied** (`tie_word_embeddings=true`, the 4B dev vehicle): `lm_head` is
+///   `None`; `forward` re-projects the final hidden states through the
+///   embedding weight via `Tensor::quantized_matmul(.., transpose=true)`.
+/// - **Untied** (`tie_word_embeddings=false`, the 27B target): `lm_head` is
+///   `Some` separate `[vocab, hidden]` quantized head, projected with the same
+///   `y = x·Wᵀ` direction.
 ///
 /// `forward` takes caller-owned `&mut [Qwen35LayerCache]` (one per layer) so a
 /// decode loop can persist them across calls.
 #[derive(Debug)]
 pub struct Qwen35Model {
     embed: QuantizedWeight,
+    /// Untied LM head (`[vocab, hidden]`, quantized) on the 27B; `None` on the
+    /// tied 4B, where logits project through `embed`.
+    lm_head: Option<QuantizedWeight>,
     layers: Vec<Qwen35DecoderLayer>,
     final_norm: RmsNormLayer,
     config: Qwen35Config,
@@ -42,8 +48,8 @@ impl Qwen35Model {
     ///
     /// # Errors
     /// - `weights.layers.len()` disagrees with `config.num_hidden_layers`.
-    /// - `config.tie_word_embeddings` is false (untied 27B `lm_head` is
-    ///   Phase 5).
+    /// - `config.tie_word_embeddings` is false but no `lm_head` weight was
+    ///   loaded (the loader enforces this, so it should not occur in practice).
     /// - a layer fails to build (mixer-weight / config mismatch).
     pub fn from_weights(weights: Qwen35Weights, config: Qwen35Config) -> Result<Self> {
         if weights.layers.len() != config.num_hidden_layers {
@@ -53,11 +59,18 @@ impl Qwen35Model {
                 config.num_hidden_layers
             )));
         }
-        if !config.tie_word_embeddings {
-            return Err(Error::InvalidArgument(
-                "Qwen35Model: untied lm_head not yet supported (27B is Phase 5)".into(),
-            ));
-        }
+        // Tied (4B): project through `embed`, no separate head. Untied (27B):
+        // use the loaded `lm_head`. The loader guarantees an untied config
+        // carries a head, so the `None` arm is a defensive guard.
+        let lm_head = match (config.tie_word_embeddings, weights.lm_head) {
+            (true, _) => None,
+            (false, Some(h)) => Some(h),
+            (false, None) => {
+                return Err(Error::InvalidArgument(
+                    "Qwen35Model: untied config (tie_word_embeddings=false) but no lm_head weight loaded".into(),
+                ));
+            }
+        };
         let layers = weights
             .layers
             .iter()
@@ -68,6 +81,7 @@ impl Qwen35Model {
         let final_norm = RmsNormLayer::new(weights.norm, config.rms_norm_eps as f32);
         Ok(Self {
             embed: weights.embed,
+            lm_head,
             layers,
             final_norm,
             config,
@@ -110,7 +124,7 @@ impl Qwen35Model {
     ///
     /// The decoder layers still run over all `T` tokens (writing every layer's
     /// mixer state for all positions into `caches`); only the final norm and
-    /// the tied LM head are computed, for the final position alone. That is the
+    /// the LM head are computed, for the final position alone. That is the
     /// single logits row greedy generation consumes — projecting the whole
     /// `[1, T, vocab]` is wasted work. Numerically identical to
     /// `forward(..)[:, -1, :]` because `RMSNorm` and the LM head are
@@ -197,13 +211,14 @@ impl Qwen35Model {
         Ok(hidden)
     }
 
-    /// Final norm + tied LM head over `hidden` (`[1, S, hidden_size]`),
-    /// returning `[1, S, vocab_size]` BF16, lazy.
+    /// Final norm + LM head over `hidden` (`[1, S, hidden_size]`), returning
+    /// `[1, S, vocab_size]` BF16, lazy.
     fn project_logits(&self, hidden: &Tensor) -> Result<Tensor> {
         let normed = self.final_norm.forward(hidden)?;
-        // Tied LM head: the embedding table is [vocab, D], so the standard
-        // y = x @ W^T direction (transpose=true) projects hidden states to
-        // vocab-size logits without a separate weight.
-        Ok(normed.quantized_matmul(&self.embed, true)?)
+        // Both heads are [vocab, D], so the standard y = x @ W^T direction
+        // (transpose=true) projects hidden states to vocab-size logits. Untied
+        // (27B): the separate `lm_head`. Tied (4B): the embedding table itself.
+        let head = self.lm_head.as_ref().unwrap_or(&self.embed);
+        Ok(normed.quantized_matmul(head, true)?)
     }
 }
