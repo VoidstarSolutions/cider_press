@@ -212,6 +212,7 @@ pub(crate) fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
 /// Deliberately not a [`Module`]: its forward needs the RoPE `offset` and a
 /// mutable [`KvCache`], mirroring mlx-lm's `Qwen3NextAttention.__call__(x,
 /// cache)`.
+#[derive(Debug)]
 pub struct GatedAttention {
     q_proj: Linear,
     k_proj: Linear,
