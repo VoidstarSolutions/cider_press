@@ -307,9 +307,9 @@ pub enum OpKind {
     /// rank ≥ 1, `w` a weight matching `x`'s trailing axis (rank-1
     /// `[hidden]` when `w_stride == 1`; a 1-element `[1.0]` scalar when
     /// `w_stride == 0`, the weightless / `weight=None` case). Output has the
-    /// same shape and dtype as `x`. Single-row kernel only (trailing axis ≤
-    /// 4096). Replaces the composed square→mean→rsqrt→mul→mul chain with one
-    /// dispatch.
+    /// same shape and dtype as `x`. Dispatches the single-row kernel for
+    /// trailing axis ≤ 4096, else the looped kernel (axis > 4096). Replaces
+    /// the composed square→mean→rsqrt→mul→mul chain with one dispatch.
     RmsNorm {
         /// Variance-stabilising epsilon added before the `rsqrt`
         /// (`1e-6` for Qwen2.5). Carried as `f32` — the reason this enum
@@ -1855,11 +1855,13 @@ impl Tensor {
     /// Schedule a fused last-axis `RMSNorm`:
     /// `out = w * x * rsqrt(mean(x²) + eps)`, reduced per row in fp32.
     ///
-    /// One dispatch of MLX's `rms_single_row`, replacing the composed
-    /// square→mean→rsqrt→mul→mul chain. Preconditions:
+    /// One dispatch of MLX's fused `RMSNorm`, replacing the composed
+    /// square→mean→rsqrt→mul→mul chain: `rms_single_row` when the trailing
+    /// axis is ≤ 4096 (fits one threadgroup), else `rms_looped` (the
+    /// threadgroup loops the row — e.g. Qwen3.6-27B's hidden 5120).
+    /// Preconditions:
     ///
     /// - `self` (x) is dense, contiguous, [`DType::BF16`], rank ≥ 1.
-    /// - The trailing axis is ≤ 4096 (the single-row kernel limit).
     /// - `eps` is finite and non-negative.
     ///
     /// `weight` selects the gamma (mirroring `mx.fast.rms_norm`'s optional
@@ -1902,11 +1904,6 @@ impl Tensor {
             return Err(Error::InvalidArgument(
                 "rms_norm: trailing axis must be non-zero".into(),
             ));
-        }
-        if hidden > 4096 {
-            return Err(Error::InvalidArgument(format!(
-                "rms_norm: trailing axis {hidden} exceeds the single-row kernel limit (4096)"
-            )));
         }
         if !eps.is_finite() || eps < 0.0 {
             return Err(Error::InvalidArgument(format!(

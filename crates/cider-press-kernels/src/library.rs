@@ -131,6 +131,16 @@ impl Pipeline {
     pub fn metal_pipeline_state(&self) -> &ProtocolObject<dyn MTLComputePipelineState> {
         &self.0
     }
+
+    /// The maximum threads a single threadgroup may launch for this
+    /// pipeline (device- and kernel-dependent, typically 1024). The
+    /// looped `RMSNorm`/softmax kernels cap their computed threadgroup
+    /// size at this value, mirroring MLX's
+    /// `kernel->maxTotalThreadsPerThreadgroup()`.
+    #[must_use]
+    pub fn max_total_threads_per_threadgroup(&self) -> usize {
+        self.0.maxTotalThreadsPerThreadgroup()
+    }
 }
 
 /// A compiled Metal library plus a pipeline-state cache keyed by
