@@ -15,6 +15,7 @@ mod block;
 mod cache;
 mod config;
 mod gated_deltanet;
+mod model;
 mod weights;
 
 pub use attention::GatedAttention;
@@ -24,6 +25,7 @@ pub use config::{
     HF_REPO, HF_REVISION, LayerType, Qwen35Config, Qwen35QuantizationConfig, RopeParameters,
 };
 pub use gated_deltanet::GatedDeltaNet;
+pub use model::Qwen35Model;
 pub use weights::{
     Qwen35FullAttnWeights, Qwen35LayerWeights, Qwen35LinearAttnWeights, Qwen35MixerWeights,
     Qwen35MlpWeights, Qwen35Weights, load_qwen35_weights,
