@@ -5,17 +5,16 @@
 //! sigmoid output gate. Phase-2 lands the helpers + mixer; see
 //! `docs/inference/models/qwen3.6.md`.
 
-use cider_press_runtime::{DType, Device, Tensor};
+use cider_press_runtime::{DType, Device, KvCache, Tensor};
 use half::bf16;
 
 use crate::error::{Error, Result};
+use crate::nn::{Linear, Module, rms_norm};
 use crate::qwen3_5::config::Qwen35Config;
+use crate::qwen3_5::weights::Qwen35FullAttnWeights;
 
 /// Rotary dims for partial RoPE: `floor(head_dim * partial_rotary_factor)`.
 /// For the 4B/27B config that is `256 * 0.25 = 64`.
-// Consumed by the `GatedAttention` forward in Task 4; only the tests exercise
-// it today.
-#[allow(dead_code)]
 pub(crate) fn rotary_dims(config: &Qwen35Config) -> usize {
     #[allow(
         clippy::cast_possible_truncation,
@@ -29,9 +28,6 @@ pub(crate) fn rotary_dims(config: &Qwen35Config) -> usize {
 /// Partial RoPE over Q or K shaped `[1, H, T, head_dim]`: rotates the leading
 /// `rotary_dims` (64 of 256) and passes the rest through. `base = rope_theta`,
 /// `scale = 1`, non-traditional (`NeoX`). `offset` is a length-1 I32 tensor.
-// Consumed by the `GatedAttention` forward in Task 4; only the tests exercise
-// it today.
-#[allow(dead_code)]
 pub(crate) fn partial_rope(x: &Tensor, offset: &Tensor, config: &Qwen35Config) -> Result<Tensor> {
     #[allow(clippy::cast_possible_truncation)]
     let base = config.rope.rope_theta as f32;
@@ -41,8 +37,7 @@ pub(crate) fn partial_rope(x: &Tensor, offset: &Tensor, config: &Qwen35Config) -
 /// Reshape `[B, H_kv, T_c, D_h]` to `[B, H_q, T_c, D_h]` by fanning the `H_kv`
 /// axis out by `ratio = H_q / H_kv`. Zero-copy through `broadcast_to`, then
 /// `copy()` to land a contiguous buffer that the matmul kernel can read.
-// Wired in Task 4 (GatedAttention forward); only the tests exercise it today.
-#[allow(dead_code, clippy::many_single_char_names)]
+#[allow(clippy::many_single_char_names)]
 fn broadcast_kv_heads(
     x: &Tensor,
     b: usize,
@@ -55,7 +50,10 @@ fn broadcast_kv_heads(
     if ratio == 1 {
         return Ok(x.copy()?);
     }
+    // x may arrive as a strided cache view (batch axis broadcast, stride 0);
+    // reshape requires a contiguous leaf, so materialize first.
     let expanded = x
+        .copy()?
         .reshape([b, h_kv, 1, t_cache, head_dim])?
         .broadcast_to([b, h_kv, ratio, t_cache, head_dim])?
         .copy()?
@@ -68,11 +66,10 @@ fn broadcast_kv_heads(
 /// QKᵀ/scale/(+mask)/softmax/·V. `mask` (if given) is an additive BF16
 /// `[T, T_cache]` broadcast over batch·heads. Used for `head_dim`-256 prefill;
 /// decode routes to the fused vector kernel via `Tensor::sdpa`.
-// Wired in Task 4 (GatedAttention forward); only the tests exercise it today.
 // Composed SDPA lineage: ported from qwen2's pre-steel-kernel chain (git
 // be74e60); kept because the fused steel sdpa_full is head_dim-64 only and
 // gated attention needs head_dim 256 for prefill.
-#[allow(dead_code, clippy::many_single_char_names)]
+#[allow(clippy::many_single_char_names)]
 pub(crate) fn composed_sdpa(
     q: &Tensor,
     k: &Tensor,
@@ -151,8 +148,6 @@ pub(crate) fn composed_sdpa(
 /// Additive causal mask `[t, t_cache]` (BF16): 0 where key j attends to query i
 /// (`j <= i + (t_cache - t)`), -inf above. For prefill-from-scratch `t_cache == t`
 /// → lower-triangular. Each row keeps at least its diagonal, so no all-masked row.
-// Wired in Task 4 (via the sdpa router); only the tests exercise it today.
-#[allow(dead_code)]
 fn causal_mask(device: &Device, t: usize, t_cache: usize) -> Result<Tensor> {
     let offset = t_cache - t;
     let mut data = Vec::with_capacity(t * t_cache);
@@ -171,8 +166,6 @@ fn causal_mask(device: &Device, t: usize, t_cache: usize) -> Result<Tensor> {
 /// SDPA for the gated-attention mixer: decode (`T_q=1`) → fused vector kernel
 /// (`head_dim` 256 instantiated); prefill (`T_q>1`) → composed (steel `sdpa_full`
 /// is `head_dim`-64 only). GQA factor and scale derive from the tensor shapes.
-// Wired in Task 4 (GatedAttention forward); only the tests exercise it today.
-#[allow(dead_code)]
 pub(crate) fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
     let qd = q.shape().dims();
     let kd = k.shape().dims();
@@ -204,6 +197,160 @@ pub(crate) fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
         })?;
         let mask = causal_mask(device, t_q, t_cache)?;
         composed_sdpa(q, k, v, scale, Some(&mask))
+    }
+}
+
+/// Qwen3.5/3.6 gated full-attention mixer (the 1-in-`full_attention_interval`
+/// softmax-attention block).
+///
+/// Owns the four quantized projections (no additive bias — `attention_bias =
+/// false`) plus the per-head QK `RMSNorm` gammas and a cloned config.
+/// [`GatedAttention::forward`] runs: query‖gate split → weighted QK-norm
+/// (before RoPE) → partial RoPE → GQA `KvCache` feed → `sdpa` → sigmoid
+/// output gate → `o_proj`.
+///
+/// Deliberately not a [`Module`]: its forward needs the RoPE `offset` and a
+/// mutable [`KvCache`], mirroring mlx-lm's `Qwen3NextAttention.__call__(x,
+/// cache)`.
+pub struct GatedAttention {
+    q_proj: Linear,
+    k_proj: Linear,
+    v_proj: Linear,
+    o_proj: Linear,
+    q_norm: Tensor,
+    k_norm: Tensor,
+    config: Qwen35Config,
+}
+
+impl GatedAttention {
+    /// Build from a layer's loaded full-attention weights and the model config.
+    /// Clones the weights (cheap refcount bumps on shared device buffers).
+    pub fn from_weights(w: &Qwen35FullAttnWeights, config: &Qwen35Config) -> Result<Self> {
+        Ok(Self {
+            q_proj: Linear::new(w.q_proj.clone(), None)?,
+            k_proj: Linear::new(w.k_proj.clone(), None)?,
+            v_proj: Linear::new(w.v_proj.clone(), None)?,
+            o_proj: Linear::new(w.o_proj.clone(), None)?,
+            q_norm: w.q_norm.clone(),
+            k_norm: w.k_norm.clone(),
+            config: config.clone(),
+        })
+    }
+
+    /// Run gated self-attention on `hidden` (`[1, T, hidden_size]`, dense BF16,
+    /// already input-layernorm'd by the caller).
+    ///
+    /// - `offset`: length-1 I32 tensor — tokens already in `cache` (the RoPE
+    ///   position base). Must equal `cache.position()` before this call.
+    /// - `cache`: the KV cache; `forward` appends this step's K/V.
+    ///
+    /// Returns `[1, T, hidden_size]`, lazy. Batch is fixed at 1 ([`KvCache`] is
+    /// single-sequence). Aliasing contract matches qwen2's `Attention::forward`:
+    /// `eval()` the result before the next [`KvCache::update`] on this cache.
+    pub fn forward(&self, hidden: &Tensor, offset: &Tensor, cache: &mut KvCache) -> Result<Tensor> {
+        let config = &self.config;
+        let head_dim = config.head_dim;
+        let h_q = config.num_attention_heads;
+        let h_kv = config.num_key_value_heads;
+        let hidden_size = config.hidden_size;
+        let eps = {
+            #[allow(clippy::cast_possible_truncation)]
+            let e = config.rms_norm_eps as f32;
+            e
+        };
+
+        let dims = hidden.shape().dims();
+        if dims.len() != 3 {
+            return Err(Error::InvalidArgument(format!(
+                "GatedAttention::forward: hidden must be rank 3 [B, T, hidden_size]; got rank {}",
+                dims.len()
+            )));
+        }
+        if dims[0] != 1 {
+            return Err(Error::InvalidArgument(format!(
+                "GatedAttention::forward: batch must be 1 (KvCache is single-sequence); got B={}",
+                dims[0]
+            )));
+        }
+        if dims[2] != hidden_size {
+            return Err(Error::InvalidArgument(format!(
+                "GatedAttention::forward: hidden last dim ({}) != config.hidden_size \
+                 ({hidden_size})",
+                dims[2]
+            )));
+        }
+        if hidden.dtype() != DType::BF16 {
+            return Err(Error::InvalidArgument(format!(
+                "GatedAttention::forward: hidden must be BF16; got {:?}",
+                hidden.dtype()
+            )));
+        }
+        let t = dims[1];
+
+        // q_proj emits query‖gate interleaved *per head*: each head's 512 cols
+        // are [256 query, 256 gate]. Reshape to [1,T,H,2*D] then slice the head
+        // axis — a flat 4096‖4096 split would scramble heads.
+        let q = self
+            .q_proj
+            .forward(hidden)?
+            .reshape([1usize, t, h_q, 2 * head_dim])?;
+        let queries = q.slice(&[0..1, 0..t, 0..h_q, 0..head_dim])?.copy()?;
+        // Trailing copy() is load-bearing: reshape returns a non-dense view here,
+        // and sigmoid (unary) reads a dense leaf, not a view chain.
+        let gate = q
+            .slice(&[0..1, 0..t, 0..h_q, head_dim..2 * head_dim])?
+            .copy()?
+            .reshape([1usize, t, h_q * head_dim])?
+            .copy()?;
+
+        // copy() after reshape: rms_norm (below) and the cache write read dense
+        // leaves, not view chains.
+        let keys = self
+            .k_proj
+            .forward(hidden)?
+            .reshape([1usize, t, h_kv, head_dim])?
+            .copy()?;
+        let values = self
+            .v_proj
+            .forward(hidden)?
+            .reshape([1usize, t, h_kv, head_dim])?
+            .copy()?;
+
+        // Weighted QK-norm over head_dim, before RoPE. Values are NOT normed.
+        let queries = rms_norm(&queries, &self.q_norm, eps)?;
+        let keys = rms_norm(&keys, &self.k_norm, eps)?;
+
+        // To head-major [1, H, T, D_h].
+        let queries = queries.permute(&[0, 2, 1, 3])?.copy()?;
+        let keys = keys.permute(&[0, 2, 1, 3])?.copy()?;
+        let values = values.permute(&[0, 2, 1, 3])?.copy()?;
+
+        // Partial RoPE on Q and K only (64 of 256 dims rotate).
+        let queries = partial_rope(&queries, offset, config)?;
+        let keys = partial_rope(&keys, offset, config)?;
+
+        // KvCache stores [step_t, n_kv_heads, head_dim]; mirror qwen2's
+        // strided cache-write permute (2,1,3,0) -> [T, H_kv, D_h, 1].
+        let k_upd = keys.permute(&[2, 1, 3, 0])?;
+        let v_upd = values.permute(&[2, 1, 3, 0])?;
+        cache.update(&k_upd, &v_upd)?;
+
+        let t_cache = cache.position();
+        let k_view = cache.keys_view().permute(&[1, 0, 2])?;
+        let v_view = cache.values_view().permute(&[1, 0, 2])?;
+        let k_sdpa = k_view.broadcast_to([1usize, h_kv, t_cache, head_dim])?;
+        let v_sdpa = v_view.broadcast_to([1usize, h_kv, t_cache, head_dim])?;
+
+        let attn = sdpa(&queries, &k_sdpa, &v_sdpa)?; // [1, H_q, T, D_h]
+
+        // Collapse heads to [1, T, H_q*D_h], then apply the sigmoid output gate
+        // (head-major, aligned with the gate slice) before o_proj.
+        let collapsed =
+            attn.permute(&[0, 2, 1, 3])?
+                .copy()?
+                .reshape([1usize, t, h_q * head_dim])?;
+        let gated = collapsed.mul(&gate.sigmoid()?)?;
+        self.o_proj.forward(&gated)
     }
 }
 

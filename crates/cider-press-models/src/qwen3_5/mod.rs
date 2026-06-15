@@ -12,6 +12,7 @@ mod attention;
 mod config;
 mod weights;
 
+pub use attention::GatedAttention;
 pub use config::{
     HF_REPO, HF_REVISION, LayerType, Qwen35Config, Qwen35QuantizationConfig, RopeParameters,
 };
