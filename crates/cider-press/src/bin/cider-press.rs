@@ -411,7 +411,7 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
 /// The generator's caches still hold the full generated context, so this is a
 /// realistic full-context decode step (T=1 at the current cache position), not
 /// a cold T=1.
-fn gpu_profile_token(generator: &mut Generator, last_id: u32) -> Result<(), BoxError> {
+fn gpu_profile_token(generator: &mut Generator<Qwen2Model>, last_id: u32) -> Result<(), BoxError> {
     if !profile::is_enabled() {
         eprintln!("  (--gpu-profile ignored; rebuild with --features profiling)");
         return Ok(());
@@ -423,7 +423,7 @@ fn gpu_profile_token(generator: &mut Generator, last_id: u32) -> Result<(), BoxE
 /// Run ONE prefill forward (T = prompt length) through the profiled eval for
 /// a per-OpKind GPU breakdown of the prefill path. Outside the timed window.
 /// Resets + advances the generator's caches as a side effect (one-shot).
-fn gpu_profile_prefill(generator: &mut Generator, ids: &[u32]) -> Result<(), BoxError> {
+fn gpu_profile_prefill(generator: &mut Generator<Qwen2Model>, ids: &[u32]) -> Result<(), BoxError> {
     if !profile::is_enabled() {
         eprintln!("  (--gpu-profile-prefill ignored; rebuild with --features profiling)");
         return Ok(());

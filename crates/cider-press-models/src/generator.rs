@@ -1,33 +1,38 @@
-//! Greedy-decode driver over [`Qwen2Model`] + [`KvCache`].
+//! Greedy-decode driver over a [`LanguageModel`] + its per-layer caches.
 //!
-//! Concrete-on-Qwen2Model for now; lifting to a `LanguageModel`
-//! trait waits until a second architecture arrives. The iterator
-//! yields `Result<u32>` ids; UTF-8 detokenization is the caller's
-//! problem (compose `Tokenizer::decode_stream` on top).
+//! Generic over the model: [`Generator<M>`] drives any
+//! [`LanguageModel`] (currently [`Qwen2Model`] with
+//! [`KvCache`](cider_press_runtime::KvCache) and
+//! [`Qwen35Model`](crate::qwen3_5::Qwen35Model) with
+//! [`Qwen35LayerCache`](crate::qwen3_5::Qwen35LayerCache)) — the async-
+//! pipelined decode loop is cache-type-agnostic. The iterator yields
+//! `Result<u32>` ids; UTF-8 detokenization is the caller's problem (compose
+//! `Tokenizer::decode_stream` on top).
 
 #![doc = include_str!("../../../docs/inference/sampling.md")]
 
 use std::collections::{HashSet, VecDeque};
 
-use cider_press_runtime::{DType, Device, KvCache, PendingEval, Tensor};
+use cider_press_runtime::{Device, PendingEval, Tensor};
 
 use crate::error::{Error, Result};
+use crate::language_model::LanguageModel;
 use crate::qwen2::Qwen2Model;
 
-/// Owns a model + pre-allocated `KvCache`s + the EOS set. One instance
+/// Owns a model + pre-allocated per-layer caches + the EOS set. One instance
 /// drives one or more `generate` calls; caches are reset on every
 /// call so previous runs don't leak into the next prompt.
 #[derive(Debug)]
-pub struct Generator {
-    model: Qwen2Model,
-    caches: Vec<KvCache>,
+pub struct Generator<M: LanguageModel> {
+    model: M,
+    caches: Vec<M::Cache>,
     eos_ids: HashSet<u32>,
     context_window: usize,
     inflight_depth: usize,
 }
 
-impl Generator {
-    /// Construct a Generator. Pre-allocates one [`KvCache`] per layer
+impl<M: LanguageModel> Generator<M> {
+    /// Construct a Generator. Pre-allocates one cache per layer
     /// sized to `context_window` tokens.
     ///
     /// # Errors
@@ -35,7 +40,7 @@ impl Generator {
     /// - `eos_ids.is_empty()` — without an EOS the loop has no
     ///   natural terminator besides `max_new_tokens`; we reject so a
     ///   caller can't accidentally rely on that.
-    pub fn new(model: Qwen2Model, context_window: usize, eos_ids: HashSet<u32>) -> Result<Self> {
+    pub fn new(model: M, context_window: usize, eos_ids: HashSet<u32>) -> Result<Self> {
         if context_window == 0 {
             return Err(Error::InvalidArgument(
                 "Generator::new: context_window must be > 0".into(),
@@ -47,19 +52,7 @@ impl Generator {
             ));
         }
         let device = Device::shared()?;
-        let cfg = model.config();
-        let head_dim = cfg.head_dim()?;
-        let caches = (0..cfg.num_hidden_layers)
-            .map(|_| {
-                KvCache::new(
-                    &device,
-                    context_window,
-                    cfg.num_key_value_heads,
-                    head_dim,
-                    DType::BF16,
-                )
-            })
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let caches = model.make_caches(context_window, &device)?;
         Ok(Self {
             model,
             caches,
@@ -85,51 +78,23 @@ impl Generator {
         self.inflight_depth = depth;
     }
 
-    /// Reset all `KvCache`s to position 0. Called automatically at the
+    /// Reset all per-layer caches to position 0. Called automatically at the
     /// start of [`Self::generate`].
     ///
     /// # Errors
-    /// Propagates [`KvCache::reset`] if a cache's last update has not been
-    /// evaluated (it must be, to keep outstanding K/V views from replaying
-    /// stale writes into the reused slab).
+    /// Propagates the cache reset (e.g. for `KvCache`, if a cache's last update
+    /// has not been evaluated — it must be, to keep outstanding K/V views from
+    /// replaying stale writes into the reused slab).
     pub fn reset(&mut self) -> Result<()> {
-        for cache in &mut self.caches {
-            cache.reset()?;
-        }
-        Ok(())
-    }
-
-    /// Run one decode-step forward (`T = 1`, offset = the current
-    /// cache position) through the profiling-only [`Tensor::profiled_eval`],
-    /// recording per-OpKind GPU time into the `profile` GPU store.
-    ///
-    /// `last_id` is the most recently sampled token; the caches must hold
-    /// the full preceding context (call this *after* draining a
-    /// [`GenerateIter`]), so the graph is a realistic full-context decode
-    /// step rather than a cold `T = 1`. Note this advances the caches by one
-    /// row as a side effect — intended for one-shot profiling, not resumable
-    /// generation.
-    ///
-    /// # Errors
-    /// Tensor construction, forward, or `profiled_eval` failure.
-    #[doc(hidden)]
-    pub fn profiled_decode_step(&mut self, last_id: u32) -> Result<()> {
         let device = Device::shared()?;
-        let pos = self.caches.first().map_or(0, KvCache::position);
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let pos_i32 = pos as i32;
-        let ids = Tensor::from_slice(&device, &[last_id], [1, 1])?;
-        let offset = Tensor::from_slice(&device, &[pos_i32], [1])?;
-        let logits = self.model.forward(&ids, &offset, &mut self.caches)?;
-        logits.profiled_eval()?;
-        Ok(())
+        self.model.reset_caches(&mut self.caches, &device)
     }
 
     /// Shared prefill graph builder for the profiling/timing entry points:
     /// resets the caches, then runs one forward at `T = input_ids.len()`,
     /// offset 0 (causal via the fused sdpa kernel). Returns the lazy
     /// **last-position** logits (`[1, 1, vocab]`) via
-    /// [`Qwen2Model::forward_last`] — the blocks still run over all `T`
+    /// [`LanguageModel::forward_last`] — the blocks still run over all `T`
     /// tokens, but only the final token is projected through the LM head, as
     /// greedy generation (and `mlx_lm`'s prefill) does. Advances the caches to
     /// `input_ids.len()` as a side effect.
@@ -214,7 +179,7 @@ impl Generator {
         &mut self,
         input_ids: &[u32],
         max_new_tokens: usize,
-    ) -> Result<GenerateIter<'_>> {
+    ) -> Result<GenerateIter<'_, M>> {
         if input_ids.is_empty() {
             return Err(Error::InvalidArgument(
                 "Generator::generate: input_ids must be non-empty".into(),
@@ -254,7 +219,7 @@ impl Generator {
             .model
             .forward_last(&ids_tensor, &offset, &mut self.caches)?;
 
-        let vocab = self.model.config().vocab_size;
+        let vocab = self.model.vocab_size();
         let idx0 = argmax_last_position_lazy(&logits, vocab)?;
         let pending0 = idx0.eval_async()?;
 
@@ -278,6 +243,42 @@ impl Generator {
     }
 }
 
+impl Generator<Qwen2Model> {
+    /// Run one decode-step forward (`T = 1`, offset = the current
+    /// cache position) through the profiling-only [`Tensor::profiled_eval`],
+    /// recording per-OpKind GPU time into the `profile` GPU store.
+    ///
+    /// `last_id` is the most recently sampled token; the caches must hold
+    /// the full preceding context (call this *after* draining a
+    /// [`GenerateIter`]), so the graph is a realistic full-context decode
+    /// step rather than a cold `T = 1`. Note this advances the caches by one
+    /// row as a side effect — intended for one-shot profiling, not resumable
+    /// generation.
+    ///
+    /// Qwen2-only: a profiling/bench helper that reads the concrete
+    /// [`KvCache`](cider_press_runtime::KvCache) position and runs the full
+    /// `forward`. The generic decode path goes through
+    /// [`LanguageModel::forward_last`].
+    ///
+    /// # Errors
+    /// Tensor construction, forward, or `profiled_eval` failure.
+    #[doc(hidden)]
+    pub fn profiled_decode_step(&mut self, last_id: u32) -> Result<()> {
+        let device = Device::shared()?;
+        let pos = self
+            .caches
+            .first()
+            .map_or(0, cider_press_runtime::KvCache::position);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let pos_i32 = pos as i32;
+        let ids = Tensor::from_slice(&device, &[last_id], [1, 1])?;
+        let offset = Tensor::from_slice(&device, &[pos_i32], [1])?;
+        let logits = self.model.forward(&ids, &offset, &mut self.caches)?;
+        logits.profiled_eval()?;
+        Ok(())
+    }
+}
+
 /// Iterator yielding `Result<u32>` sampled ids. Borrows `&mut Generator`.
 ///
 /// Runs a commit-ahead pipeline: each `next()` first commits lookahead
@@ -286,8 +287,8 @@ impl Generator {
 /// committed token. Ids are chained on-GPU — the argmax tensor feeds the
 /// next forward's embedding gather directly, never round-tripping the CPU.
 #[derive(Debug)]
-pub struct GenerateIter<'a> {
-    owner: &'a mut Generator,
+pub struct GenerateIter<'a, M: LanguageModel> {
+    owner: &'a mut Generator<M>,
     device: Device,
     prefill_len: usize,
     /// Most recent argmax tensor (`[1, 1]` U32), fed into the next forward.
@@ -314,7 +315,7 @@ pub struct GenerateIter<'a> {
     max_new_tokens: usize,
 }
 
-impl Iterator for GenerateIter<'_> {
+impl<M: LanguageModel> Iterator for GenerateIter<'_, M> {
     type Item = Result<u32>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -380,10 +381,14 @@ impl Iterator for GenerateIter<'_> {
     }
 }
 
-impl GenerateIter<'_> {
+impl<M: LanguageModel> GenerateIter<'_, M> {
     /// One decode forward from the on-GPU `feed` id tensor: build the graph,
     /// commit it async, and return the handle plus the lazy next-argmax
     /// tensor. Does not block — readback happens later in `next()`.
+    ///
+    /// The step is `T = 1`, so `forward_last` projects the whole (single-row)
+    /// sequence — identical to a full `forward` but routed through the one
+    /// forward entry point the trait exposes.
     fn advance(&mut self, feed: &Tensor) -> Result<(PendingEval, Tensor)> {
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let pos = (self.prefill_len + self.committed) as i32;
@@ -391,8 +396,8 @@ impl GenerateIter<'_> {
         let logits = self
             .owner
             .model
-            .forward(feed, &offset, &mut self.owner.caches)?;
-        let vocab = self.owner.model.config().vocab_size;
+            .forward_last(feed, &offset, &mut self.owner.caches)?;
+        let vocab = self.owner.model.vocab_size();
         let idx = argmax_last_position_lazy(&logits, vocab)?;
         let pending = idx.eval_async()?;
         Ok((pending, idx))

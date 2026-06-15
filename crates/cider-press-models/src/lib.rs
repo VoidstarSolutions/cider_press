@@ -23,6 +23,7 @@ compile_error!(
 pub mod chat_template;
 mod error;
 pub mod generator;
+pub mod language_model;
 pub mod nn;
 pub mod qwen2;
 pub mod qwen3_5;
@@ -30,4 +31,5 @@ pub mod safetensors_io;
 pub mod tokenizer;
 
 pub use error::{Error, Result};
+pub use language_model::LanguageModel;
 pub use tokenizer::Tokenizer;

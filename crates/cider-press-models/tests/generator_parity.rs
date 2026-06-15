@@ -98,7 +98,11 @@ fn run_mlx_harness(checkpoint: &Path, messages: &[Message], max_tokens: usize) -
 /// Build a fresh Generator from the checkpoint (loads weights anew each
 /// call, since `Generator::new` consumes the model). Shared by the
 /// depth-invariance test.
-fn build_generator(checkpoint: &Path, context_window: usize, eos: HashSet<u32>) -> Generator {
+fn build_generator(
+    checkpoint: &Path,
+    context_window: usize,
+    eos: HashSet<u32>,
+) -> Generator<Qwen2Model> {
     let device = Device::shared().expect("device");
     let config_bytes = fs::read(checkpoint.join("config.json")).expect("read config.json");
     let config = Qwen2Config::from_json_bytes(&config_bytes).expect("parse config.json");

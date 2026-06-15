@@ -13,6 +13,7 @@ use crate::qwen3_5::config::Qwen35Config;
 
 /// Gated-DeltaNet two-part state: the conv sliding window + the fp32 recurrent
 /// state.
+#[derive(Debug)]
 pub struct LinearState {
     /// `[1, linear_conv_kernel_dim - 1, conv_dim]` bf16 — the trailing pre-conv
     /// `q‖k‖v` rows that the next step's depthwise causal conv reads.
@@ -23,6 +24,7 @@ pub struct LinearState {
 }
 
 /// Per-layer cache, variant chosen by [`Qwen35Config::is_linear`].
+#[derive(Debug)]
 pub enum Qwen35LayerCache {
     /// Full-attention KV cache.
     Full(KvCache),
