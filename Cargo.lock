@@ -155,6 +155,8 @@ dependencies = [
  "cider-press-runtime",
  "clap",
  "safetensors",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

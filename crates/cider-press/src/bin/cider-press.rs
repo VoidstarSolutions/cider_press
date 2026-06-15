@@ -17,12 +17,20 @@ use clap::{Args, Parser, Subcommand};
 
 use cider_press_models::chat_template::{ChatTemplate, Message};
 use cider_press_models::generator::Generator;
+use cider_press_models::language_model::LanguageModel;
 use cider_press_models::qwen2::{Qwen2Config, Qwen2Model, load_qwen2_weights};
+use cider_press_models::qwen3_5::{Qwen35Config, Qwen35Model, load_qwen35_weights};
 use cider_press_models::tokenizer::Tokenizer;
 use cider_press_runtime::{Device, profile};
 use safetensors::SafeTensors;
+use serde::Deserialize;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Optional per-OpKind decode GPU-profile callback for `bench_generic`. Only
+/// `Generator<Qwen2Model>` supplies one (`profiled_decode_step` is Qwen2-only);
+/// the Qwen3.5 arm passes `None`.
+type GpuProfileDecode<M> = fn(&mut Generator<M>, u32) -> Result<(), BoxError>;
 
 const DEFAULT_BENCH_PROMPT: &str = "Write a short paragraph about the city of Seattle.";
 
@@ -124,22 +132,67 @@ struct BenchArgs {
     gpu_capture: Option<PathBuf>,
 }
 
-/// Shared load result for both subcommands.
+/// One built model, dispatched on the checkpoint's `model_type`. The two
+/// architectures expose different `LanguageModel::Cache` associated types, so a
+/// single `Generator<M>` can't hold both — the variant is matched at the start
+/// of each subcommand and handed to a generic helper.
+enum LoadedModel {
+    Qwen2(Qwen2Model),
+    Qwen35(Qwen35Model),
+}
+
+/// Shared load result for both subcommands. The tokenizer / chat-template / EOS
+/// load is identical across architectures (both checkpoints ship
+/// `tokenizer.json` + `tokenizer_config.json`).
 struct Loaded {
-    model: Qwen2Model,
+    model: LoadedModel,
     tokenizer: Tokenizer,
     eos_ids: HashSet<u32>,
     chat_template: ChatTemplate,
 }
 
+/// Minimal view of `config.json` for architecture dispatch. Qwen2 checkpoints
+/// report top-level `model_type: "qwen2"`; Qwen3.5 reports top-level
+/// `model_type: "qwen3_5"` with a nested `text_config.model_type:
+/// "qwen3_5_text"`.
+#[derive(Deserialize)]
+struct ModelTypeProbe {
+    model_type: Option<String>,
+    text_config: Option<NestedModelType>,
+}
+
+#[derive(Deserialize)]
+struct NestedModelType {
+    model_type: Option<String>,
+}
+
 fn load(checkpoint: &Path, device: &Device) -> Result<Loaded, BoxError> {
     let config_bytes = std::fs::read(checkpoint.join("config.json"))?;
-    let config = Qwen2Config::from_json_bytes(&config_bytes)?;
+    let probe: ModelTypeProbe = serde_json::from_slice(&config_bytes)?;
+    let model_type = probe.model_type.unwrap_or_default();
+    let text_model_type = probe.text_config.and_then(|t| t.model_type);
 
     let archive_bytes = std::fs::read(checkpoint.join("model.safetensors"))?;
     let archive = SafeTensors::deserialize(&archive_bytes)?;
-    let weights = load_qwen2_weights(&archive, &config, device)?;
-    let model = Qwen2Model::from_weights(weights, config)?;
+
+    let model = match (model_type.as_str(), text_model_type.as_deref()) {
+        ("qwen2", _) => {
+            let config = Qwen2Config::from_json_bytes(&config_bytes)?;
+            let weights = load_qwen2_weights(&archive, &config, device)?;
+            LoadedModel::Qwen2(Qwen2Model::from_weights(weights, config)?)
+        }
+        ("qwen3_5", _) | (_, Some("qwen3_5_text")) => {
+            let config = Qwen35Config::from_json_bytes(&config_bytes)?;
+            let weights = load_qwen35_weights(&archive, &config, device)?;
+            LoadedModel::Qwen35(Qwen35Model::from_weights(weights, config)?)
+        }
+        (other, _) => {
+            return Err(format!(
+                "unsupported model_type {other:?} (expected \"qwen2\" or \"qwen3_5\")"
+            )
+            .into());
+        }
+    };
 
     let tokenizer = Tokenizer::from_file(&checkpoint.join("tokenizer.json"))?;
     let chat_template =
@@ -182,12 +235,31 @@ fn run_chat(args: &ChatArgs) -> Result<(), BoxError> {
     )?;
     let ids = loaded.tokenizer.encode(&prompt)?;
 
-    let mut generator = Generator::new(loaded.model, args.context_window, loaded.eos_ids)?;
-    let mut stream = loaded.tokenizer.decode_stream(true);
+    match loaded.model {
+        LoadedModel::Qwen2(model) => {
+            let generator = Generator::new(model, args.context_window, loaded.eos_ids)?;
+            run_chat_generic(generator, &loaded.tokenizer, &ids, args.max_tokens)
+        }
+        LoadedModel::Qwen35(model) => {
+            let generator = Generator::new(model, args.context_window, loaded.eos_ids)?;
+            run_chat_generic(generator, &loaded.tokenizer, &ids, args.max_tokens)
+        }
+    }
+}
+
+/// The chat generate + streamed-detokenize loop, model-agnostic. The decode /
+/// EOS / token-print logic is identical regardless of architecture.
+fn run_chat_generic<M: LanguageModel>(
+    mut generator: Generator<M>,
+    tokenizer: &Tokenizer,
+    ids: &[u32],
+    max_tokens: usize,
+) -> Result<(), BoxError> {
+    let mut stream = tokenizer.decode_stream(true);
 
     let stdout = io::stdout();
     let mut handle = stdout.lock();
-    for id_result in generator.generate(&ids, args.max_tokens)? {
+    for id_result in generator.generate(ids, max_tokens)? {
         let id = id_result?;
         if let Some(text) = stream.step(id)? {
             handle.write_all(text.as_bytes())?;
@@ -212,15 +284,35 @@ fn run_gpu_capture(args: &BenchArgs, path: &Path) -> Result<(), BoxError> {
     )?;
     let ids = loaded.tokenizer.encode(&prompt)?;
 
-    let mut generator = Generator::new(loaded.model, args.context_window, loaded.eos_ids)?;
-    // Warm: JIT-compile the Metal libraries off the captured frame.
-    generator.prefill_sync(&ids)?;
-    generator.prefill_sync(&ids)?;
-
-    device.capture_gpu_trace(path, || generator.prefill_sync(&ids))??;
+    match loaded.model {
+        LoadedModel::Qwen2(model) => {
+            let generator = Generator::new(model, args.context_window, loaded.eos_ids)?;
+            capture_prefill_trace(generator, &ids, &device, path)?;
+        }
+        LoadedModel::Qwen35(model) => {
+            let generator = Generator::new(model, args.context_window, loaded.eos_ids)?;
+            capture_prefill_trace(generator, &ids, &device, path)?;
+        }
+    }
 
     println!("wrote prefill .gputrace to {}", path.display());
     println!("open in Xcode/Instruments (MTL_CAPTURE_ENABLED=1 was required to record)");
+    Ok(())
+}
+
+/// Warm the synchronous prefill path twice (settle Metal JIT) then capture
+/// exactly one prefill eval to `path`. Generic over the architecture.
+fn capture_prefill_trace<M: LanguageModel>(
+    mut generator: Generator<M>,
+    ids: &[u32],
+    device: &Device,
+    path: &Path,
+) -> Result<(), BoxError> {
+    // Warm: JIT-compile the Metal libraries off the captured frame.
+    generator.prefill_sync(ids)?;
+    generator.prefill_sync(ids)?;
+
+    device.capture_gpu_trace(path, || generator.prefill_sync(ids))??;
     Ok(())
 }
 
@@ -245,14 +337,70 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
         args.no_chat_template,
     )?;
     let ids = loaded.tokenizer.encode(&prompt)?;
-    let prompt_len = ids.len();
 
-    let mut generator = Generator::new(loaded.model, args.context_window, loaded.eos_ids)?;
-    generator.set_inflight_depth(args.inflight_depth);
+    // The per-OpKind GPU decode profile (`profiled_decode_step`) is implemented
+    // only for `Generator<Qwen2Model>`; the Qwen3.5 arm reports basic timing
+    // (prefill ms + decode tok/s) and skips that breakdown with a note.
+    match loaded.model {
+        LoadedModel::Qwen2(model) => {
+            let mut generator = Generator::new(model, args.context_window, loaded.eos_ids)?;
+            generator.set_inflight_depth(args.inflight_depth);
+            bench_generic(
+                generator,
+                args,
+                &ids,
+                load_dur,
+                rss_pre_load,
+                rss_post_load,
+                &device,
+                /* gpu_profile_decode */ Some(gpu_profile_token),
+            )
+        }
+        LoadedModel::Qwen35(model) => {
+            let mut generator = Generator::new(model, args.context_window, loaded.eos_ids)?;
+            generator.set_inflight_depth(args.inflight_depth);
+            if args.gpu_profile {
+                println!("  (--gpu-profile ignored: per-OpKind decode breakdown is Qwen2-only)");
+            }
+            bench_generic(
+                generator,
+                args,
+                &ids,
+                load_dur,
+                rss_pre_load,
+                rss_post_load,
+                &device,
+                None,
+            )
+        }
+    }
+}
+
+/// The bench timing + reporting loop, generic over the architecture. The decode
+/// timing, synchronous-prefill measurement, RSS/pool reporting, span breakdown,
+/// and generic prefill GPU profile are all model-agnostic. The Qwen2-only
+/// per-OpKind decode GPU profile is passed as an optional callback
+/// (`gpu_profile_decode`); for Qwen3.5 it is `None` and skipped.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::too_many_lines,
+    clippy::too_many_arguments
+)]
+fn bench_generic<M: LanguageModel>(
+    mut generator: Generator<M>,
+    args: &BenchArgs,
+    ids: &[u32],
+    load_dur: std::time::Duration,
+    rss_pre_load: Option<u64>,
+    rss_post_load: Option<u64>,
+    device: &Device,
+    gpu_profile_decode: Option<GpuProfileDecode<M>>,
+) -> Result<(), BoxError> {
+    let prompt_len = ids.len();
 
     // Prefill is performed inside generate() before it returns the iterator.
     let t_prefill = Instant::now();
-    let iter = generator.generate(&ids, args.max_tokens)?;
+    let iter = generator.generate(ids, args.max_tokens)?;
     let prefill_dur = t_prefill.elapsed();
 
     // Decode: drain the iterator. Discard `warmup` tokens, then reset the
@@ -297,9 +445,9 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
     // cache context, and the synchronous prefill timing below resets the caches
     // (`prefill_sync` → `reset`), so it must run after this.
     if args.gpu_profile {
-        // generate() rejects max_tokens == 0, so last_id is always Some here.
-        if let Some(id) = last_id {
-            gpu_profile_token(&mut generator, id)?;
+        if let (Some(profile_decode), Some(id)) = (gpu_profile_decode, last_id) {
+            // generate() rejects max_tokens == 0, so last_id is always Some here.
+            profile_decode(&mut generator, id)?;
         }
     }
 
@@ -313,7 +461,7 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
         // Settle Metal JIT on the synchronous eval() path before timing
         // (the caches are already warm from generate()).
         for _ in 0..2 {
-            generator.prefill_sync(&ids)?;
+            generator.prefill_sync(ids)?;
         }
         // Discard the settle-iter wall spans; keep the GPU store intact (the
         // decode GPU breakdown is drained later). drain() touches only the
@@ -321,7 +469,7 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
         let _ = profile::drain();
         let t = Instant::now();
         for _ in 0..prefill_iters {
-            generator.prefill_sync(&ids)?;
+            generator.prefill_sync(ids)?;
         }
         let dur = t.elapsed();
         (dur, profile::drain())
@@ -393,7 +541,7 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
     }
 
     if args.gpu_profile_prefill {
-        gpu_profile_prefill(&mut generator, &ids)?;
+        gpu_profile_prefill(&mut generator, ids)?;
         if profile::is_enabled() {
             let prefill_gpu = profile::drain_gpu();
             if !prefill_gpu.is_empty() {
@@ -423,7 +571,10 @@ fn gpu_profile_token(generator: &mut Generator<Qwen2Model>, last_id: u32) -> Res
 /// Run ONE prefill forward (T = prompt length) through the profiled eval for
 /// a per-OpKind GPU breakdown of the prefill path. Outside the timed window.
 /// Resets + advances the generator's caches as a side effect (one-shot).
-fn gpu_profile_prefill(generator: &mut Generator<Qwen2Model>, ids: &[u32]) -> Result<(), BoxError> {
+fn gpu_profile_prefill<M: LanguageModel>(
+    generator: &mut Generator<M>,
+    ids: &[u32],
+) -> Result<(), BoxError> {
     if !profile::is_enabled() {
         eprintln!("  (--gpu-profile-prefill ignored; rebuild with --features profiling)");
         return Ok(());
