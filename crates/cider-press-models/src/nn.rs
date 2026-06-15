@@ -388,6 +388,11 @@ pub(crate) fn repeat_axis_interleaved(x: &Tensor, axis: usize, factor: usize) ->
             "repeat_axis_interleaved: axis {axis} out of range for shape {dims:?}",
         )));
     }
+    if factor == 0 {
+        return Err(Error::InvalidArgument(
+            "repeat_axis_interleaved: factor must be non-zero".into(),
+        ));
+    }
     if factor == 1 {
         return Ok(x.copy()?);
     }
@@ -396,7 +401,12 @@ pub(crate) fn repeat_axis_interleaved(x: &Tensor, axis: usize, factor: usize) ->
     let mut broadcast = expanded.clone();
     broadcast[axis + 1] = factor;
     let mut folded: Vec<usize> = dims.to_vec();
-    folded[axis] *= factor;
+    folded[axis] = dims[axis].checked_mul(factor).ok_or_else(|| {
+        Error::InvalidArgument(format!(
+            "repeat_axis_interleaved: axis {axis} length {} × factor {factor} overflows usize",
+            dims[axis],
+        ))
+    })?;
     Ok(x.copy()?
         .reshape(expanded)?
         .broadcast_to(broadcast)?

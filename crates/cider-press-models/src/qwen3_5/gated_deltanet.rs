@@ -126,7 +126,7 @@ pub(crate) fn compute_g(a: &Tensor, a_log: &Tensor, dt_bias: &Tensor) -> Result<
             "compute_g: a must be rank-3 [1, T, Hv]; got {a_dims:?}",
         )));
     }
-    let (t, hv) = (a_dims[1], a_dims[2]);
+    let hv = a_dims[2];
     if a.dtype() != DType::BF16 {
         return Err(Error::InvalidArgument(format!(
             "compute_g: a must be BF16; got {:?}",
@@ -164,25 +164,16 @@ pub(crate) fn compute_g(a: &Tensor, a_log: &Tensor, dt_bias: &Tensor) -> Result<
 
     // Promote everything to fp32 to match the reference's fp32 chain.
     let a_f32 = a.cast(DType::F32)?;
-    // dt_bias / a_log are per-head [Hv]; reshape to [1, 1, Hv] so they broadcast
-    // over the [1, T, Hv] token axis. copy() the broadcast views to dense leaves
-    // — unary/binary ops require contiguous inputs.
-    let dt_bias_b = dt_bias
-        .cast(DType::F32)?
-        .reshape([1usize, 1, hv])?
-        .broadcast_to([1usize, t, hv])?
-        .copy()?;
+    // dt_bias / a_log are per-head [Hv]; reshape to [1, 1, Hv] and let the
+    // rank-3 strided binary op broadcast over the [1, T, Hv] token axis.
+    let dt_bias_b = dt_bias.cast(DType::F32)?.reshape([1usize, 1, hv])?;
 
     // softplus(u) = log(1 + exp(u)); `ones` is a scalar that broadcasts.
     let ones = scalar_tensor(device, DType::F32, 1.0)?;
     let u = a_f32.add(&dt_bias_b)?;
     let sp = u.exp()?.add(&ones)?.log()?;
 
-    let ea = a_log
-        .exp()?
-        .reshape([1usize, 1, hv])?
-        .broadcast_to([1usize, t, hv])?
-        .copy()?;
+    let ea = a_log.exp()?.reshape([1usize, 1, hv])?;
     let prod = ea.mul(&sp)?;
 
     // g = exp(-prod): negate via multiply by a broadcast scalar -1.
@@ -599,22 +590,14 @@ impl GatedDeltaNet {
         let g = compute_g(&a, &self.a_log, &self.dt_bias)?;
         let beta = gdn_beta(&b)?;
 
-        // 7. Delta-rule recurrence (prefill: zero state). Pre-cast q/k/v to f32
-        //    here: `recurrence`'s internal cast would be a rank-4 cross-dtype
-        //    strided copy (unsupported), so flatten to rank-3 [1, T, Hv*D] around
-        //    the cast — a contiguous flatten is bit-identical to the rank-4
-        //    layout, and `recurrence` accepts f32 inputs as-is.
-        let to_f32_r4 = |x: &Tensor, last: usize| -> Result<Tensor> {
-            x.copy()?
-                .reshape([1usize, t, hv * last])?
-                .copy()?
-                .cast(DType::F32)?
-                .reshape([1usize, t, hv, last])
-                .map_err(Error::from)
-        };
-        let q = to_f32_r4(&q, dk)?;
-        let k = to_f32_r4(&k, dk)?;
-        let v = to_f32_r4(&v, dv)?;
+        // 7. Delta-rule recurrence (prefill: zero state). Pre-cast q/k/v to f32.
+        //    `Tensor::cast` can't take a rank-4 *view* (the cross-dtype strided
+        //    copy is rank ≤ 3), so materialize each view to a dense leaf first;
+        //    the dense cast path is rank-agnostic.
+        let to_f32 = |x: &Tensor| -> Result<Tensor> { Ok(x.copy()?.cast(DType::F32)?) };
+        let q = to_f32(&q)?;
+        let k = to_f32(&k)?;
+        let v = to_f32(&v)?;
         let (y, _state) = recurrence(&q, &k, &v, &g, &beta, None)?; // [1, T, Hv, Dv] bf16
 
         // 8. Gated output norm + out_proj. The gated-output `norm` gamma is
