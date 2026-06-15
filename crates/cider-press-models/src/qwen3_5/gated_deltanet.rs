@@ -9,13 +9,18 @@
 //! `q` and `k`), and `gqa_repeat` (the interleaved key/value-head broadcast).
 //! `recurrence` is the per-token Gated-DeltaNet delta-rule update over an fp32
 //! `[Hv, Dv, Dk]` state (the parity-critical core of the mixer). The
-//! `GatedDeltaNet` struct lands in a later phase-3 task. See
-//! `docs/inference/models/qwen3.6.md` and `ROADMAP.md`.
+//! [`GatedDeltaNet`] struct composes all of these into the full mixer forward
+//! (project → conv → split → q/k norm+scale → GQA → gates → recurrence → gated
+//! output norm → `out_proj`). See `docs/inference/models/qwen3.6.md` and
+//! `ROADMAP.md`.
 
 use cider_press_runtime::{DType, Tensor};
 use half::bf16;
 
 use crate::error::{Error, Result};
+use crate::nn::{Linear, Module, silu};
+use crate::qwen3_5::config::Qwen35Config;
+use crate::qwen3_5::weights::Qwen35LinearAttnWeights;
 
 /// Depthwise causal Conv1d (kernel 4, groups = channels, no bias) + SiLU,
 /// for the Gated-DeltaNet mixer. `qkv` `[1, T, C]`, `conv_state` `[1, 3, C]`
@@ -28,7 +33,6 @@ use crate::error::{Error, Result};
 // the kernel-3 history left-pads the sequence; per output t, channel c:
 // conv_out[t,c] = silu(Σ_{j=0..3} weight[c,j,0] · conv_input[t+j, c]). The new
 // state is the last 3 PRE-conv rows for the next call.
-#[allow(dead_code)] // wired into GatedDeltaNet in B6.
 pub(crate) fn conv1d_causal(
     qkv: &Tensor,
     conv_state: &Tensor,
@@ -115,7 +119,6 @@ pub(crate) fn conv1d_causal(
 // these O(1) inputs). The reference promotes the whole chain to fp32, so we
 // cast `a`/`dt_bias` up front and keep every op in f32. `-x` is composed as a
 // multiply by a broadcast scalar (no negate primitive).
-#[allow(dead_code)] // wired into GatedDeltaNet in B6.
 pub(crate) fn compute_g(a: &Tensor, a_log: &Tensor, dt_bias: &Tensor) -> Result<Tensor> {
     let a_dims = a.shape().dims();
     if a_dims.len() != 3 || a_dims[0] != 1 {
@@ -193,7 +196,6 @@ pub(crate) fn compute_g(a: &Tensor, a_log: &Tensor, dt_bias: &Tensor) -> Result<
 // mlx-lm computes `mx.sigmoid(b)` on the BF16 input, and the recurrence then
 // promotes the result to fp32 — so we sigmoid first (BF16) and cast up after,
 // matching the reference's BF16 sigmoid → fp32 promote order.
-#[allow(dead_code)] // wired into GatedDeltaNet in B6.
 pub(crate) fn gdn_beta(b: &Tensor) -> Result<Tensor> {
     if b.dtype() != DType::BF16 {
         return Err(Error::InvalidArgument(format!(
@@ -213,7 +215,6 @@ pub(crate) fn gdn_beta(b: &Tensor) -> Result<Tensor> {
 // 2*key_dim], -1) then reshaped to (.., Hk, Dk) / (.., Hk, Dk) / (.., Hv, Dv).
 // Slices feed reshape (and downstream binary ops), so copy() each to a dense
 // leaf — view chains aren't accepted.
-#[allow(dead_code)] // wired into GatedDeltaNet in B6.
 pub(crate) fn split_qkv(
     conv_out: &Tensor,
     hk: usize,
@@ -264,7 +265,6 @@ pub(crate) fn split_qkv(
 // weightless variant is a ones-tensor [D]; rms_norm reduces the trailing axis
 // in fp32 and returns BF16, matching mlx's fused weightless rms_norm. The
 // reshaped/sliced input is a view, so copy() it to a dense leaf first.
-#[allow(dead_code)] // wired into GatedDeltaNet in B6.
 pub(crate) fn qk_norm_scale(x: &Tensor, scale: f32) -> Result<Tensor> {
     let dims = x.shape().dims();
     if dims.len() != 4 || dims[0] != 1 {
@@ -306,7 +306,6 @@ pub(crate) fn qk_norm_scale(x: &Tensor, scale: f32) -> Result<Tensor> {
 // so out heads 2i and 2i+1 both equal in head i — NOT a tiled concat. Composed
 // as reshape [..,Hk,1,D] → broadcast [..,Hk,factor,D] → copy → reshape
 // [..,Hv,D].
-#[allow(dead_code)] // wired into GatedDeltaNet in B6.
 pub(crate) fn gqa_repeat(x: &Tensor, hv: usize) -> Result<Tensor> {
     let dims = x.shape().dims();
     if dims.len() != 4 || dims[0] != 1 {
@@ -348,7 +347,6 @@ pub(crate) fn gqa_repeat(x: &Tensor, hv: usize) -> Result<Tensor> {
 //   5. out:    y_t = (M * q_t[:, None, :]).sum(-1)           # on the UPDATED M
 // kv_mem reads the decayed M (after 1, before 4); y_t reads the updated M
 // (after 4). Order is load-bearing. y_t cast to bf16; stacked over t.
-#[allow(dead_code)] // wired into GatedDeltaNet in B6.
 #[allow(
     clippy::similar_names,
     clippy::many_single_char_names,
@@ -498,6 +496,161 @@ pub(crate) fn recurrence(
     let y = Tensor::concat(&y_refs, 1)?; // [1, T, Hv, Dv] bf16
     let final_state = m.reshape([1usize, hv, dv, dk])?;
     Ok((y, final_state))
+}
+
+/// Qwen3.5/3.6 Gated-DeltaNet linear-attention mixer (the 3-in-4 block).
+///
+/// Owns the four quantized input projections (`in_proj_{qkv,z,a,b}`, all
+/// bias-free) and the output projection, plus the dense per-mixer tensors: the
+/// depthwise `conv1d_weight`, the f32 `a_log` decay log-rate, the `dt_bias`, and
+/// the weighted gated-output `norm` gamma. [`GatedDeltaNet::forward`] composes
+/// the tested helpers above: project → causal conv → q/k/v split → weightless
+/// q/k norm+scale → GQA repeat → forget/`beta` gates → fp32 delta-rule
+/// recurrence → gated output `RMSNorm` (× `silu(z)` in fp32) → `out_proj`.
+///
+/// The parity gate runs the prefill-from-zero path (`cache = None`): both the
+/// conv history and the recurrence state start at zeros.
+#[derive(Debug)]
+pub struct GatedDeltaNet {
+    in_proj_qkv: Linear,
+    in_proj_z: Linear,
+    in_proj_a: Linear,
+    in_proj_b: Linear,
+    out_proj: Linear,
+    conv1d_weight: Tensor,
+    a_log: Tensor,
+    dt_bias: Tensor,
+    norm: Tensor,
+    config: Qwen35Config,
+}
+
+impl GatedDeltaNet {
+    /// Build from a layer's loaded linear-attention weights and the model
+    /// config. The four input projections and `out_proj` are bias-free
+    /// `Linear`s; the dense tensors are cloned (cheap refcount bumps on shared
+    /// device buffers).
+    pub fn from_weights(w: &Qwen35LinearAttnWeights, config: &Qwen35Config) -> Result<Self> {
+        Ok(Self {
+            in_proj_qkv: Linear::new(w.in_proj_qkv.clone(), None)?,
+            in_proj_z: Linear::new(w.in_proj_z.clone(), None)?,
+            in_proj_a: Linear::new(w.in_proj_a.clone(), None)?,
+            in_proj_b: Linear::new(w.in_proj_b.clone(), None)?,
+            out_proj: Linear::new(w.out_proj.clone(), None)?,
+            conv1d_weight: w.conv1d_weight.clone(),
+            a_log: w.a_log.clone(),
+            dt_bias: w.dt_bias.clone(),
+            norm: w.norm.clone(),
+            config: config.clone(),
+        })
+    }
+
+    /// Run the Gated-DeltaNet mixer on `hidden` (`[1, T, hidden_size]`, dense
+    /// BF16, already input-layernorm'd by the caller). Prefill-from-zero state
+    /// (no cache). Returns `[1, T, hidden_size]`, lazy.
+    #[allow(clippy::many_single_char_names)]
+    pub fn forward(&self, hidden: &Tensor) -> Result<Tensor> {
+        let config = &self.config;
+        let hidden_size = config.hidden_size;
+        let hk = config.linear_num_key_heads;
+        let hv = config.linear_num_value_heads;
+        let dk = config.linear_key_head_dim;
+        let dv = config.linear_value_head_dim;
+        let value_dim = config.value_dim();
+        let conv_dim = config.conv_dim();
+        let eps = {
+            #[allow(clippy::cast_possible_truncation)]
+            let e = config.rms_norm_eps as f32;
+            e
+        };
+
+        let dims = hidden.shape().dims();
+        if dims.len() != 3 || dims[0] != 1 {
+            return Err(Error::InvalidArgument(format!(
+                "GatedDeltaNet::forward: hidden must be rank-3 [1, T, hidden_size]; got {dims:?}",
+            )));
+        }
+        if dims[2] != hidden_size {
+            return Err(Error::InvalidArgument(format!(
+                "GatedDeltaNet::forward: hidden last dim ({}) != config.hidden_size ({hidden_size})",
+                dims[2]
+            )));
+        }
+        if hidden.dtype() != DType::BF16 {
+            return Err(Error::InvalidArgument(format!(
+                "GatedDeltaNet::forward: hidden must be BF16; got {:?}",
+                hidden.dtype()
+            )));
+        }
+        let t = dims[1];
+        let device = hidden.device().ok_or_else(|| {
+            Error::InvalidArgument("GatedDeltaNet::forward: hidden has no device".into())
+        })?;
+
+        // 1. Project. All bias-free Linears.
+        let qkv = self.in_proj_qkv.forward(hidden)?; // [1, T, conv_dim]
+        let z = self
+            .in_proj_z
+            .forward(hidden)?
+            .reshape([1usize, t, hv, dv])?; // [1, T, Hv, Dv]
+        let a = self.in_proj_a.forward(hidden)?; // [1, T, Hv]
+        let b = self.in_proj_b.forward(hidden)?; // [1, T, Hv]
+
+        // 2. Causal depthwise conv (prefill: zero history).
+        let conv_state = Tensor::zeros(device, [1usize, 3, conv_dim], DType::BF16)?;
+        let (conv_out, _new_state) = conv1d_causal(&qkv, &conv_state, &self.conv1d_weight)?;
+
+        // 3. Split into per-head q/k/v.
+        let (q, k, v) = split_qkv(&conv_out, hk, hv, dk, dv)?;
+
+        // 4. Weightless q/k norm + scale: q ×(1/Dk), k ×(1/√Dk).
+        #[allow(clippy::cast_precision_loss)]
+        let inv = (dk as f32).powf(-0.5);
+        let q = qk_norm_scale(&q, inv * inv)?;
+        let k = qk_norm_scale(&k, inv)?;
+
+        // 5. GQA repeat q/k from Hk to Hv heads.
+        let q = gqa_repeat(&q, hv)?;
+        let k = gqa_repeat(&k, hv)?;
+
+        // 6. Forget gate g and beta (both fp32).
+        let g = compute_g(&a, &self.a_log, &self.dt_bias)?;
+        let beta = gdn_beta(&b)?;
+
+        // 7. Delta-rule recurrence (prefill: zero state). Pre-cast q/k/v to f32
+        //    here: `recurrence`'s internal cast would be a rank-4 cross-dtype
+        //    strided copy (unsupported), so flatten to rank-3 [1, T, Hv*D] around
+        //    the cast — a contiguous flatten is bit-identical to the rank-4
+        //    layout, and `recurrence` accepts f32 inputs as-is.
+        let to_f32_r4 = |x: &Tensor, last: usize| -> Result<Tensor> {
+            x.copy()?
+                .reshape([1usize, t, hv * last])?
+                .copy()?
+                .cast(DType::F32)?
+                .reshape([1usize, t, hv, last])
+                .map_err(Error::from)
+        };
+        let q = to_f32_r4(&q, dk)?;
+        let k = to_f32_r4(&k, dk)?;
+        let v = to_f32_r4(&v, dv)?;
+        let (y, _state) = recurrence(&q, &k, &v, &g, &beta, None)?; // [1, T, Hv, Dv] bf16
+
+        // 8. Gated output norm + out_proj. The gated-output `norm` gamma is
+        //    WEIGHTED (loaded as-is). Then `_precise_swiglu` in fp32:
+        //    out = silu(z_f32) * nrm_f32, cast back to bf16.
+        let nrm = y.copy()?.rms_norm(&self.norm, eps)?; // [1, T, Hv, Dv] bf16
+        // `_precise_swiglu` in fp32: out = silu(z_f32) * nrm_f32. Flatten both to
+        // rank-2 [T*Hv, Dv] before casting — the cross-dtype strided copy that
+        // backs `cast` only supports rank <= 3, and a contiguous flatten keeps
+        // the values bit-identical to the [1,T,Hv,Dv] layout.
+        let nrm_f32 = nrm.reshape([t * hv, dv])?.copy()?.cast(DType::F32)?;
+        let z_f32 = z.copy()?.reshape([t * hv, dv])?.copy()?.cast(DType::F32)?;
+        let silu_z = silu(&z_f32)?;
+        let out = silu_z
+            .mul(&nrm_f32)?
+            .cast(DType::BF16)?
+            .reshape([1usize, t, value_dim])?;
+        self.out_proj.forward(&out)
+    }
 }
 
 #[cfg(test)]
