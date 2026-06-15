@@ -476,4 +476,83 @@ mod tests {
         }
         println!("composed_sdpa max_abs={max_abs}, max_rel={max_rel}");
     }
+
+    /// Decode-path routing: `T_q == 1` must dispatch the fused vector SDPA
+    /// kernel at the production `head_dim` of 256 with GQA 16q/4kv — the
+    /// hot path that `composed_sdpa` (prefill, `T_q > 1`) never exercises.
+    /// Independent fp32 reference; a single query attends to all cached keys
+    /// (no causal mask). Guards the `head_dim`-256 vector-kernel instantiation
+    /// the prefill/decode split assumes exists.
+    #[test]
+    #[allow(clippy::many_single_char_names, clippy::cast_precision_loss)]
+    fn sdpa_decode_path_matches_fp32_reference() {
+        let device = Device::shared().unwrap();
+        // Production shape: h_q=16, h_kv=4 (ratio 4), single query, 5 cached
+        // keys, head_dim 256.
+        let (h_q, h_kv, t_cache, d) = (16usize, 4usize, 5usize, 256usize);
+        let ratio = h_q / h_kv;
+
+        let fill = |seed: usize, n: usize| -> Vec<bf16> {
+            (0..n)
+                .map(|i| bf16::from_f32(((((i + seed) % 11) as f32) - 5.0) * 0.05))
+                .collect()
+        };
+        let q_data = fill(0, h_q * d); // single query position
+        let k_data = fill(3, h_kv * t_cache * d);
+        let v_data = fill(7, h_kv * t_cache * d);
+
+        let q = Tensor::from_slice(&device, &q_data, [1usize, h_q, 1, d]).unwrap();
+        let k = Tensor::from_slice(&device, &k_data, [1usize, h_kv, t_cache, d]).unwrap();
+        let v = Tensor::from_slice(&device, &v_data, [1usize, h_kv, t_cache, d]).unwrap();
+
+        // Routes through the `t_q == 1` branch -> Tensor::sdpa fused kernel.
+        let got = sdpa(&q, &k, &v).unwrap();
+        got.eval().unwrap();
+        assert_eq!(got.shape().dims(), &[1, h_q, 1, d]);
+        let got = got.cpu_to_vec::<bf16>().unwrap();
+        assert_eq!(got.len(), h_q * d);
+
+        let scale = (d as f32).powf(-0.5);
+        let qf: Vec<f32> = q_data.iter().map(|x| x.to_f32()).collect();
+        let kf: Vec<f32> = k_data.iter().map(|x| x.to_f32()).collect();
+        let vf: Vec<f32> = v_data.iter().map(|x| x.to_f32()).collect();
+        let qi = |hq: usize, dd: usize| qf[hq * d + dd];
+        let ki = |hk: usize, j: usize, dd: usize| kf[(hk * t_cache + j) * d + dd];
+        let vi = |hk: usize, j: usize, dd: usize| vf[(hk * t_cache + j) * d + dd];
+
+        let mut reference = vec![0f32; h_q * d];
+        for hq in 0..h_q {
+            let hk = hq / ratio;
+            let mut scores = vec![0f32; t_cache];
+            for (j, score) in scores.iter_mut().enumerate() {
+                let mut s = 0f32;
+                for dd in 0..d {
+                    s += qi(hq, dd) * ki(hk, j, dd);
+                }
+                *score = scale * s;
+            }
+            let m = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = scores.iter().map(|s| (s - m).exp()).collect();
+            let sum: f32 = exps.iter().sum();
+            for dd in 0..d {
+                let mut o = 0f32;
+                for (j, e) in exps.iter().enumerate() {
+                    o += (e / sum) * vi(hk, j, dd);
+                }
+                reference[hq * d + dd] = o;
+            }
+        }
+
+        let (atol, rtol) = (5e-2f32, 5e-2f32);
+        let mut max_abs = 0f32;
+        for (g, r) in got.iter().map(|x| x.to_f32()).zip(reference.iter()) {
+            let abs = (g - r).abs();
+            max_abs = max_abs.max(abs);
+            assert!(
+                abs <= atol + rtol * r.abs(),
+                "sdpa decode mismatch: got={g}, ref={r}, abs={abs}",
+            );
+        }
+        println!("sdpa_decode max_abs={max_abs}");
+    }
 }
