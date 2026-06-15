@@ -33,6 +33,29 @@ fn parity_rms_norm_small() {
     parity(2, 64);
 }
 
+/// `rms_norm_bf16` must reject `w_stride > 1`: the kernel reads
+/// `w[w_stride * i]`, so any stride other than 0/1 would index out of bounds
+/// while still passing the length check (`expected_w == axis_size`).
+#[test]
+fn rejects_invalid_w_stride() {
+    let device = Device::system_default().expect("Metal device");
+    let library = KernelLibrary::rms_norm(&device).expect("compile rms_norm.metal");
+    let (n_rows, axis) = (1usize, 4usize);
+    let src: Buffer<bf16> = device.upload(&vec![bf16::ONE; n_rows * axis]).expect("x");
+    let w: Buffer<bf16> = device.upload(&vec![bf16::ONE; axis]).expect("w");
+    let mut dst: Buffer<bf16> = device.alloc_buffer(n_rows * axis).expect("out");
+    let mut cmds = device.commands().expect("commands");
+
+    let err = kernels::rms_norm::rms_norm_bf16(
+        &mut cmds, &library, &src, &w, &mut dst, axis, n_rows, EPS, 2,
+    )
+    .expect_err("w_stride=2 must be rejected");
+    assert!(
+        err.to_string().contains("w_stride must be 0"),
+        "unexpected error: {err}"
+    );
+}
+
 fn parity(n_rows: usize, hidden: usize) {
     let (x, gamma, out_ref) = fixture(n_rows, hidden);
     let device = Device::system_default().expect("Metal device");

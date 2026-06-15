@@ -192,12 +192,17 @@ impl Device {
         &self.inner.kernels
     }
 
-    /// A one-element `[1.0]` BF16 buffer, uploaded once and shared via a
-    /// `Retained` handle clone on every call. Used as the stride-0 scalar
-    /// gamma for weightless `rms_norm` (mlx's `weight=None`): the forward
-    /// kernel always multiplies by `w[w_stride * i]`, so a `w_stride = 0`
-    /// scalar `1.0` is an identity gamma without uploading a `[hidden]`
-    /// ones-vector per call. See [`crate::Tensor::rms_norm`].
+    /// A one-element `[1.0]` BF16 buffer, cached after first use and shared
+    /// via a `Retained` handle clone on every call. Used as the stride-0
+    /// scalar gamma for weightless `rms_norm` (mlx's `weight=None`): the
+    /// forward kernel always multiplies by `w[w_stride * i]`, so a
+    /// `w_stride = 0` scalar `1.0` is an identity gamma without uploading a
+    /// `[hidden]` ones-vector per call. See [`crate::Tensor::rms_norm`].
+    ///
+    /// A concurrent first-call race could upload the 2-byte buffer more than
+    /// once; `get_or_init` keeps the first and drops the rest, so the cached
+    /// handle is always consistent (the redundant upload is harmless, and
+    /// `get_or_try_init` — which would avoid it — is still unstable).
     pub(crate) fn scalar_one_bf16(&self) -> Result<Buffer<u8>> {
         if let Some(buf) = self.inner.scalar_one_bf16.get() {
             return Ok(buf.clone_handle());

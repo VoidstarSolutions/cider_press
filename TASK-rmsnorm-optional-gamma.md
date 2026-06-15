@@ -1,5 +1,11 @@
 # Task: optional-gamma (weightless) `rms_norm`
 
+> **STATUS — IMPLEMENTED (PR #49).** This is a historical design/task record
+> captured at the phase-3 tip (`fedfab0`). The "Current cider state" and
+> snippets below describe the **pre-PR baseline** on purpose; they are not the
+> post-merge code. For the shipped behavior see `Tensor::rms_norm`
+> (`Option<&Self>` gamma) and `docs/inference/rmsnorm.md`.
+
 **Branch:** `feat/qwen35-rmsnorm-optional-gamma`
 **Worktree:** `.claude/worktrees/feat+rmsnorm-optional-gamma`
 **Origin:** phase-3 code-review finding #8 (the GDN review of `feat/qwen35-phase3`).

@@ -1811,20 +1811,8 @@ impl Tensor {
         ))
     }
 
-    /// Schedule a fused last-axis `RMSNorm`:
-    /// `out = w * x * rsqrt(mean(x²) + eps)`, reduced per row in fp32.
-    ///
-    /// One dispatch of MLX's `rms_single_row`, replacing the composed
-    /// square→mean→rsqrt→mul→mul chain. Preconditions:
-    ///
-    /// - `self` (x) is dense, contiguous, [`DType::BF16`], rank ≥ 1.
-    /// - `weight` (w) is a dense, contiguous, rank-1 [`DType::BF16`]
-    ///   tensor sized to `self`'s trailing axis.
-    /// - The trailing axis is ≤ 4096 (the single-row kernel limit).
-    ///
-    /// Output has the same shape, dtype, and (dense) layout as `self`.
-    /// Validate a weighted `rms_norm` gamma: same device as `self`, a dense
-    /// contiguous non-view rank-1 `[hidden]` BF16 leaf. The weightless
+    /// Validate a `Some` `rms_norm` gamma: same device as `self`, a dense
+    /// contiguous non-view rank-1 `[hidden]` BF16 tensor. The weightless
     /// (`None`) path skips this — it binds a cached stride-0 scalar instead.
     fn validate_rms_gamma(device: &Device, weight: &Self, hidden: usize) -> Result<()> {
         let w_device = weight.inner.device.as_ref().ok_or_else(|| {
@@ -1864,6 +1852,27 @@ impl Tensor {
         }
     }
 
+    /// Schedule a fused last-axis `RMSNorm`:
+    /// `out = w * x * rsqrt(mean(x²) + eps)`, reduced per row in fp32.
+    ///
+    /// One dispatch of MLX's `rms_single_row`, replacing the composed
+    /// square→mean→rsqrt→mul→mul chain. Preconditions:
+    ///
+    /// - `self` (x) is dense, contiguous, [`DType::BF16`], rank ≥ 1.
+    /// - The trailing axis is ≤ 4096 (the single-row kernel limit).
+    /// - `eps` is finite and non-negative.
+    ///
+    /// `weight` selects the gamma (mirroring `mx.fast.rms_norm`'s optional
+    /// weight):
+    ///
+    /// - `Some(w)` — the affine gamma: a dense, contiguous, rank-1
+    ///   [`DType::BF16`] tensor sized to `self`'s trailing axis, on the same
+    ///   device.
+    /// - `None` — weightless (`weight=None`): a device-cached one-element
+    ///   `[1.0]` scalar bound at `w_stride = 0`, so every lane reads `w[0]`
+    ///   (an identity gamma) without uploading a `[hidden]` ones-vector.
+    ///
+    /// Output has the same shape, dtype, and (dense) layout as `self`.
     pub fn rms_norm(&self, weight: Option<&Self>, eps: f32) -> Result<Self> {
         let device = self.inner.device.as_ref().ok_or_else(|| {
             Error::InvalidArgument(

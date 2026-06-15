@@ -76,6 +76,16 @@ pub fn rms_norm_bf16(
             out.len()
         )));
     }
+    // Only stride 0 (weightless scalar) and 1 (contiguous `[axis_size]`
+    // gamma) are valid: the kernel reads `w[w_stride * i]`, so any other
+    // stride would index out of bounds while still passing the length check
+    // below (`expected_w == axis_size`).
+    if w_stride > 1 {
+        return Err(Error::InvalidArgument(format!(
+            "rms_norm_bf16: w_stride must be 0 (weightless scalar) or 1 \
+             (contiguous gamma); got {w_stride}"
+        )));
+    }
     // Weighted (stride 1): `w` is the `[axis_size]` gamma. Weightless
     // (stride 0): `w` is a 1-element `[1.0]` scalar read by every lane.
     let expected_w = if w_stride == 0 { 1 } else { axis_size };
