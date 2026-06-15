@@ -14,3 +14,7 @@ mod weights;
 pub use config::{
     HF_REPO, HF_REVISION, LayerType, Qwen35Config, Qwen35QuantizationConfig, RopeParameters,
 };
+pub use weights::{
+    Qwen35FullAttnWeights, Qwen35LayerWeights, Qwen35LinearAttnWeights, Qwen35MixerWeights,
+    Qwen35MlpWeights, Qwen35Weights, load_qwen35_weights,
+};
