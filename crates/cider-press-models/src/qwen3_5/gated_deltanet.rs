@@ -1,9 +1,11 @@
 //! Qwen3.5 / Qwen3.6 Gated-DeltaNet linear-attention mixer.
 //!
-//! Phase-3 lands the mixer's building blocks; this module currently provides
-//! the depthwise causal Conv1d that opens the mixer (over the `q‖k‖v`
-//! projection). The `GatedDeltaNet` struct and the gated recurrence land in
-//! later phase-3 tasks. See `docs/inference/models/qwen3.6.md` and `ROADMAP.md`.
+//! Phase-3 lands the mixer's building blocks incrementally: the depthwise
+//! causal Conv1d that opens the mixer (over the `q‖k‖v` projection) and the
+//! per-(token, value-head) gates (`compute_g` — the Mamba2 forget gate — and
+//! `gdn_beta`, computed in fp32). The `GatedDeltaNet` struct, the q/k norm,
+//! and the gated recurrence land in later phase-3 tasks. See
+//! `docs/inference/models/qwen3.6.md` and `ROADMAP.md`.
 
 use cider_press_runtime::{DType, Tensor};
 
@@ -96,6 +98,106 @@ pub(crate) fn conv1d_causal(
     Ok((conv_out, new_state))
 }
 
+/// Gated-DeltaNet forget gate `g = exp(-exp(A_log) * softplus(a + dt_bias))`,
+/// computed entirely in fp32 (the recurrence runs in fp32). `a` `[1, T, Hv]`
+/// BF16 (from a Linear), `a_log` `[Hv]` f32 (loaded f32), `dt_bias` `[Hv]`
+/// BF16. Returns `g` `[1, T, Hv]` f32.
+//
+// mlx-lm `gated_delta.py:compute_g`:
+//   exp(-exp(A_log.astype(f32)) * softplus(a + dt_bias))
+// with softplus(u) = log(1 + exp(u)) (mlx uses logaddexp(u, 0); equivalent for
+// these O(1) inputs). The reference promotes the whole chain to fp32, so we
+// cast `a`/`dt_bias` up front and keep every op in f32. `-x` is composed as a
+// multiply by a broadcast scalar (no negate primitive).
+#[allow(dead_code)] // wired into GatedDeltaNet in B6.
+pub(crate) fn compute_g(a: &Tensor, a_log: &Tensor, dt_bias: &Tensor) -> Result<Tensor> {
+    let a_dims = a.shape().dims();
+    if a_dims.len() != 3 || a_dims[0] != 1 {
+        return Err(Error::InvalidArgument(format!(
+            "compute_g: a must be rank-3 [1, T, Hv]; got {a_dims:?}",
+        )));
+    }
+    let (t, hv) = (a_dims[1], a_dims[2]);
+    if a.dtype() != DType::BF16 {
+        return Err(Error::InvalidArgument(format!(
+            "compute_g: a must be BF16; got {:?}",
+            a.dtype()
+        )));
+    }
+    if dt_bias.shape().dims() != [hv] {
+        return Err(Error::InvalidArgument(format!(
+            "compute_g: dt_bias must be [{hv}]; got {:?}",
+            dt_bias.shape().dims()
+        )));
+    }
+    if dt_bias.dtype() != DType::BF16 {
+        return Err(Error::InvalidArgument(format!(
+            "compute_g: dt_bias must be BF16; got {:?}",
+            dt_bias.dtype()
+        )));
+    }
+    if a_log.shape().dims() != [hv] {
+        return Err(Error::InvalidArgument(format!(
+            "compute_g: a_log must be [{hv}]; got {:?}",
+            a_log.shape().dims()
+        )));
+    }
+    if a_log.dtype() != DType::F32 {
+        return Err(Error::InvalidArgument(format!(
+            "compute_g: a_log must be F32; got {:?}",
+            a_log.dtype()
+        )));
+    }
+
+    let device = a
+        .device()
+        .ok_or_else(|| Error::InvalidArgument("compute_g: a has no device (placeholder)".into()))?;
+
+    // Promote everything to fp32 to match the reference's fp32 chain.
+    let a_f32 = a.cast(DType::F32)?;
+    // dt_bias / a_log are per-head [Hv]; reshape to [1, 1, Hv] so they broadcast
+    // over the [1, T, Hv] token axis. copy() the broadcast views to dense leaves
+    // — unary/binary ops require contiguous inputs.
+    let dt_bias_b = dt_bias
+        .cast(DType::F32)?
+        .reshape([1usize, 1, hv])?
+        .broadcast_to([1usize, t, hv])?
+        .copy()?;
+
+    // softplus(u) = log(1 + exp(u)); `ones` is a scalar that broadcasts.
+    let ones = Tensor::from_slice(device, &[1.0f32], [1usize])?;
+    let u = a_f32.add(&dt_bias_b)?;
+    let sp = u.exp()?.add(&ones)?.log()?;
+
+    let ea = a_log
+        .exp()?
+        .reshape([1usize, 1, hv])?
+        .broadcast_to([1usize, t, hv])?
+        .copy()?;
+    let prod = ea.mul(&sp)?;
+
+    // g = exp(-prod): negate via multiply by a broadcast scalar -1.
+    let neg_one = Tensor::from_slice(device, &[-1.0f32], [1usize])?;
+    Ok(prod.mul(&neg_one)?.exp()?)
+}
+
+/// Gated-DeltaNet `beta = sigmoid(b)`, returned as f32 `[1, T, Hv]` for the
+/// fp32 recurrence. `b` `[1, T, Hv]` BF16.
+//
+// mlx-lm computes `mx.sigmoid(b)` on the BF16 input, and the recurrence then
+// promotes the result to fp32 — so we sigmoid first (BF16) and cast up after,
+// matching the reference's BF16 sigmoid → fp32 promote order.
+#[allow(dead_code)] // wired into GatedDeltaNet in B6.
+pub(crate) fn gdn_beta(b: &Tensor) -> Result<Tensor> {
+    if b.dtype() != DType::BF16 {
+        return Err(Error::InvalidArgument(format!(
+            "gdn_beta: b must be BF16; got {:?}",
+            b.dtype()
+        )));
+    }
+    Ok(b.sigmoid()?.cast(DType::F32)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +274,78 @@ mod tests {
                 "new_state must be bit-exact: got={g}, ref={r}",
             );
         }
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss, clippy::many_single_char_names)]
+    fn gates_match_fp32_reference() {
+        let device = Device::shared().unwrap();
+        let (t, hv) = (2usize, 4usize);
+
+        // Deterministic O(1) values; a_log = ln of small positives.
+        let a_data: Vec<bf16> = (0..t * hv)
+            .map(|i| bf16::from_f32(((i % 7) as f32 - 3.0) * 0.2))
+            .collect();
+        let b_data: Vec<bf16> = (0..t * hv)
+            .map(|i| bf16::from_f32(((i % 5) as f32 - 2.0) * 0.3))
+            .collect();
+        let a_log_f32: Vec<f32> = vec![0.5f32.ln(), 2.0f32.ln(), 4.0f32.ln(), 8.0f32.ln()];
+        let dt_bias_data: Vec<bf16> = (0..hv)
+            .map(|i| bf16::from_f32(1.0 + (i as f32) * 0.1))
+            .collect();
+
+        let a = Tensor::from_slice(&device, &a_data, [1usize, t, hv]).unwrap();
+        let b = Tensor::from_slice(&device, &b_data, [1usize, t, hv]).unwrap();
+        let a_log = Tensor::from_slice(&device, &a_log_f32, [hv]).unwrap();
+        let dt_bias = Tensor::from_slice(&device, &dt_bias_data, [hv]).unwrap();
+
+        let g = compute_g(&a, &a_log, &dt_bias).unwrap();
+        let beta = gdn_beta(&b).unwrap();
+        g.eval().unwrap();
+        beta.eval().unwrap();
+        assert_eq!(g.dtype(), DType::F32);
+        assert_eq!(beta.dtype(), DType::F32);
+        let got_g = g.cpu_to_vec::<f32>().unwrap();
+        let got_beta = beta.cpu_to_vec::<f32>().unwrap();
+        assert_eq!(got_g.len(), t * hv);
+        assert_eq!(got_beta.len(), t * hv);
+
+        // fp32 host reference.
+        let af: Vec<f32> = a_data.iter().map(|x| x.to_f32()).collect();
+        let bf: Vec<f32> = b_data.iter().map(|x| x.to_f32()).collect();
+        let dbf: Vec<f32> = dt_bias_data.iter().map(|x| x.to_f32()).collect();
+
+        let mut ref_g = vec![0f32; t * hv];
+        let mut ref_beta = vec![0f32; t * hv];
+        for tt in 0..t {
+            for h in 0..hv {
+                let idx = tt * hv + h;
+                let u = af[idx] + dbf[h];
+                let softplus = (1.0 + u.exp()).ln();
+                ref_g[idx] = (-a_log_f32[h].exp() * softplus).exp();
+                ref_beta[idx] = 1.0 / (1.0 + (-bf[idx]).exp());
+            }
+        }
+
+        // exp/log/sigmoid carrying → combined bf16-ULP bound.
+        let (atol, rtol) = (1e-2f32, 2e-2f32);
+        let mut max_abs = 0f32;
+        for (g, r) in got_g.iter().zip(ref_g.iter()) {
+            let abs = (g - r).abs();
+            max_abs = max_abs.max(abs);
+            assert!(
+                abs <= atol + rtol * r.abs(),
+                "g mismatch: got={g}, ref={r}, abs={abs}"
+            );
+        }
+        for (g, r) in got_beta.iter().zip(ref_beta.iter()) {
+            let abs = (g - r).abs();
+            max_abs = max_abs.max(abs);
+            assert!(
+                abs <= atol + rtol * r.abs(),
+                "beta mismatch: got={g}, ref={r}, abs={abs}"
+            );
+        }
+        println!("gates max_abs={max_abs}");
     }
 }
