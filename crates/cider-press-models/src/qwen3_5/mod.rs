@@ -12,6 +12,7 @@
 mod attention;
 mod block;
 mod config;
+mod gated_deltanet;
 mod weights;
 
 pub use attention::GatedAttention;
