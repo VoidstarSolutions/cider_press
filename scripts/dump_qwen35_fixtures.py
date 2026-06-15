@@ -63,6 +63,10 @@ def main() -> None:
         if i in (0, 3):
             caps[f"layer{i}_in"] = x
         if i == 3:
+            # Validate the layer-type invariant before touching `self_attn`, so a
+            # layout drift fails with a clear message instead of an opaque
+            # AttributeError on a linear (GDN) layer that has no `self_attn`.
+            assert not layer.is_linear, "layer 3 expected to be a full-attention layer"
             # Isolated gated-attention mixer (Phase-2 parity gate): pre-residual.
             # cache=None => prefill; same fa_mask the full layer uses. Mirrors
             # DecoderLayer.__call__: r = self.self_attn(input_layernorm(x), mask, cache).
@@ -75,10 +79,10 @@ def main() -> None:
     caps["final_hidden"] = lm.norm(x)
     caps["logits"] = model(ids)  # full forward incl. lm_head (tied on 4B)
 
-    # Validate the layer-type taps before writing, so a surprising layout fails
-    # loudly instead of saving a mislabeled fixture.
+    # Validate the remaining layer-type tap before writing, so a surprising
+    # layout fails loudly instead of saving a mislabeled fixture. (Layer 3 is
+    # guarded inline above, before its `self_attn` tap.)
     assert lm.layers[0].is_linear, "layer 0 expected to be a GDN (linear) layer"
-    assert not lm.layers[3].is_linear, "layer 3 expected to be a full-attention layer"
 
     mx.eval(list(caps.values()))
     mx.save_safetensors(args.out, caps)
