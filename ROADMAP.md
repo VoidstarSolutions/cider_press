@@ -140,10 +140,16 @@ concrete **parity gate** (the Qwen2.5 discipline). Phases 0–5 reach *correctne
 - Deliberately match the incumbent's *naive* perf here — correctness first.
 - **Exit:** single GDN layer parity vs mlx-lm's sequential path (fp32 state honored).
 
-### Phase 4 — Assemble full model (4B), end-to-end parity
+### Phase 4 — Assemble full model (4B), end-to-end parity ✅ **LANDED**
 - 3:1 interleave, final norm, tied lm_head (4B), embedding (confirm any scaling),
   greedy decode through the `cider-press` CLI.
 - **Exit:** logits parity vs mlx-lm on 4B across a prompt; identical greedy token stream.
+- **Done (2026-06-15):** `Qwen35Model` + unified `Qwen35LayerCache` (KV / conv+fp32-
+  recurrent), GDN decode threading (prefill-decode equivalence), `LanguageModel`-generic
+  `Generator`, CLI `model_type` dispatch. Embedding = plain lookup, no √scale. Last-
+  position logits argmax matches mlx-lm; **greedy token stream bit-exact (24/24)**. The
+  4B runs end-to-end via the CLI (`--no-chat-template`; native chat template is a
+  `minijinja` follow-up).
 
 ### Phase 5 — Scale to 27B (functional milestone — *it runs*)
 - Loader handles untied embeddings, 64 layers, the official quantization; memory

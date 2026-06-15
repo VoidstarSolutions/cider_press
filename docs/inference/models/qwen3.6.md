@@ -176,6 +176,22 @@ Incumbent baseline to beat (mlx-lm, this machine): 27B decode **~33 tok/s** at
   per-token recurrence), and full-model decode-cache wiring — a unified per-layer
   cache enum threaded through one `forward` — which lands in Phase 4 (full-model
   assembly). Phase 3 complete.
+- **Phase 4 (full-model assembly + greedy decode) landed — the 4B runs
+  end-to-end:** `qwen3_5/model.rs` (`Qwen35Model`: embed *no √scale* → 32 mixed
+  decoder layers → final RMSNorm → tied lm_head) + a unified per-layer
+  `Qwen35LayerCache::{Full(KvCache), Linear(conv-window + fp32 recurrent state)}`.
+  The GDN mixer now threads its two-part state (`GatedDeltaNet::forward(.., Option<&mut
+  LinearState>)`) so it decodes, proven by a prefill-decode equivalence test
+  (one-shot `[0..T]` == prefill `[0..T-1]` + decode `[T-1]`, max_abs ~2e-3);
+  `Qwen35DecoderLayer::forward` is unified over the cache enum. The `Generator` is
+  generalized over a `LanguageModel` trait (drives Qwen2 + Qwen3.5 with no Qwen2
+  regression), and the CLI dispatches on `config.json` `model_type`. **Parity:**
+  full 32-layer logits match mlx-lm (last-position argmax exact) and the **greedy
+  token stream matches mlx-lm bit-exactly (24/24 tokens)** on the 4B. Deferred:
+  27B (untied lm_head, 48 value-heads, multi-shard load) → Phase 5; the perf levers
+  → Phases 6–7; and the Qwen3.5 `chat_template.jinja` does not render in the current
+  `minijinja` engine (a `[::-1]` step-slice + `|length` arithmetic) — `--no-chat-template`
+  works; native templated chat is a follow-up. Phase 4 complete.
 - mRoPE interleave layout for text (sections `[11,11,10]` = 32 rotary pairs):
   **confirmed during Phase 2** — `rope_type=default` collapses mRoPE to plain 1-D
   partial RoPE for text, so no multi-section position handling is needed.
