@@ -8,6 +8,7 @@
 //! the forward pass lands in later phases. See `docs/inference/models/qwen3.6.md`
 //! and `ROADMAP.md`.
 
+mod attention;
 mod config;
 mod weights;
 
