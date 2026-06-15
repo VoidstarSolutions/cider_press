@@ -1884,6 +1884,14 @@ fn dispatch_rope(
             &shape_i32,
         )?;
         // Kernel now reads `dst` in place (dense, row-contiguous unit strides).
+        // SAFETY/aliasing: `in_typed` (returned here) and `dst_typed` (below)
+        // are independent `Buffer` handles over the *same* `dst` MTLBuffer — the
+        // rope kernel intentionally reads and writes in place, exactly as MLX's
+        // `dims_ < D` branch does after its `copy_gpu(in, out)`. The vendored
+        // kernel only rewrites the leading `rotary_dims` and reads each element
+        // before overwriting it, so the in-place aliasing is sound. Do not
+        // "optimize" this into a second output buffer — the pre-copy + in-place
+        // rotate is the whole point of mirroring MLX here.
         (dst_pre, mat, i64::from(head_dim))
     } else {
         // Full rotation: the kernel writes every element, so it can read the
