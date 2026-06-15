@@ -385,10 +385,11 @@ pub enum BinaryOp {
 
 /// Element-wise unary operations supported by [`OpKind::Unary`].
 ///
-/// Includes the two ops the `rms_norm` composition needs and the two
-/// primitives MLX itself composes `silu` and `gelu` from in `mlx.nn`.
-/// MLX's `unary.metal` has many more (Exp / Sin / Tanh / …) that land
-/// the same way when their first consumer arrives.
+/// Includes the two ops the `rms_norm` composition needs, the two
+/// primitives MLX itself composes `silu` and `gelu` from in `mlx.nn`,
+/// and `Exp` / `Log` for the Gated-DeltaNet recurrence. MLX's
+/// `unary.metal` has many more (Sin / Tanh / …) that land the same way
+/// when their first consumer arrives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnaryOp {
     /// `out = x * x`.
@@ -399,6 +400,10 @@ pub enum UnaryOp {
     Sigmoid,
     /// `out = erf(x)`. Primitive for exact-`GELU` composition.
     Erf,
+    /// `out = exp(x)`. Primitive for the Gated-DeltaNet `compute_g` gate.
+    Exp,
+    /// `out = ln(x)`. Primitive for the Gated-DeltaNet `softplus`.
+    Log,
 }
 
 /// Reduction kinds supported by [`OpKind::Reduce`].
@@ -987,6 +992,20 @@ impl Tensor {
     /// preconditions.
     pub fn erf(&self) -> Result<Self> {
         self.unary(UnaryOp::Erf)
+    }
+
+    /// Schedule `out = exp(x)` element-wise. Primitive for the
+    /// Gated-DeltaNet `compute_g` gate. See [`Tensor::unary`] for
+    /// shared preconditions.
+    pub fn exp(&self) -> Result<Self> {
+        self.unary(UnaryOp::Exp)
+    }
+
+    /// Schedule `out = ln(x)` (natural log) element-wise. Primitive for
+    /// the Gated-DeltaNet `softplus`. See [`Tensor::unary`] for shared
+    /// preconditions.
+    pub fn log(&self) -> Result<Self> {
+        self.unary(UnaryOp::Log)
     }
 
     /// Schedule an element-wise unary op. Output inherits this
@@ -3040,6 +3059,86 @@ mod tests {
         assert_eq!(t.dtype(), DType::BF16);
         let read_back = t.cpu_slice::<bf16>().expect("cpu_slice bf16");
         assert_eq!(read_back, data.as_slice());
+    }
+
+    #[test]
+    fn exp_bf16_matches_host_within_ulp_tolerance() {
+        let device = Device::shared().expect("system default device");
+        let host = [-1.0f32, 0.0, 0.5, 1.0, 2.0];
+        let data: Vec<bf16> = host.iter().map(|&x| bf16::from_f32(x)).collect();
+        let t = Tensor::from_slice(&device, &data, [host.len()]).expect("from_slice");
+        let y = t.exp().expect("schedule exp");
+        y.eval().expect("eval");
+        let out: Vec<bf16> = y.cpu_to_vec().expect("dense out");
+        // `metal::exp` drifts 1–2 bf16 ULPs; the combined np.allclose
+        // bound `|a-b| <= atol + rtol*|b|` covers the bf16 rounding.
+        for (&x, a) in host.iter().zip(out.iter()) {
+            let want = x.exp();
+            let got = a.to_f32();
+            let bound = 0.01 + 0.02 * want.abs();
+            assert!(
+                (got - want).abs() <= bound,
+                "exp({x}): got {got}, want {want}, diff {} > bound {bound}",
+                (got - want).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn exp_f32_matches_host_within_ulp_tolerance() {
+        let device = Device::shared().expect("system default device");
+        let host = [-1.0f32, 0.0, 0.5, 1.0, 2.0];
+        let t = Tensor::from_slice(&device, &host, [host.len()]).expect("from_slice");
+        let y = t.exp().expect("schedule exp");
+        y.eval().expect("eval");
+        let out: Vec<f32> = y.cpu_to_vec().expect("dense out");
+        for (&x, &got) in host.iter().zip(out.iter()) {
+            let want = x.exp();
+            let bound = 1e-4 + 1e-4 * want.abs();
+            assert!(
+                (got - want).abs() <= bound,
+                "exp({x}): got {got}, want {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn log_bf16_matches_host_within_ulp_tolerance() {
+        let device = Device::shared().expect("system default device");
+        let host = [0.5f32, 1.0, 2.0, 4.0, 10.0];
+        let data: Vec<bf16> = host.iter().map(|&x| bf16::from_f32(x)).collect();
+        let t = Tensor::from_slice(&device, &data, [host.len()]).expect("from_slice");
+        let y = t.log().expect("schedule log");
+        y.eval().expect("eval");
+        let out: Vec<bf16> = y.cpu_to_vec().expect("dense out");
+        for (&x, a) in host.iter().zip(out.iter()) {
+            let want = x.ln();
+            let got = a.to_f32();
+            let bound = 0.01 + 0.02 * want.abs();
+            assert!(
+                (got - want).abs() <= bound,
+                "log({x}): got {got}, want {want}, diff {} > bound {bound}",
+                (got - want).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn log_f32_matches_host_within_ulp_tolerance() {
+        let device = Device::shared().expect("system default device");
+        let host = [0.5f32, 1.0, 2.0, 4.0, 10.0];
+        let t = Tensor::from_slice(&device, &host, [host.len()]).expect("from_slice");
+        let y = t.log().expect("schedule log");
+        y.eval().expect("eval");
+        let out: Vec<f32> = y.cpu_to_vec().expect("dense out");
+        for (&x, &got) in host.iter().zip(out.iter()) {
+            let want = x.ln();
+            let bound = 1e-4 + 1e-4 * want.abs();
+            assert!(
+                (got - want).abs() <= bound,
+                "log({x}): got {got}, want {want}"
+            );
+        }
     }
 
     #[test]

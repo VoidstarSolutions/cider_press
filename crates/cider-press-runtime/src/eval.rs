@@ -1465,6 +1465,8 @@ fn dispatch_unary(
                 UnaryOp::Rsqrt => unary::v_rsqrt_f32(commands, library, &s, &mut d)?,
                 UnaryOp::Sigmoid => unary::v_sigmoid_f32(commands, library, &s, &mut d)?,
                 UnaryOp::Erf => unary::v_erf_f32(commands, library, &s, &mut d)?,
+                UnaryOp::Exp => unary::v_exp_f32(commands, library, &s, &mut d)?,
+                UnaryOp::Log => unary::v_log_f32(commands, library, &s, &mut d)?,
             }
         }
         DType::F16 => {
@@ -1475,6 +1477,8 @@ fn dispatch_unary(
                 UnaryOp::Rsqrt => unary::v_rsqrt_f16(commands, library, &s, &mut d)?,
                 UnaryOp::Sigmoid => unary::v_sigmoid_f16(commands, library, &s, &mut d)?,
                 UnaryOp::Erf => unary::v_erf_f16(commands, library, &s, &mut d)?,
+                UnaryOp::Exp => unary::v_exp_f16(commands, library, &s, &mut d)?,
+                UnaryOp::Log => unary::v_log_f16(commands, library, &s, &mut d)?,
             }
         }
         DType::BF16 => {
@@ -1485,6 +1489,8 @@ fn dispatch_unary(
                 UnaryOp::Rsqrt => unary::v_rsqrt_bf16(commands, library, &s, &mut d)?,
                 UnaryOp::Sigmoid => unary::v_sigmoid_bf16(commands, library, &s, &mut d)?,
                 UnaryOp::Erf => unary::v_erf_bf16(commands, library, &s, &mut d)?,
+                UnaryOp::Exp => unary::v_exp_bf16(commands, library, &s, &mut d)?,
+                UnaryOp::Log => unary::v_log_bf16(commands, library, &s, &mut d)?,
             }
         }
         dtype @ (DType::I32 | DType::U32) => {
