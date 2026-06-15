@@ -247,6 +247,91 @@ pub fn copy_g_u32(
     )
 }
 
+/// Widening cast copy `src` (bf16) → `dst` (f32), dense/contiguous.
+///
+/// Binds MLX's `v_copybfloat16float32` cross-dtype kernel. See
+/// [`copy_v_f32`] for the encode contract; `library` must be a
+/// [`KernelLibrary::copy`].
+pub fn copy_v_bf16_to_f32(
+    commands: &mut Commands<'_>,
+    library: &KernelLibrary,
+    src: &Buffer<bf16>,
+    dst: &mut Buffer<f32>,
+) -> Result<()> {
+    encode_v_copy(commands, library, "v_copybfloat16float32", src, dst)
+}
+
+/// Narrowing cast copy `src` (f32) → `dst` (bf16), dense/contiguous.
+///
+/// Binds MLX's `v_copyfloat32bfloat16` cross-dtype kernel (round-to-
+/// nearest-even in the MSL `static_cast`). See [`copy_v_f32`] for the
+/// encode contract; `library` must be a [`KernelLibrary::copy`].
+pub fn copy_v_f32_to_bf16(
+    commands: &mut Commands<'_>,
+    library: &KernelLibrary,
+    src: &Buffer<f32>,
+    dst: &mut Buffer<bf16>,
+) -> Result<()> {
+    encode_v_copy(commands, library, "v_copyfloat32bfloat16", src, dst)
+}
+
+/// Strided widening cast `src` (bf16) → contiguous `dst` (f32). Binds
+/// MLX's `g{1,2,3}_copybfloat16float32` (single-strided `General` copy:
+/// strided gather from `src`, contiguous write to `dst`). Mirrors the
+/// `General` branch of MLX's `copy_gpu_inplace` — unlike the same-dtype
+/// `gg*` family, `dst` is implicitly row-major contiguous
+/// (no dst strides), which is exactly a cast of a strided view into a
+/// fresh dense output.
+#[allow(clippy::too_many_arguments)]
+pub fn copy_g_bf16_to_f32(
+    commands: &mut Commands<'_>,
+    library: &KernelLibrary,
+    src: &Buffer<bf16>,
+    src_byte_offset: usize,
+    src_strides: &[i64],
+    dst: &mut Buffer<f32>,
+    dst_byte_offset: usize,
+    shape: &[i32],
+) -> Result<()> {
+    encode_general_copy(
+        commands,
+        library,
+        "bfloat16float32",
+        src.metal_buffer(),
+        src_byte_offset,
+        src_strides,
+        dst.metal_buffer(),
+        dst_byte_offset,
+        shape,
+    )
+}
+
+/// Strided narrowing cast `src` (f32) → contiguous `dst` (bf16). Binds
+/// MLX's `g{1,2,3}_copyfloat32bfloat16`. See [`copy_g_bf16_to_f32`].
+#[allow(clippy::too_many_arguments)]
+pub fn copy_g_f32_to_bf16(
+    commands: &mut Commands<'_>,
+    library: &KernelLibrary,
+    src: &Buffer<f32>,
+    src_byte_offset: usize,
+    src_strides: &[i64],
+    dst: &mut Buffer<bf16>,
+    dst_byte_offset: usize,
+    shape: &[i32],
+) -> Result<()> {
+    encode_general_copy(
+        commands,
+        library,
+        "float32bfloat16",
+        src.metal_buffer(),
+        src_byte_offset,
+        src_strides,
+        dst.metal_buffer(),
+        dst_byte_offset,
+        shape,
+    )
+}
+
 const MAX_COPY_SPECIALIZED_DIMS: usize = 3;
 
 /// Shared encoder for the `copy_gg*` (general-general, same-dtype)
@@ -346,6 +431,101 @@ fn encode_g_copy(
     commands.dispatch_threads(grid, threadgroup)
 }
 
+/// Shared encoder for the `copy_g*` (single-strided `General`) template
+/// family — strided gather from `src`, contiguous row-major write to
+/// `dst`. Mirrors the `CopyType::General` branch of MLX's
+/// `copy_gpu_inplace`: it binds `src` strides at slot 3 but no `dst`
+/// strides (the kernel computes the dst index from the grid directly),
+/// so `dst` must be a fresh dense contiguous buffer. This is the family
+/// the cross-dtype casts use (the `gg*` two-strided family is
+/// instantiated for same-dtype only).
+///
+/// **Rank ≤ 3 only.** MLX's `General` copy selects a `work_per_thread = 2`
+/// kernel (`gn2_copy`) for `ndim > 3` and divides the x-grid dimension
+/// (`dim0`) by that factor (`../mlx/mlx/backend/metal/copy.cpp` ~line 141);
+/// without that division the grid over-dispatches and double-writes. This
+/// helper does not yet implement the higher-rank grid scaling, so it
+/// rejects rank ≥ 4 rather than ship a subtly-wrong calc. The only
+/// consumer (the `BF16 ↔ F32` cast) operates on rank ≤ 3 tensors; lift
+/// this limit when a higher-rank consumer appears.
+#[allow(clippy::too_many_arguments)]
+fn encode_general_copy(
+    commands: &mut Commands<'_>,
+    library: &KernelLibrary,
+    dtype_suffix: &str,
+    src_buffer: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+    src_byte_offset: usize,
+    src_strides: &[i64],
+    dst_buffer: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+    dst_byte_offset: usize,
+    shape: &[i32],
+) -> Result<()> {
+    let ndim = shape.len();
+    if ndim == 0 {
+        return Err(Error::InvalidArgument(
+            "copy_g: rank-0 (scalar) strided copy is not supported; use a vector copy".into(),
+        ));
+    }
+    if ndim > MAX_COPY_SPECIALIZED_DIMS {
+        return Err(Error::InvalidArgument(format!(
+            "encode_general_copy: cross-dtype strided copy supports rank <= {MAX_COPY_SPECIALIZED_DIMS} (got {ndim}); the gn2 work-per-thread grid scaling for higher ranks is not yet implemented"
+        )));
+    }
+    if src_strides.len() != ndim {
+        return Err(Error::InvalidArgument(format!(
+            "copy_g: strides/shape rank mismatch (shape={ndim}, src_strides={})",
+            src_strides.len(),
+        )));
+    }
+    if shape.iter().any(|&d| d <= 0) {
+        return Ok(());
+    }
+
+    let kernel_name = format!("g{ndim}_copy{dtype_suffix}");
+    let pipeline = library.pipeline(&kernel_name)?;
+
+    #[allow(clippy::cast_sign_loss)]
+    let dim0 = shape[ndim - 1] as usize;
+    #[allow(clippy::cast_sign_loss)]
+    let dim1 = if ndim > 1 {
+        shape[ndim - 2] as usize
+    } else {
+        1
+    };
+    #[allow(clippy::cast_sign_loss)]
+    let rest: usize = shape[..ndim.saturating_sub(2)]
+        .iter()
+        .map(|&d| d as usize)
+        .product::<usize>()
+        .max(1);
+
+    {
+        let encoder = commands.encoder()?;
+        encoder.setComputePipelineState(pipeline.metal_pipeline_state());
+        // SAFETY: bind slots / dtypes match the rank ≤ 3 `g{1,2,3}_copy*`
+        // MSL signatures in `kernels-mlx/.../copy.h` (src@0, dst@1,
+        // src_strides@3). The rank ≥ 4 variants take shape@2 + ndim@5, but
+        // higher ranks are rejected above, so those binds are omitted. No
+        // dst-strides bind: the kernel derives the dst index from the grid,
+        // so `dst` is contiguous. Byte offsets ride along on the buffer binds.
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(src_buffer), src_byte_offset, 0);
+            encoder.setBuffer_offset_atIndex(Some(dst_buffer), dst_byte_offset, 1);
+
+            let src_strides_ptr: NonNull<c_void> = NonNull::from(src_strides).cast();
+            encoder.setBytes_length_atIndex(src_strides_ptr, std::mem::size_of_val(src_strides), 3);
+        }
+    }
+
+    let threadgroup = get_block_dims(dim0, dim1, rest, 10);
+    let grid = MTLSize {
+        width: dim0,
+        height: dim1,
+        depth: rest,
+    };
+    commands.dispatch_threads(grid, threadgroup)
+}
+
 /// Port of MLX `get_block_dims_common` (`common/utils.cpp:117`).
 ///
 /// Picks a power-of-two threadgroup shape with total log2 bits ≤ `pow2`
@@ -377,13 +557,15 @@ fn get_block_dims(dim0: usize, dim1: usize, dim2: usize, max_log2: u32) -> MTLSi
     }
 }
 
-/// Shared encoder for the `copy_v<T, T, 1>` template family.
-fn encode_v_copy<T>(
+/// Shared encoder for the `copy_v<S, D, 1>` template family. `S` and `D`
+/// are equal for the same-dtype identity copies and differ for the
+/// cross-dtype casts; the MSL kernel performs the `static_cast<D>(S)`.
+fn encode_v_copy<S, D>(
     commands: &mut Commands<'_>,
     library: &KernelLibrary,
     kernel_name: &str,
-    src: &Buffer<T>,
-    dst: &mut Buffer<T>,
+    src: &Buffer<S>,
+    dst: &mut Buffer<D>,
 ) -> Result<()> {
     if src.len() != dst.len() {
         return Err(Error::InvalidArgument(format!(

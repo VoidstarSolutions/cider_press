@@ -49,6 +49,7 @@ use crate::tensor::{
 pub(crate) fn op_kind_label(kind: &OpKind) -> &'static str {
     match kind {
         OpKind::Copy => "copy",
+        OpKind::Cast => "cast",
         OpKind::QuantizedMatMul { .. } => "quantized_matmul",
         OpKind::Binary { .. } => "binary",
         OpKind::Unary { .. } => "unary",
@@ -660,6 +661,7 @@ fn dispatch(
         .expect("topo invariant: only op nodes here");
     match op.kind {
         OpKind::Copy => dispatch_copy(inner, op, commands, outputs, dst, index_of),
+        OpKind::Cast => dispatch_cast(inner, op, commands, outputs, dst, index_of),
         OpKind::QuantizedMatMul {
             group_size,
             bits,
@@ -778,6 +780,118 @@ fn dispatch_copy(
             let src_typed = unsafe { src.reinterpret_as::<u32>() };
             let mut dst_typed = unsafe { dst.reinterpret_as::<u32>() };
             copy::copy_v_u32(commands, library, &src_typed, &mut dst_typed)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Dispatch an [`OpKind::Cast`]: cross-dtype copy from the input's dtype
+/// into this node's `inner.dtype`. Mirrors [`dispatch_copy`] but the
+/// source and destination scalar types differ — the kernel name is
+/// selected from the `(src, dst)` dtype pair. Branches view → strided
+/// `g*_copy` (the recurrence casts slices like `q[:, t]`) vs dense
+/// `v_copy`. Only `BF16 ↔ F32` reaches here (`Tensor::cast` rejects
+/// other pairs at construction).
+fn dispatch_cast(
+    inner: &Arc<TensorInner>,
+    op: &OpNode,
+    commands: &mut Commands<'_>,
+    outputs: &[Buffer<u8>],
+    dst: &mut Buffer<u8>,
+    index_of: &HashMap<*const TensorInner, usize>,
+) -> Result<()> {
+    let device = inner
+        .device
+        .as_ref()
+        .expect("op nodes are always constructed with a device");
+    let inputs = op.lock_inputs();
+    let input = inputs
+        .first()
+        .expect("Cast has exactly one input by construction");
+    let library = device.copy_library()?;
+
+    let src_dtype = input.inner.dtype;
+    let dst_dtype = inner.dtype;
+
+    // Strided source view: walk the view chain and feed the source
+    // element strides into the cross-dtype `g*_copy`. Mirrors
+    // `dispatch_copy_strided`, but with differing src/dst scalar types.
+    if input.inner.view.is_some() {
+        let (src_bytes, src_byte_offset) = resolve_view_storage(input, outputs, index_of)?;
+        let src_strides = match input.layout() {
+            Layout::Dense { strides } => strides_to_i64(strides.as_slice())?,
+            Layout::Quantized(_) => {
+                return Err(Error::InvalidArgument(
+                    "eval: strided cast from a quantized view is not supported".into(),
+                ));
+            }
+        };
+        let shape_i32 = shape_to_i32(input.shape().dims())?;
+
+        // SAFETY: the runtime dtype tags are the source of truth for the
+        // byte contents; reinterpreting each `Buffer<u8>` as its typed
+        // view matches the kernel's MSL scalar types. Buffers were sized
+        // as `elem_count * size_bytes`, so byte length divides evenly.
+        // The `copy_g_*` family writes the destination contiguously, so
+        // the freshly-allocated dense `dst` needs no explicit strides.
+        match (src_dtype, dst_dtype) {
+            (DType::BF16, DType::F32) => {
+                let src = unsafe { src_bytes.reinterpret_as::<half::bf16>() };
+                let mut dst_typed = unsafe { dst.reinterpret_as::<f32>() };
+                copy::copy_g_bf16_to_f32(
+                    commands,
+                    library,
+                    &src,
+                    src_byte_offset,
+                    &src_strides,
+                    &mut dst_typed,
+                    0,
+                    &shape_i32,
+                )?;
+            }
+            (DType::F32, DType::BF16) => {
+                let src = unsafe { src_bytes.reinterpret_as::<f32>() };
+                let mut dst_typed = unsafe { dst.reinterpret_as::<half::bf16>() };
+                copy::copy_g_f32_to_bf16(
+                    commands,
+                    library,
+                    &src,
+                    src_byte_offset,
+                    &src_strides,
+                    &mut dst_typed,
+                    0,
+                    &shape_i32,
+                )?;
+            }
+            other => {
+                return Err(Error::InvalidArgument(format!(
+                    "eval: unsupported cast pair {other:?} (only BF16 ↔ F32 is wired)",
+                )));
+            }
+        }
+        return Ok(());
+    }
+
+    let src = dense_input_buffer(input, outputs, index_of)?;
+
+    // SAFETY: as above — typed reinterpret of each `Buffer<u8>` matches
+    // the kernel scalar types; byte lengths divide evenly.
+    match (src_dtype, dst_dtype) {
+        (DType::BF16, DType::F32) => {
+            let src_typed = unsafe { src.reinterpret_as::<half::bf16>() };
+            let mut dst_typed = unsafe { dst.reinterpret_as::<f32>() };
+            copy::copy_v_bf16_to_f32(commands, library, &src_typed, &mut dst_typed)?;
+        }
+        (DType::F32, DType::BF16) => {
+            let src_typed = unsafe { src.reinterpret_as::<f32>() };
+            let mut dst_typed = unsafe { dst.reinterpret_as::<half::bf16>() };
+            copy::copy_v_f32_to_bf16(commands, library, &src_typed, &mut dst_typed)?;
+        }
+        other => {
+            return Err(Error::InvalidArgument(format!(
+                "eval: unsupported cast pair {other:?} (only BF16 ↔ F32 is wired)",
+            )));
         }
     }
 

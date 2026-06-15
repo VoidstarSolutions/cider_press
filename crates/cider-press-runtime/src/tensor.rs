@@ -188,6 +188,14 @@ pub enum OpKind {
     /// the same shape, dtype, and values as the input. Mirrors MLX's
     /// `mx.copy` and dispatches to the vendored `v_copy` kernel.
     Copy,
+    /// Element-wise dtype cast. The single input carries the *source*
+    /// dtype; this node's own [`DType`] carries the *target*.
+    /// Output is a fresh dense tensor with the input's shape and the
+    /// target dtype. Dispatches the vendored MLX cross-dtype copy
+    /// kernels (`v_copy`/`g*_copy` `bfloat16↔float32`). Only the
+    /// `BF16 ↔ F32` pair is wired today (see [`Tensor::cast`]); it is
+    /// the primitive for the Gated-DeltaNet fp32 recurrent state.
+    Cast,
     /// Affine-quantized matrix multiply: `y = x · dequant(w)ᵀ`.
     /// Inputs (in [`Tensor::op_inputs`] order) are `[w, x]` where `w`
     /// is a [`Layout::Quantized`] tensor and `x` is a dense bf16
@@ -763,6 +771,53 @@ impl Tensor {
             self.inner.dtype,
             layout,
             OpKind::Copy,
+            vec![self.clone()],
+        ))
+    }
+
+    /// Schedule an element-wise cast of this tensor to `to`.
+    ///
+    /// The result inherits this tensor's [`Shape`] and [`Device`]; its
+    /// dtype is `to` and its [`Layout`] is dense and contiguous
+    /// (strided-view inputs are materialised through the cross-dtype
+    /// `g*_copy` kernel). Widening `BF16 → F32` is loss-free; narrowing
+    /// `F32 → BF16` rounds to nearest-even (the MSL `static_cast`).
+    ///
+    /// A cast to the input's own dtype is a no-op: it returns
+    /// `self.clone()` with no op node and no dispatch.
+    ///
+    /// Only the `BF16 ↔ F32` pair is wired (the primitive for the
+    /// Gated-DeltaNet fp32 recurrent state). Any other pair returns
+    /// [`Error::InvalidArgument`]; F16 and integer casts are out of
+    /// scope until a consumer needs them.
+    pub fn cast(&self, to: DType) -> Result<Self> {
+        let device = self.inner.device.as_ref().ok_or_else(|| {
+            Error::InvalidArgument("cast: cannot apply an op to a placeholder (no device)".into())
+        })?;
+        let from = self.inner.dtype;
+        if to == from {
+            return Ok(self.clone());
+        }
+        if !matches!(
+            (from, to),
+            (DType::BF16, DType::F32) | (DType::F32, DType::BF16)
+        ) {
+            return Err(Error::InvalidArgument(format!(
+                "cast: unsupported dtype pair {from:?} → {to:?} (only BF16 ↔ F32 is wired)",
+            )));
+        }
+        if matches!(self.layout(), Layout::Quantized(_)) {
+            return Err(Error::InvalidArgument(
+                "cast: quantized tensors are not supported".into(),
+            ));
+        }
+        let layout = dense_layout(self.shape());
+        Ok(Self::op_tensor(
+            device,
+            self.inner.shape.clone(),
+            to,
+            layout,
+            OpKind::Cast,
             vec![self.clone()],
         ))
     }
@@ -3139,6 +3194,114 @@ mod tests {
                 "log({x}): got {got}, want {want}"
             );
         }
+    }
+
+    #[test]
+    fn cast_bf16_to_f32_is_exact_widening() {
+        let device = Device::shared().expect("system default device");
+        let host = [-1.5f32, 0.0, 0.25, 3.0];
+        let data: Vec<bf16> = host.iter().map(|&x| bf16::from_f32(x)).collect();
+        let t = Tensor::from_slice(&device, &data, [host.len()]).expect("from_slice");
+        let y = t.cast(DType::F32).expect("schedule cast");
+        y.eval().expect("eval");
+        assert_eq!(y.dtype(), DType::F32);
+        let out: Vec<f32> = y.cpu_to_vec().expect("dense out");
+        // Widening bf16 → f32 is loss-free: each output must equal the
+        // exact f32 expansion of the stored bf16.
+        for (src, &got) in data.iter().zip(out.iter()) {
+            assert_eq!(
+                got.to_bits(),
+                src.to_f32().to_bits(),
+                "cast bf16→f32 must widen exactly"
+            );
+        }
+    }
+
+    #[test]
+    fn cast_f32_to_bf16_is_round_to_nearest_even() {
+        let device = Device::shared().expect("system default device");
+        // Values chosen to exercise rounding: 1.0078125 is the bf16 ULP
+        // above 1.0; 0.1 has no exact bf16; 65504 / -2.5 are representable.
+        let host = [1.0f32, 1.007_812_5, 0.1, 65504.0, -2.5];
+        let t = Tensor::from_slice(&device, &host, [host.len()]).expect("from_slice");
+        let y = t.cast(DType::BF16).expect("schedule cast");
+        y.eval().expect("eval");
+        assert_eq!(y.dtype(), DType::BF16);
+        let out: Vec<bf16> = y.cpu_to_vec().expect("dense out");
+        for (&x, &got) in host.iter().zip(out.iter()) {
+            assert_eq!(
+                got,
+                bf16::from_f32(x),
+                "cast f32→bf16 must round-to-nearest-even"
+            );
+        }
+    }
+
+    #[test]
+    fn cast_of_strided_view_is_correct() {
+        let device = Device::shared().expect("system default device");
+        // Build a [2, 3] bf16 leaf, permute to [3, 2] (non-contiguous),
+        // then cast to f32 — exercises the general (g*) cross-dtype path.
+        let host = [1.5f32, -2.0, 0.5, 4.0, -0.25, 8.0];
+        let data: Vec<bf16> = host.iter().map(|&x| bf16::from_f32(x)).collect();
+        let t = Tensor::from_slice(&device, &data, [2usize, 3]).expect("from_slice");
+        let view = t.permute(&[1, 0]).expect("permute");
+        let y = view.cast(DType::F32).expect("schedule cast");
+        y.eval().expect("eval");
+        assert_eq!(y.dtype(), DType::F32);
+        let out: Vec<f32> = y.cpu_to_vec().expect("dense out");
+        // Logical [3, 2] order of the transposed source.
+        let want = [1.5f32, 4.0, -2.0, -0.25, 0.5, 8.0];
+        for (&got, &w) in out.iter().zip(want.iter()) {
+            assert_eq!(
+                got.to_bits(),
+                bf16::from_f32(w).to_f32().to_bits(),
+                "strided cast value mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn cast_of_strided_rank4_view_errors_cleanly() {
+        // The cross-dtype General copy (encode_general_copy) only
+        // implements the rank ≤ 3 grid; rank ≥ 4 must be rejected rather
+        // than over-dispatch the gn2 (work-per-thread = 2) kernel. A
+        // permuted rank-4 view is non-contiguous, so it routes through the
+        // strided cast path and should surface the guard error.
+        let device = Device::shared().expect("system default device");
+        let data: Vec<bf16> = (0u8..16).map(|i| bf16::from_f32(f32::from(i))).collect();
+        let t = Tensor::from_slice(&device, &data, [2usize, 2, 2, 2]).expect("from_slice");
+        let view = t.permute(&[3, 2, 1, 0]).expect("permute");
+        let y = view.cast(DType::F32).expect("schedule cast");
+        let err = y.eval().unwrap_err();
+        // The guard lives in the kernels crate, so it surfaces wrapped as
+        // `Error::Kernels` (a kernel-layer `InvalidArgument`).
+        assert!(
+            matches!(err, Error::Kernels(_) | Error::InvalidArgument(_)),
+            "rank-4 strided cast should reject in encode_general_copy, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn cast_to_same_dtype_is_identity() {
+        let device = Device::shared().expect("system default device");
+        let host = [1.0f32, 2.0, 3.0];
+        let t = Tensor::from_slice(&device, &host, [host.len()]).expect("from_slice");
+        let y = t.cast(DType::F32).expect("no-op cast");
+        y.eval().expect("eval");
+        assert_eq!(y.dtype(), DType::F32);
+        let out: Vec<f32> = y.cpu_to_vec().expect("dense out");
+        let out_bits: Vec<u32> = out.iter().map(|x| x.to_bits()).collect();
+        let want_bits: Vec<u32> = host.iter().map(|x| x.to_bits()).collect();
+        assert_eq!(out_bits, want_bits);
+    }
+
+    #[test]
+    fn cast_rejects_unsupported_pair() {
+        let device = Device::shared().expect("system default device");
+        let t = Tensor::zeros(&device, [4], DType::F32).expect("zeros");
+        let err = t.cast(DType::I32).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
     }
 
     #[test]
