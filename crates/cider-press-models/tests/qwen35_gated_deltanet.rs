@@ -4,7 +4,7 @@ use std::{fs, path::PathBuf};
 
 use cider_press_models::nn::rms_norm;
 use cider_press_models::qwen3_5::{
-    GatedDeltaNet, Qwen35Config, Qwen35MixerWeights, load_qwen35_weights,
+    GatedDeltaNet, Qwen35Config, Qwen35DecoderLayer, Qwen35MixerWeights, load_qwen35_weights,
 };
 use cider_press_runtime::{Device, Tensor};
 use cider_press_test_utils::read_bf16;
@@ -79,4 +79,39 @@ fn gated_deltanet_layer0_matches_mlx() {
     out.eval().unwrap();
     let got: Vec<bf16> = out.cpu_to_vec().unwrap();
     assert_close("gated_deltanet layer0", &got, &expected);
+}
+
+/// Whole linear (GDN) decoder layer parity vs mlx-lm. Layer 0 is a linear
+/// mixer; `forward_linear` runs pre-norm GDN + residual, then pre-norm SwiGLU
+/// MLP + residual (prefill from zero state, no KV cache). The fixture taps the
+/// full decoder layer output `layer0_out`.
+#[test]
+fn decoder_layer0_matches_mlx() {
+    let Some(dir) = checkpoint_path() else {
+        eprintln!("skipping: CIDER_QWEN35_CHECKPOINT_PATH unset");
+        return;
+    };
+    if !std::path::Path::new(FIXTURES).exists() {
+        eprintln!("skipping: {FIXTURES} missing — run scripts/dump_qwen35_fixtures.py");
+        return;
+    }
+    let config =
+        Qwen35Config::from_json_bytes(&fs::read(dir.join("config.json")).unwrap()).unwrap();
+    let archive_bytes = fs::read(dir.join("model.safetensors")).unwrap();
+    let archive = SafeTensors::deserialize(&archive_bytes).unwrap();
+    let device = Device::shared().unwrap();
+    let weights = load_qwen35_weights(&archive, &config, &device).unwrap();
+
+    let fx_bytes = fs::read(FIXTURES).unwrap();
+    let fx = SafeTensors::deserialize(&fx_bytes).unwrap();
+    let layer0_in = read_bf16(&fx, "layer0_in"); // [1, T, 2560]
+    let expected = read_bf16(&fx, "layer0_out"); // [1, T, 2560]
+    let t = layer0_in.len() / config.hidden_size;
+
+    let x = Tensor::from_slice(&device, &layer0_in, [1usize, t, config.hidden_size]).unwrap();
+    let layer = Qwen35DecoderLayer::from_weights(&weights.layers[0], &config).unwrap();
+    let out = layer.forward_linear(&x).unwrap();
+    out.eval().unwrap();
+    let got: Vec<bf16> = out.cpu_to_vec().unwrap();
+    assert_close("decoder layer0", &got, &expected);
 }

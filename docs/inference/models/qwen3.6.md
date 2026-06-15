@@ -161,6 +161,21 @@ Incumbent baseline to beat (mlx-lm, this machine): 27B decode **~33 tok/s** at
   fixture flow (vs the current `/tmp` path); and fp32 score accumulation in the
   composed SDPA (it accumulates in bf16 today — within the combined bound, but a
   lever if parity is ever tightened).
+- **Phase 3 (Gated-DeltaNet linear mixer) landed:** `qwen3_5/gated_deltanet.rs` +
+  `block.rs` — the linear mixer composes a depthwise causal Conv1d (+SiLU) over
+  the `q‖k‖v` projection, the per-(token, value-head) `compute_g`/`beta` gates
+  (fp32), weightless per-head q/k RMSNorm + scalar scale, interleaved-GQA
+  key/value broadcast, the fp32 per-token delta-rule recurrence over an
+  `[Hv, Dv, Dk]` state, and a gated output RMSNorm before `out_proj`. Mixer and
+  whole-linear-layer parity vs mlx-lm on the 4B layer-0 fixture (mixer max_abs
+  ~7.8e-3, full layer ~1.6e-2). Enabled by 4 new runtime ops (`exp`, `log`,
+  `cast`, `concat`). `Qwen35DecoderLayer` now generalizes over both mixers (a
+  `Mixer::{Full, Linear}` enum) with two entry points — `forward` (full attn +
+  KV cache) and `forward_linear` (GDN prefill, no cache). Deferred: the
+  chunkwise-parallel GDN kernel (the Phase-7 perf-lead lever vs mlx-lm's naive
+  per-token recurrence), and full-model decode-cache wiring — a unified per-layer
+  cache enum threaded through one `forward` — which lands in Phase 4 (full-model
+  assembly). Phase 3 complete.
 - mRoPE interleave layout for text (sections `[11,11,10]` = 32 rotary pairs):
   **confirmed during Phase 2** — `rope_type=default` collapses mRoPE to plain 1-D
   partial RoPE for text, so no multi-section position handling is needed.
