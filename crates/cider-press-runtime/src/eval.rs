@@ -49,6 +49,7 @@ use crate::tensor::{
 pub(crate) fn op_kind_label(kind: &OpKind) -> &'static str {
     match kind {
         OpKind::Copy => "copy",
+        OpKind::Cast => "cast",
         OpKind::QuantizedMatMul { .. } => "quantized_matmul",
         OpKind::Binary { .. } => "binary",
         OpKind::Unary { .. } => "unary",
@@ -62,6 +63,7 @@ pub(crate) fn op_kind_label(kind: &OpKind) -> &'static str {
         OpKind::SliceUpdate { .. } => "slice_update",
         OpKind::Sdpa { .. } => "sdpa",
         OpKind::ArgReduce { .. } => "arg_reduce",
+        OpKind::Concat { .. } => "concat",
     }
 }
 
@@ -660,6 +662,7 @@ fn dispatch(
         .expect("topo invariant: only op nodes here");
     match op.kind {
         OpKind::Copy => dispatch_copy(inner, op, commands, outputs, dst, index_of),
+        OpKind::Cast => dispatch_cast(inner, op, commands, outputs, dst, index_of),
         OpKind::QuantizedMatMul {
             group_size,
             bits,
@@ -714,6 +717,9 @@ fn dispatch(
         ),
         OpKind::ArgReduce { kind, axis } => {
             dispatch_arg_reduce(inner, op, commands, outputs, dst, index_of, kind, axis)
+        }
+        OpKind::Concat { axis } => {
+            dispatch_concat(inner, op, commands, outputs, dst, index_of, axis)
         }
     }
 }
@@ -778,6 +784,118 @@ fn dispatch_copy(
             let src_typed = unsafe { src.reinterpret_as::<u32>() };
             let mut dst_typed = unsafe { dst.reinterpret_as::<u32>() };
             copy::copy_v_u32(commands, library, &src_typed, &mut dst_typed)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Dispatch an [`OpKind::Cast`]: cross-dtype copy from the input's dtype
+/// into this node's `inner.dtype`. Mirrors [`dispatch_copy`] but the
+/// source and destination scalar types differ — the kernel name is
+/// selected from the `(src, dst)` dtype pair. Branches view → strided
+/// `g*_copy` (the recurrence casts slices like `q[:, t]`) vs dense
+/// `v_copy`. Only `BF16 ↔ F32` reaches here (`Tensor::cast` rejects
+/// other pairs at construction).
+fn dispatch_cast(
+    inner: &Arc<TensorInner>,
+    op: &OpNode,
+    commands: &mut Commands<'_>,
+    outputs: &[Buffer<u8>],
+    dst: &mut Buffer<u8>,
+    index_of: &HashMap<*const TensorInner, usize>,
+) -> Result<()> {
+    let device = inner
+        .device
+        .as_ref()
+        .expect("op nodes are always constructed with a device");
+    let inputs = op.lock_inputs();
+    let input = inputs
+        .first()
+        .expect("Cast has exactly one input by construction");
+    let library = device.copy_library()?;
+
+    let src_dtype = input.inner.dtype;
+    let dst_dtype = inner.dtype;
+
+    // Strided source view: walk the view chain and feed the source
+    // element strides into the cross-dtype `g*_copy`. Mirrors
+    // `dispatch_copy_strided`, but with differing src/dst scalar types.
+    if input.inner.view.is_some() {
+        let (src_bytes, src_byte_offset) = resolve_view_storage(input, outputs, index_of)?;
+        let src_strides = match input.layout() {
+            Layout::Dense { strides } => strides_to_i64(strides.as_slice())?,
+            Layout::Quantized(_) => {
+                return Err(Error::InvalidArgument(
+                    "eval: strided cast from a quantized view is not supported".into(),
+                ));
+            }
+        };
+        let shape_i32 = shape_to_i32(input.shape().dims())?;
+
+        // SAFETY: the runtime dtype tags are the source of truth for the
+        // byte contents; reinterpreting each `Buffer<u8>` as its typed
+        // view matches the kernel's MSL scalar types. Buffers were sized
+        // as `elem_count * size_bytes`, so byte length divides evenly.
+        // The `copy_g_*` family writes the destination contiguously, so
+        // the freshly-allocated dense `dst` needs no explicit strides.
+        match (src_dtype, dst_dtype) {
+            (DType::BF16, DType::F32) => {
+                let src = unsafe { src_bytes.reinterpret_as::<half::bf16>() };
+                let mut dst_typed = unsafe { dst.reinterpret_as::<f32>() };
+                copy::copy_g_bf16_to_f32(
+                    commands,
+                    library,
+                    &src,
+                    src_byte_offset,
+                    &src_strides,
+                    &mut dst_typed,
+                    0,
+                    &shape_i32,
+                )?;
+            }
+            (DType::F32, DType::BF16) => {
+                let src = unsafe { src_bytes.reinterpret_as::<f32>() };
+                let mut dst_typed = unsafe { dst.reinterpret_as::<half::bf16>() };
+                copy::copy_g_f32_to_bf16(
+                    commands,
+                    library,
+                    &src,
+                    src_byte_offset,
+                    &src_strides,
+                    &mut dst_typed,
+                    0,
+                    &shape_i32,
+                )?;
+            }
+            other => {
+                return Err(Error::InvalidArgument(format!(
+                    "eval: unsupported cast pair {other:?} (only BF16 ↔ F32 is wired)",
+                )));
+            }
+        }
+        return Ok(());
+    }
+
+    let src = dense_input_buffer(input, outputs, index_of)?;
+
+    // SAFETY: as above — typed reinterpret of each `Buffer<u8>` matches
+    // the kernel scalar types; byte lengths divide evenly.
+    match (src_dtype, dst_dtype) {
+        (DType::BF16, DType::F32) => {
+            let src_typed = unsafe { src.reinterpret_as::<half::bf16>() };
+            let mut dst_typed = unsafe { dst.reinterpret_as::<f32>() };
+            copy::copy_v_bf16_to_f32(commands, library, &src_typed, &mut dst_typed)?;
+        }
+        (DType::F32, DType::BF16) => {
+            let src_typed = unsafe { src.reinterpret_as::<f32>() };
+            let mut dst_typed = unsafe { dst.reinterpret_as::<half::bf16>() };
+            copy::copy_v_f32_to_bf16(commands, library, &src_typed, &mut dst_typed)?;
+        }
+        other => {
+            return Err(Error::InvalidArgument(format!(
+                "eval: unsupported cast pair {other:?} (only BF16 ↔ F32 is wired)",
+            )));
         }
     }
 
@@ -859,6 +977,124 @@ fn dispatch_slice_update(
         &dst_strides,
         &shape_i32,
     )?;
+    Ok(())
+}
+
+/// Dispatch an [`OpKind::Concat`]: join the input parts along `axis`
+/// into the fresh dense `dst`. Copy-to-region mover — each part is
+/// written into its own contiguous byte range of `dst` at a running
+/// offset via MLX's strided `copy_g_*`, which takes a destination byte
+/// offset (the same mechanism `dispatch_slice_update` uses).
+///
+/// The contiguous-block precondition (leading dims before `axis` product
+/// to 1) is validated at construction by [`Tensor::concat`], so each
+/// part's `elem_count` bytes land in one contiguous run. A part that is
+/// a strided view is materialised through the view chain (its source
+/// element strides feed `copy_g_*`); a dense part copies with contiguous
+/// source strides over its own shape. Wired dtypes are `BF16` and `F32`.
+fn dispatch_concat(
+    inner: &Arc<TensorInner>,
+    op: &OpNode,
+    commands: &mut Commands<'_>,
+    outputs: &[Buffer<u8>],
+    dst: &mut Buffer<u8>,
+    index_of: &HashMap<*const TensorInner, usize>,
+    _axis: usize,
+) -> Result<()> {
+    let device = inner
+        .device
+        .as_ref()
+        .expect("op nodes are always constructed with a device");
+    let library = device.copy_library()?;
+    let inputs = op.lock_inputs();
+
+    let elem_bytes = match inner.dtype {
+        DType::BF16 | DType::F32 => inner.dtype.size_bytes(),
+        other => {
+            return Err(Error::InvalidArgument(format!(
+                "concat: unsupported dtype {other:?} (only BF16 and F32 are wired)",
+            )));
+        }
+    };
+
+    let mut dst_byte_offset: usize = 0;
+    for part in inputs.iter() {
+        let part_dims = part.shape().dims();
+        let shape_i32 = shape_to_i32(part_dims)?;
+        let dst_strides = contiguous_strides_i64(&shape_i32);
+
+        // A view resolves to its storage owner + source element strides;
+        // a dense part copies from its own buffer with contiguous strides.
+        let (src_bytes, src_byte_offset, src_strides) = if part.inner.view.is_some() {
+            let (bytes, off) = resolve_view_storage(part, outputs, index_of)?;
+            let strides = match part.layout() {
+                Layout::Dense { strides } => strides_to_i64(strides.as_slice())?,
+                Layout::Quantized(_) => {
+                    return Err(Error::InvalidArgument(
+                        "concat: quantized view part is not supported".into(),
+                    ));
+                }
+            };
+            (bytes, off, strides)
+        } else {
+            let bytes = dense_input_buffer(part, outputs, index_of)?;
+            (bytes, 0usize, contiguous_strides_i64(&shape_i32))
+        };
+
+        // SAFETY: `inner.dtype` is the source of truth for the byte
+        // contents of every part (all share this dtype, validated at
+        // construction); reinterpreting each `Buffer<u8>` as the typed
+        // view matches the kernel's MSL scalar type. Buffers were sized as
+        // `elem_count * size_bytes`, so byte length divides evenly. The
+        // copy writes only this part's element count starting at
+        // `dst_byte_offset`; the precondition guarantees that range is the
+        // part's contiguous block in `dst`.
+        match inner.dtype {
+            DType::BF16 => {
+                let src = unsafe { src_bytes.reinterpret_as::<half::bf16>() };
+                let mut dst_typed = unsafe { dst.reinterpret_as::<half::bf16>() };
+                copy::copy_g_bf16(
+                    commands,
+                    library,
+                    &src,
+                    src_byte_offset,
+                    &src_strides,
+                    &mut dst_typed,
+                    dst_byte_offset,
+                    &dst_strides,
+                    &shape_i32,
+                )?;
+            }
+            DType::F32 => {
+                let src = unsafe { src_bytes.reinterpret_as::<f32>() };
+                let mut dst_typed = unsafe { dst.reinterpret_as::<f32>() };
+                copy::copy_g_f32(
+                    commands,
+                    library,
+                    &src,
+                    src_byte_offset,
+                    &src_strides,
+                    &mut dst_typed,
+                    dst_byte_offset,
+                    &dst_strides,
+                    &shape_i32,
+                )?;
+            }
+            _ => unreachable!("dtype guarded above"),
+        }
+
+        let part_bytes = part
+            .shape()
+            .elem_count()
+            .checked_mul(elem_bytes)
+            .ok_or_else(|| {
+                Error::InvalidArgument("concat: part byte size overflows usize".into())
+            })?;
+        dst_byte_offset = dst_byte_offset.checked_add(part_bytes).ok_or_else(|| {
+            Error::InvalidArgument("concat: running dst byte offset overflows usize".into())
+        })?;
+    }
+
     Ok(())
 }
 
@@ -1465,6 +1701,8 @@ fn dispatch_unary(
                 UnaryOp::Rsqrt => unary::v_rsqrt_f32(commands, library, &s, &mut d)?,
                 UnaryOp::Sigmoid => unary::v_sigmoid_f32(commands, library, &s, &mut d)?,
                 UnaryOp::Erf => unary::v_erf_f32(commands, library, &s, &mut d)?,
+                UnaryOp::Exp => unary::v_exp_f32(commands, library, &s, &mut d)?,
+                UnaryOp::Log => unary::v_log_f32(commands, library, &s, &mut d)?,
             }
         }
         DType::F16 => {
@@ -1475,6 +1713,8 @@ fn dispatch_unary(
                 UnaryOp::Rsqrt => unary::v_rsqrt_f16(commands, library, &s, &mut d)?,
                 UnaryOp::Sigmoid => unary::v_sigmoid_f16(commands, library, &s, &mut d)?,
                 UnaryOp::Erf => unary::v_erf_f16(commands, library, &s, &mut d)?,
+                UnaryOp::Exp => unary::v_exp_f16(commands, library, &s, &mut d)?,
+                UnaryOp::Log => unary::v_log_f16(commands, library, &s, &mut d)?,
             }
         }
         DType::BF16 => {
@@ -1485,6 +1725,8 @@ fn dispatch_unary(
                 UnaryOp::Rsqrt => unary::v_rsqrt_bf16(commands, library, &s, &mut d)?,
                 UnaryOp::Sigmoid => unary::v_sigmoid_bf16(commands, library, &s, &mut d)?,
                 UnaryOp::Erf => unary::v_erf_bf16(commands, library, &s, &mut d)?,
+                UnaryOp::Exp => unary::v_exp_bf16(commands, library, &s, &mut d)?,
+                UnaryOp::Log => unary::v_log_bf16(commands, library, &s, &mut d)?,
             }
         }
         dtype @ (DType::I32 | DType::U32) => {

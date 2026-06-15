@@ -6,14 +6,15 @@
 //!
 //! Exposes the dense same-dtype `v_<Op><in_tname><out_tname>` family
 //! (the `N = 1` instantiation of `unary_v`) for `Square`, `Rsqrt`,
-//! `Sigmoid`, and `Erf` across `f32`, `f16`, and `bf16`.
+//! `Sigmoid`, `Erf`, `Exp`, and `Log` across `f32`, `f16`, and `bf16`.
 //!
 //! `Square` + `Rsqrt` cover the `rms_norm` composition. `Sigmoid` and
 //! `Erf` are the primitives MLX itself uses to compose `silu` and
 //! `gelu` in `mlx.nn` — `SiLU` = `x * sigmoid(x)`, exact `GELU` =
-//! `0.5 * x * (1 + erf(x / sqrt(2)))`. The rest of MLX's unary
-//! surface (Exp / Sin / Cos / Tanh / …) lands the same way when its
-//! first consumer arrives.
+//! `0.5 * x * (1 + erf(x / sqrt(2)))`. `Exp` + `Log` are the primitives
+//! for the Gated-DeltaNet recurrence — `compute_g` (exp gate) and
+//! `softplus` (log). The rest of MLX's unary surface (Sin / Cos /
+//! Tanh / …) lands the same way when its first consumer arrives.
 //!
 //! Higher-rank strided (`gn{1,4}large_`), 2D-large contiguous
 //! (`v2_`), and work-per-thread (`vn_`) variants are deferred — the
@@ -164,6 +165,70 @@ pub fn v_erf_bf16(
     dst: &mut Buffer<bf16>,
 ) -> Result<()> {
     encode_v(commands, library, "v_Erfbfloat16bfloat16", src, dst)
+}
+
+/// Element-wise `out = exp(x)` for dense `f32` input. Maps to MLX's
+/// `Exp` op (`metal::exp`); the dispatch slot binding is identical to
+/// every other `v_*` kernel here.
+pub fn v_exp_f32(
+    commands: &mut Commands<'_>,
+    library: &KernelLibrary,
+    src: &Buffer<f32>,
+    dst: &mut Buffer<f32>,
+) -> Result<()> {
+    encode_v(commands, library, "v_Expfloat32float32", src, dst)
+}
+
+/// `f16` analogue of [`v_exp_f32`].
+pub fn v_exp_f16(
+    commands: &mut Commands<'_>,
+    library: &KernelLibrary,
+    src: &Buffer<f16>,
+    dst: &mut Buffer<f16>,
+) -> Result<()> {
+    encode_v(commands, library, "v_Expfloat16float16", src, dst)
+}
+
+/// `bf16` analogue of [`v_exp_f32`].
+pub fn v_exp_bf16(
+    commands: &mut Commands<'_>,
+    library: &KernelLibrary,
+    src: &Buffer<bf16>,
+    dst: &mut Buffer<bf16>,
+) -> Result<()> {
+    encode_v(commands, library, "v_Expbfloat16bfloat16", src, dst)
+}
+
+/// Element-wise natural log `out = ln(x)` for dense `f32` input. Maps
+/// to MLX's `Log` op (`metal::log`); the dispatch slot binding is
+/// identical to every other `v_*` kernel here.
+pub fn v_log_f32(
+    commands: &mut Commands<'_>,
+    library: &KernelLibrary,
+    src: &Buffer<f32>,
+    dst: &mut Buffer<f32>,
+) -> Result<()> {
+    encode_v(commands, library, "v_Logfloat32float32", src, dst)
+}
+
+/// `f16` analogue of [`v_log_f32`].
+pub fn v_log_f16(
+    commands: &mut Commands<'_>,
+    library: &KernelLibrary,
+    src: &Buffer<f16>,
+    dst: &mut Buffer<f16>,
+) -> Result<()> {
+    encode_v(commands, library, "v_Logfloat16float16", src, dst)
+}
+
+/// `bf16` analogue of [`v_log_f32`].
+pub fn v_log_bf16(
+    commands: &mut Commands<'_>,
+    library: &KernelLibrary,
+    src: &Buffer<bf16>,
+    dst: &mut Buffer<bf16>,
+) -> Result<()> {
+    encode_v(commands, library, "v_Logbfloat16bfloat16", src, dst)
 }
 
 fn encode_v<T>(

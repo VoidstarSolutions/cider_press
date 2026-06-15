@@ -364,7 +364,7 @@ impl Module for Mlp {
 /// Build a `[1]` host-side tensor on `device` with the given value
 /// rounded into `dtype`. Used by [`rms_norm`] to flow `eps` into the
 /// graph as a regular leaf rather than wiring scalar-binding kernels.
-fn scalar_tensor(device: &Device, dtype: DType, value: f32) -> Result<Tensor> {
+pub(crate) fn scalar_tensor(device: &Device, dtype: DType, value: f32) -> Result<Tensor> {
     match dtype {
         DType::F32 => Ok(Tensor::from_slice(device, &[value], [1])?),
         DType::F16 => Ok(Tensor::from_slice(device, &[f16::from_f32(value)], [1])?),
@@ -373,4 +373,43 @@ fn scalar_tensor(device: &Device, dtype: DType, value: f32) -> Result<Tensor> {
             "scalar_tensor: integer dtype {dtype:?} is not supported here",
         ))),
     }
+}
+
+/// Interleaved repeat along `axis`: insert a unit axis after `axis`, broadcast
+/// it by `factor`, then fold it back so each index `i` along `axis` maps to the
+/// `factor` contiguous output indices `i*factor .. (i+1)*factor` — `mx.repeat`
+/// semantics (in-place replication), not a tiled concat. `factor == 1` is a
+/// plain contiguous copy. The input is materialized (`copy()`) first, so strided
+/// or broadcast cache views are accepted.
+pub(crate) fn repeat_axis_interleaved(x: &Tensor, axis: usize, factor: usize) -> Result<Tensor> {
+    let dims = x.shape().dims();
+    if axis >= dims.len() {
+        return Err(Error::InvalidArgument(format!(
+            "repeat_axis_interleaved: axis {axis} out of range for shape {dims:?}",
+        )));
+    }
+    if factor == 0 {
+        return Err(Error::InvalidArgument(
+            "repeat_axis_interleaved: factor must be non-zero".into(),
+        ));
+    }
+    if factor == 1 {
+        return Ok(x.copy()?);
+    }
+    let mut expanded: Vec<usize> = dims.to_vec();
+    expanded.insert(axis + 1, 1);
+    let mut broadcast = expanded.clone();
+    broadcast[axis + 1] = factor;
+    let mut folded: Vec<usize> = dims.to_vec();
+    folded[axis] = dims[axis].checked_mul(factor).ok_or_else(|| {
+        Error::InvalidArgument(format!(
+            "repeat_axis_interleaved: axis {axis} length {} × factor {factor} overflows usize",
+            dims[axis],
+        ))
+    })?;
+    Ok(x.copy()?
+        .reshape(expanded)?
+        .broadcast_to(broadcast)?
+        .copy()?
+        .reshape(folded)?)
 }

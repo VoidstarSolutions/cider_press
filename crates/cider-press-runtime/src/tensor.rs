@@ -188,6 +188,14 @@ pub enum OpKind {
     /// the same shape, dtype, and values as the input. Mirrors MLX's
     /// `mx.copy` and dispatches to the vendored `v_copy` kernel.
     Copy,
+    /// Element-wise dtype cast. The single input carries the *source*
+    /// dtype; this node's own [`DType`] carries the *target*.
+    /// Output is a fresh dense tensor with the input's shape and the
+    /// target dtype. Dispatches the vendored MLX cross-dtype copy
+    /// kernels (`v_copy`/`g*_copy` `bfloat16↔float32`). Only the
+    /// `BF16 ↔ F32` pair is wired today (see [`Tensor::cast`]); it is
+    /// the primitive for the Gated-DeltaNet fp32 recurrent state.
+    Cast,
     /// Affine-quantized matrix multiply: `y = x · dequant(w)ᵀ`.
     /// Inputs (in [`Tensor::op_inputs`] order) are `[w, x]` where `w`
     /// is a [`Layout::Quantized`] tensor and `x` is a dense bf16
@@ -372,6 +380,24 @@ pub enum OpKind {
         /// The axis being reduced (resolved, non-negative).
         axis: usize,
     },
+    /// Join N input tensors along `axis` into a fresh dense output.
+    /// Inputs (in [`Tensor::op_inputs`] order) are the parts in
+    /// concatenation order; all share rank, dtype, and device and match
+    /// shapes on every axis but `axis`. Output is dense with
+    /// `dim[axis] = Σ parts[i].dim[axis]`.
+    ///
+    /// Implemented as a copy-to-region mover: each part is copied into
+    /// its contiguous byte range of the output at a running offset. This
+    /// is only correct when each part forms a single contiguous block in
+    /// the output — i.e. the product of the dims *before* `axis` is 1.
+    /// [`Tensor::concat`] validates this precondition and rejects the
+    /// strided-region case; it covers batch-1 concat along axis ≥ 1 and
+    /// any concat along axis 0 (all the Gated-DeltaNet conv left-pad
+    /// needs). Wired dtypes are `BF16` and `F32`.
+    Concat {
+        /// The axis along which the parts are joined.
+        axis: usize,
+    },
 }
 
 /// Element-wise binary operations supported by [`OpKind::Binary`].
@@ -385,10 +411,11 @@ pub enum BinaryOp {
 
 /// Element-wise unary operations supported by [`OpKind::Unary`].
 ///
-/// Includes the two ops the `rms_norm` composition needs and the two
-/// primitives MLX itself composes `silu` and `gelu` from in `mlx.nn`.
-/// MLX's `unary.metal` has many more (Exp / Sin / Tanh / …) that land
-/// the same way when their first consumer arrives.
+/// Includes the two ops the `rms_norm` composition needs, the two
+/// primitives MLX itself composes `silu` and `gelu` from in `mlx.nn`,
+/// and `Exp` / `Log` for the Gated-DeltaNet recurrence. MLX's
+/// `unary.metal` has many more (Sin / Tanh / …) that land the same way
+/// when their first consumer arrives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnaryOp {
     /// `out = x * x`.
@@ -399,6 +426,10 @@ pub enum UnaryOp {
     Sigmoid,
     /// `out = erf(x)`. Primitive for exact-`GELU` composition.
     Erf,
+    /// `out = exp(x)`. Primitive for the Gated-DeltaNet `compute_g` gate.
+    Exp,
+    /// `out = ln(x)`. Primitive for the Gated-DeltaNet `softplus`.
+    Log,
 }
 
 /// Reduction kinds supported by [`OpKind::Reduce`].
@@ -762,6 +793,53 @@ impl Tensor {
         ))
     }
 
+    /// Schedule an element-wise cast of this tensor to `to`.
+    ///
+    /// The result inherits this tensor's [`Shape`] and [`Device`]; its
+    /// dtype is `to` and its [`Layout`] is dense and contiguous
+    /// (strided-view inputs are materialised through the cross-dtype
+    /// `g*_copy` kernel). Widening `BF16 → F32` is loss-free; narrowing
+    /// `F32 → BF16` rounds to nearest-even (the MSL `static_cast`).
+    ///
+    /// A cast to the input's own dtype is a no-op: it returns
+    /// `self.clone()` with no op node and no dispatch.
+    ///
+    /// Only the `BF16 ↔ F32` pair is wired (the primitive for the
+    /// Gated-DeltaNet fp32 recurrent state). Any other pair returns
+    /// [`Error::InvalidArgument`]; F16 and integer casts are out of
+    /// scope until a consumer needs them.
+    pub fn cast(&self, to: DType) -> Result<Self> {
+        let device = self.inner.device.as_ref().ok_or_else(|| {
+            Error::InvalidArgument("cast: cannot apply an op to a placeholder (no device)".into())
+        })?;
+        let from = self.inner.dtype;
+        if to == from {
+            return Ok(self.clone());
+        }
+        if !matches!(
+            (from, to),
+            (DType::BF16, DType::F32) | (DType::F32, DType::BF16)
+        ) {
+            return Err(Error::InvalidArgument(format!(
+                "cast: unsupported dtype pair {from:?} → {to:?} (only BF16 ↔ F32 is wired)",
+            )));
+        }
+        if matches!(self.layout(), Layout::Quantized(_)) {
+            return Err(Error::InvalidArgument(
+                "cast: quantized tensors are not supported".into(),
+            ));
+        }
+        let layout = dense_layout(self.shape());
+        Ok(Self::op_tensor(
+            device,
+            self.inner.shape.clone(),
+            to,
+            layout,
+            OpKind::Cast,
+            vec![self.clone()],
+        ))
+    }
+
     /// Schedule an in-place write of `src` into this slab
     /// tensor at row `offset_rows`, returning an [`OpKind::SliceUpdate`]
     /// op tensor whose logical shape equals the slab's.
@@ -870,6 +948,110 @@ impl Tensor {
             dense_layout(&self.inner.shape),
             OpKind::SliceUpdate { offset_rows },
             vec![self.clone(), src.clone()],
+        ))
+    }
+
+    /// Schedule a concatenation of `parts` along `axis` into a fresh
+    /// dense tensor (mirrors `mx.concatenate`).
+    ///
+    /// All parts must share rank, [`DType`], and [`Device`], and match
+    /// shapes on every axis except `axis`; `axis` must be `< rank`. The
+    /// output is dense with `dim[axis] = Σ parts[i].dim[axis]` and all
+    /// other dims unchanged.
+    ///
+    /// Implemented as a copy-to-region mover (see [`OpKind::Concat`]): no
+    /// new kernel, each part is copied into its byte range of the output
+    /// at a running offset. That is only correct when each part is a
+    /// *single contiguous block* in the output, which holds exactly when
+    /// the product of the dims before `axis` is 1 — i.e. concat along
+    /// axis 0, or batch-1 concat along any axis. This is validated here;
+    /// the strided-region case (leading dims before `axis` whose product
+    /// exceeds 1) returns [`Error::InvalidArgument`] and is not yet
+    /// implemented. It covers every Gated-DeltaNet conv left-pad
+    /// (`concat([conv_state, qkv], axis=1)` at batch 1). Wired dtypes are
+    /// `BF16` and `F32`.
+    pub fn concat(parts: &[&Tensor], axis: usize) -> Result<Self> {
+        let first = parts.first().ok_or_else(|| {
+            Error::InvalidArgument("concat: needs at least one input tensor".into())
+        })?;
+        let device = first.inner.device.as_ref().ok_or_else(|| {
+            Error::InvalidArgument("concat: cannot apply an op to a placeholder (no device)".into())
+        })?;
+        let dtype = first.inner.dtype;
+        let rank = first.rank();
+        if axis >= rank {
+            return Err(Error::InvalidArgument(format!(
+                "concat: axis {axis} out of range for rank-{rank} tensors",
+            )));
+        }
+        if matches!(first.layout(), Layout::Quantized(_)) {
+            return Err(Error::InvalidArgument(
+                "concat: quantized tensors are not supported".into(),
+            ));
+        }
+
+        let base_dims = first.shape().dims();
+        let mut axis_total: usize = 0;
+        for part in parts {
+            if part.rank() != rank {
+                return Err(Error::InvalidArgument(format!(
+                    "concat: all parts must have rank {rank} (got rank {})",
+                    part.rank(),
+                )));
+            }
+            if part.inner.dtype != dtype {
+                return Err(Error::InvalidArgument(format!(
+                    "concat: all parts must share dtype {dtype:?} (got {:?})",
+                    part.inner.dtype,
+                )));
+            }
+            let part_device = part.inner.device.as_ref().ok_or_else(|| {
+                Error::InvalidArgument("concat: part is a placeholder (no device)".into())
+            })?;
+            if !part_device.ptr_eq(device) {
+                return Err(Error::InvalidArgument(
+                    "concat: all parts must be on the same device".into(),
+                ));
+            }
+            let dims = part.shape().dims();
+            for (ax, (&d, &b)) in dims.iter().zip(base_dims).enumerate() {
+                if ax != axis && d != b {
+                    return Err(Error::InvalidArgument(format!(
+                        "concat: parts must match on every axis but {axis}; \
+                         axis {ax} differs ({d} vs {b})",
+                    )));
+                }
+            }
+            axis_total = axis_total.checked_add(dims[axis]).ok_or_else(|| {
+                Error::InvalidArgument("concat: total axis length overflows usize".into())
+            })?;
+        }
+
+        // Contiguous-region precondition: each part forms one contiguous
+        // byte range in the output only if the dims before `axis` product
+        // to 1. Otherwise a part occupies interleaved strided regions
+        // (one block per leading-index combination), which the
+        // copy-to-region mover does not handle.
+        let leading: usize = base_dims[..axis].iter().product();
+        if leading != 1 {
+            return Err(Error::InvalidArgument(format!(
+                "concat: only supported when leading dims before the axis have product 1 \
+                 (got {leading} for dims {base_dims:?} axis {axis}); \
+                 strided-region concat is not yet implemented",
+            )));
+        }
+
+        let mut out_dims = base_dims.to_vec();
+        out_dims[axis] = axis_total;
+        let out_shape = Shape::from(out_dims);
+        let inputs: Vec<Tensor> = parts.iter().map(|p| (*p).clone()).collect();
+        Ok(Self::op_tensor(
+            device,
+            out_shape.clone(),
+            dtype,
+            dense_layout(&out_shape),
+            OpKind::Concat { axis },
+            inputs,
         ))
     }
 
@@ -987,6 +1169,20 @@ impl Tensor {
     /// preconditions.
     pub fn erf(&self) -> Result<Self> {
         self.unary(UnaryOp::Erf)
+    }
+
+    /// Schedule `out = exp(x)` element-wise. Primitive for the
+    /// Gated-DeltaNet `compute_g` gate. See [`Tensor::unary`] for
+    /// shared preconditions.
+    pub fn exp(&self) -> Result<Self> {
+        self.unary(UnaryOp::Exp)
+    }
+
+    /// Schedule `out = ln(x)` (natural log) element-wise. Primitive for
+    /// the Gated-DeltaNet `softplus`. See [`Tensor::unary`] for shared
+    /// preconditions.
+    pub fn log(&self) -> Result<Self> {
+        self.unary(UnaryOp::Log)
     }
 
     /// Schedule an element-wise unary op. Output inherits this
@@ -3040,6 +3236,311 @@ mod tests {
         assert_eq!(t.dtype(), DType::BF16);
         let read_back = t.cpu_slice::<bf16>().expect("cpu_slice bf16");
         assert_eq!(read_back, data.as_slice());
+    }
+
+    #[test]
+    fn exp_bf16_matches_host_within_ulp_tolerance() {
+        let device = Device::shared().expect("system default device");
+        let host = [-1.0f32, 0.0, 0.5, 1.0, 2.0];
+        let data: Vec<bf16> = host.iter().map(|&x| bf16::from_f32(x)).collect();
+        let t = Tensor::from_slice(&device, &data, [host.len()]).expect("from_slice");
+        let y = t.exp().expect("schedule exp");
+        y.eval().expect("eval");
+        let out: Vec<bf16> = y.cpu_to_vec().expect("dense out");
+        // `metal::exp` drifts 1–2 bf16 ULPs; the combined np.allclose
+        // bound `|a-b| <= atol + rtol*|b|` covers the bf16 rounding.
+        for (&x, a) in host.iter().zip(out.iter()) {
+            let want = x.exp();
+            let got = a.to_f32();
+            let bound = 0.01 + 0.02 * want.abs();
+            assert!(
+                (got - want).abs() <= bound,
+                "exp({x}): got {got}, want {want}, diff {} > bound {bound}",
+                (got - want).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn exp_f32_matches_host_within_ulp_tolerance() {
+        let device = Device::shared().expect("system default device");
+        let host = [-1.0f32, 0.0, 0.5, 1.0, 2.0];
+        let t = Tensor::from_slice(&device, &host, [host.len()]).expect("from_slice");
+        let y = t.exp().expect("schedule exp");
+        y.eval().expect("eval");
+        let out: Vec<f32> = y.cpu_to_vec().expect("dense out");
+        for (&x, &got) in host.iter().zip(out.iter()) {
+            let want = x.exp();
+            let bound = 1e-4 + 1e-4 * want.abs();
+            assert!(
+                (got - want).abs() <= bound,
+                "exp({x}): got {got}, want {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn log_bf16_matches_host_within_ulp_tolerance() {
+        let device = Device::shared().expect("system default device");
+        let host = [0.5f32, 1.0, 2.0, 4.0, 10.0];
+        let data: Vec<bf16> = host.iter().map(|&x| bf16::from_f32(x)).collect();
+        let t = Tensor::from_slice(&device, &data, [host.len()]).expect("from_slice");
+        let y = t.log().expect("schedule log");
+        y.eval().expect("eval");
+        let out: Vec<bf16> = y.cpu_to_vec().expect("dense out");
+        for (&x, a) in host.iter().zip(out.iter()) {
+            let want = x.ln();
+            let got = a.to_f32();
+            let bound = 0.01 + 0.02 * want.abs();
+            assert!(
+                (got - want).abs() <= bound,
+                "log({x}): got {got}, want {want}, diff {} > bound {bound}",
+                (got - want).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn log_f32_matches_host_within_ulp_tolerance() {
+        let device = Device::shared().expect("system default device");
+        let host = [0.5f32, 1.0, 2.0, 4.0, 10.0];
+        let t = Tensor::from_slice(&device, &host, [host.len()]).expect("from_slice");
+        let y = t.log().expect("schedule log");
+        y.eval().expect("eval");
+        let out: Vec<f32> = y.cpu_to_vec().expect("dense out");
+        for (&x, &got) in host.iter().zip(out.iter()) {
+            let want = x.ln();
+            let bound = 1e-4 + 1e-4 * want.abs();
+            assert!(
+                (got - want).abs() <= bound,
+                "log({x}): got {got}, want {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn cast_bf16_to_f32_is_exact_widening() {
+        let device = Device::shared().expect("system default device");
+        let host = [-1.5f32, 0.0, 0.25, 3.0];
+        let data: Vec<bf16> = host.iter().map(|&x| bf16::from_f32(x)).collect();
+        let t = Tensor::from_slice(&device, &data, [host.len()]).expect("from_slice");
+        let y = t.cast(DType::F32).expect("schedule cast");
+        y.eval().expect("eval");
+        assert_eq!(y.dtype(), DType::F32);
+        let out: Vec<f32> = y.cpu_to_vec().expect("dense out");
+        // Widening bf16 → f32 is loss-free: each output must equal the
+        // exact f32 expansion of the stored bf16.
+        for (src, &got) in data.iter().zip(out.iter()) {
+            assert_eq!(
+                got.to_bits(),
+                src.to_f32().to_bits(),
+                "cast bf16→f32 must widen exactly"
+            );
+        }
+    }
+
+    #[test]
+    fn cast_f32_to_bf16_is_round_to_nearest_even() {
+        let device = Device::shared().expect("system default device");
+        // Values chosen to exercise rounding: 1.0078125 is the bf16 ULP
+        // above 1.0; 0.1 has no exact bf16; 65504 / -2.5 are representable.
+        let host = [1.0f32, 1.007_812_5, 0.1, 65504.0, -2.5];
+        let t = Tensor::from_slice(&device, &host, [host.len()]).expect("from_slice");
+        let y = t.cast(DType::BF16).expect("schedule cast");
+        y.eval().expect("eval");
+        assert_eq!(y.dtype(), DType::BF16);
+        let out: Vec<bf16> = y.cpu_to_vec().expect("dense out");
+        for (&x, &got) in host.iter().zip(out.iter()) {
+            assert_eq!(
+                got,
+                bf16::from_f32(x),
+                "cast f32→bf16 must round-to-nearest-even"
+            );
+        }
+    }
+
+    #[test]
+    fn cast_of_strided_view_is_correct() {
+        let device = Device::shared().expect("system default device");
+        // Build a [2, 3] bf16 leaf, permute to [3, 2] (non-contiguous),
+        // then cast to f32 — exercises the general (g*) cross-dtype path.
+        let host = [1.5f32, -2.0, 0.5, 4.0, -0.25, 8.0];
+        let data: Vec<bf16> = host.iter().map(|&x| bf16::from_f32(x)).collect();
+        let t = Tensor::from_slice(&device, &data, [2usize, 3]).expect("from_slice");
+        let view = t.permute(&[1, 0]).expect("permute");
+        let y = view.cast(DType::F32).expect("schedule cast");
+        y.eval().expect("eval");
+        assert_eq!(y.dtype(), DType::F32);
+        let out: Vec<f32> = y.cpu_to_vec().expect("dense out");
+        // Logical [3, 2] order of the transposed source.
+        let want = [1.5f32, 4.0, -2.0, -0.25, 0.5, 8.0];
+        for (&got, &w) in out.iter().zip(want.iter()) {
+            assert_eq!(
+                got.to_bits(),
+                bf16::from_f32(w).to_f32().to_bits(),
+                "strided cast value mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn cast_of_strided_rank4_view_errors_cleanly() {
+        // The cross-dtype General copy (encode_general_copy) only
+        // implements the rank ≤ 3 grid; rank ≥ 4 must be rejected rather
+        // than over-dispatch the gn2 (work-per-thread = 2) kernel. A
+        // permuted rank-4 view is non-contiguous, so it routes through the
+        // strided cast path and should surface the guard error.
+        let device = Device::shared().expect("system default device");
+        let data: Vec<bf16> = (0u8..16).map(|i| bf16::from_f32(f32::from(i))).collect();
+        let t = Tensor::from_slice(&device, &data, [2usize, 2, 2, 2]).expect("from_slice");
+        let view = t.permute(&[3, 2, 1, 0]).expect("permute");
+        let y = view.cast(DType::F32).expect("schedule cast");
+        let err = y.eval().unwrap_err();
+        // The guard lives in the kernels crate, so it surfaces wrapped as
+        // `Error::Kernels` (a kernel-layer `InvalidArgument`).
+        assert!(
+            matches!(err, Error::Kernels(_) | Error::InvalidArgument(_)),
+            "rank-4 strided cast should reject in encode_general_copy, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn cast_to_same_dtype_is_identity() {
+        let device = Device::shared().expect("system default device");
+        let host = [1.0f32, 2.0, 3.0];
+        let t = Tensor::from_slice(&device, &host, [host.len()]).expect("from_slice");
+        let y = t.cast(DType::F32).expect("no-op cast");
+        y.eval().expect("eval");
+        assert_eq!(y.dtype(), DType::F32);
+        let out: Vec<f32> = y.cpu_to_vec().expect("dense out");
+        let out_bits: Vec<u32> = out.iter().map(|x| x.to_bits()).collect();
+        let want_bits: Vec<u32> = host.iter().map(|x| x.to_bits()).collect();
+        assert_eq!(out_bits, want_bits);
+    }
+
+    #[test]
+    fn cast_rejects_unsupported_pair() {
+        let device = Device::shared().expect("system default device");
+        let t = Tensor::zeros(&device, [4], DType::F32).expect("zeros");
+        let err = t.cast(DType::I32).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn concat_bf16_joins_along_inner_axis() {
+        let device = Device::shared().expect("system default device");
+        #[allow(clippy::cast_precision_loss, reason = "small integers fit in f32")]
+        let a_host: Vec<bf16> = (0..12).map(|i| bf16::from_f32(i as f32)).collect();
+        #[allow(clippy::cast_precision_loss, reason = "small integers fit in f32")]
+        let b_host: Vec<bf16> = (100..108).map(|i| bf16::from_f32(i as f32)).collect();
+        let a = Tensor::from_slice(&device, &a_host, [1, 3, 4]).expect("a");
+        let b = Tensor::from_slice(&device, &b_host, [1, 2, 4]).expect("b");
+
+        let c = Tensor::concat(&[&a, &b], 1).expect("schedule concat");
+        c.eval().expect("eval");
+        assert_eq!(c.shape().dims(), &[1, 5, 4]);
+
+        let out: Vec<bf16> = c.cpu_to_vec().expect("dense out");
+        let mut want = a_host.clone();
+        want.extend_from_slice(&b_host);
+        let out_bits: Vec<u16> = out.iter().map(|x| x.to_bits()).collect();
+        let want_bits: Vec<u16> = want.iter().map(|x| x.to_bits()).collect();
+        assert_eq!(out_bits, want_bits);
+    }
+
+    #[test]
+    fn concat_bf16_gdn_conv_pad_shape() {
+        let device = Device::shared().expect("system default device");
+        let state_host = vec![bf16::from_f32(0.5); 3 * 8192];
+        let qkv_host = vec![bf16::from_f32(1.5); 6 * 8192];
+        let state = Tensor::from_slice(&device, &state_host, [1, 3, 8192]).expect("state");
+        let qkv = Tensor::from_slice(&device, &qkv_host, [1, 6, 8192]).expect("qkv");
+
+        let c = Tensor::concat(&[&state, &qkv], 1).expect("schedule concat");
+        c.eval().expect("eval");
+        assert_eq!(c.shape().dims(), &[1, 9, 8192]);
+
+        let out: Vec<bf16> = c.cpu_to_vec().expect("dense out");
+        let half_bits = bf16::from_f32(0.5).to_bits();
+        let oneandhalf_bits = bf16::from_f32(1.5).to_bits();
+        assert!(out[..3 * 8192].iter().all(|&x| x.to_bits() == half_bits));
+        assert!(
+            out[3 * 8192..]
+                .iter()
+                .all(|&x| x.to_bits() == oneandhalf_bits)
+        );
+    }
+
+    #[test]
+    fn concat_three_parts_along_axis0() {
+        let device = Device::shared().expect("system default device");
+        #[allow(clippy::cast_precision_loss, reason = "small integers fit in f32")]
+        let mk = |range: std::ops::Range<i32>| -> Vec<bf16> {
+            range.map(|i| bf16::from_f32(i as f32)).collect()
+        };
+        let a_host = mk(0..4);
+        let b_host = mk(10..14);
+        let c_host = mk(20..24);
+        let a = Tensor::from_slice(&device, &a_host, [1, 4]).expect("a");
+        let b = Tensor::from_slice(&device, &b_host, [1, 4]).expect("b");
+        let c = Tensor::from_slice(&device, &c_host, [1, 4]).expect("c");
+
+        let out_t = Tensor::concat(&[&a, &b, &c], 0).expect("schedule concat");
+        out_t.eval().expect("eval");
+        assert_eq!(out_t.shape().dims(), &[3, 4]);
+
+        let out: Vec<bf16> = out_t.cpu_to_vec().expect("dense out");
+        let mut want = a_host.clone();
+        want.extend_from_slice(&b_host);
+        want.extend_from_slice(&c_host);
+        let out_bits: Vec<u16> = out.iter().map(|x| x.to_bits()).collect();
+        let want_bits: Vec<u16> = want.iter().map(|x| x.to_bits()).collect();
+        assert_eq!(out_bits, want_bits);
+    }
+
+    #[test]
+    fn concat_materializes_strided_view_part() {
+        let device = Device::shared().expect("system default device");
+        // a is a non-contiguous inner-axis slice (a strided view).
+        #[allow(clippy::cast_precision_loss, reason = "small integers fit in f32")]
+        let base_host: Vec<bf16> = (0..12).map(|i| bf16::from_f32(i as f32)).collect();
+        let base = Tensor::from_slice(&device, &base_host, [1, 3, 4]).expect("base");
+        // Take columns 1..3 of each row → strided view [1,3,2].
+        let view = base.slice(&[0..1, 0..3, 1..3]).expect("slice view");
+
+        #[allow(clippy::cast_precision_loss, reason = "small integers fit in f32")]
+        let dense_host: Vec<bf16> = (100..104).map(|i| bf16::from_f32(i as f32)).collect();
+        let dense = Tensor::from_slice(&device, &dense_host, [1, 2, 2]).expect("dense");
+
+        let c = Tensor::concat(&[&view, &dense], 1).expect("schedule concat");
+        c.eval().expect("eval");
+        assert_eq!(c.shape().dims(), &[1, 5, 2]);
+
+        let out: Vec<bf16> = c.cpu_to_vec().expect("dense out");
+        // view columns 1,2 per row: (1,2),(5,6),(9,10) then dense 100..104.
+        let want: Vec<f32> = vec![1.0, 2.0, 5.0, 6.0, 9.0, 10.0, 100.0, 101.0, 102.0, 103.0];
+        let got: Vec<f32> = out.iter().map(|x| x.to_f32()).collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn concat_rejects_strided_region_precondition() {
+        let device = Device::shared().expect("system default device");
+        // Leading dim before axis 1 has product 2 ≠ 1 → strided regions.
+        let a = Tensor::zeros(&device, [2, 3, 4], DType::BF16).expect("a");
+        let b = Tensor::zeros(&device, [2, 1, 4], DType::BF16).expect("b");
+        let err = Tensor::concat(&[&a, &b], 1).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn concat_rejects_non_axis_shape_mismatch() {
+        let device = Device::shared().expect("system default device");
+        let a = Tensor::zeros(&device, [1, 3, 4], DType::BF16).expect("a");
+        // Differs on axis 2 (a non-concat axis) → reject.
+        let b = Tensor::zeros(&device, [1, 2, 5], DType::BF16).expect("b");
+        let err = Tensor::concat(&[&a, &b], 1).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
     }
 
     #[test]
