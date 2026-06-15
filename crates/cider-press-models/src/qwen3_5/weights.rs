@@ -6,6 +6,7 @@
 //!
 //! ```text
 //! language_model.model.embed_tokens.{weight, scales, biases}      # quant, [V, D]
+//! language_model.lm_head.{weight, scales, biases}                 # quant, [V, D]  (untied 27B only)
 //! language_model.model.norm.weight                                # bf16,  [D]
 //! language_model.model.layers.{i}.input_layernorm.weight          # bf16,  [D]
 //! language_model.model.layers.{i}.post_attention_layernorm.weight # bf16,  [D]
@@ -37,9 +38,13 @@ const TEXT_PREFIX: &str = "language_model.model";
 pub struct Qwen35Weights {
     /// Token embedding table, quantized. Logical shape `[vocab_size,
     /// hidden_size]`. On the 4B dev vehicle the LM head is tied to this table;
-    /// the 27B target ships a separate `lm_head` — TODO(27B): load it as an
-    /// `Option<QuantizedWeight>` when `tie_word_embeddings == false`.
+    /// the 27B target ships a separate [`Qwen35Weights::lm_head`].
     pub embed: QuantizedWeight,
+    /// Separate (untied) LM head, quantized. Logical shape `[vocab_size,
+    /// hidden_size]`. `Some` iff `config.tie_word_embeddings == false` (the
+    /// 27B target); `None` on the tied 4B, where the head reuses
+    /// [`Qwen35Weights::embed`]. Loaded from `language_model.lm_head`.
+    pub lm_head: Option<QuantizedWeight>,
     /// Final `RMSNorm` gamma. Dense bf16, shape `[hidden_size]`.
     pub norm: Tensor,
     /// Per-block weights. Length equals
@@ -165,8 +170,20 @@ pub fn load_qwen35_weights(
         layers.push(load_layer(archive, config, quant, device, i)?);
     }
 
+    // The tied 4B reuses `embed` as its head; the untied 27B ships a separate
+    // `language_model.lm_head` (note: under `language_model.`, not the
+    // `language_model.model.` text prefix).
+    let lm_head = if config.tie_word_embeddings {
+        None
+    } else {
+        let h = read_quantized_weight(archive, "language_model.lm_head", quant, device)?;
+        expect_q_shape("lm_head", &h, config.vocab_size, hidden)?;
+        Some(h)
+    };
+
     Ok(Qwen35Weights {
         embed,
+        lm_head,
         norm,
         layers,
     })
@@ -524,16 +541,20 @@ mod tests {
     }
 
     /// Synthesize an in-memory safetensors archive holding every key the
-    /// loader reads for `cfg`, under the `language_model.model.` prefix.
+    /// loader reads for `cfg`, under the `language_model.model.` prefix. No
+    /// separate `lm_head` (the tied case).
     fn synthesize_archive_bytes(cfg: &Qwen35Config) -> Vec<u8> {
-        synthesize_archive_bytes_with(cfg, |_, _| None)
+        synthesize_archive_bytes_with(cfg, false, |_, _| None)
     }
 
-    /// Same, but `override_shape(key, default)` may return a replacement
-    /// logical shape for a dense tensor (used by the negative test).
+    /// Same, but `with_lm_head` adds the untied `language_model.lm_head`
+    /// quantized triple (`[vocab, hidden]`), and `override_shape(key, default)`
+    /// may return a replacement logical shape for a dense tensor (used by the
+    /// negative test).
     #[allow(clippy::too_many_lines)]
     fn synthesize_archive_bytes_with(
         cfg: &Qwen35Config,
+        with_lm_head: bool,
         override_shape: impl Fn(&str, &[usize]) -> Option<Vec<usize>>,
     ) -> Vec<u8> {
         let hidden = cfg.hidden_size;
@@ -553,6 +574,14 @@ mod tests {
             cfg.vocab_size,
             hidden,
         );
+        if with_lm_head {
+            push_quantized(
+                &mut entries,
+                "language_model.lm_head",
+                cfg.vocab_size,
+                hidden,
+            );
+        }
         dense(
             &mut entries,
             &format!("{p}.norm.weight"),
@@ -705,6 +734,8 @@ mod tests {
 
         assert_eq!(weights.layers.len(), 2);
         assert_eq!(weights.embed.shape().dims(), &[256, 64]);
+        // Tied config (default): the head reuses `embed`, no separate lm_head.
+        assert!(weights.lm_head.is_none());
 
         let Qwen35MixerWeights::LinearAttn(lin) = &weights.layers[0].mixer else {
             panic!("layer 0 must be LinearAttn");
@@ -723,12 +754,54 @@ mod tests {
         let config = Qwen35Config::from_json_bytes(TINY_CONFIG_JSON.as_bytes()).expect("config");
         // Synthesize the same archive but with `norm.weight` at [63] instead of [64].
         let bad_key = format!("{TEXT_PREFIX}.norm.weight");
-        let archive_bytes = synthesize_archive_bytes_with(&config, |key, _default| {
+        let archive_bytes = synthesize_archive_bytes_with(&config, false, |key, _default| {
             (key == bad_key).then(|| vec![63])
         });
         let archive = SafeTensors::deserialize(&archive_bytes).expect("deserialize");
 
         assert!(load_qwen35_weights(&archive, &config, &device).is_err());
+    }
+
+    /// The tiny config with `tie_word_embeddings` flipped to `false` — the
+    /// 27B's untied case, which makes the loader require a separate
+    /// `language_model.lm_head`. Built from [`TINY_CONFIG_JSON`] so the two
+    /// stay in sync.
+    fn tiny_config_untied() -> Qwen35Config {
+        let json = TINY_CONFIG_JSON.replace(
+            "\"tie_word_embeddings\": true",
+            "\"tie_word_embeddings\": false",
+        );
+        Qwen35Config::from_json_bytes(json.as_bytes()).expect("config")
+    }
+
+    #[test]
+    fn loads_untied_lm_head() {
+        let device = Device::shared().expect("device");
+        let config = tiny_config_untied();
+        assert!(!config.tie_word_embeddings);
+        // Archive includes the separate `language_model.lm_head` triple.
+        let archive_bytes = synthesize_archive_bytes_with(&config, true, |_, _| None);
+        let archive = SafeTensors::deserialize(&archive_bytes).expect("deserialize");
+
+        let weights = load_qwen35_weights(&archive, &config, &device).expect("load");
+
+        let lm_head = weights
+            .lm_head
+            .expect("untied config must load a separate lm_head");
+        assert_eq!(lm_head.shape().dims(), &[256, 64]);
+    }
+
+    #[test]
+    fn untied_missing_lm_head_errors() {
+        let device = Device::shared().expect("device");
+        let config = tiny_config_untied();
+        // Untied config, but the archive LACKS `language_model.lm_head.*`.
+        let archive_bytes = synthesize_archive_bytes_with(&config, false, |_, _| None);
+        let archive = SafeTensors::deserialize(&archive_bytes).expect("deserialize");
+
+        let err = load_qwen35_weights(&archive, &config, &device)
+            .expect_err("untied config without lm_head must error");
+        assert!(matches!(err, Error::MissingKey { ref key } if key.contains("lm_head")));
     }
 
     fn checkpoint_path() -> Option<PathBuf> {
