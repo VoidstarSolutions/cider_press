@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#   "mlx-lm",
+#   "mlx-lm>=0.31",
 #   "huggingface-hub>=0.25",
 #   "safetensors>=0.4",
 # ]
@@ -55,7 +55,8 @@ def main() -> None:
 
     # 1. Authoritative config.
     cfg_path = os.path.join(local, "config.json")
-    cfg = json.load(open(cfg_path))
+    with open(cfg_path, encoding="utf-8") as f:
+        cfg = json.load(f)
     print("\n=== config.json ===")
     print(json.dumps(cfg, indent=2))
 

@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#   "mlx-lm",
+#   "mlx-lm>=0.31",
 # ]
 # ///
 """Phase-0/1 golden fixtures for the Qwen3.5/3.6 Gated-DeltaNet port.
@@ -14,7 +14,7 @@ the incumbent. Granularity matches the roadmap phase gates:
 
   - embed              : embedding output            (loader / embed step)
   - layer0_in/out      : one **GDN** layer (linear)  (Phase 3 gate)
-  - layer3_in/out      : one **gated-attention** layer(Phase 2 gate)
+  - layer3_in/out      : one **gated-attention** layer (Phase 2 gate)
   - final_hidden       : post final-norm             (assembly)
   - logits             : lm_head output (tied on 4B, separate on 27B) (Phase 4 gate)
 
