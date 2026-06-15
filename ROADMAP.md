@@ -2,7 +2,7 @@
 
 > **Status:** Phases 0–2 complete — Phase 0 (docs + tooling, 2026-06-14),
 > Phase 1 (config + text-only loader), Phase 2 (gated full-attention layer,
-> 2026-06-15); Phase 3 (Gated-DeltaNet, sequential form) is next. This is the
+> 2026-06-14); Phase 3 (Gated-DeltaNet, sequential form) is next. This is the
 > *strategic* roadmap. Each phase below gets its own detailed,
 > TDD-style implementation plan (via the `writing-plans` skill) at the moment it
 > is started — once the relevant mlx-lm reference source is in hand and the code
