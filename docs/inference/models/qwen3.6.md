@@ -192,6 +192,25 @@ Incumbent baseline to beat (mlx-lm, this machine): 27B decode **~33 tok/s** at
   → Phases 6–7; and the Qwen3.5 `chat_template.jinja` does not render in the current
   `minijinja` engine (a `[::-1]` step-slice + `|length` arithmetic) — `--no-chat-template`
   works; native templated chat is a follow-up. Phase 4 complete.
+- **Phase 5 (scale to the 27B) landed — the Qwen3.6-27B runs end-to-end:** the
+  multi-shard loader (`TensorLookup` trait + `ShardedArchive` over
+  `model.safetensors.index.json`; the 27B is 3 shards), the untied `lm_head`
+  (`language_model.lm_head`, loaded when `tie_word_embeddings=false`; the model
+  projects through it instead of the embedding), and the CLI dispatching sharded
+  vs single-file. The 64 layers / 48 value-heads / `value_dim 6144` are all
+  config-parameterized (no code change). Three **scale-specific** kernel/loader
+  fixes the 4B never tripped: (1) the 27B stores `A_log` **bf16** (4B was f32) —
+  upcast to f32 at load; (2) `hidden = 5120` exceeds the RMSNorm single-row limit
+  (4096) — dispatch the vendored `rms_looped` variant; (3) the GDN `in_proj_a/b`
+  have **N=48** (not a multiple of 32) — wire the vendored non-aligned
+  `affine_qmm_t` (`alN_false`) prefill variant (aligned path byte-identical). **Parity:**
+  the cider greedy token stream matches mlx-lm **bit-exactly (8/8 tokens)** on the
+  sharded 27B (env+fixture-gated, `#[ignore]`). Peak RSS ~31 GB (the `fs::read`
+  transient: ~15 GB host shard bytes + ~15 GB device upload), comfortably within
+  64 GB. Deferred: **memory** — mmap'ing the shards would roughly halve the peak
+  (~16 GB) by skipping the host Vec; **perf** — cider's naive per-token GDN over
+  48×64 makes 27B decode slow (the chunkwise-parallel GDN kernel is the Phase-7
+  perf-lead lever, ~33 tok/s mlx-lm baseline to beat). Phase 5 complete.
 - mRoPE interleave layout for text (sections `[11,11,10]` = 32 rotary pairs):
   **confirmed during Phase 2** — `rope_type=default` collapses mRoPE to plain 1-D
   partial RoPE for text, so no multi-section position handling is needed.

@@ -151,10 +151,18 @@ concrete **parity gate** (the Qwen2.5 discipline). Phases 0–5 reach *correctne
   4B runs end-to-end via the CLI (`--no-chat-template`; native chat template is a
   `minijinja` follow-up).
 
-### Phase 5 — Scale to 27B (functional milestone — *it runs*)
+### Phase 5 — Scale to 27B (functional milestone — *it runs*) ✅ **LANDED**
 - Loader handles untied embeddings, 64 layers, the official quantization; memory
   profiling on the 64 GB machine; end-to-end correctness vs mlx-lm 27B.
 - **Exit:** **Qwen3.6-27B runs end-to-end in the CLI, parity-validated, fits in memory.**
+- **Done (2026-06-15):** multi-shard loader (`TensorLookup`/`ShardedArchive` over
+  `index.json`), untied `lm_head`, CLI sharded dispatch. Three 27B-only kernel/loader
+  fixes the 4B never hit: bf16 `A_log` upcast, `rms_looped` for hidden 5120 (>4096),
+  and the non-aligned `affine_qmm_t` (`alN_false`) prefill variant for the GDN N=48
+  projections (aligned path byte-identical). **Greedy stream bit-exact (8/8) vs mlx-lm**
+  on the sharded 27B; peak RSS ~31 GB (fs::read transient), comfortably within 64 GB.
+  Deferred: mmap (~halve peak), and perf — naive per-token GDN makes 27B decode slow
+  (the Phase-7 chunkwise GDN kernel is the lever; ~33 tok/s mlx-lm baseline).
 
 ### Phase 6 — Perf baseline + dispatch levers
 - Measure decode tok/s + prefill ms vs `mlx_lm` (27B and 4B). Apply command-buffer
