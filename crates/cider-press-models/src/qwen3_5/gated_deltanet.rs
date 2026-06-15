@@ -1,13 +1,17 @@
 //! Qwen3.5 / Qwen3.6 Gated-DeltaNet linear-attention mixer.
 //!
 //! Phase-3 lands the mixer's building blocks incrementally: the depthwise
-//! causal Conv1d that opens the mixer (over the `q‖k‖v` projection) and the
+//! causal Conv1d that opens the mixer (over the `q‖k‖v` projection), the
 //! per-(token, value-head) gates (`compute_g` — the Mamba2 forget gate — and
-//! `gdn_beta`, computed in fp32). The `GatedDeltaNet` struct, the q/k norm,
-//! and the gated recurrence land in later phase-3 tasks. See
-//! `docs/inference/models/qwen3.6.md` and `ROADMAP.md`.
+//! `gdn_beta`, computed in fp32), and the q/k/v preparation that feeds the
+//! recurrence — `split_qkv` (the `conv_out` → per-head `q`/`k`/`v` split),
+//! `qk_norm_scale` (the weightless per-head RMSNorm + scalar scale applied to
+//! `q` and `k`), and `gqa_repeat` (the interleaved key/value-head broadcast).
+//! The `GatedDeltaNet` struct and the gated recurrence land in later phase-3
+//! tasks. See `docs/inference/models/qwen3.6.md` and `ROADMAP.md`.
 
 use cider_press_runtime::{DType, Tensor};
+use half::bf16;
 
 use crate::error::{Error, Result};
 
@@ -198,11 +202,138 @@ pub(crate) fn gdn_beta(b: &Tensor) -> Result<Tensor> {
     Ok(b.sigmoid()?.cast(DType::F32)?)
 }
 
+/// Split the post-conv `conv_out` `[1, T, conv_dim]` into per-head `q`
+/// `[1, T, Hk, Dk]`, `k` `[1, T, Hk, Dk]`, and `v` `[1, T, Hv, Dv]`. The split
+/// boundaries are `key_dim = Hk·Dk` and `2·key_dim`; the value tail is
+/// `value_dim = Hv·Dv`. Requires `conv_dim == 2·Hk·Dk + Hv·Dv`.
+//
+// mlx-lm `qwen3_5.py:GatedDeltaNet`: q, k, v = split(conv_out, [key_dim,
+// 2*key_dim], -1) then reshaped to (.., Hk, Dk) / (.., Hk, Dk) / (.., Hv, Dv).
+// Slices feed reshape (and downstream binary ops), so copy() each to a dense
+// leaf — view chains aren't accepted.
+#[allow(dead_code)] // wired into GatedDeltaNet in B6.
+pub(crate) fn split_qkv(
+    conv_out: &Tensor,
+    hk: usize,
+    hv: usize,
+    dk: usize,
+    dv: usize,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let dims = conv_out.shape().dims();
+    if dims.len() != 3 || dims[0] != 1 {
+        return Err(Error::InvalidArgument(format!(
+            "split_qkv: conv_out must be rank-3 [1, T, conv_dim]; got {dims:?}",
+        )));
+    }
+    let (t, conv_dim) = (dims[1], dims[2]);
+    let key_dim = hk * dk;
+    let value_dim = hv * dv;
+    if conv_dim != 2 * key_dim + value_dim {
+        return Err(Error::InvalidArgument(format!(
+            "split_qkv: conv_dim {conv_dim} != 2*Hk*Dk + Hv*Dv ({}); \
+             Hk={hk}, Hv={hv}, Dk={dk}, Dv={dv}",
+            2 * key_dim + value_dim,
+        )));
+    }
+
+    let q = conv_out
+        .slice(&[0..1, 0..t, 0..key_dim])?
+        .copy()?
+        .reshape([1usize, t, hk, dk])?;
+    let k = conv_out
+        .slice(&[0..1, 0..t, key_dim..2 * key_dim])?
+        .copy()?
+        .reshape([1usize, t, hk, dk])?;
+    let v = conv_out
+        .slice(&[0..1, 0..t, 2 * key_dim..conv_dim])?
+        .copy()?
+        .reshape([1usize, t, hv, dv])?;
+    Ok((q, k, v))
+}
+
+/// Weightless per-head RMSNorm over the last axis (`D`) followed by a scalar
+/// `scale` broadcast. `x` `[1, T, H, D]` BF16; the RMSNorm uses eps `1e-6` and
+/// a unit (`gamma = 1`) weight, so it normalizes each head row without an
+/// affine transform. Returns `[1, T, H, D]` BF16.
+//
+// mlx-lm: q = (inv**2) * rms_norm(q, None, 1e-6); k = inv * rms_norm(k, None,
+// 1e-6) with inv = Dk**-0.5 — so the caller passes scale = 1/Dk for q and
+// 1/sqrt(Dk) for k. The fused `Tensor::rms_norm` requires a gamma, so the
+// weightless variant is a ones-tensor [D]; rms_norm reduces the trailing axis
+// in fp32 and returns BF16, matching mlx's fused weightless rms_norm. The
+// reshaped/sliced input is a view, so copy() it to a dense leaf first.
+#[allow(dead_code)] // wired into GatedDeltaNet in B6.
+pub(crate) fn qk_norm_scale(x: &Tensor, scale: f32) -> Result<Tensor> {
+    let dims = x.shape().dims();
+    if dims.len() != 4 || dims[0] != 1 {
+        return Err(Error::InvalidArgument(format!(
+            "qk_norm_scale: x must be rank-4 [1, T, H, D]; got {dims:?}",
+        )));
+    }
+    if x.dtype() != DType::BF16 {
+        return Err(Error::InvalidArgument(format!(
+            "qk_norm_scale: x must be BF16; got {:?}",
+            x.dtype()
+        )));
+    }
+    let (t, heads, dim) = (dims[1], dims[2], dims[3]);
+    let device = x.device().ok_or_else(|| {
+        Error::InvalidArgument("qk_norm_scale: x has no device (placeholder)".into())
+    })?;
+
+    // Weightless RMSNorm: gamma = 1. rms_norm requires a contiguous, non-view
+    // input — copy() the (possibly reshaped) x to a dense leaf.
+    let ones = Tensor::from_slice(device, &vec![bf16::ONE; dim], [dim])?;
+    let normed = x.copy()?.rms_norm(&ones, 1e-6)?;
+
+    // Broadcast scalar scale. The binary op's strided dispatch is only wired up
+    // to rank 3, so flatten the contiguous rms_norm output to rank-1, multiply
+    // by the broadcast scalar, then restore the [1, T, H, D] shape.
+    let scale_t = Tensor::from_slice(device, &[bf16::from_f32(scale)], [1usize])?;
+    let scaled = normed.reshape([t * heads * dim])?.copy()?.mul(&scale_t)?;
+    Ok(scaled.reshape([1usize, t, heads, dim])?)
+}
+
+/// Interleaved GQA repeat: broadcast `[1, T, Hk, D]` to `[1, T, Hv, D]` by a
+/// factor `Hv / Hk` over the head axis. Output head `hv` reads input head
+/// `hv / factor` — i.e. each input head `i` becomes the `factor` contiguous
+/// output heads `i·factor .. (i+1)·factor`. Requires `Hv % Hk == 0`.
+//
+// mlx-lm `qwen3_5.py:GatedDeltaNet`: q, k = mx.repeat(., factor, axis=-2)
+// inside the recurrence. mx.repeat replicates each head in place (interleaved),
+// so out heads 2i and 2i+1 both equal in head i — NOT a tiled concat. Composed
+// as reshape [..,Hk,1,D] → broadcast [..,Hk,factor,D] → copy → reshape
+// [..,Hv,D].
+#[allow(dead_code)] // wired into GatedDeltaNet in B6.
+pub(crate) fn gqa_repeat(x: &Tensor, hv: usize) -> Result<Tensor> {
+    let dims = x.shape().dims();
+    if dims.len() != 4 || dims[0] != 1 {
+        return Err(Error::InvalidArgument(format!(
+            "gqa_repeat: x must be rank-4 [1, T, Hk, D]; got {dims:?}",
+        )));
+    }
+    let (t, hk, d) = (dims[1], dims[2], dims[3]);
+    if hk == 0 || hv % hk != 0 {
+        return Err(Error::InvalidArgument(format!(
+            "gqa_repeat: Hv ({hv}) must be a nonzero multiple of Hk ({hk})",
+        )));
+    }
+    let factor = hv / hk;
+
+    // Interleaved replication: insert a unit factor axis, broadcast it, then
+    // fold it back into the head axis. copy() the broadcast view to a dense
+    // leaf before the final reshape (view chains aren't reshaped lazily).
+    Ok(x.copy()?
+        .reshape([1usize, t, hk, 1, d])?
+        .broadcast_to([1usize, t, hk, factor, d])?
+        .copy()?
+        .reshape([1usize, t, hv, d])?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use cider_press_runtime::{Device, Tensor};
-    use half::bf16;
 
     #[test]
     #[allow(clippy::cast_precision_loss)]
@@ -347,5 +478,140 @@ mod tests {
             );
         }
         println!("gates max_abs={max_abs}");
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn split_qkv_maps_columns_to_heads() {
+        let device = Device::shared().unwrap();
+        // Hk=2, Hv=4, Dk=Dv=4 → key_dim=8, value_dim=16, conv_dim=32.
+        let (hk, hv, dk, dv, t) = (2usize, 4usize, 4usize, 4usize, 2usize);
+        let key_dim = hk * dk;
+        let value_dim = hv * dv;
+        let conv_dim = 2 * key_dim + value_dim;
+        assert_eq!(conv_dim, 32);
+
+        let data: Vec<bf16> = (0..t * conv_dim)
+            .map(|i| bf16::from_f32(i as f32 * 0.25))
+            .collect();
+        let conv_out = Tensor::from_slice(&device, &data, [1usize, t, conv_dim]).unwrap();
+
+        let (q, k, v) = split_qkv(&conv_out, hk, hv, dk, dv).unwrap();
+        q.eval().unwrap();
+        k.eval().unwrap();
+        v.eval().unwrap();
+        assert_eq!(q.shape().dims(), [1, t, hk, dk]);
+        assert_eq!(k.shape().dims(), [1, t, hk, dk]);
+        assert_eq!(v.shape().dims(), [1, t, hv, dv]);
+
+        let got_q = q.cpu_to_vec::<bf16>().unwrap();
+        let got_k = k.cpu_to_vec::<bf16>().unwrap();
+        let got_v = v.cpu_to_vec::<bf16>().unwrap();
+
+        // q = first key_dim cols of each row; k = next key_dim; v = tail.
+        for tt in 0..t {
+            let row = tt * conv_dim;
+            for j in 0..key_dim {
+                assert_eq!(got_q[tt * key_dim + j], data[row + j], "q mismatch");
+                assert_eq!(
+                    got_k[tt * key_dim + j],
+                    data[row + key_dim + j],
+                    "k mismatch"
+                );
+            }
+            for j in 0..value_dim {
+                assert_eq!(
+                    got_v[tt * value_dim + j],
+                    data[row + 2 * key_dim + j],
+                    "v mismatch"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn qk_norm_scale_matches_weightless_rms_reference() {
+        let device = Device::shared().unwrap();
+        let (h, d) = (2usize, 4usize);
+        let scale = 0.125f32;
+
+        let data: Vec<bf16> = (0..h * d)
+            .map(|i| bf16::from_f32((i as f32 - 3.0) * 0.5))
+            .collect();
+        let x = Tensor::from_slice(&device, &data, [1usize, 1, h, d]).unwrap();
+
+        let out = qk_norm_scale(&x, scale).unwrap();
+        out.eval().unwrap();
+        assert_eq!(out.shape().dims(), [1, 1, h, d]);
+        let got = out.cpu_to_vec::<bf16>().unwrap();
+
+        // Host weightless RMSNorm over D per head: x / sqrt(mean(x²)+eps) * scale.
+        let xf: Vec<f32> = data.iter().map(|x| x.to_f32()).collect();
+        let mut want = vec![0f32; h * d];
+        for head in 0..h {
+            let row = head * d;
+            let ms = (0..d).map(|j| xf[row + j] * xf[row + j]).sum::<f32>() / d as f32;
+            let inv = 1.0 / (ms + 1e-6).sqrt();
+            for j in 0..d {
+                want[row + j] = xf[row + j] * inv * scale;
+            }
+        }
+
+        let (atol, rtol) = (1e-2f32, 2e-2f32);
+        let mut max_abs = 0f32;
+        for (g, r) in got.iter().map(|x| x.to_f32()).zip(want.iter()) {
+            let abs = (g - r).abs();
+            max_abs = max_abs.max(abs);
+            assert!(
+                abs <= atol + rtol * r.abs(),
+                "qk_norm_scale mismatch: got={g}, ref={r}, abs={abs}"
+            );
+        }
+        println!("qk_norm_scale max_abs={max_abs}");
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn gqa_repeat_is_interleaved() {
+        let device = Device::shared().unwrap();
+        // Hk=2 → Hv=4, D=3. Critical mapping: out heads 2i,2i+1 == in head i.
+        let (hk, hv, d, t) = (2usize, 4usize, 3usize, 1usize);
+        let data: Vec<bf16> = (0..hk * d)
+            .map(|i| bf16::from_f32(i as f32 + 1.0))
+            .collect();
+        let x = Tensor::from_slice(&device, &data, [1usize, t, hk, d]).unwrap();
+
+        let out = gqa_repeat(&x, hv).unwrap();
+        out.eval().unwrap();
+        assert_eq!(out.shape().dims(), [1, t, hv, d]);
+        let got = out.cpu_to_vec::<bf16>().unwrap();
+
+        // out head hv reads in head hv/factor (factor = 2): heads 0,1 == in 0;
+        // heads 2,3 == in 1. Bit-exact (pure data movement).
+        let factor = hv / hk;
+        for out_h in 0..hv {
+            let in_h = out_h / factor;
+            for j in 0..d {
+                assert_eq!(
+                    got[out_h * d + j],
+                    data[in_h * d + j],
+                    "gqa_repeat interleave: out head {out_h} must equal in head {in_h}",
+                );
+            }
+        }
+        // Explicit critical assertions: head 0==head 1==in 0, head 2==head 3==in 1.
+        assert_eq!(got[0..d], got[d..2 * d], "out head 0 must equal out head 1");
+        assert_eq!(
+            got[2 * d..3 * d],
+            got[3 * d..4 * d],
+            "out head 2 must equal out head 3"
+        );
+        assert_eq!(got[0..d], data[0..d], "out head 0 must equal in head 0");
+        assert_eq!(
+            got[2 * d..3 * d],
+            data[d..2 * d],
+            "out head 2 must equal in head 1"
+        );
     }
 }
