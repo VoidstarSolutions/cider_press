@@ -41,7 +41,7 @@ use crate::error::{Error, Result};
 /// `mlx.nn.RMSNorm` itself uses (`mx.fast.rms_norm`); the composition was a
 /// six-dispatch deviation. `Tensor::rms_norm` carries the validation.
 pub fn rms_norm(x: &Tensor, gamma: &Tensor, eps: f32) -> Result<Tensor> {
-    Ok(x.rms_norm(gamma, eps)?)
+    Ok(x.rms_norm(Some(gamma), eps)?)
 }
 
 /// `SiLU` (a.k.a. Swish): `y = x * sigmoid(x)`. Element-wise; output

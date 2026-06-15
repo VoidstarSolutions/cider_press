@@ -277,7 +277,7 @@ pub(crate) fn qk_norm_scale(x: &Tensor, scale: f32) -> Result<Tensor> {
     // Weightless RMSNorm: gamma = 1. rms_norm requires a contiguous, non-view
     // input — copy() the (possibly reshaped) x to a dense leaf.
     let ones = Tensor::from_slice(device, &vec![bf16::ONE; dim], [dim])?;
-    let normed = x.copy()?.rms_norm(&ones, 1e-6)?;
+    let normed = x.copy()?.rms_norm(Some(&ones), 1e-6)?;
 
     // Broadcast scalar scale. The binary op's strided dispatch is only wired up
     // to rank 3, so flatten the contiguous rms_norm output to rank-1, multiply
@@ -603,7 +603,7 @@ impl GatedDeltaNet {
         // 8. Gated output norm + out_proj. The gated-output `norm` gamma is
         //    WEIGHTED (loaded as-is). Then `_precise_swiglu` in fp32:
         //    out = silu(z_f32) * nrm_f32, cast back to bf16.
-        let nrm = y.copy()?.rms_norm(&self.norm, eps)?; // [1, T, Hv, Dv] bf16
+        let nrm = y.copy()?.rms_norm(Some(&self.norm), eps)?; // [1, T, Hv, Dv] bf16
         // `_precise_swiglu` in fp32: out = silu(z_f32) * nrm_f32. Flatten both to
         // rank-2 [T*Hv, Dv] before casting — the cross-dtype strided copy that
         // backs `cast` only supports rank <= 3, and a contiguous flatten keeps

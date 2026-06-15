@@ -698,8 +698,8 @@ fn dispatch(
             scale,
             rotary_dims,
         ),
-        OpKind::RmsNorm { eps } => {
-            dispatch_rms_norm(inner, op, commands, outputs, dst, index_of, eps)
+        OpKind::RmsNorm { eps, w_stride } => {
+            dispatch_rms_norm(inner, op, commands, outputs, dst, index_of, eps, w_stride)
         }
         OpKind::Softmax { precise } => {
             dispatch_softmax(inner, op, commands, outputs, dst, index_of, precise)
@@ -2177,6 +2177,7 @@ fn dispatch_rope(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_rms_norm(
     inner: &Arc<TensorInner>,
     op: &OpNode,
@@ -2185,6 +2186,7 @@ fn dispatch_rms_norm(
     dst: &mut Buffer<u8>,
     index_of: &HashMap<*const TensorInner, usize>,
     eps: f32,
+    w_stride: u32,
 ) -> Result<()> {
     let device = inner
         .device
@@ -2224,6 +2226,7 @@ fn dispatch_rms_norm(
         axis_size,
         n_rows,
         eps,
+        w_stride,
     )?;
     Ok(())
 }

@@ -27,11 +27,19 @@ const N_READS: usize = 4;
 const LOOPED_LIMIT: usize = 4096;
 
 /// Fused `RMSNorm` over the last (contiguous) axis of a row-major
-/// `[n_rows, axis_size]` bf16 input, scaled by a rank-1 `[axis_size]`
-/// weight. Single dispatch of MLX's `rms_single_row`; one threadgroup per
-/// row.
+/// `[n_rows, axis_size]` bf16 input, scaled by a weight. Single dispatch of
+/// MLX's `rms_single_row`; one threadgroup per row.
 ///
-/// `x` and `out` are `n_rows * axis_size` long; `w` is `axis_size` long.
+/// `w_stride` is the per-element stride into `w` (matching MLX's
+/// `(w.ndim() == 1) ? w.strides()[0] : 0`): pass `1` with a rank-1
+/// `[axis_size]` weight for the standard affine gamma, or `0` with a
+/// 1-element `[1.0]` scalar for the weightless (`weight=None`) case — every
+/// lane then reads `w[0]`. The forward kernel always multiplies by
+/// `w[w_stride * i]`; there is no separate weightless code path (`has_w` is
+/// consulted only by the unused VJP variants).
+///
+/// `x` and `out` are `n_rows * axis_size` long; `w` is `axis_size` long when
+/// `w_stride == 1`, or `1` long when `w_stride == 0`.
 #[allow(clippy::too_many_arguments)]
 pub fn rms_norm_bf16(
     commands: &mut Commands<'_>,
@@ -42,6 +50,7 @@ pub fn rms_norm_bf16(
     axis_size: usize,
     n_rows: usize,
     eps: f32,
+    w_stride: u32,
 ) -> Result<()> {
     if axis_size == 0 || n_rows == 0 {
         return Err(Error::InvalidArgument(
@@ -67,9 +76,12 @@ pub fn rms_norm_bf16(
             out.len()
         )));
     }
-    if w.len() != axis_size {
+    // Weighted (stride 1): `w` is the `[axis_size]` gamma. Weightless
+    // (stride 0): `w` is a 1-element `[1.0]` scalar read by every lane.
+    let expected_w = if w_stride == 0 { 1 } else { axis_size };
+    if w.len() != expected_w {
         return Err(Error::InvalidArgument(format!(
-            "rms_norm_bf16: w.len() ({}) != axis_size ({axis_size})",
+            "rms_norm_bf16: w.len() ({}) != {expected_w} (w_stride={w_stride})",
             w.len()
         )));
     }
@@ -81,9 +93,6 @@ pub fn rms_norm_bf16(
             "rms_norm_bf16: axis_size {axis_size} overflows u32"
         ))
     })?;
-    // Contiguous rank-1 weight ⇒ unit stride (matches MLX's
-    // `(w.ndim() == 1) ? w.strides()[0] : 0`).
-    let w_stride: u32 = 1;
 
     {
         let encoder = commands.encoder()?;

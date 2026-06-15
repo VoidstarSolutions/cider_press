@@ -304,15 +304,21 @@ pub enum OpKind {
     /// Fused last-axis `RMSNorm`: `out = w * x * rsqrt(mean(x²) + eps)`,
     /// reduced per row in fp32. Inputs (in [`Tensor::op_inputs`] order)
     /// are `[x, w]` — `x` a dense, contiguous, [`DType::BF16`] tensor of
-    /// rank ≥ 1, `w` a rank-1 `[hidden]` weight matching `x`'s trailing
-    /// axis. Output has the same shape and dtype as `x`. Single-row
-    /// kernel only (trailing axis ≤ 4096). Replaces the composed
-    /// square→mean→rsqrt→mul→mul chain with one dispatch.
+    /// rank ≥ 1, `w` a weight matching `x`'s trailing axis (rank-1
+    /// `[hidden]` when `w_stride == 1`; a 1-element `[1.0]` scalar when
+    /// `w_stride == 0`, the weightless / `weight=None` case). Output has the
+    /// same shape and dtype as `x`. Single-row kernel only (trailing axis ≤
+    /// 4096). Replaces the composed square→mean→rsqrt→mul→mul chain with one
+    /// dispatch.
     RmsNorm {
         /// Variance-stabilising epsilon added before the `rsqrt`
         /// (`1e-6` for Qwen2.5). Carried as `f32` — the reason this enum
         /// is `PartialEq` but not `Eq`.
         eps: f32,
+        /// Per-element stride into `w`: `1` for a weighted `[hidden]` gamma,
+        /// `0` for the weightless scalar (every lane reads `w[0]`). Mirrors
+        /// mlx's `(w.ndim() == 1) ? w.strides()[0] : 0`.
+        w_stride: u32,
     },
     /// Numerically-stable softmax along the trailing axis. Inputs (in
     /// [`Tensor::op_inputs`] order) are `[input]` — a dense,
@@ -1817,12 +1823,10 @@ impl Tensor {
     /// - The trailing axis is ≤ 4096 (the single-row kernel limit).
     ///
     /// Output has the same shape, dtype, and (dense) layout as `self`.
-    pub fn rms_norm(&self, weight: &Self, eps: f32) -> Result<Self> {
-        let device = self.inner.device.as_ref().ok_or_else(|| {
-            Error::InvalidArgument(
-                "rms_norm: cannot apply an op to a placeholder (no device)".into(),
-            )
-        })?;
+    /// Validate a weighted `rms_norm` gamma: same device as `self`, a dense
+    /// contiguous non-view rank-1 `[hidden]` BF16 leaf. The weightless
+    /// (`None`) path skips this — it binds a cached stride-0 scalar instead.
+    fn validate_rms_gamma(device: &Device, weight: &Self, hidden: usize) -> Result<()> {
         let w_device = weight.inner.device.as_ref().ok_or_else(|| {
             Error::InvalidArgument("rms_norm: cannot use a placeholder as the weight".into())
         })?;
@@ -1831,17 +1835,52 @@ impl Tensor {
                 "rms_norm: x and weight are on different devices".into(),
             ));
         }
-        if self.inner.view.is_some() || weight.inner.view.is_some() {
+        if weight.inner.view.is_some() {
+            return Err(Error::InvalidArgument(
+                "rms_norm: view weight is not supported; copy() first".into(),
+            ));
+        }
+        if weight.inner.dtype != DType::BF16 {
+            return Err(Error::InvalidArgument(format!(
+                "rms_norm: only BF16 is wired (weight={:?})",
+                weight.inner.dtype,
+            )));
+        }
+        if weight.rank() != 1 || weight.shape().dims() != [hidden] {
+            return Err(Error::InvalidArgument(format!(
+                "rms_norm: weight must be rank-1 of size {hidden} (got rank {} shape {:?})",
+                weight.rank(),
+                weight.shape().dims(),
+            )));
+        }
+        match weight.layout() {
+            Layout::Dense { strides } if strides.is_contiguous(weight.shape()) => Ok(()),
+            Layout::Dense { .. } => Err(Error::InvalidArgument(
+                "rms_norm: weight must be contiguous; copy() first".into(),
+            )),
+            Layout::Quantized(_) => Err(Error::InvalidArgument(
+                "rms_norm: quantized weight is not supported".into(),
+            )),
+        }
+    }
+
+    pub fn rms_norm(&self, weight: Option<&Self>, eps: f32) -> Result<Self> {
+        let device = self.inner.device.as_ref().ok_or_else(|| {
+            Error::InvalidArgument(
+                "rms_norm: cannot apply an op to a placeholder (no device)".into(),
+            )
+        })?;
+        if self.inner.view.is_some() {
             return Err(Error::InvalidArgument(
                 "rms_norm: view inputs are not supported; copy() first (eval reads inputs \
                  as dense leaves and does not resolve view chains)"
                     .into(),
             ));
         }
-        if self.inner.dtype != DType::BF16 || weight.inner.dtype != DType::BF16 {
+        if self.inner.dtype != DType::BF16 {
             return Err(Error::InvalidArgument(format!(
-                "rms_norm: only BF16 is wired (x={:?}, weight={:?})",
-                self.inner.dtype, weight.inner.dtype,
+                "rms_norm: only BF16 is wired (x={:?})",
+                self.inner.dtype,
             )));
         }
         if self.rank() == 0 {
@@ -1855,13 +1894,6 @@ impl Tensor {
                 "rms_norm: trailing axis must be non-zero".into(),
             ));
         }
-        if weight.rank() != 1 || weight.shape().dims() != [hidden] {
-            return Err(Error::InvalidArgument(format!(
-                "rms_norm: weight must be rank-1 of size {hidden} (got rank {} shape {:?})",
-                weight.rank(),
-                weight.shape().dims(),
-            )));
-        }
         if hidden > 4096 {
             return Err(Error::InvalidArgument(format!(
                 "rms_norm: trailing axis {hidden} exceeds the single-row kernel limit (4096)"
@@ -1872,21 +1904,38 @@ impl Tensor {
                 "rms_norm: eps must be finite and non-negative (got {eps})"
             )));
         }
-        for (label, t) in [("x", self), ("weight", weight)] {
-            match t.layout() {
-                Layout::Dense { strides } if strides.is_contiguous(t.shape()) => {}
-                Layout::Dense { .. } => {
-                    return Err(Error::InvalidArgument(format!(
-                        "rms_norm: {label} must be contiguous; copy() first"
-                    )));
-                }
-                Layout::Quantized(_) => {
-                    return Err(Error::InvalidArgument(format!(
-                        "rms_norm: quantized {label} is not supported"
-                    )));
-                }
+        match self.layout() {
+            Layout::Dense { strides } if strides.is_contiguous(self.shape()) => {}
+            Layout::Dense { .. } => {
+                return Err(Error::InvalidArgument(
+                    "rms_norm: x must be contiguous; copy() first".into(),
+                ));
+            }
+            Layout::Quantized(_) => {
+                return Err(Error::InvalidArgument(
+                    "rms_norm: quantized x is not supported".into(),
+                ));
             }
         }
+
+        // Weighted: validate the caller's `[hidden]` gamma, stride 1.
+        // Weightless (`None`, mlx's `weight=None`): bind the device's cached
+        // `[1.0]` scalar with `w_stride = 0` — every lane reads `w[0]`, an
+        // identity gamma without a per-call `[hidden]` ones upload.
+        let (w, w_stride) = if let Some(weight) = weight {
+            Self::validate_rms_gamma(device, weight, hidden)?;
+            (weight.clone(), 1u32)
+        } else {
+            let one_shape = Shape::from([1usize]);
+            let one = Self::host_leaf(
+                device,
+                one_shape.clone(),
+                DType::BF16,
+                dense_layout(&one_shape),
+                device.scalar_one_bf16()?,
+            );
+            (one, 0u32)
+        };
 
         let out_shape = self.shape().clone();
         let layout = dense_layout(&out_shape);
@@ -1895,8 +1944,8 @@ impl Tensor {
             out_shape,
             DType::BF16,
             layout,
-            OpKind::RmsNorm { eps },
-            vec![self.clone(), weight.clone()],
+            OpKind::RmsNorm { eps, w_stride },
+            vec![self.clone(), w],
         ))
     }
 

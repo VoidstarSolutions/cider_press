@@ -27,6 +27,44 @@ fn rms_norm_op_small() {
     parity(&[3, 64]);
 }
 
+/// Weightless `rms_norm` (gamma = `None`, mlx's `weight=None`) must be
+/// **bit-exact** with the weighted path fed an explicit `[axis]` ones-vector:
+/// it's the same kernel over the same values — a stride-0 `w[0] = 1.0` read by
+/// every lane vs a `[D]` ones gamma `w[i] = 1.0`. This is the optional-gamma
+/// surface the Gated-DeltaNet q/k norm (`qk_norm_scale`) consumes.
+#[test]
+fn rms_norm_weightless_matches_explicit_ones() {
+    let device = Device::shared().expect("device");
+    // [3,64] (small) and [1,4,128] (the GDN linear_key_head_dim).
+    for shape in [vec![3usize, 64], vec![1usize, 4, 128]] {
+        let hidden = *shape.last().unwrap();
+        let rows: usize = shape[..shape.len() - 1].iter().product();
+        // Deterministic, varied input across roughly [-2, 2).
+        let x: Vec<bf16> = (0..rows * hidden)
+            .map(|i| {
+                let m = u8::try_from(i * 37 % 101).expect("< 101 fits u8");
+                bf16::from_f32(f32::from(m) / 25.0 - 2.0)
+            })
+            .collect();
+        let xt = Tensor::from_slice(&device, &x, shape.clone()).expect("x tensor");
+
+        let ones = vec![bf16::ONE; hidden];
+        let gt = Tensor::from_slice(&device, &ones, [hidden]).expect("ones gamma");
+        let weighted = xt.rms_norm(Some(&gt), EPS).expect("weighted rms_norm");
+        weighted.eval().expect("eval weighted");
+        let weighted = weighted.cpu_to_vec::<bf16>().expect("read weighted");
+
+        let weightless = xt.rms_norm(None, EPS).expect("weightless rms_norm");
+        weightless.eval().expect("eval weightless");
+        let weightless = weightless.cpu_to_vec::<bf16>().expect("read weightless");
+
+        assert_eq!(
+            weighted, weightless,
+            "weightless != weighted-with-ones for shape {shape:?}"
+        );
+    }
+}
+
 fn parity(shape: &[usize]) {
     let hidden = *shape.last().unwrap();
     let rows: usize = shape[..shape.len() - 1].iter().product();
@@ -36,7 +74,7 @@ fn parity(shape: &[usize]) {
     let xt = Tensor::from_slice(&device, &x, shape).expect("x tensor");
     let gt = Tensor::from_slice(&device, &gamma, [hidden]).expect("gamma tensor");
 
-    let out = xt.rms_norm(&gt, EPS).expect("rms_norm op");
+    let out = xt.rms_norm(Some(&gt), EPS).expect("rms_norm op");
     out.eval().expect("eval");
     let got = out.cpu_to_vec::<bf16>().expect("read out");
 

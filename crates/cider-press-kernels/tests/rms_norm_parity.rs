@@ -43,8 +43,10 @@ fn parity(n_rows: usize, hidden: usize) {
     let mut dst: Buffer<bf16> = device.alloc_buffer(n_rows * hidden).expect("alloc out");
 
     let mut cmds = device.commands().expect("commands");
-    kernels::rms_norm::rms_norm_bf16(&mut cmds, &library, &src, &w, &mut dst, hidden, n_rows, EPS)
-        .expect("dispatch rms_norm");
+    kernels::rms_norm::rms_norm_bf16(
+        &mut cmds, &library, &src, &w, &mut dst, hidden, n_rows, EPS, 1,
+    )
+    .expect("dispatch rms_norm");
     cmds.commit_and_wait().expect("commit");
 
     // SAFETY: commit_and_wait synchronised; GPU is done with `dst`.
