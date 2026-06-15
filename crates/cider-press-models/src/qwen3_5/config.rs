@@ -136,6 +136,13 @@ impl Qwen35Config {
     pub fn from_json_bytes(bytes: &[u8]) -> Result<Self> {
         let raw: RawConfig = serde_json::from_slice(bytes).map_err(Error::from)?;
         let t = raw.text_config;
+        if t.layer_types.len() != t.num_hidden_layers {
+            return Err(Error::InvalidArgument(format!(
+                "layer_types length {} != num_hidden_layers {}",
+                t.layer_types.len(),
+                t.num_hidden_layers
+            )));
+        }
         Ok(Self {
             hidden_size: t.hidden_size,
             num_hidden_layers: t.num_hidden_layers,
@@ -290,6 +297,27 @@ mod tests {
         assert_eq!(cfg.q_proj_out_dim(), 8192);
         assert_eq!(cfg.kv_dim(), 1024);
         assert_eq!(cfg.quantization().unwrap().group_size(), 64);
+    }
+
+    #[test]
+    fn rejects_layer_types_length_mismatch() {
+        // `num_hidden_layers` is 4 but only three `layer_types` are listed —
+        // the loader indexes `layer_types[i]` over `0..num_hidden_layers`, so
+        // parsing must reject this rather than defer to an index panic.
+        const MISMATCH: &str = r#"{
+            "model_type": "qwen3_5",
+            "text_config": {
+                "hidden_size": 2560, "num_hidden_layers": 4, "num_attention_heads": 16,
+                "num_key_value_heads": 4, "head_dim": 256, "intermediate_size": 9216,
+                "vocab_size": 248320, "rms_norm_eps": 1e-06, "full_attention_interval": 4,
+                "linear_conv_kernel_dim": 4, "linear_key_head_dim": 128,
+                "linear_num_key_heads": 16, "linear_num_value_heads": 32,
+                "linear_value_head_dim": 128, "tie_word_embeddings": true,
+                "layer_types": ["linear_attention", "linear_attention", "full_attention"],
+                "rope_parameters": { "rope_theta": 10000000, "partial_rotary_factor": 0.25, "mrope_section": [11, 11, 10] }
+            }
+        }"#;
+        assert!(Qwen35Config::from_json_bytes(MISMATCH.as_bytes()).is_err());
     }
 
     #[test]
