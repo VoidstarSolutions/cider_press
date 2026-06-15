@@ -37,7 +37,9 @@ const TEXT_PREFIX: &str = "language_model.model";
 #[non_exhaustive]
 pub struct Qwen35Weights {
     /// Token embedding table, quantized. Logical shape `[vocab_size,
-    /// hidden_size]`. Tied with the LM head (no separate `lm_head`).
+    /// hidden_size]`. On the 4B dev vehicle the LM head is tied to this table;
+    /// the 27B target ships a separate `lm_head` — TODO(27B): load it as an
+    /// `Option<QuantizedWeight>` when `tie_word_embeddings == false`.
     pub embed: QuantizedWeight,
     /// Final `RMSNorm` gamma. Dense bf16, shape `[hidden_size]`.
     pub norm: Tensor,
@@ -304,6 +306,8 @@ fn load_linear_attn(
     )?;
 
     let a_log = read_dense_tensor(archive, &format!("{prefix}.A_log"), device)?;
+    // The 4B dev vehicle stores `A_log` as f32; the 27B target stores it bf16
+    // (both upcast to fp32 in `compute_g`). TODO(27B): accept BF16 here too.
     expect_dense(
         &format!("{prefix}.A_log"),
         &a_log,
@@ -434,7 +438,7 @@ fn expect_q_shape(key: &str, qw: &QuantizedWeight, n: usize, k: usize) -> Result
 fn expect_dense(key: &str, t: &Tensor, dtype: DType, shape: &[usize]) -> Result<()> {
     if !matches!(t.layout(), Layout::Dense { .. }) {
         return Err(Error::InvalidArgument(format!(
-            "{key:?}: expected dense layout, got quantized"
+            "{key}: expected dense layout, got quantized"
         )));
     }
     if t.dtype() != dtype {
@@ -733,6 +737,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a real checkpoint via CIDER_QWEN35_CHECKPOINT_PATH"]
     fn loads_4b_checkpoint_with_validated_shapes() {
         let Some(dir) = checkpoint_path() else {
             eprintln!("skipping: CIDER_QWEN35_CHECKPOINT_PATH unset");

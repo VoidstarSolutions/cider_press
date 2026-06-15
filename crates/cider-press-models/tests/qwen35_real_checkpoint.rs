@@ -17,6 +17,7 @@ fn checkpoint_path() -> Option<PathBuf> {
 }
 
 #[test]
+#[ignore = "requires a real checkpoint via CIDER_QWEN35_CHECKPOINT_PATH"]
 fn real_checkpoint_loads_and_byte_round_trips() {
     const P: &str = "language_model.model";
 
