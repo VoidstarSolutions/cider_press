@@ -235,6 +235,16 @@ impl GatedAttention {
     /// Build from a layer's loaded full-attention weights and the model config.
     /// Clones the weights (cheap refcount bumps on shared device buffers).
     pub fn from_weights(w: &Qwen35FullAttnWeights, config: &Qwen35Config) -> Result<Self> {
+        // Gated attention has no additive Q/K/V/O bias; the projections below
+        // are built with `None`. Reject `attention_bias = true` rather than
+        // silently drop biases a checkpoint expects to be applied.
+        if config.attention_bias {
+            return Err(Error::InvalidArgument(
+                "GatedAttention::from_weights: attention_bias = true is not supported (gated \
+                 attention uses bias-free Q/K/V/O projections)"
+                    .into(),
+            ));
+        }
         Ok(Self {
             q_proj: Linear::new(w.q_proj.clone(), None)?,
             k_proj: Linear::new(w.k_proj.clone(), None)?,
@@ -366,7 +376,7 @@ impl GatedAttention {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cider_press_runtime::{Device, Tensor};
+    use cider_press_runtime::{Device, OpKind, Tensor};
     use half::bf16;
 
     use crate::qwen3_5::config::Qwen35Config;
@@ -515,6 +525,17 @@ mod tests {
 
         // Routes through the `t_q == 1` branch -> Tensor::sdpa fused kernel.
         let got = sdpa(&q, &k, &v).unwrap();
+        // Guard the routing itself: a numeric-only check would still pass if
+        // this silently fell back to `composed_sdpa`, defeating the test's
+        // purpose. Assert the graph node is the fused decode SDPA op.
+        assert!(
+            matches!(
+                got.op_kind(),
+                Some(OpKind::Sdpa { gqa_factor, causal: false, .. }) if gqa_factor == ratio
+            ),
+            "decode path must route to the fused Tensor::sdpa op (got {:?})",
+            got.op_kind(),
+        );
         got.eval().unwrap();
         assert_eq!(got.shape().dims(), &[1, h_q, 1, d]);
         let got = got.cpu_to_vec::<bf16>().unwrap();
