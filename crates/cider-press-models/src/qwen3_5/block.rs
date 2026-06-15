@@ -107,7 +107,7 @@ impl Qwen35DecoderLayer {
             ));
         };
         let normed = self.input_layernorm.forward(hidden)?;
-        let mixer_out = gdn.forward(&normed)?;
+        let mixer_out = gdn.forward(&normed, None)?;
         self.mlp_residual(hidden, &mixer_out)
     }
 

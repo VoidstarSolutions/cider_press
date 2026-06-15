@@ -478,8 +478,11 @@ pub(crate) fn recurrence(
 /// q/k norm+scale → GQA repeat → forget/`beta` gates → fp32 delta-rule
 /// recurrence → gated output `RMSNorm` (× `silu(z)` in fp32) → `out_proj`.
 ///
-/// The parity gate runs the prefill-from-zero path (`cache = None`): both the
-/// conv history and the recurrence state start at zeros.
+/// Decode threads a [`LinearState`](crate::qwen3_5::cache::LinearState) cache:
+/// the incoming conv window and recurrent state are read in, and the updated
+/// states are written back. `cache = None` is the prefill-from-zero path (both
+/// the conv history and the recurrence state start at zeros) and is what the
+/// parity gate runs.
 #[derive(Debug)]
 pub struct GatedDeltaNet {
     in_proj_qkv: Linear,
@@ -515,10 +518,22 @@ impl GatedDeltaNet {
     }
 
     /// Run the Gated-DeltaNet mixer on `hidden` (`[1, T, hidden_size]`, dense
-    /// BF16, already input-layernorm'd by the caller). Prefill-from-zero state
-    /// (no cache). Returns `[1, T, hidden_size]`, lazy.
+    /// BF16, already input-layernorm'd by the caller). Returns
+    /// `[1, T, hidden_size]`, lazy.
+    ///
+    /// `cache` threads the two-part GDN state across calls. When `Some(st)`, the
+    /// incoming `st.conv_state` window and `st.recurrent_state` seed the causal
+    /// conv and the recurrence, and the updated states are written back into
+    /// `st` (the cache Tensors are lazy — `eval` them before a dependent call in
+    /// a later command buffer). When `None`, the conv history and recurrence
+    /// state start at zeros (prefill-from-zero) and the updated states are
+    /// discarded.
     #[allow(clippy::many_single_char_names)]
-    pub fn forward(&self, hidden: &Tensor) -> Result<Tensor> {
+    pub fn forward(
+        &self,
+        hidden: &Tensor,
+        cache: Option<&mut crate::qwen3_5::cache::LinearState>,
+    ) -> Result<Tensor> {
         let config = &self.config;
         let hidden_size = config.hidden_size;
         let hk = config.linear_num_key_heads;
@@ -556,6 +571,14 @@ impl GatedDeltaNet {
             Error::InvalidArgument("GatedDeltaNet::forward: hidden has no device".into())
         })?;
 
+        // Read the incoming cache state up front (cheap Arc-handle clones) so the
+        // later `&mut` write-back doesn't conflict with these `&` reads.
+        let conv_in = match cache.as_ref() {
+            Some(st) => st.conv_state.clone(),
+            None => Tensor::zeros(device, [1usize, 3, conv_dim], DType::BF16)?,
+        };
+        let state0 = cache.as_ref().map(|st| st.recurrent_state.clone());
+
         // 1. Project. All bias-free Linears.
         let qkv = self.in_proj_qkv.forward(hidden)?; // [1, T, conv_dim]
         let z = self
@@ -565,9 +588,8 @@ impl GatedDeltaNet {
         let a = self.in_proj_a.forward(hidden)?; // [1, T, Hv]
         let b = self.in_proj_b.forward(hidden)?; // [1, T, Hv]
 
-        // 2. Causal depthwise conv (prefill: zero history).
-        let conv_state = Tensor::zeros(device, [1usize, 3, conv_dim], DType::BF16)?;
-        let (conv_out, _new_state) = conv1d_causal(&qkv, &conv_state, &self.conv1d_weight)?;
+        // 2. Causal depthwise conv (seeded by the incoming conv window).
+        let (conv_out, new_conv) = conv1d_causal(&qkv, &conv_in, &self.conv1d_weight)?;
 
         // 3. Split into per-head q/k/v.
         let (q, k, v) = split_qkv(&conv_out, hk, hv, dk, dv)?;
@@ -586,15 +608,16 @@ impl GatedDeltaNet {
         let g = compute_g(&a, &self.a_log, &self.dt_bias)?;
         let beta = gdn_beta(&b)?;
 
-        // 7. Delta-rule recurrence (prefill: zero state). Pre-cast q/k/v to f32.
-        //    `Tensor::cast` can't take a rank-4 *view* (the cross-dtype strided
-        //    copy is rank ≤ 3), so materialize each view to a dense leaf first;
-        //    the dense cast path is rank-agnostic.
+        // 7. Delta-rule recurrence (seeded by the incoming recurrent state, or
+        //    zeros at prefill). Pre-cast q/k/v to f32. `Tensor::cast` can't take
+        //    a rank-4 *view* (the cross-dtype strided copy is rank ≤ 3), so
+        //    materialize each view to a dense leaf first; the dense cast path is
+        //    rank-agnostic.
         let to_f32 = |x: &Tensor| -> Result<Tensor> { Ok(x.copy()?.cast(DType::F32)?) };
         let q = to_f32(&q)?;
         let k = to_f32(&k)?;
         let v = to_f32(&v)?;
-        let (y, _state) = recurrence(&q, &k, &v, &g, &beta, None)?; // [1, T, Hv, Dv] bf16
+        let (y, new_state) = recurrence(&q, &k, &v, &g, &beta, state0.as_ref())?; // [1, T, Hv, Dv] bf16
 
         // 8. Gated output norm + out_proj. The gated-output `norm` gamma is
         //    WEIGHTED (loaded as-is). Then `_precise_swiglu` in fp32:
@@ -611,7 +634,15 @@ impl GatedDeltaNet {
             .mul(&nrm_f32)?
             .cast(DType::BF16)?
             .reshape([1usize, t, value_dim])?;
-        self.out_proj.forward(&out)
+        let result = self.out_proj.forward(&out)?;
+
+        // Write back the updated two-part state for the next step (decode).
+        // `None` keeps the prefill-from-zero behavior (states discarded).
+        if let Some(st) = cache {
+            st.conv_state = new_conv;
+            st.recurrent_state = new_state;
+        }
+        Ok(result)
     }
 }
 
