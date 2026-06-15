@@ -143,6 +143,24 @@ impl Qwen35Model {
         self.project_logits(&last)
     }
 
+    /// Post-final-norm hidden states `[1, T, hidden_size]` (before the
+    /// `lm_head`). Mirrors mlx-lm's `lm.norm(x)`; used for backbone parity
+    /// localization — a failure here points at the 32 decoder layers (vs the
+    /// tied head, exercised only by [`forward`](Self::forward)).
+    ///
+    /// # Errors
+    /// `caches.len()` disagrees with the layer count, or any layer / norm op
+    /// fails.
+    pub fn forward_hidden(
+        &self,
+        input_ids: &Tensor,
+        offset: &Tensor,
+        caches: &mut [Qwen35LayerCache],
+    ) -> Result<Tensor> {
+        let hidden = self.hidden_states(input_ids, offset, caches)?;
+        self.final_norm.forward(&hidden)
+    }
+
     /// Embed `input_ids` and run every decoder layer, returning the final
     /// hidden states `[1, T, hidden_size]` (before the final norm / LM head).
     /// Writes each layer's mixer state for all `T` positions into `caches`.
