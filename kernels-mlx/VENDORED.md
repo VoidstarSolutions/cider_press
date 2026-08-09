@@ -10,7 +10,7 @@ preserved here as `COPYING` and applies to every file in this directory.
 ## Upstream commit
 
 ```text
-890644771051c0dada63930819ed8efe7d0fc66f  (2026-06-13)
+8d666298652fdac2e7727ecdcf507b1d199bba16  (2026-08-08)
 ```
 
 The full upstream path is preserved under
