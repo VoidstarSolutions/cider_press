@@ -7,13 +7,13 @@
 #   "safetensors>=0.4",
 # ]
 # ///
-"""Phase-0 architecture probe for the Qwen3.5/3.6 Gated-DeltaNet port.
+"""Architecture probe for the Qwen3.5/3.6 Gated-DeltaNet port.
 
-Locks the two facts Phase 0 needs before any Rust is written:
+Locks the two facts needed before any Rust is written:
 
   1. The authoritative ``config.json`` (every hyperparameter).
   2. The exact safetensors weight-key layout (key -> shape, dtype) — this
-     *is* the loader spec for Phase 1 (the GDN params: the **split**
+     *is* the loader spec (the GDN params: the **split**
      ``in_proj_qkv``/``in_proj_z``/``in_proj_a``/``in_proj_b`` projections —
      the checkpoint splits the reference's fused ``in_proj_qkvz``/``in_proj_ba``
      — ``A_log``, ``dt_bias``, ``conv1d.weight``, the per-layer linear-vs-full

@@ -6,7 +6,7 @@
 # ]
 # ///
 """Dump a greedy (argmax) continuation from mlx_lm for the cider-press
-Qwen3.5 token-stream parity gate (Phase-4 Task C3).
+Qwen3.5 token-stream parity gate.
 
 Loads `mlx_lm.load(<checkpoint>)`, tokenizes a fixed RAW prompt (NO chat
 template — `tokenizer.encode(prompt)`), greedy-generates N tokens (argmax
