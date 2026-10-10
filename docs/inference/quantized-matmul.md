@@ -189,9 +189,10 @@ near-roofline.
 - **`affine_qmm` non-aligned (`_alN_false`) is now wired; non-transposed is not.**
   `qmm.rs` picks `_alN_true` when `N % 32 == 0` (the aligned hot path) and
   `_alN_false` otherwise — the Qwen3.6-27B's GDN `in_proj_a`/`in_proj_b` (N = 48)
-  exercise the non-aligned variant in the M>1 prefill path (bit-exact vs
-  `mx.quantized_matmul`). The non-transposed (`transpose=false`) variant lands
-  when a consumer needs it.
+  exercise the non-aligned variant in the M>1 prefill path (matches
+  `mx.quantized_matmul` within the tested tolerance, `max_relative` 1e-2 /
+  `epsilon` 5e-2; an exact-equality check differed by 2 bf16 ULP on one element).
+  The non-transposed (`transpose=false`) variant lands when a consumer needs it.
 - **Dense `matmul` is now production-unused** — every projection routes through
   the quantized path, so the dense `Tensor::matmul` is retained only as
   scaffolding plus its parity test, not on any live forward path.

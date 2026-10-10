@@ -154,10 +154,13 @@ chunked vs unchunked on a short prefix); this is separate from the cider-vs-mlx-
 parity above. Measured on the 4B: peak footprint ~7.4–7.5 GB at 109,
 217 and 541 prompt tokens (flat), prefill ~150 tok/s; chunk 8 → ~5.6 GB but ~7%
 slower, chunk 32 → ~11.9 GB. On the 27B (`cider-press bench --no-chat-template`,
-560-token prompt, 16-token chunks): peak footprint 31.2 GB (RSS after load
-14.65 GB, so a ~15 GB prefill transient), independent of prompt length; decode
-26.4 tok/s. The chunkwise-parallel GDN kernel (Phase 7) would remove the per-token
-temporaries altogether.
+560-token prompt, 16-token chunks): prefill completes with a 31.2 GB peak
+footprint, which equals the load-time peak (~15 GB host shard bytes + ~15 GB
+device upload), so the chunked-prefill transient stays under it and is not
+separately isolated; decode 26.4 tok/s. The evidence that prefill memory no
+longer grows with prompt length is the 4B figure above (flat at ~7.4–7.5 GB, vs
+45 GB at 109 and ~107 GB at 217 tokens before chunking). The chunkwise-parallel GDN kernel (Phase 7) would remove
+the per-token temporaries altogether.
 
 ## Performance notes
 
