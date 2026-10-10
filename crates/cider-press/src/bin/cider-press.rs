@@ -28,11 +28,6 @@ use serde::Deserialize;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Optional per-OpKind decode GPU-profile callback for `bench_generic`. Only
-/// `Generator<Qwen2Model>` supplies one (`profiled_decode_step` is Qwen2-only);
-/// the Qwen3.5 arm passes `None`.
-type GpuProfileDecode<M> = fn(&mut Generator<M>, u32) -> Result<(), BoxError>;
-
 const DEFAULT_BENCH_PROMPT: &str = "Write a short paragraph about the city of Seattle.";
 
 #[derive(Parser, Debug)]
@@ -352,9 +347,6 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
     )?;
     let ids = loaded.tokenizer.encode(&prompt)?;
 
-    // The per-OpKind GPU decode profile (`profiled_decode_step`) is implemented
-    // only for `Generator<Qwen2Model>`; the Qwen3.5 arm reports basic timing
-    // (prefill ms + decode tok/s) and skips that breakdown with a note.
     match loaded.model {
         LoadedModel::Qwen2(model) => {
             let mut generator = Generator::new(model, args.context_window, loaded.eos_ids)?;
@@ -367,15 +359,11 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
                 rss_pre_load,
                 rss_post_load,
                 &device,
-                /* gpu_profile_decode */ Some(gpu_profile_token),
             )
         }
         LoadedModel::Qwen35(model) => {
             let mut generator = Generator::new(model, args.context_window, loaded.eos_ids)?;
             generator.set_inflight_depth(args.inflight_depth);
-            if args.gpu_profile {
-                println!("  (--gpu-profile ignored: per-OpKind decode breakdown is Qwen2-only)");
-            }
             bench_generic(
                 generator,
                 args,
@@ -384,7 +372,6 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
                 rss_pre_load,
                 rss_post_load,
                 &device,
-                None,
             )
         }
     }
@@ -392,14 +379,8 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
 
 /// The bench timing + reporting loop, generic over the architecture. The decode
 /// timing, synchronous-prefill measurement, RSS/pool reporting, span breakdown,
-/// and generic prefill GPU profile are all model-agnostic. The Qwen2-only
-/// per-OpKind decode GPU profile is passed as an optional callback
-/// (`gpu_profile_decode`); for Qwen3.5 it is `None` and skipped.
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::too_many_lines,
-    clippy::too_many_arguments
-)]
+/// and GPU profiles (decode and prefill) are all model-agnostic.
+#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 fn bench_generic<M: LanguageModel>(
     mut generator: Generator<M>,
     args: &BenchArgs,
@@ -408,7 +389,6 @@ fn bench_generic<M: LanguageModel>(
     rss_pre_load: Option<u64>,
     rss_post_load: Option<u64>,
     device: &Device,
-    gpu_profile_decode: Option<GpuProfileDecode<M>>,
 ) -> Result<(), BoxError> {
     let prompt_len = ids.len();
 
@@ -459,9 +439,9 @@ fn bench_generic<M: LanguageModel>(
     // cache context, and the synchronous prefill timing below resets the caches
     // (`prefill_sync` → `reset`), so it must run after this.
     if args.gpu_profile {
-        if let (Some(profile_decode), Some(id)) = (gpu_profile_decode, last_id) {
+        if let Some(id) = last_id {
             // generate() rejects max_tokens == 0, so last_id is always Some here.
-            profile_decode(&mut generator, id)?;
+            gpu_profile_token(&mut generator, id)?;
         }
     }
 
@@ -573,7 +553,10 @@ fn bench_generic<M: LanguageModel>(
 /// The generator's caches still hold the full generated context, so this is a
 /// realistic full-context decode step (T=1 at the current cache position), not
 /// a cold T=1.
-fn gpu_profile_token(generator: &mut Generator<Qwen2Model>, last_id: u32) -> Result<(), BoxError> {
+fn gpu_profile_token<M: LanguageModel>(
+    generator: &mut Generator<M>,
+    last_id: u32,
+) -> Result<(), BoxError> {
     if !profile::is_enabled() {
         eprintln!("  (--gpu-profile ignored; rebuild with --features profiling)");
         return Ok(());

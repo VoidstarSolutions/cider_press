@@ -1,7 +1,7 @@
 //! Greedy-decode driver over a [`LanguageModel`] + its per-layer caches.
 //!
 //! Generic over the model: [`Generator<M>`] drives any
-//! [`LanguageModel`] (currently [`Qwen2Model`] with
+//! [`LanguageModel`] (currently [`Qwen2Model`](crate::qwen2::Qwen2Model) with
 //! [`KvCache`](cider_press_runtime::KvCache) and
 //! [`Qwen35Model`](crate::qwen3_5::Qwen35Model) with
 //! [`Qwen35LayerCache`](crate::qwen3_5::Qwen35LayerCache)) — the async-
@@ -17,7 +17,6 @@ use cider_press_runtime::{Device, PendingEval, Tensor};
 
 use crate::error::{Error, Result};
 use crate::language_model::LanguageModel;
-use crate::qwen2::Qwen2Model;
 
 /// Owns a model + pre-allocated per-layer caches + the EOS set. One instance
 /// drives one or more `generate` calls; caches are reset on every
@@ -29,6 +28,9 @@ pub struct Generator<M: LanguageModel> {
     eos_ids: HashSet<u32>,
     context_window: usize,
     inflight_depth: usize,
+    /// Tokens fed through the caches so far — the `RoPE` / cache offset of
+    /// the next forward. Advanced by every path that feeds tokens.
+    position: usize,
 }
 
 impl<M: LanguageModel> Generator<M> {
@@ -59,6 +61,7 @@ impl<M: LanguageModel> Generator<M> {
             eos_ids,
             context_window,
             inflight_depth: 1,
+            position: 0,
         })
     }
 
@@ -87,7 +90,9 @@ impl<M: LanguageModel> Generator<M> {
     /// replaying stale writes into the reused slab).
     pub fn reset(&mut self) -> Result<()> {
         let device = Device::shared()?;
-        self.model.reset_caches(&mut self.caches, &device)
+        self.model.reset_caches(&mut self.caches, &device)?;
+        self.position = 0;
+        Ok(())
     }
 
     /// Shared prefill graph builder for the profiling/timing entry points:
@@ -106,7 +111,10 @@ impl<M: LanguageModel> Generator<M> {
         self.reset()?;
         let device = Device::shared()?;
         let chunk_len = self.model.prefill_chunk_len();
-        prefill_last_logits(&self.model, &mut self.caches, &device, input_ids, chunk_len)
+        let logits =
+            prefill_last_logits(&self.model, &mut self.caches, &device, input_ids, chunk_len)?;
+        self.position = input_ids.len();
+        Ok(logits)
     }
 
     /// Run a **prefill** (`T = input_ids.len()`, offset = 0, causal via the
@@ -211,6 +219,7 @@ impl<M: LanguageModel> Generator<M> {
         let chunk_len = self.model.prefill_chunk_len();
         let logits =
             prefill_last_logits(&self.model, &mut self.caches, &device, input_ids, chunk_len)?;
+        self.position = prefill_len;
 
         let vocab = self.model.vocab_size();
         let idx0 = argmax_last_position_lazy(&logits, vocab)?;
@@ -223,11 +232,9 @@ impl<M: LanguageModel> Generator<M> {
         Ok(GenerateIter {
             owner: self,
             device,
-            prefill_len,
             next_id_gpu: idx0,
             inflight,
             depth,
-            committed: 0,
             yielded: 0,
             done: false,
             deferred_err: None,
@@ -236,10 +243,11 @@ impl<M: LanguageModel> Generator<M> {
     }
 }
 
-impl Generator<Qwen2Model> {
-    /// Run one decode-step forward (`T = 1`, offset = the current
-    /// cache position) through the profiling-only [`Tensor::profiled_eval`],
-    /// recording per-OpKind GPU time into the `profile` GPU store.
+impl<M: LanguageModel> Generator<M> {
+    /// Run one decode-step forward (`T = 1`, offset = the generator's
+    /// committed position) through the profiling-only
+    /// [`Tensor::profiled_eval`], recording per-OpKind GPU time into the
+    /// `profile` GPU store.
     ///
     /// `last_id` is the most recently sampled token; the caches must hold
     /// the full preceding context (call this *after* draining a
@@ -248,25 +256,15 @@ impl Generator<Qwen2Model> {
     /// row as a side effect — intended for one-shot profiling, not resumable
     /// generation.
     ///
-    /// Qwen2-only: a profiling/bench helper that reads the concrete
-    /// [`KvCache`](cider_press_runtime::KvCache) position and runs the full
-    /// `forward`. The generic decode path goes through
-    /// [`LanguageModel::forward_last`].
-    ///
     /// # Errors
     /// Tensor construction, forward, or `profiled_eval` failure.
     #[doc(hidden)]
     pub fn profiled_decode_step(&mut self, last_id: u32) -> Result<()> {
         let device = Device::shared()?;
-        let pos = self
-            .caches
-            .first()
-            .map_or(0, cider_press_runtime::KvCache::position);
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let pos_i32 = pos as i32;
         let ids = Tensor::from_slice(&device, &[last_id], [1, 1])?;
-        let offset = Tensor::from_slice(&device, &[pos_i32], [1])?;
-        let logits = self.model.forward(&ids, &offset, &mut self.caches)?;
+        let offset = position_tensor(&device, self.position)?;
+        let logits = self.model.forward_last(&ids, &offset, &mut self.caches)?;
+        self.position += 1;
         logits.profiled_eval()?;
         Ok(())
     }
@@ -283,7 +281,6 @@ impl Generator<Qwen2Model> {
 pub struct GenerateIter<'a, M: LanguageModel> {
     owner: &'a mut Generator<M>,
     device: Device,
-    prefill_len: usize,
     /// Most recent argmax tensor (`[1, 1]` U32), fed into the next forward.
     /// Persists across the in-flight queue draining (needed at depth 0,
     /// where the queue empties between commits), so it is the chain source
@@ -293,8 +290,6 @@ pub struct GenerateIter<'a, M: LanguageModel> {
     inflight: VecDeque<(PendingEval, Tensor)>,
     /// Lookahead distance; target in-flight count is `depth + 1`.
     depth: usize,
-    /// Decode forwards committed so far (the `RoPE` / cache offset source).
-    committed: usize,
     /// Tokens handed back so far (caps at `max_new_tokens`).
     yielded: usize,
     /// EOS seen or max hit — stop committing further lookaheads.
@@ -340,7 +335,6 @@ impl<M: LanguageModel> Iterator for GenerateIter<'_, M> {
                 Ok((pending, idx)) => {
                     self.next_id_gpu = idx.clone();
                     self.inflight.push_back((pending, idx));
-                    self.committed += 1;
                 }
                 // Stash, don't surface: earlier committed tokens are still
                 // valid, and a deeper pipeline must not hide tokens depth 0
@@ -383,13 +377,12 @@ impl<M: LanguageModel> GenerateIter<'_, M> {
     /// sequence — identical to a full `forward` but routed through the one
     /// forward entry point the trait exposes.
     fn advance(&mut self, feed: &Tensor) -> Result<(PendingEval, Tensor)> {
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let pos = (self.prefill_len + self.committed) as i32;
-        let offset = Tensor::from_slice(&self.device, &[pos], [1])?;
+        let offset = position_tensor(&self.device, self.owner.position)?;
         let logits = self
             .owner
             .model
             .forward_last(feed, &offset, &mut self.owner.caches)?;
+        self.owner.position += 1;
         let vocab = self.owner.model.vocab_size();
         let idx = argmax_last_position_lazy(&logits, vocab)?;
         let pending = idx.eval_async()?;
@@ -415,12 +408,7 @@ fn prefill_last_logits<M: LanguageModel>(
     input_ids: &[u32],
     chunk_len: Option<usize>,
 ) -> Result<Tensor> {
-    let offset_tensor = |start: usize| -> Result<Tensor> {
-        let start = i32::try_from(start).map_err(|_| {
-            Error::InvalidArgument(format!("prefill: offset {start} overflows i32"))
-        })?;
-        Ok(Tensor::from_slice(device, &[start], [1])?)
-    };
+    let offset_tensor = |start: usize| position_tensor(device, start);
     let mut start = 0;
     if let Some(chunk) = chunk_len.filter(|&c| c > 0) {
         while input_ids.len() - start > chunk {
@@ -434,6 +422,12 @@ fn prefill_last_logits<M: LanguageModel>(
     let tail = &input_ids[start..];
     let ids = Tensor::from_slice(device, tail, [1, tail.len()])?;
     model.forward_last(&ids, &offset_tensor(start)?, caches)
+}
+
+fn position_tensor(device: &Device, position: usize) -> Result<Tensor> {
+    let position = i32::try_from(position)
+        .map_err(|_| Error::InvalidArgument(format!("offset {position} overflows i32")))?;
+    Ok(Tensor::from_slice(device, &[position], [1])?)
 }
 
 fn id_is_terminal(id: u32, eos_ids: &HashSet<u32>) -> bool {
@@ -597,5 +591,26 @@ mod tests {
                 assert_eq!(c.1, p.1, "len {len}: state {i} contents");
             }
         }
+    }
+
+    #[test]
+    fn position_tracks_prefill_and_reset() {
+        let device = Device::shared().expect("device");
+        let mut generator =
+            Generator::new(tiny_seeded_qwen35(&device), 32, HashSet::from([u32::MAX]))
+                .expect("generator");
+        let ids: Vec<u32> = (0..6).map(|i| (i * 37 + 5) % 256).collect();
+
+        generator.prefill_sync(&ids).expect("prefill");
+        assert_eq!(generator.position, 6);
+
+        generator.reset().expect("reset");
+        assert_eq!(generator.position, 0);
+        // max_new_tokens = 1 yields the prefill argmax with no decode forward.
+        assert_eq!(generator.generate(&ids, 1).expect("generate").count(), 1);
+        assert_eq!(generator.position, 6);
+
+        generator.reset().expect("reset");
+        assert_eq!(generator.position, 0);
     }
 }
