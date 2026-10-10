@@ -99,9 +99,10 @@ pub(crate) fn conv1d_causal(
     let conv_out = crate::nn::silu(&acc)?;
 
     // Next state: the last 3 PRE-conv rows of conv_input (this call's tail).
-    let new_state = conv_input
-        .slice(&[0..1, (3 + t - 3)..(3 + t), 0..c])?
-        .copy()?;
+    // Kept a view (not a copy) so it resolves to conv_input, which the conv
+    // output depends on: evaluating the layer output commits the window too.
+    // The view pins conv_input's [1, 3+T, C] buffer until the next call.
+    let new_state = conv_input.slice(&[0..1, t..(3 + t), 0..c])?;
 
     Ok((conv_out, new_state))
 }
