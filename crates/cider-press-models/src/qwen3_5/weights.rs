@@ -41,9 +41,10 @@ pub struct Qwen35Weights {
     /// the 27B target ships a separate [`Qwen35Weights::lm_head`].
     pub embed: QuantizedWeight,
     /// Separate (untied) LM head, quantized. Logical shape `[vocab_size,
-    /// hidden_size]`. `Some` iff `config.tie_word_embeddings == false` (the
-    /// 27B target); `None` on the tied 4B, where the head reuses
-    /// [`Qwen35Weights::embed`]. Loaded from `language_model.lm_head`.
+    /// hidden_size]`. The loader decides tying from
+    /// `config.tie_word_embeddings`: `None` means the head is tied to
+    /// [`Qwen35Weights::embed`] (4B); `Some` is the separately loaded
+    /// `language_model.lm_head` (27B). Consumers use it as-is.
     pub lm_head: Option<QuantizedWeight>,
     /// Final `RMSNorm` gamma. Dense bf16, shape `[hidden_size]`.
     pub norm: Tensor,

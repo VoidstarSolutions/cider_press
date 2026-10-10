@@ -55,8 +55,6 @@ impl Qwen35Model {
     ///
     /// # Errors
     /// - `weights.layers.len()` disagrees with `config.num_hidden_layers`.
-    /// - `config.tie_word_embeddings` is false but no `lm_head` weight was
-    ///   loaded (the loader enforces this, so it should not occur in practice).
     /// - a layer fails to build (mixer-weight / config mismatch).
     pub fn from_weights(weights: Qwen35Weights, config: Qwen35Config) -> Result<Self> {
         if weights.layers.len() != config.num_hidden_layers {
@@ -66,18 +64,6 @@ impl Qwen35Model {
                 config.num_hidden_layers
             )));
         }
-        // Tied (4B): project through `embed`, no separate head. Untied (27B):
-        // use the loaded `lm_head`. The loader guarantees an untied config
-        // carries a head, so the `None` arm is a defensive guard.
-        let lm_head = match (config.tie_word_embeddings, weights.lm_head) {
-            (true, _) => None,
-            (false, Some(h)) => Some(h),
-            (false, None) => {
-                return Err(Error::InvalidArgument(
-                    "Qwen35Model: untied config (tie_word_embeddings=false) but no lm_head weight loaded".into(),
-                ));
-            }
-        };
         let layers = weights
             .layers
             .iter()
@@ -88,7 +74,7 @@ impl Qwen35Model {
         let final_norm = RmsNormLayer::new(weights.norm, config.rms_norm_eps as f32);
         Ok(Self {
             embed: weights.embed,
-            lm_head,
+            lm_head: weights.lm_head,
             layers,
             final_norm,
             config,
