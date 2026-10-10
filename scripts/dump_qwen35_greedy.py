@@ -47,8 +47,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--prompt",
-        default="Reverse a string in Rust.\n",
-        help="RAW prompt — encoded directly, NO chat template.",
+        default="Write a function in Rust that reverses a string and returns it to me.\n",
+        help="RAW prompt — encoded directly, NO chat template. The default is "
+        "exactly 17 tokens (one 16-token prefill chunk + a 1-token tail).",
     )
     parser.add_argument("-n", "--num-tokens", type=int, default=24)
     parser.add_argument("--out", default="/tmp/qwen3_5_4b_greedy.json")
