@@ -640,8 +640,9 @@ mod tests {
         let device = Device::shared().unwrap();
         let (c, kernel) = (4usize, 3usize);
         let zeros = |n: usize| vec![bf16::ZERO; n];
-        // State is [1, 3, c] (wrong for kernel 3); the kernel check must fire first.
-        let conv_state = Tensor::from_slice(&device, &zeros(3 * c), [1usize, 3, c]).unwrap();
+        // [1, 2, c] is the right window for kernel 3 but not for the hard-coded 4;
+        // the kernel-size rejection must fire before any state-shape complaint.
+        let conv_state = Tensor::from_slice(&device, &zeros(2 * c), [1usize, 2, c]).unwrap();
         let qkv = Tensor::from_slice(&device, &zeros(2 * c), [1usize, 2, c]).unwrap();
         let weight = Tensor::from_slice(&device, &zeros(c * kernel), [c, kernel, 1usize]).unwrap();
         let err = conv1d_causal(&qkv, &conv_state, &weight).unwrap_err();
