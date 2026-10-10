@@ -232,6 +232,26 @@ fn build_prompt(
     Ok(chat_template.render(&messages)?)
 }
 
+/// Builds the `Generator` for whichever architecture was loaded and runs
+/// `$body` with it bound to `$generator`; the body is instantiated once per
+/// model type because `Generator<M>` is monomorphic.
+macro_rules! with_generator {
+    ($loaded:ident, $context_window:expr, |$generator:ident| $body:expr) => {
+        match $loaded.model {
+            LoadedModel::Qwen2(model) => {
+                #[allow(unused_mut)]
+                let mut $generator = Generator::new(model, $context_window, $loaded.eos_ids)?;
+                $body
+            }
+            LoadedModel::Qwen35(model) => {
+                #[allow(unused_mut)]
+                let mut $generator = Generator::new(model, $context_window, $loaded.eos_ids)?;
+                $body
+            }
+        }
+    };
+}
+
 fn run_chat(args: &ChatArgs) -> Result<(), BoxError> {
     let device = Device::shared()?;
     let loaded = load(&args.checkpoint, &device)?;
@@ -244,16 +264,9 @@ fn run_chat(args: &ChatArgs) -> Result<(), BoxError> {
     )?;
     let ids = loaded.tokenizer.encode(&prompt)?;
 
-    match loaded.model {
-        LoadedModel::Qwen2(model) => {
-            let generator = Generator::new(model, args.context_window, loaded.eos_ids)?;
-            run_chat_generic(generator, &loaded.tokenizer, &ids, args.max_tokens)
-        }
-        LoadedModel::Qwen35(model) => {
-            let generator = Generator::new(model, args.context_window, loaded.eos_ids)?;
-            run_chat_generic(generator, &loaded.tokenizer, &ids, args.max_tokens)
-        }
-    }
+    with_generator!(loaded, args.context_window, |generator| {
+        run_chat_generic(generator, &loaded.tokenizer, &ids, args.max_tokens)
+    })
 }
 
 /// The chat generate + streamed-detokenize loop, model-agnostic. The decode /
@@ -293,16 +306,9 @@ fn run_gpu_capture(args: &BenchArgs, path: &Path) -> Result<(), BoxError> {
     )?;
     let ids = loaded.tokenizer.encode(&prompt)?;
 
-    match loaded.model {
-        LoadedModel::Qwen2(model) => {
-            let generator = Generator::new(model, args.context_window, loaded.eos_ids)?;
-            capture_prefill_trace(generator, &ids, &device, path)?;
-        }
-        LoadedModel::Qwen35(model) => {
-            let generator = Generator::new(model, args.context_window, loaded.eos_ids)?;
-            capture_prefill_trace(generator, &ids, &device, path)?;
-        }
-    }
+    with_generator!(loaded, args.context_window, |generator| {
+        capture_prefill_trace(generator, &ids, &device, path)?;
+    });
 
     println!("wrote prefill .gputrace to {}", path.display());
     println!("open in Xcode/Instruments (MTL_CAPTURE_ENABLED=1 was required to record)");
@@ -347,34 +353,18 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
     )?;
     let ids = loaded.tokenizer.encode(&prompt)?;
 
-    match loaded.model {
-        LoadedModel::Qwen2(model) => {
-            let mut generator = Generator::new(model, args.context_window, loaded.eos_ids)?;
-            generator.set_inflight_depth(args.inflight_depth);
-            bench_generic(
-                generator,
-                args,
-                &ids,
-                load_dur,
-                rss_pre_load,
-                rss_post_load,
-                &device,
-            )
-        }
-        LoadedModel::Qwen35(model) => {
-            let mut generator = Generator::new(model, args.context_window, loaded.eos_ids)?;
-            generator.set_inflight_depth(args.inflight_depth);
-            bench_generic(
-                generator,
-                args,
-                &ids,
-                load_dur,
-                rss_pre_load,
-                rss_post_load,
-                &device,
-            )
-        }
-    }
+    with_generator!(loaded, args.context_window, |generator| {
+        generator.set_inflight_depth(args.inflight_depth);
+        bench_generic(
+            generator,
+            args,
+            &ids,
+            load_dur,
+            rss_pre_load,
+            rss_post_load,
+            &device,
+        )
+    })
 }
 
 /// The bench timing + reporting loop, generic over the architecture. The decode
@@ -430,8 +420,8 @@ fn bench_generic<M: LanguageModel>(
 
     // Capture the timed-window wall-clock spans BEFORE the optional profiled
     // GPU-profile token runs. `gpu_profile_token` performs a real
-    // `model.forward`, whose KvCache updates emit `kvcache.update` spans that
-    // would otherwise contaminate this table. The GPU table is a separate
+    // decode step whose cache updates emit spans that would otherwise
+    // contaminate this table. The GPU table is a separate
     // store (`record_gpu`) drained later, so it is unaffected.
     let spans = profile::drain();
 
@@ -439,10 +429,8 @@ fn bench_generic<M: LanguageModel>(
     // cache context, and the synchronous prefill timing below resets the caches
     // (`prefill_sync` → `reset`), so it must run after this.
     if args.gpu_profile {
-        if let Some(id) = last_id {
-            // generate() rejects max_tokens == 0, so last_id is always Some here.
-            gpu_profile_token(&mut generator, id)?;
-        }
+        let id = last_id.expect("generate() rejects max_tokens == 0, so a token was produced");
+        gpu_profile_token(&mut generator, id)?;
     }
 
     // Synchronous prefill timing (mlx-comparable): forward + eval-wait, warm.

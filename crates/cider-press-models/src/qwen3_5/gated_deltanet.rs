@@ -1,6 +1,6 @@
 //! Qwen3.5 / Qwen3.6 Gated-DeltaNet linear-attention mixer.
 //!
-//! Phase-3 lands the mixer's building blocks incrementally: the depthwise
+//! Building blocks: the depthwise
 //! causal Conv1d that opens the mixer (over the `q‖k‖v` projection), the
 //! per-(token, value-head) gates (`compute_g` — the Mamba2 forget gate — and
 //! `gdn_beta`, computed in fp32), and the q/k/v preparation that feeds the
@@ -48,11 +48,6 @@ pub(crate) fn conv1d_causal(
     }
     let (t, c) = (qkv_dims[1], qkv_dims[2]);
 
-    if state_dims != [1, 3, c] {
-        return Err(Error::InvalidArgument(format!(
-            "conv1d_causal: conv_state must be [1, 3, {c}]; got {state_dims:?}",
-        )));
-    }
     if w_dims.len() != 3 || w_dims[0] != c || w_dims[2] != 1 {
         return Err(Error::InvalidArgument(format!(
             "conv1d_causal: weight must be [{c}, 4, 1]; got {w_dims:?}",
@@ -62,6 +57,12 @@ pub(crate) fn conv1d_causal(
     if kernel != 4 {
         return Err(Error::InvalidArgument(format!(
             "conv1d_causal: only kernel size 4 is supported; got {kernel}",
+        )));
+    }
+    if state_dims != [1, kernel - 1, c] {
+        return Err(Error::InvalidArgument(format!(
+            "conv1d_causal: conv_state must be [1, {}, {c}]; got {state_dims:?}",
+            kernel - 1,
         )));
     }
     for (name, t) in [("qkv", qkv), ("conv_state", conv_state), ("weight", weight)] {
@@ -633,6 +634,22 @@ mod tests {
     use super::*;
     use cider_press_runtime::{Device, Tensor};
     use half::bf16;
+
+    #[test]
+    fn conv1d_causal_rejects_non_4_kernel_before_state_shape() {
+        let device = Device::shared().unwrap();
+        let (c, kernel) = (4usize, 3usize);
+        let zeros = |n: usize| vec![bf16::ZERO; n];
+        // State is [1, 3, c] (wrong for kernel 3); the kernel check must fire first.
+        let conv_state = Tensor::from_slice(&device, &zeros(3 * c), [1usize, 3, c]).unwrap();
+        let qkv = Tensor::from_slice(&device, &zeros(2 * c), [1usize, 2, c]).unwrap();
+        let weight = Tensor::from_slice(&device, &zeros(c * kernel), [c, kernel, 1usize]).unwrap();
+        let err = conv1d_causal(&qkv, &conv_state, &weight).unwrap_err();
+        assert!(
+            err.to_string().contains("only kernel size 4"),
+            "unexpected error: {err}"
+        );
+    }
 
     #[test]
     #[allow(clippy::cast_precision_loss)]

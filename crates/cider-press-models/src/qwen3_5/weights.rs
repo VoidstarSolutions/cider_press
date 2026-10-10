@@ -322,11 +322,11 @@ fn load_linear_attn(
         hidden,
     )?;
 
-    let a_log_raw = read_dense_tensor(archive, &format!("{prefix}.A_log"), device)?;
+    let a_log_key = format!("{prefix}.A_log");
+    let a_log_raw = read_dense_tensor(archive, &a_log_key, device)?;
     // The 4B dev vehicle stores `A_log` as f32; the 27B target stores it bf16.
     // `compute_g` requires f32, so upcast bf16 -> f32 at load (exact widening;
     // identical to mlx-lm's `A_log.astype(float32)`).
-    let a_log_key = format!("{prefix}.A_log");
     let a_log = match a_log_raw.dtype() {
         DType::F32 => a_log_raw,
         DType::BF16 => a_log_raw.cast(DType::F32)?,
