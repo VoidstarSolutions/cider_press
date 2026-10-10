@@ -10,7 +10,7 @@
 //!
 //! This mirrors the 4B `qwen35_greedy_parity` test, but loads the
 //! multi-shard checkpoint via `model.safetensors.index.json` +
-//! [`ShardedArchive`] instead of a single `model.safetensors`.
+//! [`ShardSet`] instead of a single `model.safetensors`.
 //!
 //! Gated on `CIDER_QWEN35_27B_CHECKPOINT_PATH` AND the reference JSON
 //! written by `scripts/dump_qwen35_greedy.py` at
@@ -21,15 +21,14 @@
 #![cfg(target_os = "macos")]
 
 use cider_press_test_utils::{require_checkpoint_dir, require_file};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::{fs, path::PathBuf};
 
 use cider_press_models::generator::Generator;
 use cider_press_models::qwen3_5::{Qwen35Config, Qwen35Model, load_qwen35_weights};
-use cider_press_models::safetensors_io::ShardedArchive;
+use cider_press_models::safetensors_io::ShardSet;
 use cider_press_models::tokenizer::Tokenizer;
 use cider_press_runtime::Device;
-use serde::Deserialize;
 
 const REFERENCE_JSON: &str = "/tmp/qwen3_6_27b_greedy.json";
 const REFERENCE_REGEN: &str = "uv run scripts/dump_qwen35_greedy.py --checkpoint mlx-community/Qwen3.6-27B-4bit -n 8 --out /tmp/qwen3_6_27b_greedy.json";
@@ -39,13 +38,6 @@ fn checkpoint_path() -> PathBuf {
         "CIDER_QWEN35_27B_CHECKPOINT_PATH",
         "a local Qwen3.6-27B-4bit MLX checkpoint directory",
     )
-}
-
-/// Minimal view of `model.safetensors.index.json`: the `weight_map` routing
-/// each tensor key to its shard filename (mirrors the CLI loader).
-#[derive(Deserialize)]
-struct SafetensorsIndex {
-    weight_map: HashMap<String, String>,
 }
 
 /// Minimal reader for the reference JSON produced by
@@ -90,20 +82,8 @@ fn qwen35_27b_greedy_stream_matches_mlx() {
         Qwen35Config::from_json_bytes(&fs::read(dir.join("config.json")).unwrap()).unwrap();
     let device = Device::shared().unwrap();
 
-    // Multi-shard load: route each tensor key to its shard via the
-    // `model.safetensors.index.json` weight_map (mirrors the CLI's C1 path).
-    let index: SafetensorsIndex =
-        serde_json::from_slice(&fs::read(dir.join("model.safetensors.index.json")).unwrap())
-            .unwrap();
-    let mut shard_names: Vec<String> = index.weight_map.values().cloned().collect();
-    shard_names.sort();
-    shard_names.dedup();
-    let shard_bytes: Vec<Vec<u8>> = shard_names
-        .iter()
-        .map(|name| fs::read(dir.join(name)).unwrap())
-        .collect();
-    let sharded = ShardedArchive::new(&shard_names, &shard_bytes, &index.weight_map).unwrap();
-    let weights = load_qwen35_weights(&sharded, &config, &device).unwrap();
+    let shards = ShardSet::read(&dir).unwrap();
+    let weights = load_qwen35_weights(&shards.archive().unwrap(), &config, &device).unwrap();
     let model = Qwen35Model::from_weights(weights, config).expect("build Qwen35Model");
 
     // Tokenizer — only used to decode mismatches for diagnostics. The prompt

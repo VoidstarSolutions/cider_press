@@ -218,7 +218,7 @@ Incumbent baseline to beat (mlx-lm, this machine): 27B decode **~33 tok/s** at
   `minijinja` engine (a `[::-1]` step-slice + `|length` arithmetic) — `--no-chat-template`
   works; native templated chat is a follow-up. Phase 4 complete.
 - **Phase 5 (scale to the 27B) landed — the Qwen3.6-27B runs end-to-end:** the
-  multi-shard loader (`TensorLookup` trait + `ShardedArchive` over
+  multi-shard loader (`TensorLookup` trait + `ShardSet`/`ShardedArchive` over
   `model.safetensors.index.json`; the 27B is 3 shards), the untied `lm_head`
   (`language_model.lm_head`, loaded when `tie_word_embeddings=false`; the model
   projects through it instead of the embedding), and the CLI dispatching sharded

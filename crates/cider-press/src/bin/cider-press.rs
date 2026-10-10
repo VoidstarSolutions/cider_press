@@ -20,7 +20,7 @@ use cider_press_models::generator::Generator;
 use cider_press_models::language_model::LanguageModel;
 use cider_press_models::qwen2::{Qwen2Config, Qwen2Model, load_qwen2_weights};
 use cider_press_models::qwen3_5::{Qwen35Config, Qwen35Model, load_qwen35_weights};
-use cider_press_models::safetensors_io::ShardedArchive;
+use cider_press_models::safetensors_io::ShardSet;
 use cider_press_models::tokenizer::Tokenizer;
 use cider_press_runtime::{Device, profile};
 use safetensors::SafeTensors;
@@ -167,13 +167,6 @@ struct NestedModelType {
     model_type: Option<String>,
 }
 
-/// Minimal view of `model.safetensors.index.json`: the `weight_map` routing
-/// each tensor key to its shard filename. The `metadata` block is ignored.
-#[derive(Deserialize)]
-struct SafetensorsIndex {
-    weight_map: std::collections::HashMap<String, String>,
-}
-
 fn load(checkpoint: &Path, device: &Device) -> Result<Loaded, BoxError> {
     let config_bytes = std::fs::read(checkpoint.join("config.json"))?;
     let probe: ModelTypeProbe = serde_json::from_slice(&config_bytes)?;
@@ -197,18 +190,9 @@ fn load(checkpoint: &Path, device: &Device) -> Result<Loaded, BoxError> {
             // the device immediately and returns device-resident weights, so the
             // shard byte buffers only need to outlive the load — they drop at the
             // end of this block.
-            let index_path = checkpoint.join("model.safetensors.index.json");
-            let weights = if index_path.exists() {
-                let index: SafetensorsIndex = serde_json::from_slice(&std::fs::read(&index_path)?)?;
-                let mut shard_names: Vec<String> = index.weight_map.values().cloned().collect();
-                shard_names.sort();
-                shard_names.dedup();
-                let shard_bytes: Vec<Vec<u8>> = shard_names
-                    .iter()
-                    .map(|n| std::fs::read(checkpoint.join(n)))
-                    .collect::<std::result::Result<_, _>>()?;
-                let sharded = ShardedArchive::new(&shard_names, &shard_bytes, &index.weight_map)?;
-                load_qwen35_weights(&sharded, &config, device)?
+            let weights = if checkpoint.join(ShardSet::INDEX_FILE).exists() {
+                let shards = ShardSet::read(checkpoint)?;
+                load_qwen35_weights(&shards.archive()?, &config, device)?
             } else {
                 let archive_bytes = std::fs::read(checkpoint.join("model.safetensors"))?;
                 let archive = SafeTensors::deserialize(&archive_bytes)?;

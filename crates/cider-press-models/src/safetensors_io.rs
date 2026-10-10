@@ -12,9 +12,11 @@
 //!   `{base}.biases` (`bf16`) triple.
 
 use std::collections::HashMap;
+use std::path::{Component, Path};
 
 use cider_press_runtime::{DType, Device, Quantization, QuantizedWeight, Tensor};
 use safetensors::{Dtype as StDtype, SafeTensors, tensor::TensorView};
+use serde::Deserialize;
 
 use crate::error::{Error, Result};
 
@@ -37,66 +39,121 @@ impl TensorLookup for SafeTensors<'_> {
     }
 }
 
-/// A multi-shard safetensors set resolved via `model.safetensors.index.json`.
+/// An owned multi-shard checkpoint read from a directory holding
+/// `model.safetensors.index.json`.
 ///
-/// Borrows the shard byte buffers (`&'a [Vec<u8>]`) for the load's duration —
-/// the caller owns the `Vec`s. A per-key index routes each lookup to the shard
-/// that holds it (from `index.json`'s `weight_map`).
-pub struct ShardedArchive<'a> {
-    archives: Vec<SafeTensors<'a>>,
-    key_to_shard: HashMap<String, usize>,
+/// Owns the shard names and bytes together so they cannot drift apart; borrow
+/// a [`ShardedArchive`] from it with [`ShardSet::archive`] for the load.
+pub struct ShardSet {
+    shard_names: Vec<String>,
+    shard_bytes: Vec<Vec<u8>>,
+    weight_map: HashMap<String, String>,
 }
 
-impl<'a> ShardedArchive<'a> {
-    /// Build a sharded archive from the parsed `index.json`.
-    ///
-    /// `shard_names` are the distinct shard filenames (any order);
-    /// `shard_bytes` are those shards' bytes in the **same order** as
-    /// `shard_names`; `weight_map` is `index.json`'s `weight_map`
-    /// (`tensor_key` → `shard_filename`).
-    ///
-    /// Errors if `shard_names` and `shard_bytes` differ in length, if a shard
-    /// fails to deserialize, or if a `weight_map` filename isn't present in
-    /// `shard_names`.
-    pub fn new(
-        shard_names: &[String],
-        shard_bytes: &'a [Vec<u8>],
-        weight_map: &HashMap<String, String>,
-    ) -> Result<Self> {
-        if shard_names.len() != shard_bytes.len() {
-            return Err(Error::InvalidArgument(format!(
-                "sharded archive: shard_names ({}) and shard_bytes ({}) length mismatch",
-                shard_names.len(),
-                shard_bytes.len(),
-            )));
-        }
+impl std::fmt::Debug for ShardSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShardSet")
+            .field("shard_names", &self.shard_names)
+            .field("tensors", &self.weight_map.len())
+            .finish_non_exhaustive()
+    }
+}
 
-        let name_to_index: HashMap<&str, usize> = shard_names
+/// Minimal view of `model.safetensors.index.json`; `metadata` is ignored.
+#[derive(Deserialize)]
+struct SafetensorsIndex {
+    weight_map: HashMap<String, String>,
+}
+
+impl ShardSet {
+    /// Name of the index file that marks a directory as a sharded checkpoint.
+    pub const INDEX_FILE: &'static str = "model.safetensors.index.json";
+
+    /// Read `dir/model.safetensors.index.json` and every shard it references.
+    ///
+    /// Errors if a referenced shard name is not a single plain filename (an
+    /// absolute path, `..`, or a separator would read outside `dir`), or if
+    /// any file cannot be read or parsed.
+    pub fn read(dir: &Path) -> Result<Self> {
+        let index_path = dir.join(Self::INDEX_FILE);
+        let index: SafetensorsIndex = serde_json::from_slice(&read_file(&index_path)?)?;
+
+        let mut shard_names: Vec<String> = index.weight_map.values().cloned().collect();
+        shard_names.sort();
+        shard_names.dedup();
+        for name in &shard_names {
+            validate_shard_name(name)?;
+        }
+        let shard_bytes = shard_names
+            .iter()
+            .map(|name| read_file(&dir.join(name)))
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Self {
+            shard_names,
+            shard_bytes,
+            weight_map: index.weight_map,
+        })
+    }
+
+    /// Deserialize the shards and index every tensor key to its shard.
+    pub fn archive(&self) -> Result<ShardedArchive<'_>> {
+        let name_to_index: HashMap<&str, usize> = self
+            .shard_names
             .iter()
             .enumerate()
             .map(|(i, name)| (name.as_str(), i))
             .collect();
 
-        let archives: Vec<SafeTensors<'a>> = shard_bytes
+        let archives = self
+            .shard_bytes
             .iter()
             .map(|bytes| SafeTensors::deserialize(bytes).map_err(Error::from))
-            .collect::<Result<_>>()?;
+            .collect::<Result<Vec<_>>>()?;
 
-        let mut key_to_shard = HashMap::with_capacity(weight_map.len());
-        for (key, shard_name) in weight_map {
-            let &index = name_to_index.get(shard_name.as_str()).ok_or_else(|| {
-                Error::InvalidArgument(format!(
-                    "sharded archive: weight_map references shard {shard_name:?} \
-                     not present in shard_names",
-                ))
-            })?;
-            key_to_shard.insert(key.clone(), index);
-        }
+        let key_to_shard = self
+            .weight_map
+            .iter()
+            .map(|(key, shard)| (key.clone(), name_to_index[shard.as_str()]))
+            .collect();
 
-        Ok(Self {
+        Ok(ShardedArchive {
             archives,
             key_to_shard,
         })
+    }
+}
+
+fn read_file(path: &Path) -> Result<Vec<u8>> {
+    std::fs::read(path)
+        .map_err(|e| Error::InvalidArgument(format!("failed to read {}: {e}", path.display())))
+}
+
+fn validate_shard_name(name: &str) -> Result<()> {
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Ok(()),
+        _ => Err(Error::InvalidArgument(format!(
+            "shard name {name:?} in {} must be a plain filename \
+             (no separators, `..`, or absolute path)",
+            ShardSet::INDEX_FILE,
+        ))),
+    }
+}
+
+/// Tensor lookup across the shards of a [`ShardSet`]; a per-key index routes
+/// each lookup to the shard that holds it.
+pub struct ShardedArchive<'a> {
+    archives: Vec<SafeTensors<'a>>,
+    key_to_shard: HashMap<String, usize>,
+}
+
+impl std::fmt::Debug for ShardedArchive<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShardedArchive")
+            .field("shards", &self.archives.len())
+            .field("tensors", &self.key_to_shard.len())
+            .finish_non_exhaustive()
     }
 }
 
@@ -255,6 +312,64 @@ mod tests {
             .collect();
         let pairs: Vec<(&String, &TensorView<'_>)> = views.iter().map(|(n, v)| (n, v)).collect();
         safetensors::serialize(pairs, None).expect("serialize archive")
+    }
+
+    fn write_shard(dir: &Path, name: &str, key: &str, value: f32) {
+        let bytes = build_archive(&[(
+            key.into(),
+            StDtype::F32,
+            vec![1],
+            value.to_le_bytes().to_vec(),
+        )]);
+        std::fs::write(dir.join(name), bytes).expect("write shard");
+    }
+
+    fn write_index(dir: &Path, weight_map: &str) {
+        std::fs::write(
+            dir.join(ShardSet::INDEX_FILE),
+            format!(r#"{{"metadata":{{}},"weight_map":{weight_map}}}"#),
+        )
+        .expect("write index");
+    }
+
+    #[test]
+    fn shard_set_round_trips_two_shards() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_shard(dir.path(), "a.safetensors", "x", 1.5);
+        write_shard(dir.path(), "b.safetensors", "y", 2.5);
+        write_index(dir.path(), r#"{"x":"a.safetensors","y":"b.safetensors"}"#);
+
+        let set = ShardSet::read(dir.path()).expect("read");
+        let archive = set.archive().expect("archive");
+        let device = Device::shared().expect("device");
+        let x = read_dense_tensor(&archive, "x", &device).expect("x");
+        let y = read_dense_tensor(&archive, "y", &device).expect("y");
+        assert_eq!(x.cpu_slice::<f32>().unwrap(), &[1.5]);
+        assert_eq!(y.cpu_slice::<f32>().unwrap(), &[2.5]);
+        assert!(matches!(
+            read_dense_tensor(&archive, "z", &device),
+            Err(Error::MissingKey { .. })
+        ));
+    }
+
+    #[test]
+    fn shard_set_rejects_non_plain_shard_names() {
+        for bad in [
+            "../x.safetensors",
+            "/etc/passwd",
+            "sub/x.safetensors",
+            "..",
+            "",
+            ".",
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            write_index(dir.path(), &format!(r#"{{"x":"{bad}"}}"#));
+            let err = ShardSet::read(dir.path()).unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidArgument(ref m) if m.contains("plain filename")),
+                "{bad:?} -> {err:?}"
+            );
+        }
     }
 
     #[test]
@@ -418,84 +533,5 @@ mod tests {
 
         let err = archive.view("nope").unwrap_err();
         assert!(matches!(err, Error::MissingKey { ref key } if key == "nope"));
-    }
-
-    #[test]
-    fn sharded_archive_routes_keys_to_shards() {
-        // Two single-key shards: A holds "alpha", B holds "beta".
-        let alpha: Vec<f32> = vec![10.0, 11.0];
-        let alpha_bytes: Vec<u8> = alpha.iter().flat_map(|x| x.to_le_bytes()).collect();
-        let beta: Vec<bf16> = vec![
-            bf16::from_f32(7.0),
-            bf16::from_f32(8.0),
-            bf16::from_f32(9.0),
-        ];
-        let beta_bytes: Vec<u8> = beta.iter().flat_map(|x| x.to_le_bytes()).collect();
-
-        let shard_a =
-            build_archive(&[("alpha".into(), StDtype::F32, vec![2], alpha_bytes.clone())]);
-        let shard_b = build_archive(&[("beta".into(), StDtype::BF16, vec![3], beta_bytes.clone())]);
-
-        let shard_names = vec!["sA.safetensors".to_string(), "sB.safetensors".to_string()];
-        let shard_bytes = vec![shard_a, shard_b];
-
-        let mut weight_map = HashMap::new();
-        weight_map.insert("alpha".to_string(), "sA.safetensors".to_string());
-        weight_map.insert("beta".to_string(), "sB.safetensors".to_string());
-
-        let sharded =
-            ShardedArchive::new(&shard_names, &shard_bytes, &weight_map).expect("build sharded");
-
-        let av = sharded.view("alpha").expect("alpha");
-        assert_eq!(av.dtype(), StDtype::F32);
-        assert_eq!(av.shape(), &[2]);
-        assert_eq!(av.data(), alpha_bytes.as_slice());
-
-        let bv = sharded.view("beta").expect("beta");
-        assert_eq!(bv.dtype(), StDtype::BF16);
-        assert_eq!(bv.shape(), &[3]);
-        assert_eq!(bv.data(), beta_bytes.as_slice());
-
-        let err = sharded.view("missing").unwrap_err();
-        assert!(matches!(err, Error::MissingKey { ref key } if key == "missing"));
-    }
-
-    #[test]
-    fn sharded_archive_read_dense_via_generic_path() {
-        let device = Device::shared().expect("device");
-        let alpha: Vec<f32> = vec![1.5, 2.5, 3.5, 4.5];
-        let alpha_bytes: Vec<u8> = alpha.iter().flat_map(|x| x.to_le_bytes()).collect();
-        let shard_a = build_archive(&[("alpha".into(), StDtype::F32, vec![4], alpha_bytes)]);
-
-        let shard_names = vec!["sA.safetensors".to_string()];
-        let shard_bytes = vec![shard_a];
-        let mut weight_map = HashMap::new();
-        weight_map.insert("alpha".to_string(), "sA.safetensors".to_string());
-
-        let sharded =
-            ShardedArchive::new(&shard_names, &shard_bytes, &weight_map).expect("build sharded");
-
-        let t = read_dense_tensor(&sharded, "alpha", &device).expect("read via sharded");
-        assert_eq!(t.dtype(), DType::F32);
-        assert_eq!(t.shape().dims(), &[4]);
-        assert_eq!(t.cpu_slice::<f32>().unwrap(), alpha.as_slice());
-    }
-
-    #[test]
-    fn sharded_archive_unknown_shard_name_errors() {
-        let shard_a = build_archive(&[(
-            "alpha".into(),
-            StDtype::F32,
-            vec![1],
-            0_f32.to_le_bytes().to_vec(),
-        )]);
-        let shard_names = vec!["sA.safetensors".to_string()];
-        let shard_bytes = vec![shard_a];
-        let mut weight_map = HashMap::new();
-        // weight_map points at a shard not in shard_names.
-        weight_map.insert("alpha".to_string(), "sZ.safetensors".to_string());
-
-        let result = ShardedArchive::new(&shard_names, &shard_bytes, &weight_map);
-        assert!(matches!(result, Err(Error::InvalidArgument(_))));
     }
 }
