@@ -36,7 +36,9 @@ pub struct Qwen35QuantizationConfig {
     pub bits: u8,
 }
 
-/// RoPE parameters (captured for later phases; unused by the loader).
+/// RoPE parameters: `rope_theta` and `partial_rotary_factor` drive the partial
+/// RoPE on the full-attention layers; `mrope_section` is parsed but unused
+/// (text-only).
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[non_exhaustive]
 pub struct RopeParameters {
@@ -91,7 +93,7 @@ pub struct Qwen35Config {
     pub tie_word_embeddings: bool,
     /// Per-layer mixer assignment.
     pub layer_types: Vec<LayerType>,
-    /// RoPE parameters (used by later phases).
+    /// RoPE parameters for the full-attention layers.
     pub rope: RopeParameters,
     /// Quantization metadata, present iff the checkpoint is pre-quantized.
     pub quantization: Option<Qwen35QuantizationConfig>,

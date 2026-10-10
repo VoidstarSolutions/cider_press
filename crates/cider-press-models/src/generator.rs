@@ -237,9 +237,7 @@ impl<M: LanguageModel> Generator<M> {
             max_new_tokens,
         })
     }
-}
 
-impl<M: LanguageModel> Generator<M> {
     /// Run one decode-step forward (`T = 1`, offset = the generator's
     /// committed position) through the profiling-only
     /// [`Tensor::profiled_eval`], recording per-OpKind GPU time into the

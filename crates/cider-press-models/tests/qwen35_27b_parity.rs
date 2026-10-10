@@ -1,4 +1,4 @@
-//! End-to-end greedy token-stream parity gate for the **sharded 27B**
+//! End-to-end greedy token-stream parity gate for the **sharded 27B** Qwen3.6 checkpoint.
 //!
 //! Asserts cider's `Generator<Qwen35Model>` greedy (argmax) continuation
 //! is identical, token-for-token, to mlx-lm's argmax stream on the same

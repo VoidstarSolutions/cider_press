@@ -1,5 +1,5 @@
 //! Qwen3.5 / Qwen3.6 text-model weights: load + shape-validate every per-layer
-//! tensor from a (single-shard) safetensors archive. Raw keys live under
+//! tensor from any [`TensorLookup`] (a single archive or a shard set). Raw keys live under
 //! `language_model.model.` (the `model.` remap is mlx-lm's in-memory `sanitize`,
 //! not present on disk). Vision (`vision_tower.*`) is skipped. Loader only —
 //! no forward.
@@ -16,7 +16,7 @@
 //! [`Qwen35Config::layer_types`]:
 //!
 //! - **Linear attention** (Gated-DeltaNet): split `in_proj_{qkv,z,a,b}`,
-//!   an f32 `A_log`, a `dt_bias`, a depthwise `conv1d.weight`, a head-dim
+//!   an `A_log` (f32 or bf16, upcast to f32), a `dt_bias`, a depthwise `conv1d.weight`, a head-dim
 //!   `norm`, and an `out_proj`.
 //! - **Full (gated) attention**: `q_proj` (query‖gate), `k_proj`, `v_proj`,
 //!   QK `RMSNorm` gammas, and `o_proj`. `attention_bias = false`, so there

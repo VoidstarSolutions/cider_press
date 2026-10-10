@@ -20,8 +20,9 @@ use crate::nn::{Module, RmsNormLayer, embed_tokens};
 /// Prompt tokens per prefill chunk. The per-token Gated-DeltaNet recurrence
 /// keeps ~5 fp32 state-sized temporaries per token per GDN layer alive until
 /// its eval completes (~0.75 GB/token on the 27B's 48 GDN layers; ~0.24
-/// GB/token measured on the 4B), so 16 bounds the 27B's prefill transient near
-/// 12 GB at any prompt length. Halving it to 8 cost ~7% 4B prefill throughput.
+/// GB/token measured on the 4B), so 16-token chunks bound the transient to
+/// 16 × that per-token cost at any prompt length. Halving it to 8 cost ~7% 4B
+/// prefill throughput.
 pub(crate) const QWEN35_PREFILL_CHUNK: usize = 16;
 
 /// Qwen3.5 / Qwen3.6 causal language model.

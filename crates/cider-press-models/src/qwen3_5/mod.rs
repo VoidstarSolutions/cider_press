@@ -4,10 +4,11 @@
 //! one module serves both; the 27B differs only by scale and two config knobs
 //! (`linear_num_value_heads`, untied `lm_head`). Vision is skipped — text only.
 //!
-//! Phases 1–3 have landed incrementally: the loader (config + weight mapping +
-//! shape validation), the gated-attention decoder layer (the full-attention
-//! mixer), and the Gated-DeltaNet linear-attention mixer ([`GatedDeltaNet`]).
-//! Full-model assembly lands in a later phase. See
+//! Provides the config and weight loader (single- or multi-shard, with shape
+//! validation), the two token mixers (gated full attention and the
+//! Gated-DeltaNet linear attention, [`GatedDeltaNet`]), the hybrid decoder
+//! layer, and [`Qwen35Model`] with its per-layer cache state
+//! ([`Qwen35LayerCache`], [`LinearState`]). See
 //! `docs/inference/models/qwen3.6.md` and `ROADMAP.md`.
 
 mod attention;
