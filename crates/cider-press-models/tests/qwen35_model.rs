@@ -13,14 +13,18 @@ use cider_press_models::qwen3_5::{
     Qwen35Config, Qwen35LayerCache, Qwen35Model, load_qwen35_weights,
 };
 use cider_press_runtime::{Device, Tensor};
-use cider_press_test_utils::{read_bf16, read_u32};
+use cider_press_test_utils::{read_bf16, read_u32, require_checkpoint_dir, require_file};
 use half::bf16;
 use safetensors::SafeTensors;
 
 const FIXTURES: &str = "/tmp/qwen3_5_4b_fixtures.safetensors";
+const FIXTURES_REGEN: &str = "uv run scripts/dump_qwen35_fixtures.py";
 
-fn checkpoint_path() -> Option<PathBuf> {
-    std::env::var_os("CIDER_QWEN35_CHECKPOINT_PATH").map(PathBuf::from)
+fn checkpoint_path() -> PathBuf {
+    require_checkpoint_dir(
+        "CIDER_QWEN35_CHECKPOINT_PATH",
+        "a local Qwen3.5-4B-4bit MLX checkpoint directory",
+    )
 }
 
 /// Combined np.allclose bound `|a-b| <= atol + rtol*|b|`. Reports max abs/rel.
@@ -57,11 +61,9 @@ fn last_row_argmax(buf: &[bf16], vocab: usize) -> usize {
 /// Build a `Qwen35Model` from the real 4B checkpoint and run a synthetic
 /// prompt through `forward`; assert the logits shape is `[1, T, vocab_size]`.
 #[test]
+#[ignore = "requires a local checkpoint; run with --ignored (see panic message for the env var)"]
 fn qwen35_model_forward_shape() {
-    let Some(dir) = checkpoint_path() else {
-        eprintln!("skipping: CIDER_QWEN35_CHECKPOINT_PATH unset");
-        return;
-    };
+    let dir = checkpoint_path();
     let config =
         Qwen35Config::from_json_bytes(&fs::read(dir.join("config.json")).unwrap()).unwrap();
     let archive_bytes = fs::read(dir.join("model.safetensors")).unwrap();
@@ -132,15 +134,10 @@ fn qwen35_model_forward_shape() {
 ///
 /// Env-gated on `CIDER_QWEN35_CHECKPOINT_PATH` + fixture existence.
 #[test]
+#[ignore = "requires a local checkpoint; run with --ignored (see panic message for the env var)"]
 fn qwen35_model_logits_match_mlx() {
-    let Some(dir) = checkpoint_path() else {
-        eprintln!("skipping: CIDER_QWEN35_CHECKPOINT_PATH unset");
-        return;
-    };
-    if !std::path::Path::new(FIXTURES).exists() {
-        eprintln!("skipping: {FIXTURES} missing — run scripts/dump_qwen35_fixtures.py");
-        return;
-    }
+    let dir = checkpoint_path();
+    let fixtures = require_file(FIXTURES, FIXTURES_REGEN);
     let config =
         Qwen35Config::from_json_bytes(&fs::read(dir.join("config.json")).unwrap()).unwrap();
     let archive_bytes = fs::read(dir.join("model.safetensors")).unwrap();
@@ -149,7 +146,7 @@ fn qwen35_model_logits_match_mlx() {
     let weights = load_qwen35_weights(&archive, &config, &device).unwrap();
     let model = Qwen35Model::from_weights(weights, config.clone()).unwrap();
 
-    let fx_bytes = fs::read(FIXTURES).unwrap();
+    let fx_bytes = fs::read(&fixtures).unwrap();
     let fx = SafeTensors::deserialize(&fx_bytes).unwrap();
     let input_ids = read_u32(&fx, "input_ids"); // [1, T]
     let t = input_ids.len();

@@ -14,6 +14,7 @@
 //! The directory must contain `config.json` and `model.safetensors`.
 //! No download is performed by this test.
 
+use cider_press_test_utils::require_checkpoint_dir;
 use std::fs;
 use std::path::PathBuf;
 
@@ -25,27 +26,17 @@ use safetensors::SafeTensors;
 /// otherwise returns the canonicalized absolute path. Panics if the
 /// env var is set but the path doesn't resolve to a directory —
 /// that's almost always operator error worth surfacing immediately.
-fn checkpoint_path() -> Option<PathBuf> {
-    let raw = std::env::var("CIDER_QWEN_CHECKPOINT_PATH").ok()?;
-    let path = fs::canonicalize(&raw)
-        .unwrap_or_else(|err| panic!("CIDER_QWEN_CHECKPOINT_PATH={raw} does not resolve: {err}"));
-    assert!(
-        path.is_dir(),
-        "CIDER_QWEN_CHECKPOINT_PATH={} is not a directory",
-        path.display(),
-    );
-    Some(path)
+fn checkpoint_path() -> PathBuf {
+    require_checkpoint_dir(
+        "CIDER_QWEN_CHECKPOINT_PATH",
+        "a local Qwen2.5-0.5B-Instruct-4bit checkpoint directory",
+    )
 }
 
 #[test]
+#[ignore = "requires a local checkpoint; run with --ignored (see panic message for the env var)"]
 fn real_checkpoint_loads_and_byte_round_trips() {
-    let Some(dir) = checkpoint_path() else {
-        eprintln!(
-            "skipped: set CIDER_QWEN_CHECKPOINT_PATH to a local Qwen2.5-0.5B-Instruct-4bit \
-             checkout to run this test"
-        );
-        return;
-    };
+    let dir = checkpoint_path();
 
     let config_bytes = fs::read(dir.join("config.json")).expect("read config.json");
     let config = Qwen2Config::from_json_bytes(&config_bytes).expect("parse config.json");

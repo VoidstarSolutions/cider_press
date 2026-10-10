@@ -20,6 +20,7 @@
 
 #![cfg(target_os = "macos")]
 
+use cider_press_test_utils::{require_checkpoint_dir, require_file};
 use std::collections::{HashMap, HashSet};
 use std::{fs, path::PathBuf};
 
@@ -31,9 +32,13 @@ use cider_press_runtime::Device;
 use serde::Deserialize;
 
 const REFERENCE_JSON: &str = "/tmp/qwen3_6_27b_greedy.json";
+const REFERENCE_REGEN: &str = "uv run scripts/dump_qwen35_greedy.py --checkpoint mlx-community/Qwen3.6-27B-4bit -n 8 --out /tmp/qwen3_6_27b_greedy.json";
 
-fn checkpoint_path() -> Option<PathBuf> {
-    std::env::var_os("CIDER_QWEN35_27B_CHECKPOINT_PATH").map(PathBuf::from)
+fn checkpoint_path() -> PathBuf {
+    require_checkpoint_dir(
+        "CIDER_QWEN35_27B_CHECKPOINT_PATH",
+        "a local Qwen3.6-27B-4bit MLX checkpoint directory",
+    )
 }
 
 /// Minimal view of `model.safetensors.index.json`: the `weight_map` routing
@@ -70,18 +75,9 @@ fn read_u32_array(json: &str, key: &str) -> Vec<u32> {
 #[test]
 #[ignore = "requires CIDER_QWEN35_27B_CHECKPOINT_PATH + /tmp/qwen3_6_27b_greedy.json"]
 fn qwen35_27b_greedy_stream_matches_mlx() {
-    let Some(dir) = checkpoint_path() else {
-        eprintln!("skipping: CIDER_QWEN35_27B_CHECKPOINT_PATH unset");
-        return;
-    };
-    let Ok(json) = fs::read_to_string(REFERENCE_JSON) else {
-        eprintln!(
-            "skipping: reference {REFERENCE_JSON} missing — run \
-             `uv run scripts/dump_qwen35_greedy.py --checkpoint \
-             mlx-community/Qwen3.6-27B-4bit -n 8 --out {REFERENCE_JSON}` first"
-        );
-        return;
-    };
+    let dir = checkpoint_path();
+    let json = fs::read_to_string(require_file(REFERENCE_JSON, REFERENCE_REGEN))
+        .expect("read reference json");
 
     let prompt_ids = read_u32_array(&json, "prompt_ids");
     let reference = read_u32_array(&json, "continuation_ids");

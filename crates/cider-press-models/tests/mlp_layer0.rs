@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use cider_press_models::nn::{Linear, Mlp, Module};
 use cider_press_models::qwen2::{Qwen2Config, load_qwen2_weights};
 use cider_press_runtime::{Device, Tensor};
-use cider_press_test_utils::{dump_mlx_op, read_bf16, tempdir};
+use cider_press_test_utils::{dump_mlx_op, read_bf16, require_checkpoint_dir, tempdir};
 use half::bf16;
 use safetensors::SafeTensors;
 
@@ -24,16 +24,11 @@ use safetensors::SafeTensors;
 const ATOL: f32 = 5e-2;
 const RTOL: f32 = 5e-2;
 
-fn checkpoint_path() -> Option<PathBuf> {
-    let raw = std::env::var("CIDER_QWEN_CHECKPOINT_PATH").ok()?;
-    let path = fs::canonicalize(&raw)
-        .unwrap_or_else(|err| panic!("CIDER_QWEN_CHECKPOINT_PATH={raw} does not resolve: {err}"));
-    assert!(
-        path.is_dir(),
-        "CIDER_QWEN_CHECKPOINT_PATH={} is not a directory",
-        path.display(),
-    );
-    Some(path)
+fn checkpoint_path() -> PathBuf {
+    require_checkpoint_dir(
+        "CIDER_QWEN_CHECKPOINT_PATH",
+        "a local Qwen2.5-0.5B-Instruct-4bit checkpoint directory",
+    )
 }
 
 fn assert_close(label: &str, got: &[bf16], expected: &[bf16]) {
@@ -117,25 +112,15 @@ fn run_layer0_mlp(checkpoint: &Path, seq_len: usize) {
 }
 
 #[test]
+#[ignore = "requires a local checkpoint; run with --ignored (see panic message for the env var)"]
 fn mlp_layer0_prefill() {
-    let Some(checkpoint) = checkpoint_path() else {
-        eprintln!(
-            "skipped: set CIDER_QWEN_CHECKPOINT_PATH to a local \
-             Qwen2.5-0.5B-Instruct-4bit MLX checkout to run this test"
-        );
-        return;
-    };
+    let checkpoint = checkpoint_path();
     run_layer0_mlp(&checkpoint, 8);
 }
 
 #[test]
+#[ignore = "requires a local checkpoint; run with --ignored (see panic message for the env var)"]
 fn mlp_layer0_decode() {
-    let Some(checkpoint) = checkpoint_path() else {
-        eprintln!(
-            "skipped: set CIDER_QWEN_CHECKPOINT_PATH to a local \
-             Qwen2.5-0.5B-Instruct-4bit MLX checkout to run this test"
-        );
-        return;
-    };
+    let checkpoint = checkpoint_path();
     run_layer0_mlp(&checkpoint, 1);
 }

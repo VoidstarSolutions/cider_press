@@ -111,6 +111,34 @@ pub fn dump_mlx_op(out: &Path, args: &[&str]) {
     assert!(status.success(), "dump_mlx_op.py {args:?} exited {status}");
 }
 
+/// Directory named by the env var `var`, for tests that only run when
+/// opted in with `--ignored`. Panics with an actionable message instead
+/// of skipping: a skipped parity check reports as a pass, which is how a
+/// misconfigured run goes unnoticed. `what` describes the expected
+/// checkpoint (e.g. "a local Qwen3.5-4B-4bit MLX checkpoint directory").
+#[must_use]
+pub fn require_checkpoint_dir(var: &str, what: &str) -> PathBuf {
+    let raw = std::env::var(var)
+        .unwrap_or_else(|_| panic!("{var} is unset; set it to {what} to run this test"));
+    let dir = std::fs::canonicalize(&raw)
+        .unwrap_or_else(|err| panic!("{var}={raw} does not resolve: {err}"));
+    assert!(dir.is_dir(), "{var}={} is not a directory", dir.display());
+    dir
+}
+
+/// `path`, asserted to exist. `regen` is the command that regenerates
+/// it, quoted in the panic message.
+#[must_use]
+pub fn require_file(path: impl AsRef<Path>, regen: &str) -> PathBuf {
+    let path = path.as_ref();
+    assert!(
+        path.exists(),
+        "missing fixture {}; regenerate it with `{regen}`",
+        path.display(),
+    );
+    path.to_path_buf()
+}
+
 #[cfg(test)]
 mod tests {
     use super::tempdir;

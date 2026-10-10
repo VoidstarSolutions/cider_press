@@ -1025,17 +1025,17 @@ mod tests {
         assert_eq!(lin.a_log.dtype(), DType::F32);
     }
 
-    fn checkpoint_path() -> Option<PathBuf> {
-        std::env::var_os("CIDER_QWEN35_CHECKPOINT_PATH").map(PathBuf::from)
+    fn checkpoint_path() -> PathBuf {
+        cider_press_test_utils::require_checkpoint_dir(
+            "CIDER_QWEN35_CHECKPOINT_PATH",
+            "a local Qwen3.5-4B-4bit MLX checkpoint directory",
+        )
     }
 
     #[test]
     #[ignore = "requires a real checkpoint via CIDER_QWEN35_CHECKPOINT_PATH"]
     fn loads_4b_checkpoint_with_validated_shapes() {
-        let Some(dir) = checkpoint_path() else {
-            eprintln!("skipping: CIDER_QWEN35_CHECKPOINT_PATH unset");
-            return;
-        };
+        let dir = checkpoint_path();
         let config =
             Qwen35Config::from_json_bytes(&fs::read(dir.join("config.json")).unwrap()).unwrap();
         let bytes = fs::read(dir.join("model.safetensors")).unwrap();

@@ -16,6 +16,7 @@ use cider_press_models::language_model::LanguageModel;
 use cider_press_models::qwen3_5::{Qwen35Config, Qwen35Model, load_qwen35_weights};
 use cider_press_models::tokenizer::Tokenizer;
 use cider_press_runtime::{Device, Tensor};
+use cider_press_test_utils::require_checkpoint_dir;
 use safetensors::SafeTensors;
 
 const PASSAGE: &str = "The river bends twice before it reaches the old mill, \
@@ -26,9 +27,10 @@ const PASSAGE: &str = "The river bends twice before it reaches the old mill, \
 const MAX_NEW: usize = 8;
 
 fn checkpoint_dir() -> PathBuf {
-    std::env::var_os("CIDER_QWEN35_CHECKPOINT_PATH")
-        .map(PathBuf::from)
-        .expect("CIDER_QWEN35_CHECKPOINT_PATH must point at the Qwen3.5-4B MLX checkpoint")
+    require_checkpoint_dir(
+        "CIDER_QWEN35_CHECKPOINT_PATH",
+        "a local Qwen3.5-4B-4bit MLX checkpoint directory",
+    )
 }
 
 fn load(dir: &std::path::Path) -> (Qwen35Model, Tokenizer) {

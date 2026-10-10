@@ -28,7 +28,7 @@ use std::path::PathBuf;
 
 use cider_press_models::qwen2::{Qwen2Config, load_qwen2_weights};
 use cider_press_runtime::{Device, Tensor};
-use cider_press_test_utils::{dump_mlx_op, read_bf16, tempdir};
+use cider_press_test_utils::{dump_mlx_op, read_bf16, require_checkpoint_dir, tempdir};
 use half::bf16;
 use safetensors::SafeTensors;
 
@@ -131,14 +131,9 @@ fn parity_case(op: &str, lhs_shape: &str, rhs_shape: &str, broadcast: bool) {
 }
 
 #[test]
+#[ignore = "requires a local checkpoint; run with --ignored (see panic message for the env var)"]
 fn real_checkpoint_layernorm_add_broadcast() {
-    let Some(dir) = checkpoint_path() else {
-        eprintln!(
-            "skipped: set CIDER_QWEN_CHECKPOINT_PATH to a local Qwen2.5-0.5B-Instruct-4bit \
-             checkout to run this test"
-        );
-        return;
-    };
+    let dir = checkpoint_path();
 
     let config_bytes = fs::read(dir.join("config.json")).expect("read config.json");
     let config = Qwen2Config::from_json_bytes(&config_bytes).expect("parse config.json");
@@ -187,14 +182,9 @@ fn real_checkpoint_layernorm_add_broadcast() {
 // helpers
 // ---------------------------------------------------------------------
 
-fn checkpoint_path() -> Option<PathBuf> {
-    let raw = std::env::var("CIDER_QWEN_CHECKPOINT_PATH").ok()?;
-    let path = fs::canonicalize(&raw)
-        .unwrap_or_else(|err| panic!("CIDER_QWEN_CHECKPOINT_PATH={raw} does not resolve: {err}"));
-    assert!(
-        path.is_dir(),
-        "CIDER_QWEN_CHECKPOINT_PATH={} is not a directory",
-        path.display(),
-    );
-    Some(path)
+fn checkpoint_path() -> PathBuf {
+    require_checkpoint_dir(
+        "CIDER_QWEN_CHECKPOINT_PATH",
+        "a local Qwen2.5-0.5B-Instruct-4bit checkpoint directory",
+    )
 }

@@ -8,16 +8,20 @@ use cider_press_models::qwen3_5::{
     load_qwen35_weights,
 };
 use cider_press_runtime::{DType, Device, KvCache, Tensor};
-use cider_press_test_utils::read_bf16;
+use cider_press_test_utils::{read_bf16, require_checkpoint_dir, require_file};
 use half::bf16;
 use safetensors::SafeTensors;
 
 const ATOL: f32 = 5e-2;
 const RTOL: f32 = 5e-2;
 const FIXTURES: &str = "/tmp/qwen3_5_4b_fixtures.safetensors";
+const FIXTURES_REGEN: &str = "uv run scripts/dump_qwen35_fixtures.py";
 
-fn checkpoint_path() -> Option<PathBuf> {
-    std::env::var_os("CIDER_QWEN35_CHECKPOINT_PATH").map(PathBuf::from)
+fn checkpoint_path() -> PathBuf {
+    require_checkpoint_dir(
+        "CIDER_QWEN35_CHECKPOINT_PATH",
+        "a local Qwen3.5-4B-4bit MLX checkpoint directory",
+    )
 }
 
 fn assert_close(label: &str, got: &[bf16], expected: &[bf16]) {
@@ -41,15 +45,10 @@ fn assert_close(label: &str, got: &[bf16], expected: &[bf16]) {
 }
 
 #[test]
+#[ignore = "requires a local checkpoint; run with --ignored (see panic message for the env var)"]
 fn gated_attention_layer3_matches_mlx() {
-    let Some(dir) = checkpoint_path() else {
-        eprintln!("skipping: CIDER_QWEN35_CHECKPOINT_PATH unset");
-        return;
-    };
-    if !std::path::Path::new(FIXTURES).exists() {
-        eprintln!("skipping: {FIXTURES} missing — run scripts/dump_qwen35_fixtures.py");
-        return;
-    }
+    let dir = checkpoint_path();
+    let fixtures = require_file(FIXTURES, FIXTURES_REGEN);
     let config =
         Qwen35Config::from_json_bytes(&fs::read(dir.join("config.json")).unwrap()).unwrap();
     let archive_bytes = fs::read(dir.join("model.safetensors")).unwrap();
@@ -57,7 +56,7 @@ fn gated_attention_layer3_matches_mlx() {
     let device = Device::shared().unwrap();
     let weights = load_qwen35_weights(&archive, &config, &device).unwrap();
 
-    let fx_bytes = fs::read(FIXTURES).unwrap();
+    let fx_bytes = fs::read(&fixtures).unwrap();
     let fx = SafeTensors::deserialize(&fx_bytes).unwrap();
     let layer3_in = read_bf16(&fx, "layer3_in"); // [1,6,2560]
     let expected = read_bf16(&fx, "layer3_attn_out"); // [1,6,2560]
@@ -90,15 +89,10 @@ fn gated_attention_layer3_matches_mlx() {
 }
 
 #[test]
+#[ignore = "requires a local checkpoint; run with --ignored (see panic message for the env var)"]
 fn decoder_layer3_matches_mlx() {
-    let Some(dir) = checkpoint_path() else {
-        eprintln!("skipping: CIDER_QWEN35_CHECKPOINT_PATH unset");
-        return;
-    };
-    if !std::path::Path::new(FIXTURES).exists() {
-        eprintln!("skipping: {FIXTURES} missing — run scripts/dump_qwen35_fixtures.py");
-        return;
-    }
+    let dir = checkpoint_path();
+    let fixtures = require_file(FIXTURES, FIXTURES_REGEN);
     let config =
         Qwen35Config::from_json_bytes(&fs::read(dir.join("config.json")).unwrap()).unwrap();
     let archive_bytes = fs::read(dir.join("model.safetensors")).unwrap();
@@ -106,7 +100,7 @@ fn decoder_layer3_matches_mlx() {
     let device = Device::shared().unwrap();
     let weights = load_qwen35_weights(&archive, &config, &device).unwrap();
 
-    let fx_bytes = fs::read(FIXTURES).unwrap();
+    let fx_bytes = fs::read(&fixtures).unwrap();
     let fx = SafeTensors::deserialize(&fx_bytes).unwrap();
     let layer3_in = read_bf16(&fx, "layer3_in");
     let expected = read_bf16(&fx, "layer3_out");

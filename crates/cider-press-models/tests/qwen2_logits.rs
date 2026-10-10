@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use cider_press_models::qwen2::{Qwen2Config, Qwen2Model, load_qwen2_weights};
 use cider_press_runtime::{DType, Device, KvCache, Tensor};
-use cider_press_test_utils::{dump_mlx_op, read_bf16, read_u32, tempdir};
+use cider_press_test_utils::{dump_mlx_op, read_bf16, read_u32, require_checkpoint_dir, tempdir};
 use half::bf16;
 use safetensors::SafeTensors;
 
@@ -34,16 +34,11 @@ const RTOL: f32 = 1.0;
 
 const PROMPT: &str = "The capital of France is";
 
-fn checkpoint_path() -> Option<PathBuf> {
-    let raw = std::env::var("CIDER_QWEN_CHECKPOINT_PATH").ok()?;
-    let path = fs::canonicalize(&raw)
-        .unwrap_or_else(|err| panic!("CIDER_QWEN_CHECKPOINT_PATH={raw} does not resolve: {err}"));
-    assert!(
-        path.is_dir(),
-        "CIDER_QWEN_CHECKPOINT_PATH={} is not a directory",
-        path.display(),
-    );
-    Some(path)
+fn checkpoint_path() -> PathBuf {
+    require_checkpoint_dir(
+        "CIDER_QWEN_CHECKPOINT_PATH",
+        "a local Qwen2.5-0.5B-Instruct-4bit checkpoint directory",
+    )
 }
 
 fn assert_close(label: &str, got: &[bf16], expected: &[bf16]) {
@@ -153,14 +148,9 @@ fn run_qwen2_logits(checkpoint: &Path) {
 }
 
 #[test]
+#[ignore = "requires a local checkpoint; run with --ignored (see panic message for the env var)"]
 fn qwen2_logits_prefill() {
-    let Some(checkpoint) = checkpoint_path() else {
-        eprintln!(
-            "skipped: set CIDER_QWEN_CHECKPOINT_PATH to a local \
-             Qwen2.5-0.5B-Instruct-4bit MLX checkout to run this test"
-        );
-        return;
-    };
+    let checkpoint = checkpoint_path();
     run_qwen2_logits(&checkpoint);
 }
 
@@ -228,14 +218,9 @@ fn run_forward_last_matches_full(checkpoint: &Path) {
 }
 
 #[test]
+#[ignore = "requires a local checkpoint; run with --ignored (see panic message for the env var)"]
 fn qwen2_forward_last_matches_full() {
-    let Some(checkpoint) = checkpoint_path() else {
-        eprintln!(
-            "skipped: set CIDER_QWEN_CHECKPOINT_PATH to a local \
-             Qwen2.5-0.5B-Instruct-4bit MLX checkout to run this test"
-        );
-        return;
-    };
+    let checkpoint = checkpoint_path();
     run_forward_last_matches_full(&checkpoint);
 }
 
@@ -319,13 +304,8 @@ fn run_split_prefill_matches_forward_last(checkpoint: &Path) {
 }
 
 #[test]
+#[ignore = "requires a local checkpoint; run with --ignored (see panic message for the env var)"]
 fn qwen2_split_prefill_matches_forward_last() {
-    let Some(checkpoint) = checkpoint_path() else {
-        eprintln!(
-            "skipped: set CIDER_QWEN_CHECKPOINT_PATH to a local \
-             Qwen2.5-0.5B-Instruct-4bit MLX checkout to run this test"
-        );
-        return;
-    };
+    let checkpoint = checkpoint_path();
     run_split_prefill_matches_forward_last(&checkpoint);
 }
