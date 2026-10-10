@@ -91,13 +91,12 @@ impl<M: LanguageModel> Generator<M> {
     }
 
     /// Shared prefill graph builder for the profiling/timing entry points:
-    /// resets the caches, then runs one forward at `T = input_ids.len()`,
-    /// offset 0 (causal via the fused sdpa kernel). Returns the lazy
-    /// **last-position** logits (`[1, 1, vocab]`) via
-    /// [`LanguageModel::forward_last`] — the blocks still run over all `T`
-    /// tokens, but only the final token is projected through the LM head, as
-    /// greedy generation (and `mlx_lm`'s prefill) does. Advances the caches to
-    /// `input_ids.len()` as a side effect.
+    /// resets the caches, then prefills `input_ids` from offset 0 via
+    /// [`prefill_last_logits`] (chunked when the model asks for it). Returns
+    /// the lazy **last-position** logits (`[1, 1, vocab]`) — the blocks still
+    /// run over all `T` tokens, but only the final token is projected through
+    /// the LM head, as greedy generation (and `mlx_lm`'s prefill) does.
+    /// Advances the caches to `input_ids.len()` as a side effect.
     fn prefill_logits(&mut self, input_ids: &[u32]) -> Result<Tensor> {
         if input_ids.is_empty() {
             return Err(Error::InvalidArgument(
@@ -106,15 +105,13 @@ impl<M: LanguageModel> Generator<M> {
         }
         self.reset()?;
         let device = Device::shared()?;
-        let prefill_len = input_ids.len();
-        let ids_tensor = Tensor::from_slice(&device, input_ids, [1, prefill_len])?;
-        let offset = Tensor::from_slice(&device, &[0i32], [1])?;
-        self.model
-            .forward_last(&ids_tensor, &offset, &mut self.caches)
+        let chunk_len = self.model.prefill_chunk_len();
+        prefill_last_logits(&self.model, &mut self.caches, &device, input_ids, chunk_len)
     }
 
-    /// Run one **prefill** forward (`T = input_ids.len()`, offset = 0,
-    /// causal via the fused sdpa kernel) through the profiling-only
+    /// Run a **prefill** (`T = input_ids.len()`, offset = 0, causal via the
+    /// fused sdpa kernel; chunked when the model asks for it, with only the
+    /// final chunk profiled) through the profiling-only
     /// [`Tensor::profiled_eval`],
     /// recording per-OpKind GPU time into the `profile` GPU store.
     ///
@@ -134,8 +131,9 @@ impl<M: LanguageModel> Generator<M> {
         Ok(())
     }
 
-    /// Run one prefill forward (`T = input_ids.len()`, offset 0, causal via
-    /// the fused sdpa kernel) and **synchronously** `eval()` the
+    /// Run a prefill (`T = input_ids.len()`, offset 0, causal via the fused
+    /// sdpa kernel; chunked when the model asks for it) and **synchronously**
+    /// `eval()` the
     /// last-position `[1, 1, vocab]` logits (see `prefill_logits`),
     /// waiting for GPU completion. Mirrors `mlx_lm`'s prefill, which evals
     /// only the KV cache for the prompt and projects the LM head for a single
@@ -154,8 +152,10 @@ impl<M: LanguageModel> Generator<M> {
     /// Greedy-decode up to `max_new_tokens` ids from `input_ids`.
     ///
     /// Runs prefill (one forward at `T = input_ids.len()`, offset=0,
-    /// causal via the fused sdpa kernel) then yields sampled ids one at a
-    /// time. Iterator
+    /// causal via the fused sdpa kernel — or, for a model with a
+    /// [`prefill_chunk_len`](LanguageModel::prefill_chunk_len), synchronously
+    /// evaluated chunks followed by that forward over the last chunk) then
+    /// yields sampled ids one at a time. Iterator
     /// terminates on EOS or after `max_new_tokens` items.
     ///
     /// # Errors
@@ -208,16 +208,9 @@ impl<M: LanguageModel> Generator<M> {
         self.reset()?;
         let device = Device::shared()?;
         let prefill_len = input_ids.len();
-
-        // Prefill: [1, T] ids, offset=0. Causal via the fused sdpa kernel's
-        // do_causal — no materialized mask.
-        let ids_tensor = Tensor::from_slice(&device, input_ids, [1, prefill_len])?;
-        let offset = Tensor::from_slice(&device, &[0i32], [1])?;
-        // Only the last token's logits drive the first sampled id; project the
-        // LM head for that position alone (the blocks still cache all T K/V).
-        let logits = self
-            .model
-            .forward_last(&ids_tensor, &offset, &mut self.caches)?;
+        let chunk_len = self.model.prefill_chunk_len();
+        let logits =
+            prefill_last_logits(&self.model, &mut self.caches, &device, input_ids, chunk_len)?;
 
         let vocab = self.model.vocab_size();
         let idx0 = argmax_last_position_lazy(&logits, vocab)?;
@@ -404,6 +397,45 @@ impl<M: LanguageModel> GenerateIter<'_, M> {
     }
 }
 
+/// Prefill `input_ids` into `caches` (which must be at position 0) and return
+/// the lazy last-position logits `[1, 1, vocab]`.
+///
+/// With `chunk_len = Some(c)` and a prompt longer than `c`, every chunk but
+/// the last runs through [`LanguageModel::fill_cache`] and is evaluated
+/// synchronously before the next is built, so peak memory tracks `c` rather
+/// than the prompt length. The last chunk (a full `c` tokens when the prompt is
+/// an exact multiple) goes through [`LanguageModel::forward_last`] like an
+/// unchunked prefill. `None`, `Some(0)`, or a prompt of at most `c` tokens is a
+/// single `forward_last` over the whole prompt. Causality comes from the fused
+/// sdpa kernel's `do_causal` — no materialized mask.
+fn prefill_last_logits<M: LanguageModel>(
+    model: &M,
+    caches: &mut [M::Cache],
+    device: &Device,
+    input_ids: &[u32],
+    chunk_len: Option<usize>,
+) -> Result<Tensor> {
+    let offset_tensor = |start: usize| -> Result<Tensor> {
+        let start = i32::try_from(start).map_err(|_| {
+            Error::InvalidArgument(format!("prefill: offset {start} overflows i32"))
+        })?;
+        Ok(Tensor::from_slice(device, &[start], [1])?)
+    };
+    let mut start = 0;
+    if let Some(chunk) = chunk_len.filter(|&c| c > 0) {
+        while input_ids.len() - start > chunk {
+            let ids = Tensor::from_slice(device, &input_ids[start..start + chunk], [1, chunk])?;
+            model
+                .fill_cache(&ids, &offset_tensor(start)?, caches)?
+                .eval()?;
+            start += chunk;
+        }
+    }
+    let tail = &input_ids[start..];
+    let ids = Tensor::from_slice(device, tail, [1, tail.len()])?;
+    model.forward_last(&ids, &offset_tensor(start)?, caches)
+}
+
 fn id_is_terminal(id: u32, eos_ids: &HashSet<u32>) -> bool {
     eos_ids.contains(&id)
 }
@@ -440,4 +472,130 @@ fn read_id(idx: &Tensor) -> Result<u32> {
         )
     })?;
     Ok(ids[0])
+}
+
+#[cfg(test)]
+mod tests {
+    use half::bf16;
+    use safetensors::SafeTensors;
+
+    use super::*;
+    use crate::qwen3_5::test_support::{Fill, TINY_CONFIG_JSON, synthesize_archive_bytes_with};
+    use crate::qwen3_5::{Qwen35Config, Qwen35LayerCache, Qwen35Model, load_qwen35_weights};
+
+    fn tiny_seeded_qwen35(device: &Device) -> Qwen35Model {
+        let config = Qwen35Config::from_json_bytes(TINY_CONFIG_JSON.as_bytes()).expect("config");
+        let bytes =
+            synthesize_archive_bytes_with(&config, false, Fill::Seeded(0x5eed), |_, _| None);
+        let archive = SafeTensors::deserialize(&bytes).expect("deserialize");
+        let weights = load_qwen35_weights(&archive, &config, device).expect("load");
+        Qwen35Model::from_weights(weights, config).expect("model")
+    }
+
+    fn host<T: cider_press_runtime::Scalar>(t: &Tensor) -> Vec<T> {
+        let dense = t.copy().expect("copy");
+        dense.eval().expect("eval");
+        dense.cpu_to_vec::<T>().expect("host read")
+    }
+
+    /// Every piece of per-layer state as `(position, values widened to f32)`;
+    /// GDN states carry position 0.
+    type CacheSnapshot = Vec<(usize, Vec<f32>)>;
+
+    fn cache_snapshot(caches: &[Qwen35LayerCache]) -> CacheSnapshot {
+        let widen = |v: Vec<bf16>| v.into_iter().map(bf16::to_f32).collect::<Vec<_>>();
+        caches
+            .iter()
+            .flat_map(|cache| match cache {
+                Qwen35LayerCache::Full(kv) => vec![
+                    (kv.position(), widen(host(&kv.keys_view()))),
+                    (kv.position(), widen(host(&kv.values_view()))),
+                ],
+                Qwen35LayerCache::Linear(st) => vec![
+                    (0, widen(host(&st.conv_state))),
+                    (0, host::<f32>(&st.recurrent_state)),
+                ],
+            })
+            .collect()
+    }
+
+    /// Prefill `ids` with and without chunking from fresh caches; return the
+    /// last-position logits and the resulting cache state of each run.
+    fn prefill_both_ways(
+        model: &Qwen35Model,
+        device: &Device,
+        ids: &[u32],
+        chunk_len: usize,
+    ) -> [(Vec<f32>, CacheSnapshot); 2] {
+        [None, Some(chunk_len)].map(|chunk| {
+            let mut caches = model.make_caches(32, device).expect("caches");
+            let logits =
+                prefill_last_logits(model, &mut caches, device, ids, chunk).expect("prefill");
+            assert_eq!(logits.shape().dims(), &[1, 1, model.vocab_size()]);
+            let logits: Vec<f32> = host::<bf16>(&logits)
+                .into_iter()
+                .map(bf16::to_f32)
+                .collect();
+            (logits, cache_snapshot(&caches))
+        })
+    }
+
+    /// Evaluating the `fill_cache` handle alone must materialize every piece of
+    /// state the next chunk reads; anything left lazy would be recomputed (or,
+    /// for a `KvCache` write, dropped) by the next chunk's graph.
+    #[test]
+    fn fill_cache_eval_commits_every_cache_state() {
+        let device = Device::shared().expect("device");
+        let model = tiny_seeded_qwen35(&device);
+        let mut caches = model.make_caches(32, &device).expect("caches");
+        let ids = Tensor::from_slice(&device, &[3u32, 1, 4, 1, 5], [1, 5]).expect("ids");
+        let offset = Tensor::from_slice(&device, &[0i32], [1]).expect("offset");
+        model
+            .fill_cache(&ids, &offset, &mut caches)
+            .expect("fill_cache")
+            .eval()
+            .expect("eval");
+        for (i, cache) in caches.iter().enumerate() {
+            let states = match cache {
+                Qwen35LayerCache::Full(kv) => [kv.keys_view(), kv.values_view()],
+                Qwen35LayerCache::Linear(st) => [st.conv_state.clone(), st.recurrent_state.clone()],
+            };
+            for state in &states {
+                assert!(state.is_materialized(), "layer {i}: state left lazy");
+            }
+        }
+    }
+
+    #[test]
+    fn chunked_prefill_matches_single_forward() {
+        let device = Device::shared().expect("device");
+        let model = tiny_seeded_qwen35(&device);
+        // 11 = 4 + 4 + 3 (ragged last chunk); 12 = 4 + 4 + 4 (exact multiple:
+        // the last chunk is a full chunk through forward_last).
+        for len in [11u32, 12] {
+            let ids: Vec<u32> = (0..len).map(|i| (i * 37 + 5) % 256).collect();
+            let [(plain_logits, plain_state), (chunked_logits, chunked_state)] =
+                prefill_both_ways(&model, &device, &ids, 4);
+
+            let spread = plain_logits
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max)
+                - plain_logits.iter().copied().fold(f32::INFINITY, f32::min);
+            assert!(
+                spread > 0.0,
+                "len {len}: degenerate logits, the test proves nothing"
+            );
+
+            assert_eq!(
+                chunked_logits, plain_logits,
+                "len {len}: last-position logits"
+            );
+            assert_eq!(chunked_state.len(), plain_state.len());
+            for (i, (c, p)) in chunked_state.iter().zip(&plain_state).enumerate() {
+                assert_eq!(c.0, p.0, "len {len}: state {i} position");
+                assert_eq!(c.1, p.1, "len {len}: state {i} contents");
+            }
+        }
+    }
 }

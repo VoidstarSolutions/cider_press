@@ -160,7 +160,12 @@ concrete **parity gate** (the Qwen2.5 discipline). Phases 0–5 reach *correctne
   fixes the 4B never hit: bf16 `A_log` upcast, `rms_looped` for hidden 5120 (>4096),
   and the non-aligned `affine_qmm_t` (`alN_false`) prefill variant for the GDN N=48
   projections (aligned path byte-identical). **Greedy stream bit-exact (8/8) vs mlx-lm**
-  on the sharded 27B; peak RSS ~31 GB (fs::read transient), comfortably within 64 GB.
+  on the sharded 27B; peak RSS ~31 GB (fs::read transient) on the short parity prompt.
+  That hid a prompt-length term: single-eval prefill grew ~0.75 GB/prompt-token on the
+  27B (the unrolled per-token GDN recurrence), >64 GB at ~60 tokens. Fixed by
+  **chunked prefill** (`Generator` feeds Qwen3.5 prompts in 16-token `fill_cache`
+  chunks, each evaluated before the next): ~12 GB transient at any prompt length;
+  4B peak footprint flat at ~7.5 GB from 109 to 541 tokens (was ~45 GB at 109).
   Deferred: mmap (~halve peak), and perf — naive per-token GDN makes 27B decode slow
   (the Phase-7 chunkwise GDN kernel is the lever; ~33 tok/s mlx-lm baseline).
 

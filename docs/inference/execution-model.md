@@ -262,10 +262,15 @@ the step doc that owns its detail.
   cached cross-process). See [weights and quantization](./weights-and-quantization.md).
 - **Chunked prefill via `fill_cache`** — for long prompts under bounded memory.
   The MLX-faithful T−1-fill + T=1-step split was measured a *pessimization* for
-  short prompts and reverted, but
-  [`fill_cache`](../../crates/cider-press-models/src/qwen2/model.rs) and its
-  equivalence test were kept as the building block: chunking the cache fill caps
-  peak working set on prompts longer than one chunk. See [KV cache](./kv-cache.md).
+  short prompts and reverted, but `fill_cache` survived as the building block and
+  is now wired: the `Generator` chunks prefill for any model whose
+  `LanguageModel::prefill_chunk_len` is `Some` — every chunk but the last goes
+  through `fill_cache` + a synchronous `eval()`, the last through `forward_last`.
+  Qwen3.5 opts in (16 tokens) because its unrolled GDN recurrence makes the
+  single-eval prefill transient grow per token (see
+  [Qwen3.6](./models/qwen3.6.md#prefill-memory-chunked-prefill)); Qwen2 keeps
+  single-forward prefill, where chunking would only add synchronized
+  command-buffer boundaries. See [KV cache](./kv-cache.md).
 - **Prefill concurrency** — the <50%-occupancy floor. Prefill runs synchronously
   per `eval()`, and *every* dispatch-count lever was refuted: the cadence probe
   (fewer/bigger command buffers made GPU-wait *worse*), copy-count reduction, and

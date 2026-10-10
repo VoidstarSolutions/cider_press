@@ -22,9 +22,12 @@ use crate::qwen3_5::Qwen35Model;
 ///
 /// The generator never names a concrete cache type — it holds a
 /// `Vec<M::Cache>` and threads it through [`forward_last`](Self::forward_last).
-/// Both prefill (`T = prompt_len`) and each decode step (`T = 1`) go through
+/// Prefill's final (or only) chunk and each decode step (`T = 1`) go through
 /// `forward_last`, which projects only the final position to `[1, 1, vocab]`
-/// (for `T = 1` that is the whole sequence).
+/// (for `T = 1` that is the whole sequence). A model that opts into chunked
+/// prefill via [`prefill_chunk_len`](Self::prefill_chunk_len) has its earlier
+/// prompt chunks run through [`fill_cache`](Self::fill_cache), each evaluated
+/// before the next.
 pub trait LanguageModel {
     /// Per-layer cache the model writes K/V (or mixer) state into. `Debug` so
     /// the generator and its iterator can derive `Debug` uniformly.
@@ -49,6 +52,28 @@ pub trait LanguageModel {
         offset: &Tensor,
         caches: &mut [Self::Cache],
     ) -> Result<Tensor>;
+
+    /// Run every layer over `input_ids` `[1, T]` at `offset`, advancing all
+    /// `caches` by `T`, without the final norm / LM head. Returns a lazy handle
+    /// whose `eval()` commits every cache write for the chunk; the caller must
+    /// evaluate it before the next cache-writing call.
+    ///
+    /// # Errors
+    /// Empty `input_ids`, a cache-count mismatch, or any underlying op failure.
+    fn fill_cache(
+        &self,
+        input_ids: &Tensor,
+        offset: &Tensor,
+        caches: &mut [Self::Cache],
+    ) -> Result<Tensor>;
+
+    /// Maximum prompt tokens per prefill eval, or `None` to prefill the whole
+    /// prompt in one forward. A model whose prefill transient grows with `T`
+    /// (beyond the caches themselves) returns `Some` to bound peak memory; the
+    /// generator then feeds longer prompts chunk by chunk.
+    fn prefill_chunk_len(&self) -> Option<usize> {
+        None
+    }
 
     /// Reset every cache to position 0 for a fresh sequence. `device` is the
     /// allocation device for caches that re-zero state tensors (the attention
@@ -92,6 +117,15 @@ impl LanguageModel for Qwen2Model {
         Qwen2Model::forward_last(self, input_ids, offset, caches)
     }
 
+    fn fill_cache(
+        &self,
+        input_ids: &Tensor,
+        offset: &Tensor,
+        caches: &mut [Self::Cache],
+    ) -> Result<Tensor> {
+        Qwen2Model::fill_cache(self, input_ids, offset, caches)
+    }
+
     fn reset_caches(&self, caches: &mut [Self::Cache], _device: &Device) -> Result<()> {
         for cache in caches {
             cache.reset()?;
@@ -121,6 +155,19 @@ impl LanguageModel for Qwen35Model {
         caches: &mut [Self::Cache],
     ) -> Result<Tensor> {
         Qwen35Model::forward_last(self, input_ids, offset, caches)
+    }
+
+    fn fill_cache(
+        &self,
+        input_ids: &Tensor,
+        offset: &Tensor,
+        caches: &mut [Self::Cache],
+    ) -> Result<Tensor> {
+        Qwen35Model::fill_cache(self, input_ids, offset, caches)
+    }
+
+    fn prefill_chunk_len(&self) -> Option<usize> {
+        Some(crate::qwen3_5::QWEN35_PREFILL_CHUNK)
     }
 
     fn reset_caches(&self, caches: &mut [Self::Cache], device: &Device) -> Result<()> {

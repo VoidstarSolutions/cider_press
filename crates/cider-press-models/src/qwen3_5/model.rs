@@ -17,6 +17,13 @@ use super::weights::Qwen35Weights;
 use crate::error::{Error, Result};
 use crate::nn::{Module, RmsNormLayer, embed_tokens};
 
+/// Prompt tokens per prefill chunk. The per-token Gated-DeltaNet recurrence
+/// keeps ~5 fp32 state-sized temporaries per token per GDN layer alive until
+/// its eval completes (~0.75 GB/token on the 27B's 48 GDN layers; ~0.24
+/// GB/token measured on the 4B), so 16 bounds the 27B's prefill transient near
+/// 12 GB at any prompt length. Halving it to 8 cost ~7% 4B prefill throughput.
+pub(crate) const QWEN35_PREFILL_CHUNK: usize = 16;
+
 /// Qwen3.5 / Qwen3.6 causal language model.
 ///
 /// Owns the embedding weight, all (mixed full-attention / Gated-DeltaNet)
@@ -155,6 +162,36 @@ impl Qwen35Model {
                 .copy()?
         };
         self.project_logits(&last)
+    }
+
+    /// Run every decoder layer over `input_ids` at `offset`, advancing all
+    /// `caches` by `T`, **without** the final norm / LM head — the
+    /// non-final-chunk step of chunked prefill.
+    ///
+    /// Returns the final hidden states `[1, T, hidden_size]`, lazy. Every
+    /// piece of cache state the next call reads is an ancestor of it: each
+    /// full-attention layer's output reads the K/V `slice_update` it wrote,
+    /// each GDN layer's last output token reads the final recurrent state,
+    /// and the conv window is a view of the conv input those outputs consume.
+    /// `eval()`ing it therefore commits the whole chunk — which the caller
+    /// must do before the next call (an un-committed `KvCache` write is
+    /// dropped by the next update).
+    ///
+    /// # Errors
+    /// `input_ids` is empty, `caches.len()` disagrees with the layer count, or
+    /// any underlying op fails.
+    pub fn fill_cache(
+        &self,
+        input_ids: &Tensor,
+        offset: &Tensor,
+        caches: &mut [Qwen35LayerCache],
+    ) -> Result<Tensor> {
+        if input_ids.elem_count() == 0 {
+            return Err(Error::InvalidArgument(
+                "Qwen35Model::fill_cache: empty input_ids (need at least one token)".into(),
+            ));
+        }
+        self.hidden_states(input_ids, offset, caches)
     }
 
     /// Post-final-norm hidden states `[1, T, hidden_size]` (before the
