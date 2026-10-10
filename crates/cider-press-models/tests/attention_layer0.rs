@@ -16,8 +16,8 @@
 //!   property setter (`mlx_lm` ≥0.21) to seed the cache with `offset` zero
 //!   rows before the attention call.
 //!
-//! Both tests gate on `CIDER_QWEN_CHECKPOINT_PATH`; when unset they
-//! no-op with an `eprintln!` message and return PASS. When set, both
+//! Both tests are `#[ignore]`d and gate on `CIDER_QWEN_CHECKPOINT_PATH`
+//! (run with `--ignored`; they panic if it is unset). Both
 //! sub-tests must pass within `ATOL=5e-2, RTOL=3e-2` (np.allclose-style
 //! combined bound).
 //!

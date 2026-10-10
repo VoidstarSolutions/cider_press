@@ -2,8 +2,7 @@
 //!
 //! `head_dim` 256, GQA 16 q / 4 kv, per-head query‖gate split, weighted QK-norm
 //! (`RMSNorm` over `head_dim`, before RoPE), partial rotary (64 of 256 dims),
-//! sigmoid output gate. Phase-2 lands the helpers + mixer; see
-//! `docs/inference/models/qwen3.6.md`.
+//! sigmoid output gate. See `docs/inference/models/qwen3.6.md`.
 
 use cider_press_runtime::{DType, Device, KvCache, Tensor};
 use half::bf16;

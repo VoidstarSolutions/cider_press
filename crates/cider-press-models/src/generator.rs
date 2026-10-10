@@ -117,17 +117,15 @@ impl<M: LanguageModel> Generator<M> {
     }
 
     /// Run a **prefill** (`T = input_ids.len()`, offset = 0, causal via the
-    /// fused sdpa kernel; chunked when the model asks for it, with only the
-    /// final chunk profiled) through the profiling-only
-    /// [`Tensor::profiled_eval`],
-    /// recording per-OpKind GPU time into the `profile` GPU store.
+    /// fused sdpa kernel; chunked when the model asks for it, in which case
+    /// earlier chunks fill the caches unprofiled and only the final chunk's
+    /// forward is profiled) through the profiling-only
+    /// [`Tensor::profiled_eval`], recording per-OpKind GPU time into the
+    /// `profile` GPU store.
     ///
-    /// The T>1 analog of [`Self::profiled_decode_step`]: it exercises the
-    /// **composed** attention path (the fused vector kernel is T=1 only), so
-    /// the recorded breakdown surfaces the prefill copy / score-matmul /
-    /// softmax dispatches. Resets the caches first; advances them to
-    /// `input_ids.len()` as a side effect — intended for one-shot profiling,
-    /// not resumable generation.
+    /// The T>1 analog of [`Self::profiled_decode_step`]. Resets the caches
+    /// first; advances them to `input_ids.len()` as a side effect — intended
+    /// for one-shot profiling, not resumable generation.
     ///
     /// # Errors
     /// `input_ids` empty, or device / forward / `profiled_eval` failure.
@@ -140,8 +138,7 @@ impl<M: LanguageModel> Generator<M> {
 
     /// Run a prefill (`T = input_ids.len()`, offset 0, causal via the fused
     /// sdpa kernel; chunked when the model asks for it) and **synchronously**
-    /// `eval()` the
-    /// last-position `[1, 1, vocab]` logits (see `prefill_logits`),
+    /// `eval()` the last-position `[1, 1, vocab]` logits (see `prefill_logits`),
     /// waiting for GPU completion. Mirrors `mlx_lm`'s prefill, which evals
     /// only the KV cache for the prompt and projects the LM head for a single
     /// token — so this is an apples-to-apples prefill wall-clock measurement
@@ -437,9 +434,9 @@ fn id_is_terminal(id: u32, eos_ids: &HashSet<u32>) -> bool {
 /// tensor, returning a `[1, 1]` U32 index tensor **without** evaluating it —
 /// the caller commits it via `eval_async` and reads it back after waiting.
 ///
-/// Both callers feed last-position-only logits: decode runs `forward` on a
-/// `T = 1` token and prefill projects the LM head for the final position alone
-/// (`Qwen2Model::forward_last`). `vocab` is accepted to validate that shape.
+/// Both callers feed last-position-only logits: decode runs a `T = 1` token
+/// and prefill projects the LM head for the final position alone
+/// ([`LanguageModel::forward_last`]). `vocab` is accepted to validate that shape.
 fn argmax_last_position_lazy(logits: &Tensor, vocab: usize) -> Result<Tensor> {
     // A real runtime check, not `debug_assert_eq!`: release builds (the perf
     // test/bench path) compile that out, which would let a non-`[1,1,vocab]`

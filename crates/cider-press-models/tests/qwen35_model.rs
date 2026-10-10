@@ -2,10 +2,10 @@
 
 //! Qwen3.5 full text-model (`Qwen35Model`) build + shape smoke test.
 //!
-//! Env-gated on a real checkpoint (`CIDER_QWEN35_CHECKPOINT_PATH`): full
-//! numeric parity is Phase-4 Task B2 — this only asserts the model **builds**
-//! and `forward` produces logits of shape `[1, T, vocab_size]`. The skip path
-//! (env unset) is the default in CI and compiles + returns early.
+//! `#[ignore]`d; needs a real checkpoint (`CIDER_QWEN35_CHECKPOINT_PATH`).
+//! This asserts the model **builds** and `forward` produces logits of shape
+//! `[1, T, vocab_size]`; numeric parity against mlx-lm is covered by the
+//! fixture tests below.
 
 use std::{fs, path::PathBuf};
 
@@ -74,7 +74,7 @@ fn qwen35_model_forward_shape() {
     let model = Qwen35Model::from_weights(weights, config.clone()).unwrap();
 
     // Synthetic prompt: a short run of low token ids is enough for a shape /
-    // it-runs check (numeric parity against mlx-lm is Task B2).
+    // it-runs check (numeric parity is covered by the fixture tests).
     let ids: Vec<u32> = (0..5u32).collect();
     let t = ids.len();
     let input_ids = Tensor::from_slice(&device, &ids, [1usize, t]).unwrap();
@@ -106,11 +106,11 @@ fn qwen35_model_forward_shape() {
     println!("Qwen35Model forward [1,{t},{}] OK", config.vocab_size);
 }
 
-/// End-to-end parity for the full 32-layer assembly vs mlx-lm on the 4B
+/// End-to-end parity for the full decoder-stack assembly vs mlx-lm on the 4B
 /// fixture. Two gates:
 ///
 /// 1. **`final_hidden` (backbone):** post-final-norm hidden (`forward_hidden`,
-///    mirrors mlx-lm `lm.norm(x)`). Localizes a failure to the 32 decoder
+///    mirrors mlx-lm `lm.norm(x)`). Localizes a failure to the decoder
 ///    layers vs the head.
 /// 2. **logits (end-to-end):** full `forward` (incl. the tied `lm_head`).
 ///

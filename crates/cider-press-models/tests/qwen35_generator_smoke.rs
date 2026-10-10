@@ -1,7 +1,7 @@
 //! Env-gated smoke test: drive a real `Qwen35Model` through the generic
 //! `Generator<Qwen35Model>`. Verifies the `LanguageModel` plumbing yields the
-//! requested number of token ids end-to-end; token *values* are validated in
-//! C3 (greedy parity). Gated on `CIDER_QWEN35_CHECKPOINT_PATH` (skips in CI).
+//! requested number of token ids end-to-end; token *values* are validated by
+//! `qwen35_greedy_parity`. `#[ignore]`d; needs `CIDER_QWEN35_CHECKPOINT_PATH`.
 
 #![cfg(target_os = "macos")]
 

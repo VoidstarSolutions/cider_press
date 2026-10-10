@@ -11,9 +11,7 @@
 //!
 //! Analogue of `mlx::core::metal::qmm()` in
 //! `mlx/backend/metal/quantized.cpp`. This module covers the
-//! `transpose=true, batched=false (B=1)` case, picking the aligned
-//! (`alN_true`) or non-aligned (`alN_false`) kernel variant by
-//! `N % BN == 0` (the `BN=32` output tile), exactly as MLX's `qmm()` does.
+//! `transpose=true, batched=false (B=1)` case.
 //!
 //! Explained in the inference guide: `docs/inference/quantized-matmul.md`.
 
@@ -54,7 +52,7 @@ const BN: usize = 32;
 /// - `biases.len() == N * K / group_size`
 /// - `x.len()      == M * K`
 /// - `y.len()      == M * N`
-/// - `N > 0` (any N; the `BN=32` tail is bounds-checked by `alN_false`)
+/// - `N > 0`
 ///
 /// `group_size` must be in `{32, 64, 128}` and `bits` must be in
 /// `{2, 3, 4, 5, 6, 8}` — these are the combinations MLX's
@@ -117,9 +115,6 @@ pub fn affine_qmm_t_bf16(
         bits,
     )?;
 
-    // transpose=true, batched=false (B=1). Pick aligned vs non-aligned by
-    // N % BN, matching MLX's qmm() (BN=32 for this kernel). The non-aligned
-    // variant bounds-checks the final < BN output-column tile.
     let aligned = n % BN == 0;
     let aligned_suffix = if aligned { "true" } else { "false" };
     let kernel_name =

@@ -2129,9 +2129,8 @@ impl Tensor {
                 "quantized_matmul: inner dim mismatch: activation last dim {x_k} != weight K {k_logical}",
             )));
         }
-        // The M>1 prefill path dispatches `affine_qmm_t`, which now picks the
-        // aligned (`alN_true`, N % 32 == 0) or non-aligned (`alN_false`, any N)
-        // kernel variant per `qmm.rs`, so any N > 0 is accepted; M=1 decode
+        // The M>1 prefill path dispatches `affine_qmm_t`, which accepts any
+        // N > 0 (the aligned/non-aligned variant choice lives in `qmm.rs`); M=1 decode
         // routes to the generic `affine_qmv`, which is likewise unconstrained.
         let q = weight.quantization();
         // Build output shape: leading dims of self (all but last), then N.
@@ -4858,8 +4857,8 @@ mod tests {
     fn quantized_matmul_accepts_unaligned_n_for_prefill() {
         let device = Device::shared().expect("device");
         // make_test_qw has N=4, which is not a multiple of BN=32. The M>1
-        // prefill path now dispatches the non-aligned `affine_qmm_t` variant
-        // (`alN_false`), so the graph build must succeed (no N-alignment reject).
+        // prefill path dispatches the non-aligned `affine_qmm_t` variant, so
+        // the graph build must succeed (no N-alignment reject).
         let qw = make_test_qw(&device);
 
         let m = 2;
@@ -5165,11 +5164,10 @@ mod tests {
     #[test]
     fn rope_accepts_canonical_view_matches_leaf() {
         // rope must accept a *canonical* view (view.is_some() AND
-        // is_dense_contiguous) — that is exactly what copy()'s elision (Task 3)
+        // is_dense_contiguous) — that is exactly what copy()'s elision
         // produces for a degenerate decode permute. It must read identically to
-        // the equivalent dense leaf. (The raw permute view is non-canonical and
-        // is exercised in Task 3; here we test the canonical-view input rope
-        // will actually receive.)
+        // the equivalent dense leaf. (The raw permute view is non-canonical;
+        // here we test the canonical-view input rope will actually receive.)
         let device = Device::shared().expect("system default device");
         let data: Vec<half::bf16> = (0..8_u8)
             .map(|i| half::bf16::from_f32(f32::from(i) + 1.0))

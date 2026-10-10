@@ -36,7 +36,7 @@ fn rms_norm_op_small() {
 fn rms_norm_weightless_matches_explicit_ones() {
     let device = Device::shared().expect("device");
     // [3,64] (small), [1,4,128] (the GDN linear_key_head_dim), and
-    // and the single-row/looped boundary (4096 / 4097) plus a wide looped axis.
+    // the single-row/looped boundary (4096 / 4097) plus a wide looped axis.
     for shape in [
         vec![3usize, 64],
         vec![1usize, 4, 128],

@@ -1,5 +1,4 @@
 //! End-to-end greedy token-stream parity gate for the **sharded 27B**
-//! (Phase-5 Task C2).
 //!
 //! Asserts cider's `Generator<Qwen35Model>` greedy (argmax) continuation
 //! is identical, token-for-token, to mlx-lm's argmax stream on the same
@@ -14,9 +13,9 @@
 //!
 //! Gated on `CIDER_QWEN35_27B_CHECKPOINT_PATH` AND the reference JSON
 //! written by `scripts/dump_qwen35_greedy.py` at
-//! `/tmp/qwen3_6_27b_greedy.json`. Either missing → the test skips with a
-//! message (clean in CI). `#[ignore]` because the 27B is ~15 GB and decode
-//! is slow (naive per-token GDN; perf is Phases 6–7).
+//! `/tmp/qwen3_6_27b_greedy.json`. Either missing → the test panics.
+//! `#[ignore]`d because the 27B is ~15 GB and decode is slow (naive per-token
+//! GDN).
 
 #![cfg(target_os = "macos")]
 

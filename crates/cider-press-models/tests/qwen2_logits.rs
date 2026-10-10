@@ -5,7 +5,7 @@
 //! `Qwen2Model::forward` and `mlx_lm.models.qwen2.Model`, and compares the
 //! [1, T, vocab] logits at bf16-compose tolerance.
 //!
-//! Skips with a PASS + `eprintln!` when the env var is unset.
+//! Marked `#[ignore]`; run with `--ignored`. Panics (rather than skips) when the env var is unset.
 
 #![cfg(target_os = "macos")]
 #![allow(clippy::cast_precision_loss)]

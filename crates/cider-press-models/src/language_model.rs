@@ -2,14 +2,12 @@
 //! drives: build per-layer caches, run a last-position forward, and reset the
 //! caches between sequences.
 //!
-//! Lifting the generator to a trait waited until a second architecture
-//! arrived; with both [`Qwen2Model`] (cache =
-//! [`KvCache`](cider_press_runtime::KvCache)) and
-//! [`Qwen35Model`] (cache =
-//! [`Qwen35LayerCache`](crate::qwen3_5::Qwen35LayerCache)) in the tree, the
-//! generator is generic over this trait and its associated `Cache` type. The
-//! async-pipelined decode loop only needs `forward_last` + argmax + the cache
-//! vector, all of which are cache-type-agnostic.
+//! The generator is generic over this trait and its associated `Cache` type:
+//! [`Qwen2Model`] uses [`KvCache`](cider_press_runtime::KvCache) and
+//! [`Qwen35Model`] uses
+//! [`Qwen35LayerCache`](crate::qwen3_5::Qwen35LayerCache). The async-pipelined
+//! decode loop only needs `forward_last` + argmax + the cache vector, all of
+//! which are cache-type-agnostic.
 
 use cider_press_runtime::{Device, Tensor};
 

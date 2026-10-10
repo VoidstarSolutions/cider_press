@@ -28,7 +28,7 @@ pub(crate) const QWEN35_PREFILL_CHUNK: usize = 16;
 ///
 /// Owns the embedding weight, all (mixed full-attention / Gated-DeltaNet)
 /// decoder layers, and the final `RMSNorm`. The embedding is a plain lookup
-/// (no `√hidden` scale). The LM head selection depends on the config:
+/// (no `√hidden` scale). The LM head is chosen at load time from the checkpoint weights:
 ///
 /// - **Tied** (`tie_word_embeddings=true`, the 4B dev vehicle): `lm_head` is
 ///   `None`; `forward` re-projects the final hidden states through the
@@ -195,8 +195,8 @@ impl Qwen35Model {
 
     /// Post-final-norm hidden states `[1, T, hidden_size]` (before the
     /// `lm_head`). Mirrors mlx-lm's `lm.norm(x)`; used for backbone parity
-    /// localization — a failure here points at the 32 decoder layers (vs the
-    /// tied head, exercised only by [`forward`](Self::forward)).
+    /// localization — a failure here points at the decoder layers (vs the
+    /// LM head, exercised only by [`forward`](Self::forward)).
     ///
     /// # Errors
     /// `caches.len()` disagrees with the layer count, or any layer / norm op

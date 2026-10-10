@@ -110,8 +110,9 @@ pub fn rms_norm_bf16(
     {
         let encoder = commands.encoder()?;
         encoder.setComputePipelineState(pipeline.metal_pipeline_state());
-        // SAFETY: bind slots/dtypes match `rms_single_row`'s and
-        // `rms_looped`'s identical MSL signatures (x@0, w@1, out@2, eps float@3, axis_size uint@4, w_stride uint@5).
+        // SAFETY: bind slots/dtypes match the identical MSL signatures of
+        // `rms_single_row` and `rms_looped` (x@0, w@1, out@2, eps float@3,
+        // axis_size uint@4, w_stride uint@5).
         unsafe {
             encoder.setBuffer_offset_atIndex(Some(x.metal_buffer()), 0, 0);
             encoder.setBuffer_offset_atIndex(Some(w.metal_buffer()), 0, 1);

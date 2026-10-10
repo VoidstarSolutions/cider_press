@@ -5,7 +5,7 @@
 //! get the HF reference ids for a fixed corpus, and asserts exact-id
 //! equality plus decode round-trip on the Rust side.
 //!
-//! Skips with a PASS + `eprintln!` when the env var is unset.
+//! Marked `#[ignore]`; run with `--ignored`. Panics (rather than skips) when the env var is unset.
 
 #![cfg(target_os = "macos")]
 

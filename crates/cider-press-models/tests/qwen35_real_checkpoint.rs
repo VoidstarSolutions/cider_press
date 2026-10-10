@@ -1,5 +1,5 @@
-//! Phase-1 loader faithfulness: every tensor the loader maps must byte-match the
-//! safetensors archive. Gated on `CIDER_QWEN35_CHECKPOINT_PATH` (skips in CI).
+//! Loader faithfulness: every tensor the loader maps must byte-match the
+//! safetensors archive. `#[ignore]`d; needs `CIDER_QWEN35_CHECKPOINT_PATH`.
 
 #![cfg(target_os = "macos")]
 

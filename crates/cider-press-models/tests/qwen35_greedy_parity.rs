@@ -1,15 +1,14 @@
-//! End-to-end greedy token-stream parity gate (Phase-4 Task C3).
+//! End-to-end greedy token-stream parity gate.
 //!
 //! Asserts cider's `Generator<Qwen35Model>` greedy (argmax) continuation
 //! is identical, token-for-token, to mlx-lm's argmax stream on the same
 //! RAW prompt (no chat template) + same tokenizer. Greedy is
 //! deterministic, so an exact per-step match is the robust correctness
-//! gate (B2 confirmed the first-token argmax matches; this extends it to
-//! the full N-token stream).
+//! gate over the full N-token stream.
 //!
 //! Gated on `CIDER_QWEN35_CHECKPOINT_PATH` AND the reference JSON written
 //! by `scripts/dump_qwen35_greedy.py` at `/tmp/qwen3_5_4b_greedy.json`.
-//! Both missing → the test skips with a message (clean in CI).
+//! Either missing → the test panics (it is `#[ignore]`d; run with `--ignored`).
 
 #![cfg(target_os = "macos")]
 

@@ -214,8 +214,8 @@ impl KernelLibrary {
     }
 
     /// JIT-compile MLX's `rms_norm.metal` (vendored under `kernels-mlx/`).
-    /// Hosts the fused last-axis `RMSNorm`: `rms<dtype>` (single-threadgroup,
-    /// axis ≤ 4096) and `rms_looped<dtype>` (axis > 4096). The forward
+    /// Hosts the fused last-axis `RMSNorm`: `rms<dtype>` (single-threadgroup)
+    /// and `rms_looped<dtype>` (wide axes). The forward
     /// kernels reference no `[[function_constant]]` slots (the `has_w`
     /// constant is used only by the VJP variants), so plain
     /// [`Self::pipeline`] suffices.

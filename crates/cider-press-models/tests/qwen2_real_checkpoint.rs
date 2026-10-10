@@ -2,8 +2,9 @@
 //! `mlx-community/Qwen2.5-0.5B-Instruct-4bit` checkpoint pinned in
 //! [`cider_press_models::qwen2::HF_REVISION`].
 //!
-//! Skipped by default; runs only when `CIDER_QWEN_CHECKPOINT_PATH`
-//! points at a local checkout of the HF repo at the pinned revision.
+//! `#[ignore]`d by default; run with `--ignored` and
+//! `CIDER_QWEN_CHECKPOINT_PATH` pointing at a local checkout of the HF repo
+//! at the pinned revision.
 //! Use:
 //!
 //! ```sh
@@ -22,10 +23,8 @@ use cider_press_models::qwen2::{Qwen2Config, load_qwen2_weights};
 use cider_press_runtime::Device;
 use safetensors::SafeTensors;
 
-/// Skip-or-load helper. Returns `None` if the env var isn't set,
-/// otherwise returns the canonicalized absolute path. Panics if the
-/// env var is set but the path doesn't resolve to a directory —
-/// that's almost always operator error worth surfacing immediately.
+/// Returns the canonicalized checkpoint directory. Panics if the env var is
+/// unset or the path doesn't resolve to a directory.
 fn checkpoint_path() -> PathBuf {
     require_checkpoint_dir(
         "CIDER_QWEN_CHECKPOINT_PATH",
