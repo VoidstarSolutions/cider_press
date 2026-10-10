@@ -36,10 +36,12 @@ fn rms_norm_op_small() {
 fn rms_norm_weightless_matches_explicit_ones() {
     let device = Device::shared().expect("device");
     // [3,64] (small), [1,4,128] (the GDN linear_key_head_dim), and
-    // [1,1,5120] (wider than 4096 → the looped kernel).
+    // and the single-row/looped boundary (4096 / 4097) plus a wide looped axis.
     for shape in [
         vec![3usize, 64],
         vec![1usize, 4, 128],
+        vec![1usize, 1, 4096],
+        vec![1usize, 1, 4097],
         vec![1usize, 1, 5120],
     ] {
         let hidden = *shape.last().unwrap();
@@ -70,17 +72,27 @@ fn rms_norm_weightless_matches_explicit_ones() {
     }
 }
 
-/// Qwen3.5-4B hidden 2560 — single-row path (axis ≤ 4096), unchanged.
+/// Qwen3.5-4B hidden 2560 — single-row path.
 #[test]
 fn rms_norm_op_4b_hidden() {
     parity(&[1, 1, 2560]);
 }
 
-/// Qwen3.6-27B hidden 5120 — exceeds the single-row limit (4096), so this
+/// Qwen3.6-27B hidden 5120 — wider than a single threadgroup covers, so this
 /// dispatches the looped kernel.
 #[test]
 fn rms_norm_op_27b_hidden_looped() {
     parity(&[1, 1, 5120]);
+}
+
+#[test]
+fn rms_norm_op_widest_single_row() {
+    parity(&[1, 1, 4096]);
+}
+
+#[test]
+fn rms_norm_op_narrowest_looped() {
+    parity(&[1, 1, 4097]);
 }
 
 fn parity(shape: &[usize]) {
@@ -97,7 +109,7 @@ fn parity(shape: &[usize]) {
     let got = out.cpu_to_vec::<bf16>().expect("read out");
 
     // Wider axes accumulate a longer fp32 reduction; allow a slightly
-    // looser bf16-ULP bound for the looped (> 4096) regime.
+    // looser bf16-ULP bound for the looped regime (> 4096).
     let (abs_tol, rel_tol) = if hidden > 4096 {
         (0.01, 0.02)
     } else {

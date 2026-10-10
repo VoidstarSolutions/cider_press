@@ -307,8 +307,8 @@ pub enum OpKind {
     /// rank ≥ 1, `w` a weight matching `x`'s trailing axis (rank-1
     /// `[hidden]` when `w_stride == 1`; a 1-element `[1.0]` scalar when
     /// `w_stride == 0`, the weightless / `weight=None` case). Output has the
-    /// same shape and dtype as `x`. Dispatches the single-row kernel for
-    /// trailing axis ≤ 4096, else the looped kernel (axis > 4096). Replaces
+    /// same shape and dtype as `x`. The kernels layer picks the single-row or
+    /// looped kernel from the trailing axis width. Replaces
     /// the composed square→mean→rsqrt→mul→mul chain with one dispatch.
     RmsNorm {
         /// Variance-stabilising epsilon added before the `rsqrt`
@@ -1856,9 +1856,8 @@ impl Tensor {
     /// `out = w * x * rsqrt(mean(x²) + eps)`, reduced per row in fp32.
     ///
     /// One dispatch of MLX's fused `RMSNorm`, replacing the composed
-    /// square→mean→rsqrt→mul→mul chain: `rms_single_row` when the trailing
-    /// axis is ≤ 4096 (fits one threadgroup), else `rms_looped` (the
-    /// threadgroup loops the row — e.g. Qwen3.6-27B's hidden 5120).
+    /// square→mean→rsqrt→mul→mul chain; the kernels layer selects the
+    /// single-row or looped variant from the trailing axis width.
     /// Preconditions:
     ///
     /// - `self` (x) is dense, contiguous, [`DType::BF16`], rank ≥ 1.

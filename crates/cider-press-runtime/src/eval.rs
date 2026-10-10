@@ -2217,33 +2217,17 @@ fn dispatch_rms_norm(
     let n_rows = x.shape().elem_count() / axis_size;
 
     let library = device.rms_norm_library()?;
-    // Axis ≤ 4096 fits a row in one threadgroup (single-row); wider axes
-    // (e.g. Qwen3.6-27B's hidden 5120) need the looped kernel.
-    if axis_size > cider_press_kernels::kernels::rms_norm::LOOPED_LIMIT {
-        cider_press_kernels::kernels::rms_norm::rms_norm_looped_bf16(
-            commands,
-            library,
-            &x_typed,
-            &w_typed,
-            &mut dst_typed,
-            axis_size,
-            n_rows,
-            eps,
-            w_stride,
-        )?;
-    } else {
-        cider_press_kernels::kernels::rms_norm::rms_norm_bf16(
-            commands,
-            library,
-            &x_typed,
-            &w_typed,
-            &mut dst_typed,
-            axis_size,
-            n_rows,
-            eps,
-            w_stride,
-        )?;
-    }
+    cider_press_kernels::kernels::rms_norm::rms_norm_bf16(
+        commands,
+        library,
+        &x_typed,
+        &w_typed,
+        &mut dst_typed,
+        axis_size,
+        n_rows,
+        eps,
+        w_stride,
+    )?;
     Ok(())
 }
 
