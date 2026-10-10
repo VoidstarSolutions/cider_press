@@ -149,11 +149,14 @@ commits every piece of state the next chunk reads — the KV `slice_update` writ
 and the final recurrent state are ancestors of the chunk's hidden states, and the
 conv window is a view of the conv input the layer output consumes. Chunked and
 single-forward prefill are bit-exact on the seeded synthetic model (logits and
-cache state; unit test) and greedy-token-identical on the 4B real checkpoint.
-Measured on the 4B: peak footprint ~7.4–7.5 GB at 109,
+cache state; unit test) and produce identical greedy tokens on the 4B (8/8,
+chunked vs unchunked on a short prefix); this is separate from the cider-vs-mlx-lm
+parity above. Measured on the 4B: peak footprint ~7.4–7.5 GB at 109,
 217 and 541 prompt tokens (flat), prefill ~150 tok/s; chunk 8 → ~5.6 GB but ~7%
-slower, chunk 32 → ~11.9 GB. On the 27B, 16-token chunks bound the transient near
-12 GB. The chunkwise-parallel GDN kernel (Phase 7) would remove the per-token
+slower, chunk 32 → ~11.9 GB. On the 27B (`cider-press bench --no-chat-template`,
+560-token prompt, 16-token chunks): peak footprint 31.2 GB (RSS after load
+14.65 GB, so a ~15 GB prefill transient), independent of prompt length; decode
+26.4 tok/s. The chunkwise-parallel GDN kernel (Phase 7) would remove the per-token
 temporaries altogether.
 
 ## Performance notes
@@ -235,7 +238,7 @@ Incumbent baseline to beat (mlx-lm, this machine): 27B decode **~33 tok/s** at
   parity prompt (the `fs::read` transient: ~15 GB host shard bytes + ~15 GB device
   upload). That figure hid a prompt-length term: single-eval prefill grew ~0.75
   GB/prompt-token on the 27B (>64 GB at ~60 tokens) until **chunked prefill**
-  bounded it (16-token chunks, ~12 GB transient at any length — see
+  bounded it (16-token chunks; measured 31.2 GB peak footprint at 560 tokens, independent of length — see
   [Prefill memory](#prefill-memory-chunked-prefill)). Deferred: **memory** —
   mmap'ing the shards would roughly halve the peak (~16 GB) by skipping the
   host Vec; **perf** — cider's naive per-token GDN over 48×64 makes 27B decode

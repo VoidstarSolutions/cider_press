@@ -164,7 +164,9 @@ concrete **parity gate** (the Qwen2.5 discipline). Phases 0–5 reach *correctne
   That hid a prompt-length term: single-eval prefill grew ~0.75 GB/prompt-token on the
   27B (the unrolled per-token GDN recurrence), >64 GB at ~60 tokens. Fixed by
   **chunked prefill** (`Generator` feeds Qwen3.5 prompts in 16-token `fill_cache`
-  chunks, each evaluated before the next): ~12 GB transient at any prompt length;
+  chunks, each evaluated before the next): measured on the 27B (560-token prompt)
+  peak footprint 31.2 GB (RSS after load 14.65 GB, ~15 GB transient), independent
+  of prompt length, decode 26.4 tok/s;
   4B peak footprint flat at ~7.5 GB from 109 to 541 tokens (was ~45 GB at 109).
   Deferred: mmap (~halve peak), and perf — naive per-token GDN makes 27B decode slow
   (the Phase-7 chunkwise GDN kernel is the lever; ~33 tok/s mlx-lm baseline).

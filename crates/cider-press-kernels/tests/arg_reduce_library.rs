@@ -2,7 +2,7 @@
 //!
 //! Confirms the flattened MSL source compiles via
 //! `newLibraryWithSource:`. Dispatch-level tests (argmax correctness,
-//! tie-break locking) land in Task 2 alongside the dispatch wrapper.
+//! tie-break locking) live with the dispatch wrapper's own tests.
 
 #![cfg(target_os = "macos")]
 
