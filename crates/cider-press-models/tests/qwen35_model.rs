@@ -80,9 +80,7 @@ fn qwen35_model_forward_shape() {
     let input_ids = Tensor::from_slice(&device, &ids, [1usize, t]).unwrap();
     let offset = Tensor::from_slice(&device, &[0i32], [1usize]).unwrap();
 
-    let mut caches: Vec<Qwen35LayerCache> = (0..config.num_hidden_layers)
-        .map(|i| Qwen35LayerCache::for_layer(&config, i, &device, t).unwrap())
-        .collect();
+    let mut caches: Vec<Qwen35LayerCache> = model.make_caches(t, &device).unwrap();
 
     let logits = model.forward(&input_ids, &offset, &mut caches).unwrap();
     logits.eval().unwrap();
@@ -94,9 +92,7 @@ fn qwen35_model_forward_shape() {
     );
 
     // forward_last projects only the final position: [1, 1, vocab_size].
-    let mut last_caches: Vec<Qwen35LayerCache> = (0..config.num_hidden_layers)
-        .map(|i| Qwen35LayerCache::for_layer(&config, i, &device, t).unwrap())
-        .collect();
+    let mut last_caches: Vec<Qwen35LayerCache> = model.make_caches(t, &device).unwrap();
     let last = model
         .forward_last(&input_ids, &offset, &mut last_caches)
         .unwrap();
@@ -153,11 +149,7 @@ fn qwen35_model_logits_match_mlx() {
     let ids = Tensor::from_slice(&device, &input_ids, [1usize, t]).unwrap();
     let offset = Tensor::from_slice(&device, &[0i32], [1usize]).unwrap();
 
-    let build_caches = || -> Vec<Qwen35LayerCache> {
-        (0..config.num_hidden_layers)
-            .map(|i| Qwen35LayerCache::for_layer(&config, i, &device, t).unwrap())
-            .collect()
-    };
+    let build_caches = || -> Vec<Qwen35LayerCache> { model.make_caches(t, &device).unwrap() };
 
     // (1) Backbone: post-final-norm hidden. Tighter — localizes layer vs head.
     let mut caches = build_caches();

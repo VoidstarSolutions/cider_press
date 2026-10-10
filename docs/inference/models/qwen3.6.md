@@ -205,8 +205,8 @@ Incumbent baseline to beat (mlx-lm, this machine): 27B decode **~33 tok/s** at
   end-to-end:** `qwen3_5/model.rs` (`Qwen35Model`: embed *no √scale* → 32 mixed
   decoder layers → final RMSNorm → tied lm_head) + a unified per-layer
   `Qwen35LayerCache::{Full(KvCache), Linear(conv-window + fp32 recurrent state)}`.
-  The GDN mixer now threads its two-part state (`GatedDeltaNet::forward(.., Option<&mut
-  LinearState>)`) so it decodes, proven by a prefill-decode equivalence test
+  The GDN mixer now threads its two-part state (`GatedDeltaNet::forward(.., &mut
+  LinearState)`) so it decodes, proven by a prefill-decode equivalence test
   (one-shot `[0..T]` == prefill `[0..T-1]` + decode `[T-1]`, max_abs ~2e-3);
   `Qwen35DecoderLayer::forward` is unified over the cache enum. The `Generator` is
   generalized over a `LanguageModel` trait (drives Qwen2 + Qwen3.5 with no Qwen2

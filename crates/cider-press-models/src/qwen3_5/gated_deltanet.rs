@@ -16,9 +16,10 @@
 
 use crate::error::{Error, Result};
 use crate::nn::{Linear, Module, repeat_axis_interleaved, scalar_tensor, silu};
+use crate::qwen3_5::cache::LinearState;
 use crate::qwen3_5::config::Qwen35Config;
 use crate::qwen3_5::weights::Qwen35LinearAttnWeights;
-use cider_press_runtime::{DType, Tensor};
+use cider_press_runtime::{DType, Device, Tensor};
 
 /// Depthwise causal Conv1d (kernel 4, groups = channels, no bias) + SiLU,
 /// for the Gated-DeltaNet mixer. `qkv` `[1, T, C]`, `conv_state` `[1, 3, C]`
@@ -315,7 +316,7 @@ pub(crate) fn gqa_repeat(x: &Tensor, hv: usize) -> Result<Tensor> {
 
 /// Gated-DeltaNet per-token recurrence (fp32 state). `q`, `k`, `v`
 /// `[1, T, Hv, D]` (cast to f32 internally), `g`, `beta` `[1, T, Hv]` f32,
-/// `state0` `[1, Hv, Dv, Dk]` f32 (or `None` ⇒ zeros). Returns
+/// `state0` `[1, Hv, Dv, Dk]` f32. Returns
 /// (`y` `[1, T, Hv, Dv]` bf16, `final_state` `[1, Hv, Dv, Dk]` f32). The state
 /// is worked in rank-3 `[Hv, Dv, Dk]` to stay within the wired strided-binary
 /// ranks.
@@ -340,7 +341,7 @@ pub(crate) fn recurrence(
     v: &Tensor,
     g: &Tensor,
     beta: &Tensor,
-    state0: Option<&Tensor>,
+    state0: &Tensor,
 ) -> Result<(Tensor, Tensor)> {
     let qd = q.shape().dims();
     let kd = k.shape().dims();
@@ -394,24 +395,19 @@ pub(crate) fn recurrence(
     let vf = v.cast(DType::F32)?;
 
     // State M [Hv, Dv, Dk] f32 (rank-3 to stay within wired strided binaries).
-    let mut m = match state0 {
-        Some(s) => {
-            let sd = s.shape().dims();
-            if sd != [1, hv, dv, dk] {
-                return Err(Error::InvalidArgument(format!(
-                    "recurrence: state0 must be [1, {hv}, {dv}, {dk}]; got {sd:?}",
-                )));
-            }
-            if s.dtype() != DType::F32 {
-                return Err(Error::InvalidArgument(format!(
-                    "recurrence: state0 must be F32; got {:?}",
-                    s.dtype()
-                )));
-            }
-            s.copy()?.reshape([hv, dv, dk])?
-        }
-        None => Tensor::zeros(device, [hv, dv, dk], DType::F32)?,
-    };
+    let sd = state0.shape().dims();
+    if sd != [1, hv, dv, dk] {
+        return Err(Error::InvalidArgument(format!(
+            "recurrence: state0 must be [1, {hv}, {dv}, {dk}]; got {sd:?}",
+        )));
+    }
+    if state0.dtype() != DType::F32 {
+        return Err(Error::InvalidArgument(format!(
+            "recurrence: state0 must be F32; got {:?}",
+            state0.dtype()
+        )));
+    }
+    let mut m = state0.copy()?.reshape([hv, dv, dk])?;
 
     let neg_one = scalar_tensor(device, DType::F32, -1.0)?;
 
@@ -479,11 +475,9 @@ pub(crate) fn recurrence(
 /// q/k norm+scale → GQA repeat → forget/`beta` gates → fp32 delta-rule
 /// recurrence → gated output `RMSNorm` (× `silu(z)` in fp32) → `out_proj`.
 ///
-/// Decode threads a [`LinearState`](crate::qwen3_5::cache::LinearState) cache:
-/// the incoming conv window and recurrent state are read in, and the updated
-/// states are written back. `cache = None` is the prefill-from-zero path (both
-/// the conv history and the recurrence state start at zeros) and is what the
-/// parity gate runs.
+/// Every call threads a [`LinearState`]: the incoming conv window and
+/// recurrent state are read in, and the updated states are written back. A
+/// fresh [`make_state`](Self::make_state) is the prefill-from-zero start.
 #[derive(Debug)]
 pub struct GatedDeltaNet {
     in_proj_qkv: Linear,
@@ -518,23 +512,26 @@ impl GatedDeltaNet {
         })
     }
 
+    /// A zeroed [`LinearState`] sized for this mixer (the start of a fresh
+    /// sequence).
+    ///
+    /// # Errors
+    /// Device allocation failure.
+    pub fn make_state(&self, device: &Device) -> Result<LinearState> {
+        LinearState::zeros(&self.config, device)
+    }
+
     /// Run the Gated-DeltaNet mixer on `hidden` (`[1, T, hidden_size]`, dense
     /// BF16, already input-layernorm'd by the caller). Returns
     /// `[1, T, hidden_size]`, lazy.
     ///
-    /// `cache` threads the two-part GDN state across calls. When `Some(st)`, the
-    /// incoming `st.conv_state` window and `st.recurrent_state` seed the causal
-    /// conv and the recurrence, and the updated states are written back into
-    /// `st` (the cache Tensors are lazy — `eval` them before a dependent call in
-    /// a later command buffer). When `None`, the conv history and recurrence
-    /// state start at zeros (prefill-from-zero) and the updated states are
-    /// discarded.
+    /// `state` threads the two-part GDN state across calls: its incoming conv
+    /// window and recurrent state seed the causal conv and the recurrence, and
+    /// the updated states are written back into it (lazily — evaluate them, or
+    /// an output that depends on them, before a dependent call in a later
+    /// command buffer).
     #[allow(clippy::many_single_char_names)]
-    pub fn forward(
-        &self,
-        hidden: &Tensor,
-        cache: Option<&mut crate::qwen3_5::cache::LinearState>,
-    ) -> Result<Tensor> {
+    pub fn forward(&self, hidden: &Tensor, state: &mut LinearState) -> Result<Tensor> {
         let config = &self.config;
         let hidden_size = config.hidden_size;
         let hk = config.linear_num_key_heads;
@@ -542,7 +539,6 @@ impl GatedDeltaNet {
         let dk = config.linear_key_head_dim;
         let dv = config.linear_value_head_dim;
         let value_dim = config.value_dim();
-        let conv_dim = config.conv_dim();
         let eps = {
             #[allow(clippy::cast_possible_truncation)]
             let e = config.rms_norm_eps as f32;
@@ -568,17 +564,6 @@ impl GatedDeltaNet {
             )));
         }
         let t = dims[1];
-        let device = hidden.device().ok_or_else(|| {
-            Error::InvalidArgument("GatedDeltaNet::forward: hidden has no device".into())
-        })?;
-
-        // Read the incoming cache state up front (cheap Arc-handle clones) so the
-        // later `&mut` write-back doesn't conflict with these `&` reads.
-        let conv_in = match cache.as_ref() {
-            Some(st) => st.conv_state.clone(),
-            None => Tensor::zeros(device, [1usize, 3, conv_dim], DType::BF16)?,
-        };
-        let state0 = cache.as_ref().map(|st| st.recurrent_state.clone());
 
         // 1. Project. All bias-free Linears.
         let qkv = self.in_proj_qkv.forward(hidden)?; // [1, T, conv_dim]
@@ -590,7 +575,7 @@ impl GatedDeltaNet {
         let b = self.in_proj_b.forward(hidden)?; // [1, T, Hv]
 
         // 2. Causal depthwise conv (seeded by the incoming conv window).
-        let (conv_out, new_conv) = conv1d_causal(&qkv, &conv_in, &self.conv1d_weight)?;
+        let (conv_out, new_conv) = conv1d_causal(&qkv, &state.conv_state, &self.conv1d_weight)?;
 
         // 3. Split into per-head q/k/v.
         let (q, k, v) = split_qkv(&conv_out, hk, hv, dk, dv)?;
@@ -609,8 +594,8 @@ impl GatedDeltaNet {
         let g = compute_g(&a, &self.a_log, &self.dt_bias)?;
         let beta = gdn_beta(&b)?;
 
-        // 7. Delta-rule recurrence (seeded by the incoming recurrent state, or
-        //    zeros at prefill). Pre-cast q/k/v to f32. `Tensor::cast` can't take
+        // 7. Delta-rule recurrence (seeded by the incoming recurrent state).
+        //    Pre-cast q/k/v to f32. `Tensor::cast` can't take
         //    a rank-4 *view* (the cross-dtype strided copy is rank ≤ 3), so
         //    materialize each view to a dense leaf first; the dense cast path is
         //    rank-agnostic.
@@ -618,7 +603,7 @@ impl GatedDeltaNet {
         let q = to_f32(&q)?;
         let k = to_f32(&k)?;
         let v = to_f32(&v)?;
-        let (y, new_state) = recurrence(&q, &k, &v, &g, &beta, state0.as_ref())?; // [1, T, Hv, Dv] bf16
+        let (y, new_state) = recurrence(&q, &k, &v, &g, &beta, &state.recurrent_state)?; // [1, T, Hv, Dv] bf16
 
         // 8. Gated output norm + out_proj. The gated-output `norm` gamma is
         //    WEIGHTED (loaded as-is). Then `_precise_swiglu` in fp32:
@@ -637,12 +622,8 @@ impl GatedDeltaNet {
             .reshape([1usize, t, value_dim])?;
         let result = self.out_proj.forward(&out)?;
 
-        // Write back the updated two-part state for the next step (decode).
-        // `None` keeps the prefill-from-zero behavior (states discarded).
-        if let Some(st) = cache {
-            st.conv_state = new_conv;
-            st.recurrent_state = new_state;
-        }
+        state.conv_state = new_conv;
+        state.recurrent_state = new_state;
         Ok(result)
     }
 }
@@ -893,7 +874,8 @@ mod tests {
     #[allow(
         clippy::cast_precision_loss,
         clippy::many_single_char_names,
-        clippy::needless_range_loop
+        clippy::needless_range_loop,
+        clippy::too_many_lines
     )]
     fn recurrence_matches_fp32_reference() {
         let device = Device::shared().unwrap();
@@ -923,7 +905,8 @@ mod tests {
         let g = Tensor::from_slice(&device, &g_data, [1usize, t, hv]).unwrap();
         let beta = Tensor::from_slice(&device, &beta_data, [1usize, t, hv]).unwrap();
 
-        let (y, state) = recurrence(&q, &k, &v, &g, &beta, None).unwrap();
+        let state0 = Tensor::zeros(&device, [1usize, hv, dv, dk], DType::F32).unwrap();
+        let (y, state) = recurrence(&q, &k, &v, &g, &beta, &state0).unwrap();
         y.eval().unwrap();
         state.eval().unwrap();
         assert_eq!(y.dtype(), DType::BF16);

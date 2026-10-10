@@ -230,6 +230,21 @@ impl GatedAttention {
         })
     }
 
+    /// A fresh BF16 [`KvCache`] sized for `max_tokens` positions of this
+    /// layer's K/V heads.
+    ///
+    /// # Errors
+    /// Device allocation failure.
+    pub fn make_cache(&self, max_tokens: usize, device: &Device) -> Result<KvCache> {
+        Ok(KvCache::new(
+            device,
+            max_tokens,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+            DType::BF16,
+        )?)
+    }
+
     /// Run gated self-attention on `hidden` (`[1, T, hidden_size]`, dense BF16,
     /// already input-layernorm'd by the caller).
     ///

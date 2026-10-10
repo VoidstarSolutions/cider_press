@@ -75,13 +75,11 @@ pub trait LanguageModel {
         None
     }
 
-    /// Reset every cache to position 0 for a fresh sequence. `device` is the
-    /// allocation device for caches that re-zero state tensors (the attention
-    /// KV caches merely rewind; the linear caches re-allocate).
+    /// Reset every cache to position 0 for a fresh sequence.
     ///
     /// # Errors
     /// Propagates a cache reset failure (e.g. an un-committed prior update).
-    fn reset_caches(&self, caches: &mut [Self::Cache], device: &Device) -> Result<()>;
+    fn reset_caches(&self, caches: &mut [Self::Cache]) -> Result<()>;
 
     /// Vocabulary size — the logits inner dimension, used to validate the
     /// argmax input shape.
@@ -126,7 +124,7 @@ impl LanguageModel for Qwen2Model {
         Qwen2Model::fill_cache(self, input_ids, offset, caches)
     }
 
-    fn reset_caches(&self, caches: &mut [Self::Cache], _device: &Device) -> Result<()> {
+    fn reset_caches(&self, caches: &mut [Self::Cache]) -> Result<()> {
         for cache in caches {
             cache.reset()?;
         }
@@ -142,10 +140,7 @@ impl LanguageModel for Qwen35Model {
     type Cache = crate::qwen3_5::Qwen35LayerCache;
 
     fn make_caches(&self, max_tokens: usize, device: &Device) -> Result<Vec<Self::Cache>> {
-        let cfg = self.config();
-        (0..cfg.num_hidden_layers)
-            .map(|i| crate::qwen3_5::Qwen35LayerCache::for_layer(cfg, i, device, max_tokens))
-            .collect()
+        Qwen35Model::make_caches(self, max_tokens, device)
     }
 
     fn forward_last(
@@ -170,9 +165,9 @@ impl LanguageModel for Qwen35Model {
         Some(crate::qwen3_5::QWEN35_PREFILL_CHUNK)
     }
 
-    fn reset_caches(&self, caches: &mut [Self::Cache], device: &Device) -> Result<()> {
+    fn reset_caches(&self, caches: &mut [Self::Cache]) -> Result<()> {
         for cache in caches {
-            cache.reset(device)?;
+            cache.reset()?;
         }
         Ok(())
     }

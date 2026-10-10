@@ -89,8 +89,7 @@ impl<M: LanguageModel> Generator<M> {
     /// has not been evaluated — it must be, to keep outstanding K/V views from
     /// replaying stale writes into the reused slab).
     pub fn reset(&mut self) -> Result<()> {
-        let device = Device::shared()?;
-        self.model.reset_caches(&mut self.caches, &device)?;
+        self.model.reset_caches(&mut self.caches)?;
         self.position = 0;
         Ok(())
     }
@@ -506,8 +505,8 @@ mod tests {
                     (kv.position(), widen(host(&kv.values_view()))),
                 ],
                 Qwen35LayerCache::Linear(st) => vec![
-                    (0, widen(host(&st.conv_state))),
-                    (0, host::<f32>(&st.recurrent_state)),
+                    (0, widen(host(st.conv_state()))),
+                    (0, host::<f32>(st.recurrent_state())),
                 ],
             })
             .collect()
@@ -552,7 +551,9 @@ mod tests {
         for (i, cache) in caches.iter().enumerate() {
             let states = match cache {
                 Qwen35LayerCache::Full(kv) => [kv.keys_view(), kv.values_view()],
-                Qwen35LayerCache::Linear(st) => [st.conv_state.clone(), st.recurrent_state.clone()],
+                Qwen35LayerCache::Linear(st) => {
+                    [st.conv_state().clone(), st.recurrent_state().clone()]
+                }
             };
             for state in &states {
                 assert!(state.is_materialized(), "layer {i}: state left lazy");

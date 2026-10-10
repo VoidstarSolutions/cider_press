@@ -4,10 +4,10 @@ use std::{fs, path::PathBuf};
 
 use cider_press_models::nn::rms_norm;
 use cider_press_models::qwen3_5::{
-    GatedDeltaNet, LinearState, Qwen35Config, Qwen35DecoderLayer, Qwen35LayerCache,
-    Qwen35MixerWeights, load_qwen35_weights,
+    GatedDeltaNet, LinearState, Qwen35Config, Qwen35DecoderLayer, Qwen35MixerWeights,
+    load_qwen35_weights,
 };
-use cider_press_runtime::{DType, Device, Tensor};
+use cider_press_runtime::{Device, Tensor};
 use cider_press_test_utils::{read_bf16, require_checkpoint_dir, require_file};
 use half::bf16;
 use safetensors::SafeTensors;
@@ -75,7 +75,8 @@ fn gated_deltanet_layer0_matches_mlx() {
         panic!("layer 0 must be linear");
     };
     let gdn = GatedDeltaNet::from_weights(la, &config).unwrap();
-    let out = gdn.forward(&normed, None).unwrap();
+    let mut state = LinearState::zeros(&config, &device).unwrap();
+    let out = gdn.forward(&normed, &mut state).unwrap();
     out.eval().unwrap();
     let got: Vec<bf16> = out.cpu_to_vec().unwrap();
     assert_close("gated_deltanet layer0", &got, &expected);
@@ -106,7 +107,7 @@ fn decoder_layer0_matches_mlx() {
 
     let x = Tensor::from_slice(&device, &layer0_in, [1usize, t, config.hidden_size]).unwrap();
     let layer = Qwen35DecoderLayer::from_weights(&weights.layers[0], &config).unwrap();
-    let mut cache = Qwen35LayerCache::for_layer(&config, 0, &device, t).unwrap();
+    let mut cache = layer.make_cache(t, &device).unwrap();
     let offset = Tensor::from_slice(&device, &[0i32], [1usize]).unwrap();
     let out = layer.forward(&x, &offset, &mut cache).unwrap();
     out.eval().unwrap();
@@ -115,7 +116,7 @@ fn decoder_layer0_matches_mlx() {
 }
 
 /// Prefill-decode cache-correctness gate. Runs the layer-0 GDN mixer two ways
-/// over the same `T`-token input: (1) one-shot over `[0..T]` with no cache; (2)
+/// over the same `T`-token input: (1) one-shot over `[0..T]` from a fresh state; (2)
 /// split — prefill `[0..T-1]` threading a `LinearState`, then a single decode
 /// step over `[T-1..T]` threading the updated cache. The last row of the
 /// one-shot output must match the single decode row, proving the conv-window +
@@ -149,20 +150,15 @@ fn gated_deltanet_prefill_decode_equivalence() {
     };
     let gdn = GatedDeltaNet::from_weights(la, &config).unwrap();
 
-    // (1) One-shot, no cache.
-    let y_full = gdn.forward(&normed, None).unwrap();
+    // (1) One-shot from a fresh state.
+    let mut st_full = LinearState::zeros(&config, &device).unwrap();
+    let y_full = gdn.forward(&normed, &mut st_full).unwrap();
     y_full.eval().unwrap();
     assert_eq!(y_full.shape().dims(), [1, t, config.hidden_size]);
     let full: Vec<bf16> = y_full.cpu_to_vec().unwrap();
 
     // (2) Split: prefill [0..T-1] then decode [T-1..T], threading a cache.
-    let hv = config.linear_num_value_heads;
-    let dv = config.linear_value_head_dim;
-    let dk = config.linear_key_head_dim;
-    let mut st = LinearState {
-        conv_state: Tensor::zeros(&device, [1usize, 3, config.conv_dim()], DType::BF16).unwrap(),
-        recurrent_state: Tensor::zeros(&device, [1usize, hv, dv, dk], DType::F32).unwrap(),
-    };
+    let mut st = LinearState::zeros(&config, &device).unwrap();
 
     // Build compact prefill/decode inputs from the host rows. (A device-side
     // row-prefix slice+copy elides to a zero-copy view over the full backing
@@ -176,14 +172,14 @@ fn gated_deltanet_prefill_decode_equivalence() {
     let normed_dec =
         Tensor::from_slice(&device, &normed_host[(t - 1) * h..t * h], [1usize, 1, h]).unwrap();
 
-    let _ = gdn.forward(&normed_prefill, Some(&mut st)).unwrap();
+    let _ = gdn.forward(&normed_prefill, &mut st).unwrap();
     // CRITICAL: commit the lazy cache Tensors before the decode reads them
     // (producer→consumer split across evals — the un-evaluated conv/recurrent
     // writes would otherwise be dropped by the next call).
-    st.conv_state.eval().unwrap();
-    st.recurrent_state.eval().unwrap();
+    st.conv_state().eval().unwrap();
+    st.recurrent_state().eval().unwrap();
 
-    let y_dec = gdn.forward(&normed_dec, Some(&mut st)).unwrap();
+    let y_dec = gdn.forward(&normed_dec, &mut st).unwrap();
     y_dec.eval().unwrap();
     assert_eq!(y_dec.shape().dims(), [1, 1, config.hidden_size]);
     let dec: Vec<bf16> = y_dec.cpu_to_vec().unwrap();

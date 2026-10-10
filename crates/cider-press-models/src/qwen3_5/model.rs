@@ -8,7 +8,7 @@
 //! model is mixer-agnostic — it zips layers with caches; (2) the caches are
 //! [`Qwen35LayerCache`]s, not a flat `KvCache` per layer.
 
-use cider_press_runtime::{QuantizedWeight, Tensor};
+use cider_press_runtime::{Device, QuantizedWeight, Tensor};
 
 use super::block::Qwen35DecoderLayer;
 use super::cache::Qwen35LayerCache;
@@ -37,8 +37,9 @@ pub(crate) const QWEN35_PREFILL_CHUNK: usize = 16;
 ///   `Some` separate `[vocab, hidden]` quantized head, projected with the same
 ///   `y = x·Wᵀ` direction.
 ///
-/// `forward` takes caller-owned `&mut [Qwen35LayerCache]` (one per layer) so a
-/// decode loop can persist them across calls.
+/// `forward` takes caller-owned `&mut [Qwen35LayerCache]` (one per layer, from
+/// [`make_caches`](Self::make_caches)) so a decode loop can persist them
+/// across calls.
 #[derive(Debug)]
 pub struct Qwen35Model {
     embed: QuantizedWeight,
@@ -79,6 +80,18 @@ impl Qwen35Model {
             final_norm,
             config,
         })
+    }
+
+    /// One fresh cache per layer, each matching its layer's mixer; full-attention
+    /// caches are sized for `max_tokens` positions.
+    ///
+    /// # Errors
+    /// Device allocation failure.
+    pub fn make_caches(&self, max_tokens: usize, device: &Device) -> Result<Vec<Qwen35LayerCache>> {
+        self.layers
+            .iter()
+            .map(|layer| layer.make_cache(max_tokens, device))
+            .collect()
     }
 
     /// The config the model was built from.
@@ -243,5 +256,51 @@ impl Qwen35Model {
         // (27B): the separate `lm_head`. Tied (4B): the embedding table itself.
         let head = self.lm_head.as_ref().unwrap_or(&self.embed);
         Ok(normed.quantized_matmul(head, true)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use cider_press_runtime::DType;
+    use safetensors::SafeTensors;
+
+    use super::*;
+    use crate::qwen3_5::load_qwen35_weights;
+    use crate::qwen3_5::test_support::{Fill, TINY_CONFIG_JSON, synthesize_archive_bytes_with};
+
+    #[test]
+    fn make_caches_follow_each_layer_mixer() {
+        let device = Device::shared().unwrap();
+        let config = Qwen35Config::from_json_bytes(TINY_CONFIG_JSON.as_bytes()).unwrap();
+        let bytes = synthesize_archive_bytes_with(&config, false, Fill::Zeros, |_, _| None);
+        let archive = SafeTensors::deserialize(&bytes).unwrap();
+        let weights = load_qwen35_weights(&archive, &config, &device).unwrap();
+        let model = Qwen35Model::from_weights(weights, config.clone()).unwrap();
+
+        let caches = model.make_caches(8, &device).unwrap();
+        assert_eq!(caches.len(), config.num_hidden_layers);
+        for (i, cache) in caches.iter().enumerate() {
+            match cache {
+                Qwen35LayerCache::Linear(state) => {
+                    assert!(
+                        config.is_linear(i),
+                        "layer {i}: Linear cache on a full layer"
+                    );
+                    assert_eq!(
+                        state.conv_state().shape().dims(),
+                        &[1, config.linear_conv_kernel_dim - 1, config.conv_dim()]
+                    );
+                    assert_eq!(state.recurrent_state().dtype(), DType::F32);
+                }
+                Qwen35LayerCache::Full(kv) => {
+                    assert!(
+                        !config.is_linear(i),
+                        "layer {i}: Full cache on a linear layer"
+                    );
+                    assert_eq!(kv.head_dim(), config.head_dim);
+                    assert_eq!(kv.dtype(), DType::BF16);
+                }
+            }
+        }
     }
 }

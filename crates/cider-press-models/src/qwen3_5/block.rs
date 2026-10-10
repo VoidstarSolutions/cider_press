@@ -5,17 +5,15 @@
 //!
 //! The two mixers carry different state needs: the full mixer threads a RoPE
 //! `offset` and a [`KvCache`](cider_press_runtime::KvCache); the linear (GDN)
-//! mixer threads a depthwise-conv window plus an fp32 recurrent state. Phase 4
-//! unifies both behind one [`Qwen35DecoderLayer::forward`] that dispatches on a
-//! per-layer [`Qwen35LayerCache`] enum: a [`Full`](Qwen35LayerCache::Full)
-//! mixer pairs with a [`Full`](Qwen35LayerCache::Full) cache, a
-//! [`Linear`](Qwen35LayerCache::Linear) mixer with a
-//! [`Linear`](Qwen35LayerCache::Linear) cache; a mismatched pair errors. The
-//! `offset` is threaded for the full path's RoPE; the linear (GDN) mixer
-//! carries no position and ignores it (matching mlx-lm, where the GDN layer
-//! takes no offset).
+//! mixer threads a depthwise-conv window plus an fp32 recurrent state. One
+//! [`Qwen35DecoderLayer::forward`] serves both, dispatching on a per-layer
+//! [`Qwen35LayerCache`] enum built by [`Qwen35DecoderLayer::make_cache`], so
+//! the cache variant matches the mixer by construction (a hand-built
+//! mismatched cache errors). The `offset` is threaded for the full path's
+//! RoPE; the linear (GDN) mixer carries no position and ignores it (matching
+//! mlx-lm, where the GDN layer takes no offset).
 
-use cider_press_runtime::Tensor;
+use cider_press_runtime::{Device, Tensor};
 
 use crate::error::{Error, Result};
 use crate::nn::{Linear, Mlp, Module, RmsNormLayer};
@@ -74,6 +72,19 @@ impl Qwen35DecoderLayer {
         })
     }
 
+    /// A fresh cache for this layer's mixer: a [`KvCache`](cider_press_runtime::KvCache)
+    /// sized for `max_tokens` positions for full attention, a zeroed
+    /// [`LinearState`](crate::qwen3_5::LinearState) for Gated-DeltaNet.
+    ///
+    /// # Errors
+    /// Device allocation failure.
+    pub fn make_cache(&self, max_tokens: usize, device: &Device) -> Result<Qwen35LayerCache> {
+        Ok(match &self.mixer {
+            Mixer::Full(attn) => Qwen35LayerCache::Full(attn.make_cache(max_tokens, device)?),
+            Mixer::Linear(gdn) => Qwen35LayerCache::Linear(gdn.make_state(device)?),
+        })
+    }
+
     /// Forward over either mixer, dispatching on the per-layer cache: pre-norm
     /// mixer + residual, pre-norm SwiGLU MLP + residual.
     ///
@@ -81,13 +92,14 @@ impl Qwen35DecoderLayer {
     /// - `offset`: RoPE offset, forwarded to [`GatedAttention::forward`] on the
     ///   full path. The linear (Gated-DeltaNet) mixer carries no position and
     ///   ignores it (matching mlx-lm, where the GDN layer takes no offset).
-    /// - `cache`: the [`Qwen35LayerCache`] whose variant must match the layer's
-    ///   mixer — [`Full`](Qwen35LayerCache::Full) threads the [`KvCache`](cider_press_runtime::KvCache);
+    /// - `cache`: this layer's [`Qwen35LayerCache`] (from
+    ///   [`make_cache`](Self::make_cache)) — [`Full`](Qwen35LayerCache::Full) threads the [`KvCache`](cider_press_runtime::KvCache);
     ///   [`Linear`](Qwen35LayerCache::Linear) threads the GDN conv-window +
     ///   recurrent state.
     ///
-    /// Returns `[1, T, hidden_size]`, lazy. Errors on a mixer/cache type
-    /// mismatch (a full mixer needs a full cache; linear needs linear).
+    /// Returns `[1, T, hidden_size]`, lazy. Errors on a mixer/cache variant
+    /// mismatch, possible only with a cache not built by
+    /// [`make_cache`](Self::make_cache).
     pub fn forward(
         &self,
         hidden: &Tensor,
@@ -97,7 +109,7 @@ impl Qwen35DecoderLayer {
         let normed = self.input_layernorm.forward(hidden)?;
         let mixer_out = match (&self.mixer, cache) {
             (Mixer::Full(attn), Qwen35LayerCache::Full(kv)) => attn.forward(&normed, offset, kv)?,
-            (Mixer::Linear(gdn), Qwen35LayerCache::Linear(st)) => gdn.forward(&normed, Some(st))?,
+            (Mixer::Linear(gdn), Qwen35LayerCache::Linear(st)) => gdn.forward(&normed, st)?,
             _ => {
                 return Err(Error::InvalidArgument(
                     "Qwen35DecoderLayer::forward: mixer/cache type mismatch (Full mixer needs \

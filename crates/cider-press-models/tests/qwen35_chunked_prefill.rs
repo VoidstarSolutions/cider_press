@@ -12,7 +12,6 @@ use std::fs;
 use std::path::PathBuf;
 
 use cider_press_models::generator::Generator;
-use cider_press_models::language_model::LanguageModel;
 use cider_press_models::qwen3_5::{Qwen35Config, Qwen35Model, load_qwen35_weights};
 use cider_press_models::tokenizer::Tokenizer;
 use cider_press_runtime::{Device, Tensor};
