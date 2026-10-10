@@ -326,28 +326,18 @@ fn load_linear_attn(
     // The 4B dev vehicle stores `A_log` as f32; the 27B target stores it bf16.
     // `compute_g` requires f32, so upcast bf16 -> f32 at load (exact widening;
     // identical to mlx-lm's `A_log.astype(float32)`).
-    if !matches!(a_log_raw.layout(), Layout::Dense { .. }) {
-        return Err(Error::InvalidArgument(format!(
-            "{prefix}.A_log: expected dense layout, got quantized"
-        )));
-    }
-    if a_log_raw.shape().dims() != [value_heads] {
-        return Err(Error::ShapeMismatch {
-            key: format!("{prefix}.A_log"),
-            expected: vec![value_heads],
-            actual: a_log_raw.shape().dims().to_vec(),
-        });
-    }
+    let a_log_key = format!("{prefix}.A_log");
     let a_log = match a_log_raw.dtype() {
         DType::F32 => a_log_raw,
         DType::BF16 => a_log_raw.cast(DType::F32)?,
         other => {
             return Err(Error::UnsupportedDtype {
-                key: format!("{prefix}.A_log"),
+                key: a_log_key,
                 dtype: format!("{other:?}"),
             });
         }
     };
+    expect_dense(&a_log_key, &a_log, DType::F32, &[value_heads])?;
     let dt_bias = read_dense_tensor(archive, &format!("{prefix}.dt_bias"), device)?;
     expect_dense(
         &format!("{prefix}.dt_bias"),
