@@ -159,7 +159,10 @@ checkpoint → tokenize → chat-template → greedy decode, streamed):
   on top of the encoder/sync-model port (`docs/inference/execution-model.md`).
   Prefill uses the fused steel `sdpa_full` kernel and the last-position LM
   head; the prefill-gap investigation is **closed** (cider's ~7.76 ms already
-  matches `mlx`'s real prefill structure-for-structure).
+  matches `mlx`'s real prefill structure-for-structure). On NAX GPUs (M5+)
+  prefill `qmm` now runs on tensor cores: 12.1 → 7.1 ms at T = 150,
+  33.8 → 13.8 ms at T = 512, 140 → 60 ms at T = 2048 (M5 Max; MLX 9.1 /
+  12.8 / 44.7), decode unchanged.
 - **Qwen3.5 / Qwen3.6** (`model_type: qwen3_5`, text-only) — the hybrid
   Gated DeltaNet (linear attention, fp32 recurrent state) + gated full
   attention stack (3:1). **Qwen3.5-4B-4bit** (dev vehicle) and the sharded
@@ -275,7 +278,19 @@ let prefill chunks grow); `.metallib` precompile. Step docs under
   cross-encoder/-token ordering rests entirely on the encoder **fence
   chain**. Escape hatches: `CIDER_PRESS_TRACKED_BUFFERS=1` (restore
   automatic tracking), `CIDER_PRESS_NO_BARRIER_ELISION=1` (barrier every
-  dispatch) — both for bisecting sync bugs.
+  dispatch), `CIDER_PRESS_NO_NAX=1` (classic kernels even on a NAX GPU) —
+  all for bisecting.
+- **NAX (tensor-core) kernels.** On GPUs of generation ≥ 17 under macOS
+  ≥ 26.2 (`Device::nax_available`, a port of MLX's `is_nax_available`),
+  `M > 1` quantized matmuls dispatch MLX's `qmm_t_nax` (64×64×64 tiles;
+  `K % 64 == 0`), the same kernel MLX runs there — bit-exact against MLX
+  fixtures generated on such a machine, and *not* bit-exact with the classic
+  kernels (different accumulation order). Prefill on an M5 Max: 33.8 → 13.8 ms
+  at T = 512 vs MLX 12.8. The classic kernels stay for everything else (M = 1,
+  `K % 64 != 0`, older GPUs, the hatch). `quantized_nax.metal` needs Metal 4.0
+  and is JIT-compiled only on first NAX dispatch (~11 s cold). MLX's own
+  routing differs on small-tile shapes (it prefers a classic split-K `qmm`
+  below 512 classic threadgroups) — see `docs/inference/quantized-matmul.md`.
 
 ---
 
