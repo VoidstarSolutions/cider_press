@@ -2129,9 +2129,6 @@ impl Tensor {
                 "quantized_matmul: inner dim mismatch: activation last dim {x_k} != weight K {k_logical}",
             )));
         }
-        // The M>1 prefill path dispatches `affine_qmm_t`, which accepts any
-        // N > 0 (the aligned/non-aligned variant choice lives in `qmm.rs`); M=1 decode
-        // routes to the generic `affine_qmv`, which is likewise unconstrained.
         let q = weight.quantization();
         // Build output shape: leading dims of self (all but last), then N.
         // For rank-1 activation [K] the leading dims are empty → output is [N].
