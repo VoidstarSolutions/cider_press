@@ -3,17 +3,16 @@
 //! caches between sequences.
 //!
 //! The generator is generic over this trait and its associated `Cache` type:
-//! [`Qwen2Model`] uses [`KvCache`](cider_press_runtime::KvCache) and
-//! [`Qwen35Model`] uses
+//! [`Qwen2Model`](crate::qwen2::Qwen2Model) uses [`KvCache`](cider_press_runtime::KvCache) and
+//! [`Qwen35Model`](crate::qwen3_5::Qwen35Model) uses
 //! [`Qwen35LayerCache`](crate::qwen3_5::Qwen35LayerCache). The async-pipelined
 //! decode loop only needs `forward_last` + argmax + the cache vector, all of
-//! which are cache-type-agnostic.
+//! which are cache-type-agnostic. Each model implements the trait next to its
+//! own definition.
 
 use cider_press_runtime::{Device, Tensor};
 
 use crate::error::Result;
-use crate::qwen2::Qwen2Model;
-use crate::qwen3_5::Qwen35Model;
 
 /// A causal language model the greedy generator can drive: it builds and resets
 /// its own per-layer caches and exposes a last-position forward.
@@ -76,75 +75,4 @@ pub trait LanguageModel {
     /// Vocabulary size — the logits inner dimension, used to validate the
     /// argmax input shape.
     fn vocab_size(&self) -> usize;
-}
-
-impl LanguageModel for Qwen2Model {
-    type Cache = cider_press_runtime::KvCache;
-
-    fn make_caches(&self, max_tokens: usize, device: &Device) -> Result<Vec<Self::Cache>> {
-        let cfg = self.config();
-        let head_dim = cfg.head_dim()?;
-        (0..cfg.num_hidden_layers)
-            .map(|_| {
-                cider_press_runtime::KvCache::new(
-                    device,
-                    max_tokens,
-                    cfg.num_key_value_heads,
-                    head_dim,
-                    cider_press_runtime::DType::BF16,
-                )
-                .map_err(Into::into)
-            })
-            .collect()
-    }
-
-    fn forward_last(&self, input_ids: &Tensor, caches: &mut [Self::Cache]) -> Result<Tensor> {
-        Qwen2Model::forward_last(self, input_ids, caches)
-    }
-
-    fn fill_cache(&self, input_ids: &Tensor, caches: &mut [Self::Cache]) -> Result<Tensor> {
-        Qwen2Model::fill_cache(self, input_ids, caches)
-    }
-
-    fn reset_caches(&self, caches: &mut [Self::Cache]) -> Result<()> {
-        for cache in caches {
-            cache.reset()?;
-        }
-        Ok(())
-    }
-
-    fn vocab_size(&self) -> usize {
-        self.config().vocab_size
-    }
-}
-
-impl LanguageModel for Qwen35Model {
-    type Cache = crate::qwen3_5::Qwen35LayerCache;
-
-    fn make_caches(&self, max_tokens: usize, device: &Device) -> Result<Vec<Self::Cache>> {
-        Qwen35Model::make_caches(self, max_tokens, device)
-    }
-
-    fn forward_last(&self, input_ids: &Tensor, caches: &mut [Self::Cache]) -> Result<Tensor> {
-        Qwen35Model::forward_last(self, input_ids, caches)
-    }
-
-    fn fill_cache(&self, input_ids: &Tensor, caches: &mut [Self::Cache]) -> Result<Tensor> {
-        Qwen35Model::fill_cache(self, input_ids, caches)
-    }
-
-    fn prefill_chunk_len(&self) -> Option<usize> {
-        Some(crate::qwen3_5::QWEN35_PREFILL_CHUNK)
-    }
-
-    fn reset_caches(&self, caches: &mut [Self::Cache]) -> Result<()> {
-        for cache in caches {
-            cache.reset()?;
-        }
-        Ok(())
-    }
-
-    fn vocab_size(&self) -> usize {
-        self.config().vocab_size
-    }
 }

@@ -26,7 +26,6 @@ pub use config::{
     HF_REPO, HF_REVISION, LayerType, Qwen35Config, Qwen35QuantizationConfig, RopeParameters,
 };
 pub use gated_deltanet::GatedDeltaNet;
-pub(crate) use model::QWEN35_PREFILL_CHUNK;
 pub use model::Qwen35Model;
 #[cfg(test)]
 pub(crate) use weights::test_support;

@@ -84,7 +84,8 @@ impl ShardSet {
     ///
     /// # Errors
     ///
-    /// - [`Error::Io`] if a file cannot be read; a directory with neither the
+    /// - [`Error::Io`] if a file cannot be read (including an index whose
+    ///   existence cannot be determined); a directory with neither the
     ///   index nor `model.safetensors` reports `NotFound` for the latter.
     /// - [`Error::InvalidShardName`] if a shard name in the index is not a
     ///   single plain file name (an absolute path, `..`, or a separator would
@@ -92,7 +93,11 @@ impl ShardSet {
     /// - [`Error::Json`] if the index is malformed.
     pub fn read(dir: &Path) -> Result<Self> {
         let index_path = dir.join(Self::INDEX_FILE);
-        if !index_path.exists() {
+        let has_index = index_path.try_exists().map_err(|source| Error::Io {
+            path: index_path.clone(),
+            source,
+        })?;
+        if !has_index {
             let bytes = read_file(&dir.join(Self::SINGLE_FILE))?;
             return Ok(Self {
                 shard_names: Vec::new(),

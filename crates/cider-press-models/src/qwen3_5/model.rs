@@ -15,6 +15,7 @@ use super::cache::Qwen35LayerCache;
 use super::config::Qwen35Config;
 use super::weights::Qwen35Weights;
 use crate::error::{Error, Result};
+use crate::language_model::LanguageModel;
 use crate::nn::{Module, RmsNormLayer, embed_tokens, rope_offset};
 
 /// Prompt tokens per prefill chunk. The per-token Gated-DeltaNet recurrence
@@ -23,7 +24,7 @@ use crate::nn::{Module, RmsNormLayer, embed_tokens, rope_offset};
 /// GB/token measured on the 4B), so 16-token chunks bound the transient to
 /// 16 × that per-token cost at any prompt length. Halving it to 8 cost ~7% 4B
 /// prefill throughput.
-pub(crate) const QWEN35_PREFILL_CHUNK: usize = 16;
+const QWEN35_PREFILL_CHUNK: usize = 16;
 
 /// Qwen3.5 / Qwen3.6 causal language model.
 ///
@@ -218,6 +219,14 @@ impl Qwen35Model {
             )));
         }
 
+        let offset = rope_offset(
+            caches.iter().filter_map(|cache| match cache {
+                Qwen35LayerCache::Full(kv) => Some(kv),
+                Qwen35LayerCache::Linear(_) => None,
+            }),
+            "Qwen35Model",
+        )?;
+
         // embed_tokens takes rank-1 ids and returns [T, hidden]; the layers
         // require [1, T, hidden]. Flatten on the way in, restore the leading
         // batch axis on the way out. Qwen3.5 uses a plain lookup (no √hidden
@@ -226,13 +235,6 @@ impl Qwen35Model {
         // reshape returns a view; gather and the downstream unary/reduce
         // dispatchers read inputs as dense leaves and don't resolve view
         // chains, so materialise both ends with copy().
-        let offset = rope_offset(
-            caches.iter().filter_map(|cache| match cache {
-                Qwen35LayerCache::Full(kv) => Some(kv),
-                Qwen35LayerCache::Linear(_) => None,
-            }),
-            "Qwen35Model",
-        )?;
         let flat_ids = input_ids.reshape([t])?.copy()?;
         let embedded = embed_tokens(&flat_ids, &self.embed)?;
         let mut hidden = embedded
@@ -253,6 +255,37 @@ impl Qwen35Model {
         // (27B): the separate `lm_head`. Tied (4B): the embedding table itself.
         let head = self.lm_head.as_ref().unwrap_or(&self.embed);
         Ok(normed.quantized_matmul(head, true)?)
+    }
+}
+
+impl LanguageModel for Qwen35Model {
+    type Cache = Qwen35LayerCache;
+
+    fn make_caches(&self, max_tokens: usize, device: &Device) -> Result<Vec<Qwen35LayerCache>> {
+        Qwen35Model::make_caches(self, max_tokens, device)
+    }
+
+    fn forward_last(&self, input_ids: &Tensor, caches: &mut [Qwen35LayerCache]) -> Result<Tensor> {
+        Qwen35Model::forward_last(self, input_ids, caches)
+    }
+
+    fn fill_cache(&self, input_ids: &Tensor, caches: &mut [Qwen35LayerCache]) -> Result<Tensor> {
+        Qwen35Model::fill_cache(self, input_ids, caches)
+    }
+
+    fn prefill_chunk_len(&self) -> Option<usize> {
+        Some(QWEN35_PREFILL_CHUNK)
+    }
+
+    fn reset_caches(&self, caches: &mut [Qwen35LayerCache]) -> Result<()> {
+        for cache in caches {
+            cache.reset()?;
+        }
+        Ok(())
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.config.vocab_size
     }
 }
 

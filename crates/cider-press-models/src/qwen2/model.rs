@@ -3,12 +3,13 @@
 
 #![doc = include_str!("../../../../docs/inference/embedding.md")]
 
-use cider_press_runtime::{KvCache, QuantizedWeight, Tensor};
+use cider_press_runtime::{DType, Device, KvCache, QuantizedWeight, Tensor};
 
 use super::block::TransformerBlock;
 use super::config::Qwen2Config;
 use super::weights::Qwen2Weights;
 use crate::error::{Error, Result};
+use crate::language_model::LanguageModel;
 use crate::nn::{Module, RmsNormLayer, embed_tokens, rope_offset};
 
 /// Qwen2-family causal language model.
@@ -146,6 +147,8 @@ impl Qwen2Model {
             )));
         }
 
+        let offset = rope_offset(caches.iter(), "Qwen2Model")?;
+
         // embed_tokens takes rank-1 ids and returns [T, hidden]; the blocks
         // require [1, T, hidden]. Flatten on the way in, restore the leading
         // batch axis on the way out.
@@ -153,7 +156,6 @@ impl Qwen2Model {
         // reshape returns a view; gather and the downstream unary/reduce
         // dispatchers read inputs as dense leaves and don't resolve view
         // chains, so materialise both ends with copy().
-        let offset = rope_offset(caches.iter(), "Qwen2Model")?;
         let flat_ids = input_ids.reshape([t])?.copy()?;
         let embedded = embed_tokens(&flat_ids, &self.embed)?;
         let mut hidden = embedded
@@ -173,5 +175,45 @@ impl Qwen2Model {
         // y = x @ W^T direction (transpose=true) projects hidden states to
         // vocab-size logits without a separate weight.
         Ok(normed.quantized_matmul(&self.embed, true)?)
+    }
+}
+
+impl LanguageModel for Qwen2Model {
+    type Cache = KvCache;
+
+    fn make_caches(&self, max_tokens: usize, device: &Device) -> Result<Vec<KvCache>> {
+        let cfg = &self.config;
+        let head_dim = cfg.head_dim()?;
+        (0..cfg.num_hidden_layers)
+            .map(|_| {
+                KvCache::new(
+                    device,
+                    max_tokens,
+                    cfg.num_key_value_heads,
+                    head_dim,
+                    DType::BF16,
+                )
+                .map_err(Into::into)
+            })
+            .collect()
+    }
+
+    fn forward_last(&self, input_ids: &Tensor, caches: &mut [KvCache]) -> Result<Tensor> {
+        Qwen2Model::forward_last(self, input_ids, caches)
+    }
+
+    fn fill_cache(&self, input_ids: &Tensor, caches: &mut [KvCache]) -> Result<Tensor> {
+        Qwen2Model::fill_cache(self, input_ids, caches)
+    }
+
+    fn reset_caches(&self, caches: &mut [KvCache]) -> Result<()> {
+        for cache in caches {
+            cache.reset()?;
+        }
+        Ok(())
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.config.vocab_size
     }
 }
