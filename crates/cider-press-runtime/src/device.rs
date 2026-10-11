@@ -192,6 +192,12 @@ impl Device {
         &self.inner.kernels
     }
 
+    /// See [`cider_press_kernels::Device::nax_available`].
+    #[must_use]
+    pub fn nax_available(&self) -> bool {
+        self.inner.kernels.nax_available()
+    }
+
     /// A one-element `[1.0]` BF16 buffer, cached after first use and shared
     /// via a `Retained` handle clone on every call. Used as the stride-0
     /// scalar gamma for weightless `rms_norm` (mlx's `weight=None`): the
