@@ -290,14 +290,14 @@ pub struct SdpaFullArgs {
 
 /// Fused prefill attention via MLX's vendored `steel_attention`
 /// (`sdpa_full`). Pinned to the `bd64` bf16 instantiation
-/// (`steel_attention_bfloat16_bq32_bk32_bd64_wm4_wn1_maskbfloat16`);
+/// (`steel_attention_bfloat16_bq32_bk32_bd64_bv64_wm4_wn1_maskbfloat16`);
 /// `head_dim` must be 64. Mirrors `sdpa_full_self_attention_metal`
 /// (`backend/metal/scaled_dot_product_attention.cpp`) for the
-/// no-mask / no-sinks case: function constants 200/201 (align Q/K),
-/// 300 = `has_mask` (false), 301 = `do_causal` (`args.causal`), 302 =
-/// `has_sinks` (false). The mask/sinks buffers (5/6/7) are gated behind
-/// those false constants, so they are absent from this specialization
-/// and must not be bound.
+/// no-mask / no-sinks / no-LSE case: function constants 200/201 (align
+/// Q/K), 300 = `has_mask` (false), 301 = `do_causal` (`args.causal`),
+/// 302 = `has_sinks` (false), 303 = `save_lse` (false). The mask, sinks,
+/// and LSE buffers (5/6/7/8) are gated behind those false constants, so
+/// they are absent from this specialization and must not be bound.
 ///
 /// `out` must hold `h_q * q_len * head_dim` elements. Buffers are
 /// bounds-checked against the maximum strided element index before
@@ -434,7 +434,7 @@ pub fn dispatch_sdpa_full_bf16(
     }
 
     let pipeline = library.pipeline_specialized(
-        "steel_attention_bfloat16_bq32_bk32_bd64_wm4_wn1_maskbfloat16",
+        "steel_attention_bfloat16_bq32_bk32_bd64_bv64_wm4_wn1_maskbfloat16",
         &[
             FunctionConstant::Bool {
                 index: 200,
@@ -456,6 +456,10 @@ pub fn dispatch_sdpa_full_bf16(
                 index: 302,
                 value: false,
             }, // has_sinks
+            FunctionConstant::Bool {
+                index: 303,
+                value: false,
+            }, // save_lse
         ],
     )?;
 
@@ -464,9 +468,9 @@ pub fn dispatch_sdpa_full_bf16(
         encoder.setComputePipelineState(pipeline.metal_pipeline_state());
         // SAFETY: buffer / byte indices match the `steel_attention` MSL
         // signature: q=0, k=1, v=2, o=3, params(AttnParams)=4. The mask
-        // params/array (5/6) and sinks (7) are gated behind has_mask /
-        // has_sinks (both pinned false), so they are absent from this
-        // specialization and must not be bound. Buffers sized to match
+        // params/array (5/6), sinks (7), and LSE (8) are gated behind
+        // has_mask / has_sinks / save_lse (all pinned false), so they are
+        // absent from this specialization and must not be bound. Buffers sized to match
         // (checked above).
         unsafe {
             encoder.setBuffer_offset_atIndex(Some(q.metal_buffer()), 0, 0);

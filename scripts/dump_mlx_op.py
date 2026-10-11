@@ -641,13 +641,13 @@ def run_attention_layer0(args: argparse.Namespace) -> dict[str, mx.array]:
     else:
         # Decode: pre-prime the KVCache with `offset` zero rows so that
         # mlx_lm's attention uses `cache.offset` for RoPE positioning.
-        # `KVCache.state` setter assigns keys/values and sets
-        # `self.offset = keys.shape[2]`, giving us arbitrary-offset seeding
-        # without patching mlx_lm internals.
+        # `update_and_fetch` appends the rows and advances `offset` — public
+        # API, unlike the `state` setter, whose tuple arity changed in
+        # mlx_lm 0.32.
         cache = KVCache()
         pad_k = mx.zeros((1, n_kv_heads, args.offset, head_dim), dtype=mx.bfloat16)
         pad_v = mx.zeros_like(pad_k)
-        cache.state = (pad_k, pad_v)
+        cache.update_and_fetch(pad_k, pad_v)
         out = attn(x, mask=None, cache=cache)
 
     mx.eval(x, out)

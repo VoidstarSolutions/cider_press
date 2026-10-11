@@ -40,9 +40,13 @@ fn steel_attention_library_compiles() {
             index: 302,
             value: false,
         }, // has_sinks
+        FunctionConstant::Bool {
+            index: 303,
+            value: false,
+        }, // save_lse
     ];
     lib.pipeline_specialized(
-        "steel_attention_bfloat16_bq32_bk32_bd64_wm4_wn1_maskbfloat16",
+        "steel_attention_bfloat16_bq32_bk32_bd64_bv64_wm4_wn1_maskbfloat16",
         &constants,
     )
     .expect("steel_attention bf16 bd64 causal pipeline");

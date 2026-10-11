@@ -68,9 +68,11 @@ qmm path picks the aligned `affine_qmm_t` instantiation when `N % 32 == 0` and
 the non-aligned one otherwise (see "Open levers" below).
 
 **The `qmv_fast` vs. generic variant.** `qmv.rs` mirrors MLX's dispatcher: it
-selects the faster `affine_qmv_fast` kernel when `K % 512 == 0 && N % 8 == 0`,
-and the generic `affine_qmv` otherwise. The selection is purely by shape
-alignment — same kernel source, a faster tiling when `K` is a 512-multiple.
+selects the faster `affine_qmv_fast` kernel when `K` meets its bit-width
+alignment (`K % 512 == 0` for 4-bit), using its partial-rows instantiation
+(`_pr_1`) when `N % 8 != 0`, and the generic `affine_qmv` otherwise. The
+selection is purely by shape alignment — same kernel source, a faster tiling
+when `K` is a 512-multiple.
 This matters because *no* native Qwen2.5-0.5B decode shape has a 512-multiple
 `K` (they are `896` or `4864`), so absent intervention the fast path never
 fires — which is exactly what the A1 padding below exploits.
