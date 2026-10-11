@@ -80,12 +80,29 @@ impl<M: LanguageModel> Generator<M> {
     /// Reset all per-layer caches to position 0. Called automatically at the
     /// start of [`Self::generate`].
     ///
+    /// Recovers from a failed forward: a forward or eval that errored after
+    /// scheduling cache writes leaves them unevaluated, which an in-place cache
+    /// reset refuses. The caches are then replaced with fresh ones.
+    ///
     /// # Errors
-    /// Propagates the cache reset (e.g. for `KvCache`, if a cache's last update
-    /// has not been evaluated — it must be, to keep outstanding K/V views from
-    /// replaying stale writes into the reused slab).
+    /// Device acquisition or cache allocation failure while replacing the
+    /// caches; the next `reset` retries.
     pub fn reset(&mut self) -> Result<()> {
-        self.model.reset_caches(&mut self.caches)?;
+        // An empty vector is a replacement that failed to allocate (every
+        // model has at least one layer), not a valid reset state.
+        if !self.caches.is_empty() && self.model.reset_caches(&mut self.caches).is_ok() {
+            return Ok(());
+        }
+        // Discarding the caches is safe here and only here: they are private,
+        // so no caller holds a view of them, and a failed forward has dropped
+        // its graph — the caches hold the only refs to the unevaluated writes,
+        // which die with them. Every command buffer an eval submitted was waited
+        // (eval's own wait, or the blocking drop of its handles), so nothing
+        // still writes the old slabs. Drop before allocating so peak memory
+        // stays at one set of caches.
+        self.caches = Vec::new();
+        let device = Device::shared()?;
+        self.caches = self.model.make_caches(self.context_window, &device)?;
         Ok(())
     }
 
@@ -598,5 +615,146 @@ mod tests {
 
         generator.reset().expect("reset");
         at(0, &generator);
+    }
+
+    /// Delegates to the tiny Qwen3.5 model, except that the cache-writing call
+    /// numbered `fail_on_call` (counting `forward_last` and `fill_cache`
+    /// together, from 0) builds a real two-token forward into the caches, drops
+    /// it unevaluated, and errors — the state any forward that fails after
+    /// scheduling its cache writes leaves behind.
+    #[derive(Debug)]
+    struct FailingModel {
+        inner: Qwen35Model,
+        chunk_len: Option<usize>,
+        fail_on_call: Option<usize>,
+        calls: std::cell::Cell<usize>,
+    }
+
+    const INJECTED: &str = "injected forward failure";
+
+    impl FailingModel {
+        fn maybe_fail(&self, caches: &mut [Qwen35LayerCache]) -> Result<()> {
+            let call = self.calls.get();
+            self.calls.set(call + 1);
+            if self.fail_on_call != Some(call) {
+                return Ok(());
+            }
+            let device = Device::shared()?;
+            let ids = Tensor::from_slice(&device, &[7u32, 9], [1, 2])?;
+            drop(self.inner.fill_cache(&ids, caches)?);
+            Err(Error::InvalidArgument(INJECTED.into()))
+        }
+    }
+
+    impl LanguageModel for FailingModel {
+        type Cache = Qwen35LayerCache;
+
+        fn make_caches(&self, max_tokens: usize, device: &Device) -> Result<Vec<Self::Cache>> {
+            self.inner.make_caches(max_tokens, device)
+        }
+
+        fn forward_last(&self, input_ids: &Tensor, caches: &mut [Self::Cache]) -> Result<Tensor> {
+            self.maybe_fail(caches)?;
+            self.inner.forward_last(input_ids, caches)
+        }
+
+        fn fill_cache(&self, input_ids: &Tensor, caches: &mut [Self::Cache]) -> Result<Tensor> {
+            self.maybe_fail(caches)?;
+            self.inner.fill_cache(input_ids, caches)
+        }
+
+        fn prefill_chunk_len(&self) -> Option<usize> {
+            self.chunk_len
+        }
+
+        fn reset_caches(&self, caches: &mut [Self::Cache]) -> Result<()> {
+            self.inner.reset_caches(caches)
+        }
+
+        fn vocab_size(&self) -> usize {
+            self.inner.vocab_size()
+        }
+    }
+
+    fn failing_generator(
+        device: &Device,
+        chunk_len: Option<usize>,
+        fail_on_call: Option<usize>,
+    ) -> Generator<FailingModel> {
+        let model = FailingModel {
+            inner: tiny_seeded_qwen35(device),
+            chunk_len,
+            fail_on_call,
+            calls: std::cell::Cell::new(0),
+        };
+        Generator::new(model, 32, HashSet::from([u32::MAX])).expect("generator")
+    }
+
+    fn assert_injected<T: std::fmt::Debug>(result: Result<T>) {
+        let err = result.expect_err("the injected failure did not fire");
+        assert!(
+            err.to_string().contains(INJECTED),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Ids from a one-token `generate` (the prefill argmax; the tiny model's
+    /// `T = 1` decode is not exercised) plus every cache state it leaves.
+    fn generate_one(
+        generator: &mut Generator<FailingModel>,
+        ids: &[u32],
+    ) -> (Vec<u32>, CacheSnapshot) {
+        let out = generator
+            .generate(ids, 1)
+            .expect("generate")
+            .collect::<Result<Vec<_>>>()
+            .expect("tokens");
+        (out, cache_snapshot(&generator.caches))
+    }
+
+    /// A forward that fails after scheduling cache writes leaves every cache
+    /// with an unevaluated write. The generator must recover on the next
+    /// `generate` and match a fresh generator exactly — prefill, chunked
+    /// prefill, and decode failures alike.
+    #[test]
+    fn generator_recovers_from_a_failed_forward() {
+        let device = Device::shared().expect("device");
+        let ids: Vec<u32> = (0..11).map(|i| (i * 37 + 5) % 256).collect();
+        let expected = generate_one(&mut failing_generator(&device, Some(4), None), &ids);
+
+        let prefill_fail = |chunk_len, call| {
+            let mut generator = failing_generator(&device, chunk_len, Some(call));
+            assert_injected(generator.generate(&ids, 1));
+            generator
+        };
+        let mut failed = vec![
+            ("unchunked prefill", prefill_fail(None, 0)),
+            ("first prefill chunk", prefill_fail(Some(4), 0)),
+            ("later prefill chunk", prefill_fail(Some(4), 1)),
+            ("final prefill chunk", prefill_fail(Some(4), 2)),
+        ];
+
+        let mut sync = failing_generator(&device, Some(4), Some(1));
+        assert_injected(sync.prefill_sync(&ids));
+        failed.push(("prefill_sync", sync));
+
+        // Calls 0..=2 are the prefill chunks; call 3 is the first decode step.
+        let mut decode = failing_generator(&device, Some(4), Some(3));
+        let mut iter = decode.generate(&ids, 3).expect("generate");
+        assert!(iter.next().expect("prefill token").is_ok());
+        assert_injected(iter.next().expect("decode step"));
+        drop(iter);
+        failed.push(("decode step", decode));
+
+        for (case, mut generator) in failed {
+            let caches = &mut generator.caches;
+            let stuck = generator.model.inner.reset_caches(caches);
+            assert!(
+                stuck.is_err(),
+                "{case}: failure left no uncommitted cache write"
+            );
+            assert_eq!(generate_one(&mut generator, &ids), expected, "{case}");
+            generator.reset().expect("reset after recovery");
+        }
     }
 }
