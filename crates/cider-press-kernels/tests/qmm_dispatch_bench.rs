@@ -42,14 +42,16 @@ fn qmm_bytes(m: usize, k: usize, n: usize, group_size: usize, bits: usize) -> us
     weights + scales_biases + x + y
 }
 
-/// Average GPU-execution time per `affine_qmm_t_bf16` dispatch, in
-/// nanoseconds, via stage-boundary counter sampling. All `reps`
-/// dispatches share one command buffer. Returns `None` when the device
-/// lacks counter sampling (caller falls back to the wall-clock number).
+/// Average GPU-execution time per `affine_qmm_t_bf16` (or, with `nax`,
+/// `affine_qmm_t_nax_bf16`) dispatch, in nanoseconds, via stage-boundary
+/// counter sampling. All `reps` dispatches share one command buffer.
+/// Returns `None` when the device lacks counter sampling (caller falls back
+/// to the wall-clock number).
 #[allow(clippy::too_many_arguments)]
 fn qmm_gpu_ns(
     device: &Device,
     library: &KernelLibrary,
+    nax: bool,
     w: &Buffer<u32>,
     s: &Buffer<bf16>,
     b: &Buffer<bf16>,
@@ -68,9 +70,15 @@ fn qmm_gpu_ns(
     let mut cmds = device.commands_profiled(reps).expect("profiled commands");
     for _ in 0..reps {
         cmds.begin_profiled_op("qmm");
-        kernels::qmm::affine_qmm_t_bf16(
-            &mut cmds, library, w, s, b, x, y, m, n, k, group_size, bits,
-        )
+        if nax {
+            kernels::qmm::affine_qmm_t_nax_bf16(
+                &mut cmds, library, w, s, b, x, y, m, n, k, group_size, bits,
+            )
+        } else {
+            kernels::qmm::affine_qmm_t_bf16(
+                &mut cmds, library, w, s, b, x, y, m, n, k, group_size, bits,
+            )
+        }
         .expect("dispatch");
     }
     let segments = cmds.commit_wait_resolve().expect("resolve");
@@ -118,7 +126,7 @@ fn bench(device: &Device, library: &KernelLibrary, k: usize, n: usize, label: &s
     // 64 dispatches per profiled command buffer — enough to average out noise,
     // few enough to bound counter-segment overhead for large shapes.
     match qmm_gpu_ns(
-        device, library, &w, &s, &b, &x, &mut y, M, n, k, GROUP_SIZE, BITS, 64,
+        device, library, false, &w, &s, &b, &x, &mut y, M, n, k, GROUP_SIZE, BITS, 64,
     ) {
         Some(gpu_ns) => {
             let eff_gbps = bytes as f64 / (gpu_ns / 1e9) / 1e9;
@@ -161,5 +169,113 @@ fn perf_affine_qmm_t_bf16_prefill_shapes() {
     ];
     for &(k, n, label) in shapes {
         bench(&device, &library, k, n, label);
+    }
+}
+
+/// GPU-execution time per dispatch (64 per profiled command buffer, so the
+/// commit/wait floor is excluded) at prefill-sized M for both kernels on the
+/// Qwen3-Embedding-0.6B and Qwen2.5-0.5B projection shapes; wall-clock per
+/// isolated dispatch alongside for reference.
+fn bench_m512(
+    device: &Device,
+    classic: &KernelLibrary,
+    nax: Option<&KernelLibrary>,
+    k: usize,
+    n: usize,
+    label: &str,
+) {
+    const M512: usize = 512;
+    let w: Buffer<u32> = device
+        .alloc_buffer(n * (k * BITS as usize / 32))
+        .expect("alloc w");
+    let s: Buffer<bf16> = device
+        .alloc_buffer(n * (k / GROUP_SIZE as usize))
+        .expect("alloc scales");
+    let b: Buffer<bf16> = device
+        .alloc_buffer(n * (k / GROUP_SIZE as usize))
+        .expect("alloc biases");
+    let x: Buffer<bf16> = device.alloc_buffer(M512 * k).expect("alloc x");
+    let mut y: Buffer<bf16> = device.alloc_buffer(M512 * n).expect("alloc y");
+    let flops = 2.0 * M512 as f64 * k as f64 * n as f64;
+
+    let mut measure = |use_nax: bool| -> Option<(f64, Option<f64>)> {
+        let library = if use_nax { nax? } else { classic };
+        let dispatch = |y: &mut Buffer<bf16>| {
+            let mut cmds = device.commands().expect("commands");
+            if use_nax {
+                kernels::qmm::affine_qmm_t_nax_bf16(
+                    &mut cmds, library, &w, &s, &b, &x, y, M512, n, k, GROUP_SIZE, BITS,
+                )
+            } else {
+                kernels::qmm::affine_qmm_t_bf16(
+                    &mut cmds, library, &w, &s, &b, &x, y, M512, n, k, GROUP_SIZE, BITS,
+                )
+            }
+            .expect("dispatch");
+            cmds.commit_and_wait().expect("commit");
+        };
+        for _ in 0..WARMUP {
+            dispatch(&mut y);
+        }
+        let start = Instant::now();
+        for _ in 0..TIMED {
+            dispatch(&mut y);
+        }
+        let wall_s = start.elapsed().as_secs_f64() / TIMED as f64;
+        let gpu_s = qmm_gpu_ns(
+            device, library, use_nax, &w, &s, &b, &x, &mut y, M512, n, k, GROUP_SIZE, BITS, 64,
+        )
+        .map(|ns| ns / 1e9);
+        Some((wall_s, gpu_s))
+    };
+    let fmt = |(wall_s, gpu_s): (f64, Option<f64>)| match gpu_s {
+        Some(g) => format!(
+            "gpu {:>7.1}us {:>5.1} TFLOPS (wall {:>7.1}us)",
+            g * 1e6,
+            flops / g / 1e12,
+            wall_s * 1e6
+        ),
+        None => format!("gpu (no counters) (wall {:>7.1}us)", wall_s * 1e6),
+    };
+    let classic_m = measure(false).expect("classic");
+    let line = format!(
+        "  {label:<11} M=512 K={k:>4} N={n:>5}  classic {}",
+        fmt(classic_m)
+    );
+    match measure(true) {
+        Some(nax_m) => {
+            let speedup = match (classic_m.1, nax_m.1) {
+                (Some(c), Some(x)) => c / x,
+                _ => classic_m.0 / nax_m.0,
+            };
+            eprintln!("{line}   nax {}   x{speedup:.2}", fmt(nax_m));
+        }
+        None => eprintln!("{line}   nax (unavailable)"),
+    }
+}
+
+#[test]
+#[ignore = "perf benchmark; run with --ignored"]
+fn perf_affine_qmm_t_nax_vs_classic_m512() {
+    let device = Device::system_default().expect("Metal device");
+    let classic = KernelLibrary::quantized(&device).expect("compile quantized.metal");
+    let nax = device
+        .nax_available()
+        .then(|| KernelLibrary::quantized_nax(&device).expect("compile quantized_nax.metal"));
+    eprintln!();
+    eprintln!(
+        "qmm M=512: classic affine_qmm_t vs affine_qmm_t_nax (gpu = counter-sampled kernel time, 64 dispatches/buffer; wall = isolated dispatch incl. commit+wait, warmup={WARMUP}, timed={TIMED})"
+    );
+    for &(k, n, label) in &[
+        (1024usize, 2048usize, "emb q_proj"),
+        (1024, 1024, "emb kv"),
+        (2048, 1024, "emb o_proj"),
+        (1024, 3072, "emb gate/up"),
+        (3072, 1024, "emb down"),
+        (896, 896, "q25 q_proj"),
+        (896, 4864, "q25 gate/up"),
+        (4864, 896, "q25 down"),
+    ] {
+        bench_m512(&device, &classic, nax.as_ref(), k, n, label);
     }
 }

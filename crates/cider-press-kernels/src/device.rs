@@ -15,7 +15,7 @@ use std::sync::Mutex;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2_foundation::{NSString, NSURL};
+use objc2_foundation::{NSOperatingSystemVersion, NSProcessInfo, NSString, NSURL};
 use objc2_metal::{
     MTLBuffer, MTLCaptureDescriptor, MTLCaptureDestination, MTLCaptureManager, MTLCommandBuffer,
     MTLCommandQueue, MTLCounterSamplingPoint, MTLCreateSystemDefaultDevice, MTLDevice, MTLFence,
@@ -32,6 +32,48 @@ fn tracked_buffers_requested() -> bool {
     static TRACKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *TRACKED
         .get_or_init(|| std::env::var_os("CIDER_PRESS_TRACKED_BUFFERS").is_some_and(|v| v == "1"))
+}
+
+/// Escape hatch: `CIDER_PRESS_NO_NAX=1` keeps every dispatch on the classic
+/// (non-tensor-core) kernels even where NAX is available — for bisecting a
+/// parity or sync question to the kernel family.
+fn nax_disabled_by_env() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("CIDER_PRESS_NO_NAX").is_some_and(|v| v == "1"))
+}
+
+/// MLX's `is_nax_available()` (`mlx/backend/metal/device.cpp`): the GPU
+/// architecture name `applegpu_gNNc` carries the generation `NN` as the two
+/// digits before the trailing class letter `c`; NAX needs generation ≥ 17,
+/// or ≥ 18 for class `p`, and macOS ≥ 26.2.
+pub(crate) fn nax_policy(architecture: &str, os_at_least_26_2: bool, disabled: bool) -> bool {
+    if disabled || !os_at_least_26_2 {
+        return false;
+    }
+    let bytes = architecture.as_bytes();
+    let Some((&class, digits)) = bytes.split_last() else {
+        return false;
+    };
+    let Some(tens_ones) = digits.get(digits.len().saturating_sub(2)..) else {
+        return false;
+    };
+    let [tens, ones] = tens_ones else {
+        return false;
+    };
+    if !(tens.is_ascii_digit() && ones.is_ascii_digit()) {
+        return false;
+    }
+    let generation = i32::from(tens - b'0') * 10 + i32::from(ones - b'0');
+    let required = if class == b'p' { 18 } else { 17 };
+    generation >= required
+}
+
+fn os_at_least(major: isize, minor: isize) -> bool {
+    NSProcessInfo::processInfo().isOperatingSystemAtLeastVersion(NSOperatingSystemVersion {
+        majorVersion: major,
+        minorVersion: minor,
+        patchVersion: 0,
+    })
 }
 
 // `MTLCreateSystemDefaultDevice` requires CoreGraphics at link time.
@@ -69,6 +111,9 @@ pub struct Device {
     /// live by the pool across a generation and eviction is rare; a workload
     /// that churns size classes mid-flight would want MLX-style retirement.
     prev_outputs: Mutex<HashMap<usize, Retained<ProtocolObject<dyn MTLFence>>>>,
+    /// `MTLDevice.architecture.name`, e.g. `applegpu_g17s`.
+    architecture: String,
+    nax_available: std::sync::OnceLock<bool>,
 }
 
 impl Device {
@@ -79,11 +124,35 @@ impl Device {
         let queue = device.newCommandQueue().ok_or(Error::AppleApi {
             context: "MTLDevice::newCommandQueue",
         })?;
+        let architecture = device.architecture().name().to_string();
         Ok(Self {
             device,
             queue,
             prev_outputs: Mutex::new(HashMap::new()),
+            architecture,
+            nax_available: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Whether this GPU + OS can run MLX's tensor-core (`nax`) kernels:
+    /// generation ≥ 17 (≥ 18 for the `p` class) under macOS ≥ 26.2, unless
+    /// `CIDER_PRESS_NO_NAX=1`. Evaluated once.
+    #[must_use]
+    pub fn nax_available(&self) -> bool {
+        *self.nax_available.get_or_init(|| {
+            nax_policy(
+                &self.architecture,
+                os_at_least(26, 2),
+                nax_disabled_by_env(),
+            )
+        })
+    }
+
+    /// The GPU architecture class letter (`s`, `p`, `g`, `d`, …) from the
+    /// architecture name; MLX keys gemm tile choices on it.
+    #[must_use]
+    pub fn architecture_class(&self) -> Option<char> {
+        self.architecture.chars().last()
     }
 
     /// Fences a closing encoder must wait on: the prior-writer fence of every
@@ -445,5 +514,43 @@ mod tests {
         assert_eq!(w7.len(), 1);
         assert_eq!(Retained::as_ptr(&w7[0]), Retained::as_ptr(&f1));
         assert!(device.fence_waits(&[8], false).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod nax_policy_tests {
+    use super::nax_policy;
+
+    #[test]
+    fn gen17_s_class_on_new_os_is_available() {
+        assert!(nax_policy("applegpu_g17s", true, false));
+    }
+
+    #[test]
+    fn gen16_is_not_available() {
+        assert!(!nax_policy("applegpu_g16s", true, false));
+    }
+
+    #[test]
+    fn p_class_needs_gen18() {
+        assert!(!nax_policy("applegpu_g17p", true, false));
+        assert!(nax_policy("applegpu_g18p", true, false));
+    }
+
+    #[test]
+    fn os_below_26_2_is_not_available() {
+        assert!(!nax_policy("applegpu_g17s", false, false));
+    }
+
+    #[test]
+    fn policy_disabled_by_env() {
+        assert!(!nax_policy("applegpu_g17s", true, true));
+    }
+
+    #[test]
+    fn unparseable_architecture_is_not_available() {
+        assert!(!nax_policy("", true, false));
+        assert!(!nax_policy("g1", true, false));
+        assert!(!nax_policy("applegpu_gxys", true, false));
     }
 }

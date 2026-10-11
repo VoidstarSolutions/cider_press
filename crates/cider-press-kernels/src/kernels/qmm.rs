@@ -39,6 +39,17 @@ use crate::library::KernelLibrary;
 /// dispatched via `dispatchThreadgroups:threadsPerThreadgroup:`.
 const BM: usize = 32;
 const BN: usize = 32;
+/// Tile edge of MLX's `qmm_t_nax` kernels (`quantized.cpp::qmm_nax`:
+/// `bn = bk = 64`, `wm = wn = 2`; `bm` per [`nax_qmm_bm`]). The K-loop runs
+/// whole tiles, so the kernel requires `K % 64 == 0` (MLX gates the dispatch
+/// on it).
+const NAX_TILE: usize = 64;
+
+/// Row tile of `qmm_t_nax` for `M` activation rows, as MLX picks it: the
+/// 32-row instantiation when one block covers all of `M`, 64 otherwise.
+const fn nax_qmm_bm(m: usize) -> usize {
+    if m <= 32 { 32 } else { 64 }
+}
 
 /// Quantized matrix-matrix multiply: `y = x · dequant(w_q)ᵀ`, all bf16-typed.
 ///
@@ -156,6 +167,123 @@ pub fn affine_qmm_t_bf16(
     commands.dispatch_threadgroups(grid, threadgroup)
 }
 
+/// Dispatch MLX's tensor-core `affine_qmm_t_nax` (bf16 activations, affine
+/// int-`bits` weights, `group_size` groups, `transpose=true`, unbatched):
+/// `y[M, N] = x[M, K] · dequant(w)[N, K]ᵀ`. Same contract and buffer layout
+/// as [`affine_qmm_t_bf16`]; `library` must be the
+/// [`KernelLibrary::quantized_nax`] library and the device must report
+/// [`crate::Device::nax_available`] — this routine does not check it.
+///
+/// Mirrors `quantized.cpp::qmm_nax`: `bm`×64×64 tiles with `bm = 32` when
+/// `M ≤ 32` and 64 otherwise, threadgroup (32, 2, 2), grid
+/// `(⌈N/64⌉, ⌈M/bm⌉, 1)`, `alN_true` when `N % 64 == 0`, binds
+/// `w, scales, biases, x, y, K, N, M` (buffers 0–7; the batch shape/stride
+/// buffers 8–15 stay unbound for the `batch_0` variant exactly as MLX leaves
+/// them for `B ≤ 1`).
+///
+/// # Errors
+/// [`Error::InvalidArgument`] when `K % 64 != 0`, on any dimension that is
+/// zero or exceeds `i32`, `K % group_size != 0`, or buffer lengths that
+/// disagree with `(M, N, K)` (an A1-padded decode weight against an `M > 1`
+/// activation lands here); [`Error::Compile`] / pipeline errors from the
+/// library.
+pub fn affine_qmm_t_nax_bf16(
+    commands: &mut Commands<'_>,
+    library: &KernelLibrary,
+    w_q: &Buffer<u32>,
+    scales: &Buffer<bf16>,
+    biases: &Buffer<bf16>,
+    x: &Buffer<bf16>,
+    y: &mut Buffer<bf16>,
+    m: usize,
+    n: usize,
+    k: usize,
+    group_size: u32,
+    bits: u32,
+) -> Result<()> {
+    let m_i32 = i32::try_from(m).map_err(|_| {
+        Error::InvalidArgument(format!("affine_qmm_t_nax: M={m} does not fit in i32"))
+    })?;
+    let n_i32 = i32::try_from(n).map_err(|_| {
+        Error::InvalidArgument(format!("affine_qmm_t_nax: N={n} does not fit in i32"))
+    })?;
+    let k_i32 = i32::try_from(k).map_err(|_| {
+        Error::InvalidArgument(format!("affine_qmm_t_nax: K={k} does not fit in i32"))
+    })?;
+    if m_i32 <= 0 || n_i32 <= 0 || k_i32 <= 0 {
+        return Err(Error::InvalidArgument(format!(
+            "affine_qmm_t_nax: M ({m}), N ({n}), K ({k}) must all be positive"
+        )));
+    }
+    if k % NAX_TILE != 0 {
+        return Err(Error::InvalidArgument(format!(
+            "affine_qmm_t_nax: K ({k}) must be a multiple of 64 (the kernel's K tile)"
+        )));
+    }
+    if group_size == 0 {
+        return Err(Error::InvalidArgument(
+            "affine_qmm_t_nax: group_size must be positive".to_owned(),
+        ));
+    }
+    if k % (group_size as usize) != 0 {
+        return Err(Error::InvalidArgument(format!(
+            "affine_qmm_t_nax: K ({k}) must be a multiple of group_size ({group_size})"
+        )));
+    }
+    validate_qmm_buffer_lens(
+        w_q.len(),
+        scales.len(),
+        biases.len(),
+        x.len(),
+        y.len(),
+        m,
+        n,
+        k,
+        group_size,
+        bits,
+    )?;
+
+    let bm = nax_qmm_bm(m);
+    let aligned_suffix = if n % NAX_TILE == 0 { "true" } else { "false" };
+    let kernel_name = format!(
+        "affine_qmm_t_nax_bfloat16_t_gs_{group_size}_b_{bits}_bm{bm}_bn64_bk64_wm2_wn2_alN_{aligned_suffix}_batch_0"
+    );
+    let pipeline = library.pipeline(&kernel_name)?;
+
+    {
+        let encoder = commands.encoder()?;
+        encoder.setComputePipelineState(pipeline.metal_pipeline_state());
+        // SAFETY: bind slots and dtypes match the `affine_qmm_t_nax` MSL
+        // signature (quantized_nax.h: w=0, scales=1, biases=2, x=3, y=4,
+        // K=5, N=6, M=7); batch buffers 8–15 are unused by `batch_0`.
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(w_q.metal_buffer()), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(scales.metal_buffer()), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(biases.metal_buffer()), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(x.metal_buffer()), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(y.metal_buffer()), 0, 4);
+            let k_ptr: NonNull<c_void> = NonNull::from(&k_i32).cast();
+            let n_ptr: NonNull<c_void> = NonNull::from(&n_i32).cast();
+            let m_ptr: NonNull<c_void> = NonNull::from(&m_i32).cast();
+            encoder.setBytes_length_atIndex(k_ptr, std::mem::size_of::<i32>(), 5);
+            encoder.setBytes_length_atIndex(n_ptr, std::mem::size_of::<i32>(), 6);
+            encoder.setBytes_length_atIndex(m_ptr, std::mem::size_of::<i32>(), 7);
+        }
+    }
+
+    let grid = MTLSize {
+        width: n.div_ceil(NAX_TILE),
+        height: m.div_ceil(bm),
+        depth: 1,
+    };
+    let threadgroup = MTLSize {
+        width: 32,
+        height: 2,
+        depth: 2,
+    };
+    commands.dispatch_threadgroups(grid, threadgroup)
+}
+
 /// Validate the five buffer lengths against the logical `(M, N, K)`
 /// geometry. Uses checked arithmetic so an `i32`-valid-but-huge shape
 /// can't wrap a product into a small expected length and let an
@@ -216,4 +344,22 @@ fn validate_qmm_buffer_lens(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod nax_tile_tests {
+    use super::nax_qmm_bm;
+
+    #[test]
+    fn one_block_covers_small_m_with_32_rows() {
+        assert_eq!(nax_qmm_bm(1), 32);
+        assert_eq!(nax_qmm_bm(16), 32);
+        assert_eq!(nax_qmm_bm(32), 32);
+    }
+
+    #[test]
+    fn larger_m_uses_64_rows() {
+        assert_eq!(nax_qmm_bm(33), 64);
+        assert_eq!(nax_qmm_bm(512), 64);
+    }
 }

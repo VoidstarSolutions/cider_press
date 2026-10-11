@@ -188,19 +188,28 @@ pub fn assert_allclose(label: &str, got: &[bf16], expected: &[bf16], atol: f32, 
     let mut worst_excess = 0.0f32;
     let mut worst_at = 0usize;
     let mut worst_pair = (0.0f32, 0.0f32);
+    let mut max_abs = 0.0f32;
+    let mut max_bound_ratio = 0.0f32;
     for (i, (a, b)) in got.iter().zip(expected).enumerate() {
         let (a, b) = (a.to_f32(), b.to_f32());
         assert!(
             a.is_finite() && b.is_finite(),
             "{label}: non-finite at element [{i}] got={a} want={b}"
         );
-        let excess = (a - b).abs() - (atol + rtol * b.abs());
+        let abs = (a - b).abs();
+        let bound = atol + rtol * b.abs();
+        max_abs = max_abs.max(abs);
+        max_bound_ratio = max_bound_ratio.max(abs / bound);
+        let excess = abs - bound;
         if excess > worst_excess {
             worst_excess = excess;
             worst_at = i;
             worst_pair = (a, b);
         }
     }
+    eprintln!(
+        "{label}: max_abs={max_abs:.6} worst |diff|/(atol+rtol*|want|)={max_bound_ratio:.3} (atol={atol} rtol={rtol})"
+    );
     assert!(
         worst_excess <= 0.0,
         "{label}: tolerance exceeded — worst element [{worst_at}] \

@@ -36,6 +36,7 @@ struct DeviceInner {
     /// ~100 ms thanks to Metal's cross-process compiled-library
     /// cache). Populated on first qmv/qmm dispatch.
     quantized_library: OnceLock<kernels::KernelLibrary>,
+    quantized_nax_library: OnceLock<kernels::KernelLibrary>,
     /// JIT'd MLX `binary.metal` library. Populated on first binary
     /// op dispatch (Add / Mul today; the rest of the family lands as
     /// the runtime asks for it).
@@ -118,6 +119,7 @@ impl Device {
                 kernels: kernels::Device::system_default()?,
                 copy_library: OnceLock::new(),
                 quantized_library: OnceLock::new(),
+                quantized_nax_library: OnceLock::new(),
                 binary_library: OnceLock::new(),
                 unary_library: OnceLock::new(),
                 reduce_library: OnceLock::new(),
@@ -156,6 +158,7 @@ impl Device {
             kernels: kernels::Device::system_default()?,
             copy_library: OnceLock::new(),
             quantized_library: OnceLock::new(),
+            quantized_nax_library: OnceLock::new(),
             binary_library: OnceLock::new(),
             unary_library: OnceLock::new(),
             reduce_library: OnceLock::new(),
@@ -190,6 +193,12 @@ impl Device {
     /// callers outside the crate should stay at the [`Device`] level.
     pub(crate) fn kernels(&self) -> &kernels::Device {
         &self.inner.kernels
+    }
+
+    /// See [`cider_press_kernels::Device::nax_available`].
+    #[must_use]
+    pub fn nax_available(&self) -> bool {
+        self.inner.kernels.nax_available()
     }
 
     /// A one-element `[1.0]` BF16 buffer, cached after first use and shared
@@ -322,6 +331,16 @@ impl Device {
         }
         let lib = kernels::KernelLibrary::quantized(&self.inner.kernels)?;
         Ok(self.inner.quantized_library.get_or_init(|| lib))
+    }
+
+    /// Lazily JIT-compile and cache MLX's `quantized_nax.metal`. Callers
+    /// must check [`Device::nax_available`] first; this never does.
+    pub(crate) fn quantized_nax_library(&self) -> Result<&kernels::KernelLibrary> {
+        if let Some(lib) = self.inner.quantized_nax_library.get() {
+            return Ok(lib);
+        }
+        let lib = kernels::KernelLibrary::quantized_nax(&self.inner.kernels)?;
+        Ok(self.inner.quantized_nax_library.get_or_init(|| lib))
     }
 
     /// Lazily JIT-compile and cache MLX's `binary.metal` library.

@@ -67,6 +67,42 @@ inner dim matches the weight's logical `K`. Any `N` is accepted: the `M > 1`
 qmm path picks the aligned `affine_qmm_t` instantiation when `N % 32 == 0` and
 the non-aligned one otherwise (see "Open levers" below).
 
+### Tensor-core path (NAX)
+
+On GPUs that have MLX's tensor-core kernels — generation ≥ 17 (≥ 18 for the
+`p` class) under macOS ≥ 26.2, as reported by
+[`Device::nax_available`](../../crates/cider-press-kernels/src/device.rs),
+a port of MLX's `is_nax_available()` — the `M > 1` path routes every
+quantized matmul with `K % 64 == 0` to `affine_qmm_t_nax` instead
+(`affine_qmm_t_nax_bfloat16_t_gs_{gs}_b_{bits}_bm{32|64}_bn64_bk64_wm2_wn2_alN_{true|false}_batch_0`
+from the vendored
+[`quantized_nax.metal`](../../kernels-mlx/mlx/backend/metal/kernels/quantized_nax.metal),
+flattened by `build.rs` into its own library and JIT-compiled on first NAX
+dispatch — ~11 s cold for 540 kernels, sub-second from Metal's disk cache
+after). The dispatcher
+([`affine_qmm_t_nax_bf16`](../../crates/cider-press-kernels/src/kernels/qmm.rs))
+mirrors `quantized.cpp::qmm_nax`: `bm`×64×64 tiles with `bm = 32` when one
+block covers all of `M` (`M ≤ 32`, e.g. Qwen3.5's 16-token prefill chunks) and
+64 otherwise, threadgroup `(32, 2, 2)`, grid `(⌈N/64⌉, ⌈M/bm⌉, 1)`,
+`alN_true` when `N % 64 == 0`. The K-loop runs
+whole tiles, so `K % 64 != 0` (a synthetic hidden size, say 96) silently stays
+on the classic kernel. Everything else is unchanged: `M = 1` is still `qmv`,
+non-NAX machines and `CIDER_PRESS_NO_NAX=1` (the bisecting escape hatch) take
+the classic `affine_qmm_t`.
+
+Parity is **bit-exact** against MLX on a NAX machine, where
+`mx.quantized_matmul` runs the same kernel: the fixtures are generated on
+demand (`dump_mlx_op qmm`) on aligned, unaligned-`N` (1000), partial-row-tile
+(`M = 150`) and `bm = 32` (`M = 16`) shapes. The NAX and classic kernels are *not* bit-identical to each
+other (different accumulation order), so the model-level logits tests run under
+their tolerance either way. One routing caveat when choosing parity shapes:
+MLX sends transposed, unbatched `qmm` through `qmm_splitk` first, which picks a
+classic split-K kernel (32×32 tiles, fp32 partials) whenever
+`⌈N/32⌉·⌈M/32⌉ < 512` and `K` splits into whole 64-wide partitions — the
+small-tile shapes (e.g. k/v at `N = 128`) where cider now dispatches NAX and MLX
+does not. That is the one place this routing rule deviates from MLX's; see
+"Open levers".
+
 **The `qmv_fast` vs. generic variant.** `qmv.rs` mirrors MLX's dispatcher: it
 selects the faster `affine_qmv_fast` kernel when `K` meets its bit-width
 alignment (`K % 512 == 0` for 4-bit), using its partial-rows instantiation
@@ -164,7 +200,52 @@ length. Only q/k/v/o are padded — the LM head is already roofline-bound and
 would *regress* on +14% weight bytes, and the FFN projections are already
 near-roofline.
 
+### Prefill: NAX vs classic `qmm`
+
+Per-dispatch kernel time at `M = 512` (GPU-counter sampled, 64 dispatches per
+command buffer; `perf_affine_qmm_t_nax_vs_classic_m512` in
+[`qmm_dispatch_bench.rs`](../../crates/cider-press-kernels/tests/qmm_dispatch_bench.rs)),
+M5 Max, macOS 27.0.1:
+
+| shape (K×N)  | linear            | classic `affine_qmm_t` | `affine_qmm_t_nax` | speed-up |
+|--------------|-------------------|-----------------------:|-------------------:|---------:|
+| 1024×2048    | emb `q_proj`        | 639 µs / 3.4 TFLOPS    | 78 µs / 27.7 TFLOPS | 8.2× |
+| 1024×1024    | emb k/v (gs64)    | 149 µs / 7.2           | 44 µs / 24.2        | 3.4× |
+| 2048×1024    | emb `o_proj`        | 316 µs / 6.8           | 89 µs / 24.2        | 3.6× |
+| 1024×3072    | emb gate/up       | 463 µs / 7.0           | 105 µs / 30.7       | 4.4× |
+| 3072×1024    | emb down          | 472 µs / 6.8           | 147 µs / 21.9       | 3.2× |
+| 896×896      | q25 `q_proj`        | 245 µs / 3.4           | 70 µs / 11.7        | 3.5× |
+| 896×4864     | q25 gate/up       | 1124 µs / 4.0          | 228 µs / 19.6       | 4.9× |
+| 4864×896     | q25 down          | 657 µs / 6.8           | 195 µs / 22.9       | 3.4× |
+
+Whole-forward synchronous prefill on Qwen2.5-0.5B-Instruct-4bit (`cider-press
+bench --prefill-iters 10`, medians of 5 runs; `classic` is the same binary with
+`CIDER_PRESS_NO_NAX=1`; MLX 0.32.3 warm single forward on the same prompts for
+reference, from the embedding phase-0 measurements):
+
+| prompt tokens | classic   | NAX       | speed-up | MLX warm forward | cider / MLX |
+|--------------:|----------:|----------:|---------:|-----------------:|------------:|
+| 150           | 12.08 ms  | 7.14 ms   | 1.69×    | 9.07 ms          | 0.79×       |
+| 512           | 33.84 ms  | 13.76 ms  | 2.46×    | 12.84 ms         | 1.07×       |
+| 2048          | 140.5 ms  | 59.7 ms   | 2.35×    | 44.67 ms         | 1.34×       |
+
+Decode is `M = 1` (`qmv`) and is untouched: 641–645 tok/s interleaved either
+way. The residual at long prompts is attention and the dense gemm, which still
+run the classic steel kernels — the next two levers below.
+
 ## Open levers
+
+- **NAX gemm and attention (next).** With `qmm` on tensor cores the prefill
+  gap to MLX closes at short and mid prompts (above) but reopens at `T = 2048`
+  (1.34×), where MLX also runs `steel_gemm_fused_nax` and
+  `steel_attention_nax`. Porting those dispatches is the planned follow-on
+  (gemm, then attention).
+- **MLX's split-K routing for small tiles.** MLX prefers a classic split-K
+  `qmm` over NAX when the classic grid has fewer than 512 threadgroups (see
+  the NAX subsection). cider dispatches NAX for every `K % 64 == 0` shape; on
+  the k/v projections (`N = 128`) that means a 2×8-threadgroup NAX grid at
+  `T = 512`. The whole-forward numbers above include that choice; whether a
+  split-K port wins anything on those shapes is unmeasured.
 
 - **A2 (a cider-owned small-N `qmv` kernel for k/v): CLOSED — no-go.** A2 was
   the deferred idea of writing a new MIT-attributed kernel that splits the
