@@ -120,6 +120,7 @@ struct RawTextConfig {
     attention_bias: bool,
     #[serde(default)]
     attn_output_gate: bool,
+    #[serde(default = "default_full_attention_interval")]
     full_attention_interval: usize,
     linear_conv_kernel_dim: usize,
     linear_key_head_dim: usize,
@@ -130,6 +131,10 @@ struct RawTextConfig {
     tie_word_embeddings: bool,
     layer_types: Vec<LayerType>,
     rope_parameters: RopeParameters,
+}
+
+fn default_full_attention_interval() -> usize {
+    4
 }
 
 impl Qwen35Config {
@@ -144,6 +149,28 @@ impl Qwen35Config {
                 t.layer_types.len(),
                 t.num_hidden_layers
             )));
+        }
+        if t.full_attention_interval == 0 {
+            return Err(Error::InvalidArgument(
+                "full_attention_interval must be > 0".into(),
+            ));
+        }
+        // mlx-lm derives each mixer from the interval alone and ignores
+        // `layer_types`, so a disagreement would diverge from the reference.
+        for (i, ty) in t.layer_types.iter().enumerate() {
+            let linear_by_interval = (i + 1) % t.full_attention_interval != 0;
+            if (*ty == LayerType::LinearAttention) != linear_by_interval {
+                return Err(Error::InvalidArgument(format!(
+                    "layer_types[{i}] = {ty:?} disagrees with full_attention_interval {}",
+                    t.full_attention_interval
+                )));
+            }
+        }
+        // The RoPE offset is read from a full-attention KV cache.
+        if !t.layer_types.contains(&LayerType::FullAttention) {
+            return Err(Error::InvalidArgument(
+                "config has no full-attention layer".into(),
+            ));
         }
         Ok(Self {
             hidden_size: t.hidden_size,
@@ -322,6 +349,74 @@ mod tests {
         assert!(Qwen35Config::from_json_bytes(MISMATCH.as_bytes()).is_err());
     }
 
+    fn config_with(interval: &str, layer_types: &str) -> String {
+        format!(
+            r#"{{
+            "model_type": "qwen3_5",
+            "text_config": {{
+                "hidden_size": 2560, "num_hidden_layers": 2, "num_attention_heads": 16,
+                "num_key_value_heads": 4, "head_dim": 256, "intermediate_size": 9216,
+                "vocab_size": 248320, "rms_norm_eps": 1e-06{interval},
+                "linear_conv_kernel_dim": 4, "linear_key_head_dim": 128,
+                "linear_num_key_heads": 16, "linear_num_value_heads": 32,
+                "linear_value_head_dim": 128, "tie_word_embeddings": true,
+                "layer_types": {layer_types},
+                "rope_parameters": {{ "rope_theta": 10000000, "partial_rotary_factor": 0.25, "mrope_section": [11, 11, 10] }}
+            }}
+        }}"#
+        )
+    }
+
+    #[test]
+    fn rejects_config_without_full_attention_layer() {
+        let json = config_with(
+            r#", "full_attention_interval": 4"#,
+            r#"["linear_attention", "linear_attention"]"#,
+        );
+        let err = Qwen35Config::from_json_bytes(json.as_bytes()).unwrap_err();
+        assert!(err.to_string().contains("no full-attention"), "{err}");
+    }
+
+    #[test]
+    fn rejects_layer_types_disagreeing_with_interval() {
+        let json = config_with(
+            r#", "full_attention_interval": 2"#,
+            r#"["full_attention", "linear_attention"]"#,
+        );
+        let err = Qwen35Config::from_json_bytes(json.as_bytes()).unwrap_err();
+        assert!(err.to_string().contains("disagrees"), "{err}");
+    }
+
+    #[test]
+    fn rejects_zero_interval() {
+        let json = config_with(
+            r#", "full_attention_interval": 0"#,
+            r#"["linear_attention", "full_attention"]"#,
+        );
+        assert!(Qwen35Config::from_json_bytes(json.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn missing_interval_defaults_to_four_like_mlx_lm() {
+        let json = config_with("", r#"["linear_attention", "linear_attention"]"#);
+        // Defaulted interval 4 over 2 layers is all-linear, so it still fails
+        // the full-attention check rather than the parse.
+        let err = Qwen35Config::from_json_bytes(json.as_bytes()).unwrap_err();
+        assert!(err.to_string().contains("no full-attention"), "{err}");
+        let ok = config_with("", r#"["linear_attention", "linear_attention"]"#)
+            .replace("\"num_hidden_layers\": 2", "\"num_hidden_layers\": 4")
+            .replace(
+                r#"["linear_attention", "linear_attention"]"#,
+                r#"["linear_attention", "linear_attention", "linear_attention", "full_attention"]"#,
+            );
+        assert_eq!(
+            Qwen35Config::from_json_bytes(ok.as_bytes())
+                .unwrap()
+                .full_attention_interval,
+            4
+        );
+    }
+
     #[test]
     fn quantization_method_errors_when_absent() {
         // A config with no top-level `quantization` block — the loader requires
@@ -342,5 +437,23 @@ mod tests {
         let cfg = Qwen35Config::from_json_bytes(NO_QUANT.as_bytes()).unwrap();
         assert!(cfg.quantization.is_none());
         assert!(cfg.quantization().is_err());
+    }
+
+    #[test]
+    #[ignore = "opt-in: needs CIDER_QWEN35_CHECKPOINT_PATH and/or CIDER_QWEN35_27B_CHECKPOINT_PATH"]
+    fn real_checkpoint_configs_are_accepted() {
+        let mut seen = 0;
+        for var in [
+            "CIDER_QWEN35_CHECKPOINT_PATH",
+            "CIDER_QWEN35_27B_CHECKPOINT_PATH",
+        ] {
+            let Ok(dir) = std::env::var(var) else {
+                continue;
+            };
+            let bytes = std::fs::read(std::path::Path::new(&dir).join("config.json")).unwrap();
+            Qwen35Config::from_json_bytes(&bytes).unwrap_or_else(|e| panic!("{var}: {e}"));
+            seen += 1;
+        }
+        assert!(seen > 0, "no checkpoint env var set");
     }
 }
