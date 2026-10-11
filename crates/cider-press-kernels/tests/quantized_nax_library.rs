@@ -16,6 +16,8 @@ fn quantized_nax_library_exposes_bf16_gs64_b4_qmm_t_variants() {
     for name in [
         "affine_qmm_t_nax_bfloat16_t_gs_64_b_4_bm64_bn64_bk64_wm2_wn2_alN_true_batch_0",
         "affine_qmm_t_nax_bfloat16_t_gs_64_b_4_bm64_bn64_bk64_wm2_wn2_alN_false_batch_0",
+        "affine_qmm_t_nax_bfloat16_t_gs_64_b_4_bm32_bn64_bk64_wm2_wn2_alN_true_batch_0",
+        "affine_qmm_t_nax_bfloat16_t_gs_64_b_4_bm32_bn64_bk64_wm2_wn2_alN_false_batch_0",
     ] {
         library
             .pipeline(name)

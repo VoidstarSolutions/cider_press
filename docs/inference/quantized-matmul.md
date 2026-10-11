@@ -74,15 +74,17 @@ On GPUs that have MLX's tensor-core kernels — generation ≥ 17 (≥ 18 for th
 [`Device::nax_available`](../../crates/cider-press-kernels/src/device.rs),
 a port of MLX's `is_nax_available()` — the `M > 1` path routes every
 quantized matmul with `K % 64 == 0` to `affine_qmm_t_nax` instead
-(`affine_qmm_t_nax_bfloat16_t_gs_{gs}_b_{bits}_bm64_bn64_bk64_wm2_wn2_alN_{true|false}_batch_0`
+(`affine_qmm_t_nax_bfloat16_t_gs_{gs}_b_{bits}_bm{32|64}_bn64_bk64_wm2_wn2_alN_{true|false}_batch_0`
 from the vendored
 [`quantized_nax.metal`](../../kernels-mlx/mlx/backend/metal/kernels/quantized_nax.metal),
 flattened by `build.rs` into its own library and JIT-compiled on first NAX
 dispatch — ~11 s cold for 540 kernels, sub-second from Metal's disk cache
 after). The dispatcher
 ([`affine_qmm_t_nax_bf16`](../../crates/cider-press-kernels/src/kernels/qmm.rs))
-mirrors `quantized.cpp::qmm_nax`: 64×64×64 tiles, threadgroup `(32, 2, 2)`,
-grid `(⌈N/64⌉, ⌈M/64⌉, 1)`, `alN_true` when `N % 64 == 0`. The K-loop runs
+mirrors `quantized.cpp::qmm_nax`: `bm`×64×64 tiles with `bm = 32` when one
+block covers all of `M` (`M ≤ 32`, e.g. Qwen3.5's 16-token prefill chunks) and
+64 otherwise, threadgroup `(32, 2, 2)`, grid `(⌈N/64⌉, ⌈M/bm⌉, 1)`,
+`alN_true` when `N % 64 == 0`. The K-loop runs
 whole tiles, so `K % 64 != 0` (a synthetic hidden size, say 96) silently stays
 on the classic kernel. Everything else is unchanged: `M = 1` is still `qmv`,
 non-NAX machines and `CIDER_PRESS_NO_NAX=1` (the bisecting escape hatch) take
@@ -90,8 +92,8 @@ the classic `affine_qmm_t`.
 
 Parity is **bit-exact** against MLX on a NAX machine, where
 `mx.quantized_matmul` runs the same kernel: the fixtures are generated on
-demand (`dump_mlx_op qmm`) on aligned, unaligned-`N` (1000) and partial-row-tile
-(`M = 150`) shapes. The NAX and classic kernels are *not* bit-identical to each
+demand (`dump_mlx_op qmm`) on aligned, unaligned-`N` (1000), partial-row-tile
+(`M = 150`) and `bm = 32` (`M = 16`) shapes. The NAX and classic kernels are *not* bit-identical to each
 other (different accumulation order), so the model-level logits tests run under
 their tolerance either way. One routing caveat when choosing parity shapes:
 MLX sends transposed, unbatched `qmm` through `qmm_splitk` first, which picks a
@@ -244,10 +246,6 @@ run the classic steel kernels — the next two levers below.
   the k/v projections (`N = 128`) that means a 2×8-threadgroup NAX grid at
   `T = 512`. The whole-forward numbers above include that choice; whether a
   split-K port wins anything on those shapes is unmeasured.
-- **NAX `bm = 32` variant for `M ≤ 32`.** MLX uses a 32-row `qmm_t_nax`
-  instantiation when one block covers all of `M`; cider always dispatches
-  `bm = 64`. Only matters for short chunks (`2 ≤ M ≤ 32`), where MLX itself
-  mostly routes to `qmv` anyway.
 
 - **A2 (a cider-owned small-N `qmv` kernel for k/v): CLOSED — no-go.** A2 was
   the deferred idea of writing a new MIT-attributed kernel that splits the

@@ -40,9 +40,16 @@ use crate::library::KernelLibrary;
 const BM: usize = 32;
 const BN: usize = 32;
 /// Tile edge of MLX's `qmm_t_nax` kernels (`quantized.cpp::qmm_nax`:
-/// `bm = bn = bk = 64`, `wm = wn = 2`). The K-loop runs whole tiles, so the
-/// kernel requires `K % 64 == 0` (MLX gates the dispatch on it).
+/// `bn = bk = 64`, `wm = wn = 2`; `bm` per [`nax_qmm_bm`]). The K-loop runs
+/// whole tiles, so the kernel requires `K % 64 == 0` (MLX gates the dispatch
+/// on it).
 const NAX_TILE: usize = 64;
+
+/// Row tile of `qmm_t_nax` for `M` activation rows, as MLX picks it: the
+/// 32-row instantiation when one block covers all of `M`, 64 otherwise.
+const fn nax_qmm_bm(m: usize) -> usize {
+    if m <= 32 { 32 } else { 64 }
+}
 
 /// Quantized matrix-matrix multiply: `y = x · dequant(w_q)ᵀ`, all bf16-typed.
 ///
@@ -167,8 +174,9 @@ pub fn affine_qmm_t_bf16(
 /// [`KernelLibrary::quantized_nax`] library and the device must report
 /// [`crate::Device::nax_available`] — this routine does not check it.
 ///
-/// Mirrors `quantized.cpp::qmm_nax`: 64×64×64 tiles, threadgroup (32, 2, 2),
-/// grid `(⌈N/64⌉, ⌈M/64⌉, 1)`, `alN_true` when `N % 64 == 0`, binds
+/// Mirrors `quantized.cpp::qmm_nax`: `bm`×64×64 tiles with `bm = 32` when
+/// `M ≤ 32` and 64 otherwise, threadgroup (32, 2, 2), grid
+/// `(⌈N/64⌉, ⌈M/bm⌉, 1)`, `alN_true` when `N % 64 == 0`, binds
 /// `w, scales, biases, x, y, K, N, M` (buffers 0–7; the batch shape/stride
 /// buffers 8–15 stay unbound for the `batch_0` variant exactly as MLX leaves
 /// them for `B ≤ 1`).
@@ -235,9 +243,10 @@ pub fn affine_qmm_t_nax_bf16(
         bits,
     )?;
 
+    let bm = nax_qmm_bm(m);
     let aligned_suffix = if n % NAX_TILE == 0 { "true" } else { "false" };
     let kernel_name = format!(
-        "affine_qmm_t_nax_bfloat16_t_gs_{group_size}_b_{bits}_bm64_bn64_bk64_wm2_wn2_alN_{aligned_suffix}_batch_0"
+        "affine_qmm_t_nax_bfloat16_t_gs_{group_size}_b_{bits}_bm{bm}_bn64_bk64_wm2_wn2_alN_{aligned_suffix}_batch_0"
     );
     let pipeline = library.pipeline(&kernel_name)?;
 
@@ -264,7 +273,7 @@ pub fn affine_qmm_t_nax_bf16(
 
     let grid = MTLSize {
         width: n.div_ceil(NAX_TILE),
-        height: m.div_ceil(NAX_TILE),
+        height: m.div_ceil(bm),
         depth: 1,
     };
     let threadgroup = MTLSize {
@@ -335,4 +344,22 @@ fn validate_qmm_buffer_lens(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod nax_tile_tests {
+    use super::nax_qmm_bm;
+
+    #[test]
+    fn one_block_covers_small_m_with_32_rows() {
+        assert_eq!(nax_qmm_bm(1), 32);
+        assert_eq!(nax_qmm_bm(16), 32);
+        assert_eq!(nax_qmm_bm(32), 32);
+    }
+
+    #[test]
+    fn larger_m_uses_64_rows() {
+        assert_eq!(nax_qmm_bm(33), 64);
+        assert_eq!(nax_qmm_bm(512), 64);
+    }
 }

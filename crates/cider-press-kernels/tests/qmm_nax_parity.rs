@@ -108,6 +108,15 @@ fn parity_affine_qmm_t_nax_bf16_m150_partial_row_tile() {
 }
 
 #[test]
+fn parity_affine_qmm_t_nax_bf16_m16_bm32_variant() {
+    // M ≤ 32 selects the 32-row instantiation (MLX: `bm = 32` when one block
+    // covers all of M). 304 classic tiles → MLX's split-K gate is a no-op and
+    // its reference is this same kernel; K = 2560 / N = 9728 keep M = 16
+    // above MLX's qmv batch limit (13 for these dims).
+    run_case("kernels-qmm-nax-m16", 16, 9728, 2560);
+}
+
+#[test]
 fn nax_rejects_k_not_multiple_of_64() {
     let device = Device::system_default().expect("Metal device");
     if !device.nax_available() {

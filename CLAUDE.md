@@ -282,8 +282,8 @@ let prefill chunks grow); `.metallib` precompile. Step docs under
   all for bisecting.
 - **NAX (tensor-core) kernels.** On GPUs of generation ≥ 17 under macOS
   ≥ 26.2 (`Device::nax_available`, a port of MLX's `is_nax_available`),
-  `M > 1` quantized matmuls dispatch MLX's `qmm_t_nax` (64×64×64 tiles;
-  `K % 64 == 0`), the same kernel MLX runs there — bit-exact against MLX
+  `M > 1` quantized matmuls dispatch MLX's `qmm_t_nax` (`bm`×64×64 tiles,
+  `bm = 32` for `M ≤ 32`; `K % 64 == 0`), the same kernel MLX runs there — bit-exact against MLX
   fixtures generated on such a machine, and *not* bit-exact with the classic
   kernels (different accumulation order). Prefill on an M5 Max: 33.8 → 13.8 ms
   at T = 512 vs MLX 12.8. The classic kernels stay for everything else (M = 1,
