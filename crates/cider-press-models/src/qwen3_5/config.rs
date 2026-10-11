@@ -172,6 +172,14 @@ impl Qwen35Config {
                 "config has no full-attention layer".into(),
             ));
         }
+        // `conv1d_causal` supports kernel 4 only; 0 would also underflow the
+        // conv-state window (`kernel - 1`).
+        if t.linear_conv_kernel_dim != 4 {
+            return Err(Error::InvalidArgument(format!(
+                "linear_conv_kernel_dim must be 4 (got {})",
+                t.linear_conv_kernel_dim
+            )));
+        }
         Ok(Self {
             hidden_size: t.hidden_size,
             num_hidden_layers: t.num_hidden_layers,
@@ -394,6 +402,24 @@ mod tests {
             r#"["linear_attention", "full_attention"]"#,
         );
         assert!(Qwen35Config::from_json_bytes(json.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn rejects_unsupported_conv_kernel_dim() {
+        for dim in [0, 3] {
+            let json = config_with("", r#"["linear_attention", "linear_attention"]"#)
+                .replace("\"num_hidden_layers\": 2", "\"num_hidden_layers\": 4")
+                .replace(
+                    r#"["linear_attention", "linear_attention"]"#,
+                    r#"["linear_attention", "linear_attention", "linear_attention", "full_attention"]"#,
+                )
+                .replace(
+                    "\"linear_conv_kernel_dim\": 4",
+                    &format!("\"linear_conv_kernel_dim\": {dim}"),
+                );
+            let err = Qwen35Config::from_json_bytes(json.as_bytes()).unwrap_err();
+            assert!(err.to_string().contains("linear_conv_kernel_dim"), "{err}");
+        }
     }
 
     #[test]
