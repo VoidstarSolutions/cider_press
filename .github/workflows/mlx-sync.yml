@@ -2,7 +2,10 @@ name: MLX upstream sync
 
 # Watches MLX upstream for changes to the kernel files we vendor in
 # `kernels-mlx/`. When upstream drifts, opens a PR with the new files
-# and the new commit SHA in VENDORED.md. CI on the PR re-runs the
+# and the new commit SHA in VENDORED.md. There is only ever one sync PR:
+# it lives on the fixed `mlx-sync/upstream` branch, so a later run
+# force-updates that branch and the open PR's title/body to the newest
+# upstream SHA instead of stacking a new PR. CI on the PR re-runs the
 # parity tests, which act as the canary for MLX-side changes that
 # break us.
 #
@@ -22,6 +25,10 @@ on:
 permissions:
   contents: write
   pull-requests: write
+
+concurrency:
+  group: mlx-sync
+  cancel-in-progress: false
 
 jobs:
   sync:
@@ -64,7 +71,7 @@ jobs:
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          branch: mlx-sync/${{ env.MLX_SHA }}
+          branch: mlx-sync/upstream
           base: main
           title: "chore(mlx-sync): bump vendored kernels to ${{ env.MLX_SHA }}"
           commit-message: |

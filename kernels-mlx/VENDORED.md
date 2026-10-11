@@ -69,8 +69,10 @@ MLX_DIR=../mlx ./scripts/sync_mlx_kernels.sh
 ```
 
 The `.github/workflows/mlx-sync.yml` GitHub Actions workflow runs this
-on a schedule against the upstream `main` branch and opens a pull
-request when drift is detected.
+on a schedule against the upstream `main` branch and, when drift is
+detected, opens a pull request from the fixed `mlx-sync/upstream`
+branch — or updates the already-open one, so there is never more than
+one sync PR.
 
 ## Adding a new entry point
 
