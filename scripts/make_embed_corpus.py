@@ -51,7 +51,11 @@ def iter_text_files(repo: Path):
         if not rel:
             continue
         path = repo / rel.decode("utf-8", "surrogateescape")
-        if not path.is_file():
+        # A tracked symlink can point anywhere on disk; the corpus is sent to
+        # an embedding server, so never read outside the repository.
+        if path.is_symlink() or not path.is_file():
+            continue
+        if not path.resolve().is_relative_to(repo):
             continue
         try:
             yield path, path.read_text(encoding="utf-8")
@@ -69,6 +73,8 @@ def chunks_from_text(text: str, max_bytes: int, window_lines: int):
         while len(encoded) > max_bytes:
             cut = encoded[:max_bytes].decode("utf-8", "ignore")
             cut = cut.rsplit("\n", 1)[0] or cut
+            if not cut:
+                raise SystemExit(f"--max-bytes {max_bytes} cannot hold the next UTF-8 character")
             yield cut
             window = window[len(cut) :].lstrip("\n")
             encoded = window.encode("utf-8")

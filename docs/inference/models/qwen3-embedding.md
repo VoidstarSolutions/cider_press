@@ -110,16 +110,23 @@ correctness/memory work with no measurable throughput upside.
 Prefill is **86–92 % quantized matmul**, and cider's qmm runs at an
 effective ~10.5 TFLOPS (0.716 GFLOP/token × 14.6 k tok/s) while a direct
 MLX micro-benchmark of `mx.quantized_matmul` at the embedding model's
-prefill shapes (`scripts/measure_qmm_vs_gemm_mlx.py`, median of 5 rounds)
-reaches **31.5 TFLOPS at M = 512** (28.8–32.1) and 45.7 (44.5–45.9) at
-M = 2048 (bf16 `mx.matmul`: 22.1 / 41.9). Per MLX's source (local checkout
+prefill shapes (`scripts/measure_qmm_vs_gemm_mlx.py`, median of 5 rounds
+of independent dispatches — an earlier accumulator-summing version of the
+script under-read both by 1.2–3×, caught in review) reaches **47.9 TFLOPS
+at M = 512** (41.1–48.9) and 51.5 (50.9–52.2) at M = 2048 (bf16
+`mx.matmul`: 48.1 / 61.2). Against cider's ~11.6 TFLOPS qmm-only rate at
+T = 512 (0.716 GFLOP/token × 512 ÷ 35.0 ms × 90.5 % GPU share) that is a
+**~4× kernel gap**, larger than the 2.7× whole-forward ratio in §1. Per MLX's source (local checkout
 7b7c124; the measured pip MLX is 0.32.3), on GPUs of generation ≥ 17
 (≥ 18 for the `p` architecture) under macOS ≥ 26.2 (`is_nax_available`,
 `device.cpp:828`), MLX dispatches the tensor-core **`qmm_t_nax` /
 `steel_gemm_fused_nax`** kernels (`quantized.cpp:695`:
 `is_nax_available() && transpose && K % 64 == 0`). That dispatch was not
-confirmed with a `.gputrace` capture; the ~2.7× kernel-level gap is
-measured, its attribution to NAX is read from source.
+confirmed with a `.gputrace` capture; the ~4× kernel-level gap is
+measured, its attribution to NAX is read from source. A throwaway probe
+also confirmed the runtime Metal compiler builds the flattened
+`quantized_nax` source under language version 4.0 on this machine and
+yields both `affine_qmm_t_nax_…_alN_{true,false}_batch_0` pipelines.
 Those kernels (`quantized_nax.metal`, `steel/gemm/gemm_nax.h`, `nax.h`)
 are **absent from `kernels-mlx/`** (vendored 8906447 and the in-flight
 06eb748 sync alike) and from cider's dispatch, which only knows
@@ -148,8 +155,9 @@ reachable ceiling once it dispatches the same kernels.
 
 ## Open levers
 
-- **NAX `qmm_t` / steel gemm dispatch (new, largest):** bound 2.7× at
-  T = 512 (MLX 39.9 k vs cider 14.6 k tok/s on the proxy model). Requires
+- **NAX `qmm_t` / steel gemm dispatch (new, largest):** bound 2.7× on
+  the whole forward at T = 512 (MLX 39.9 k vs cider 14.6 k tok/s on the
+  proxy model), ~4× on the qmm kernel itself. Requires
   vendoring `quantized_nax.*`, `gemm_nax.h`, `nax.h` (the sync script
   copies a fixed list), a runtime check mirroring `is_nax_available`
   (architecture gen ≥ 17, ≥ 18 for `p`; macOS ≥ 26.2), and a `qmm_t_nax` dispatch

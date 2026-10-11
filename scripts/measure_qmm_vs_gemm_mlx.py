@@ -12,8 +12,8 @@ For M in {150, 512, 2048} and the five distinct per-layer projection shapes
 (q 1024→2048, k/v 1024→1024, o 2048→1024, gate/up 1024→3072, down 3072→1024;
 k/v and gate/up counted once each), times `mx.quantized_matmul(x, wq, s, b,
 transpose=True, group_size=64, bits=4)` and `x @ w.T` on random bf16 data:
---warmup evals, then --rounds rounds of --reps dispatches accumulated under one
-`mx.eval` (amortised, as scripts/measure_qmm_mlx.py does). Reports the median
+--warmup evals, then --rounds rounds of --reps independent dispatches evaluated
+under one `mx.eval` (no accumulator: summing outputs would time the adds too). Reports the median
 round's TFLOPS (2·M·K·N / t summed over the shapes) with min–max. On a GPU
 where MLX's `is_nax_available()` holds, these are the NAX kernels.
 
@@ -36,15 +36,15 @@ BITS = 4
 
 
 def bench(fn, warmup: int, reps: int) -> float:
+    """Time `reps` independent dispatches evaluated together. Summing the
+    outputs into one accumulator would add `reps - 1` elementwise adds to
+    the timed work (measured: 1.6x on qmm, 3x on gemm at M = 512)."""
     for _ in range(warmup):
         mx.eval(fn())
     mx.synchronize()
     t0 = time.perf_counter()
-    acc = None
-    for _ in range(reps):
-        y = fn()
-        acc = y if acc is None else acc + y
-    mx.eval(acc)
+    outs = [fn() for _ in range(reps)]
+    mx.eval(*outs)
     mx.synchronize()
     return (time.perf_counter() - t0) / reps
 
