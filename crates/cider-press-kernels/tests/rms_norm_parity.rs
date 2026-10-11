@@ -157,6 +157,7 @@ fn assert_within_tolerance(
             samples.push((i, af, bf, abs));
         }
     }
+    eprintln!("{label}: max_abs={max_abs:.6} max_rel={max_rel:.6} (tol {abs_tol} / {rel_tol})");
     if max_abs > abs_tol || max_rel > rel_tol {
         eprintln!(
             "{label}: {mismatches}/{} mismatches, max_abs={max_abs:.6}, max_rel={max_rel:.6}",

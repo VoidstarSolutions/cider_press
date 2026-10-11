@@ -59,17 +59,32 @@ vendored — they're resolved by Apple's Metal compiler at JIT time.
 The vendored kernels are parity-tested **bit-exact** against MLX fixtures.
 That only holds if both sides hand the Metal compiler the same policy, so
 `KernelLibrary::compile_options()` (`crates/cider-press-kernels/src/library.rs`)
-mirrors MLX's `Device::build_library_` in `mlx/backend/metal/device.cpp`:
+mirrors MLX in two places that must agree:
 
-- `fastMathEnabled = false`
-- `languageVersion` = `get_metal_version()`: 4.0 on macOS 26+, 3.2 on
-  macOS 15+, else 3.1
-- `enableLogging` only in debug builds (`#ifndef NDEBUG`)
+- **Fixture-producing kernels** (the pip `mlx` wheel's ahead-of-time
+  `mlx.metallib`): `METAL_FLAGS` in `mlx/backend/metal/kernels/CMakeLists.txt`
+  — `-fno-fast-math`; `-fmetal-enable-logging` only for Debug builds with
+  Metal ≥ 3.2; no `-std=`, so the language version is the SDK compiler's
+  default.
+- **MLX's JIT path** (`Device::build_library_` in
+  `mlx/backend/metal/device.cpp`, the exact analogue of cider's
+  `newLibraryWithSource:`): `setFastMathEnabled(false)`;
+  `setLanguageVersion(get_metal_version())` = 4.0 on macOS 26+, 3.2 on
+  macOS 15+, else 3.1; `setEnableLogging` only `#ifndef NDEBUG`.
 
-`device.cpp` is **not** vendored (it is C++ dispatch code, not a kernel), so
-the sync script prints MLX's current block at the end of every sync. If it
-differs from the bullets above, update `compile_options()` in the same PR as
-the kernel bump and re-run the full parity suite.
+cider sets `fastMathEnabled = false` through the same (deprecated) setter
+MLX uses. On macOS 15+ that setter sets both of the newer knobs —
+`mathMode = Safe` **and** `mathFloatingPointFunctions = Precise` — which
+`setMathMode(Safe)` alone does not; `tests/compile_options.rs` pins the
+effective knobs. Measured on an M5 Max: under the old default (fast math on)
+~80 % of f32 `metal::exp` results differed bit-wise from the precise path,
+collapsing to 1–2 in 65 536 after bf16 rounding — which is why bf16 parity
+tests never caught it.
+
+Neither `device.cpp` nor the CMake file is vendored (dispatch code, not
+kernels), so the sync script prints both blocks at the end of every sync. If
+either differs from the bullets above, update `compile_options()` in the same
+PR as the kernel bump and re-run the full parity suite.
 
 ## Sync procedure
 

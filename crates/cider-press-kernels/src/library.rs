@@ -1,3 +1,8 @@
+// Compile-options policy ported from MLX (https://github.com/ml-explore/mlx,
+// `mlx/backend/metal/device.cpp` + `kernels/CMakeLists.txt`).
+// Copyright © 2023-2024 Apple Inc. Released under the MIT license — see
+// the full upstream notice at `kernels-mlx/COPYING`.
+
 //! Metal kernel libraries with per-name pipeline-state caching.
 //!
 //! A [`KernelLibrary`] is the result of JIT-compiling one MSL source
@@ -21,7 +26,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fmt::Write as _;
 use std::ptr::NonNull;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use objc2::Message;
 use objc2::rc::Retained;
@@ -161,37 +166,43 @@ impl KernelLibrary {
     #[must_use]
     pub fn compile_options() -> Retained<MTLCompileOptions> {
         let options = MTLCompileOptions::new();
-        // MLX calls the (deprecated) flag rather than `mathMode`; mirror it
-        // exactly so the two compilers see the same request.
+        // The deprecated flag, not `setMathMode(Safe)`: on macOS 15+ it sets
+        // BOTH `mathMode = Safe` and `mathFloatingPointFunctions = Precise`,
+        // while `setMathMode(Safe)` alone leaves the FP functions Fast. It is
+        // also the call MLX makes.
         #[allow(deprecated)]
         options.setFastMathEnabled(false);
-        options.setLanguageVersion(Self::metal_language_version());
-        if cfg!(debug_assertions)
-            && Self::metal_language_version() >= MTLLanguageVersion::Version3_2
-        {
+        let version = Self::metal_language_version();
+        options.setLanguageVersion(version);
+        if cfg!(debug_assertions) && version >= MTLLanguageVersion::Version3_2 {
             options.setEnableLogging(true);
         }
         options
     }
 
     /// MLX's `get_metal_version()`: Metal 4.0 on macOS 26+, 3.2 on macOS 15+,
-    /// else 3.1.
+    /// else 3.1. Resolved once per process.
     #[must_use]
     pub fn metal_language_version() -> MTLLanguageVersion {
-        let at_least = |major: isize| {
-            NSProcessInfo::processInfo().isOperatingSystemAtLeastVersion(NSOperatingSystemVersion {
-                majorVersion: major,
-                minorVersion: 0,
-                patchVersion: 0,
-            })
-        };
-        if at_least(26) {
-            MTLLanguageVersion::Version4_0
-        } else if at_least(15) {
-            MTLLanguageVersion::Version3_2
-        } else {
-            MTLLanguageVersion::Version3_1
-        }
+        static VERSION: OnceLock<MTLLanguageVersion> = OnceLock::new();
+        *VERSION.get_or_init(|| {
+            let at_least = |major: isize| {
+                NSProcessInfo::processInfo().isOperatingSystemAtLeastVersion(
+                    NSOperatingSystemVersion {
+                        majorVersion: major,
+                        minorVersion: 0,
+                        patchVersion: 0,
+                    },
+                )
+            };
+            if at_least(26) {
+                MTLLanguageVersion::Version4_0
+            } else if at_least(15) {
+                MTLLanguageVersion::Version3_2
+            } else {
+                MTLLanguageVersion::Version3_1
+            }
+        })
     }
 
     /// Compile MSL source into a library on `device`.

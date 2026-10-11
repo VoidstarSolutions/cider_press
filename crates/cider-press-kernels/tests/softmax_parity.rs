@@ -7,9 +7,11 @@
 //! `max` / `sum(exp)` reduction via `simd_max` / `simd_sum` which
 //! depend on lane-order summation, and `metal::fast::exp` carries a
 //! relative-precision bound — same hardware-drift story as the
-//! sigmoid case in `unary_parity`. The precise variant is meaningfully
-//! tighter than the default since its float accumulator absorbs the
-//! lane-summation drift before the final bf16 cast.
+//! sigmoid case in `unary_parity`. The precise variant is **bit-exact**:
+//! its float accumulator absorbs the lane-summation drift before the final
+//! bf16 cast, and its only measured drift (`max_rel` 0.0046 on an M5 Max) was
+//! cider compiling with fast math while MLX does not — gone under
+//! `KernelLibrary::compile_options()`.
 //!
 //! Drives a Qwen2-attention-shape input `[1, 14, T, T]` for two
 //! values of T (4 and 256) to exercise both small (single-simd
@@ -39,12 +41,12 @@ fn parity_block_softmax_bf16_medium() {
 
 #[test]
 fn parity_block_softmax_precise_bf16_small() {
-    parity(4, true, 0.005, 0.01);
+    parity(4, true, 0.0, 0.0);
 }
 
 #[test]
 fn parity_block_softmax_precise_bf16_medium() {
-    parity(256, true, 0.005, 0.01);
+    parity(256, true, 0.0, 0.0);
 }
 
 fn parity(seq_len: usize, precise: bool, abs_tol: f32, rel_tol: f32) {
@@ -113,6 +115,7 @@ fn assert_within_tolerance(
             samples.push((i, af, bf, abs));
         }
     }
+    eprintln!("{label}: max_abs={max_abs:.6} max_rel={max_rel:.6} (tol {abs_tol} / {rel_tol})");
     if max_abs > abs_tol || max_rel > rel_tol {
         eprintln!(
             "{label}: {mismatches}/{} mismatches, max_abs={max_abs:.6}, max_rel={max_rel:.6}",
