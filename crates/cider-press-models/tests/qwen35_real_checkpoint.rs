@@ -4,8 +4,8 @@
 #![cfg(target_os = "macos")]
 
 use cider_press_models::safetensors_io::{ShardSet, TensorLookup};
-use cider_press_test_utils::require_checkpoint_dir;
-use std::{fs, path::PathBuf};
+use cider_press_test_utils::qwen35_4b_checkpoint_dir;
+use std::fs;
 
 use cider_press_models::qwen3_5::{
     Qwen35Config, Qwen35FullAttnWeights, Qwen35LinearAttnWeights, Qwen35MixerWeights,
@@ -13,19 +13,12 @@ use cider_press_models::qwen3_5::{
 };
 use cider_press_runtime::Device;
 
-fn checkpoint_path() -> PathBuf {
-    require_checkpoint_dir(
-        "CIDER_QWEN35_CHECKPOINT_PATH",
-        "a local Qwen3.5-4B-4bit MLX checkpoint directory",
-    )
-}
-
 #[test]
 #[ignore = "requires a real checkpoint via CIDER_QWEN35_CHECKPOINT_PATH"]
 fn real_checkpoint_loads_and_byte_round_trips() {
     const P: &str = "language_model.model";
 
-    let dir = checkpoint_path();
+    let dir = qwen35_4b_checkpoint_dir();
     let config =
         Qwen35Config::from_json_bytes(&fs::read(dir.join("config.json")).unwrap()).unwrap();
     let shards = ShardSet::read(&dir).unwrap();

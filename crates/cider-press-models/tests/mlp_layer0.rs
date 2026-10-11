@@ -17,7 +17,9 @@ use std::path::{Path, PathBuf};
 use cider_press_models::nn::{Linear, Mlp, Module};
 use cider_press_models::qwen2::{Qwen2Config, load_qwen2_weights};
 use cider_press_runtime::{Device, Tensor};
-use cider_press_test_utils::{dump_mlx_op, read_bf16, require_checkpoint_dir, tempdir};
+use cider_press_test_utils::{
+    assert_allclose, dump_mlx_op, read_bf16, require_checkpoint_dir, tempdir,
+};
 use half::bf16;
 use safetensors::SafeTensors;
 
@@ -30,36 +32,6 @@ fn checkpoint_path() -> PathBuf {
         "CIDER_QWEN_CHECKPOINT_PATH",
         "a local Qwen2.5-0.5B-Instruct-4bit checkpoint directory",
     )
-}
-
-fn assert_close(label: &str, got: &[bf16], expected: &[bf16]) {
-    assert_eq!(got.len(), expected.len(), "{label}: length mismatch");
-    let mut worst_excess = 0.0f32;
-    let mut worst_at = 0usize;
-    let mut worst_pair = (0.0f32, 0.0f32);
-    for (i, (a, b)) in got.iter().zip(expected.iter()).enumerate() {
-        if a == b {
-            continue;
-        }
-        let af = a.to_f32();
-        let bfv = b.to_f32();
-        let diff = (af - bfv).abs();
-        let bound = ATOL + RTOL * bfv.abs();
-        let excess = diff - bound;
-        if excess > worst_excess {
-            worst_excess = excess;
-            worst_at = i;
-            worst_pair = (af, bfv);
-        }
-    }
-    assert!(
-        worst_excess <= 0.0,
-        "{label}: tolerance exceeded — worst element [{worst_at}] \
-         got={} want={} |diff|={} > atol={ATOL} + rtol={RTOL}*|want|",
-        worst_pair.0,
-        worst_pair.1,
-        (worst_pair.0 - worst_pair.1).abs(),
-    );
 }
 
 fn run_layer0_mlp(checkpoint: &Path, seq_len: usize) {
@@ -108,7 +80,13 @@ fn run_layer0_mlp(checkpoint: &Path, seq_len: usize) {
     out.eval().expect("eval");
     let got: Vec<bf16> = out.cpu_to_vec().expect("cpu_to_vec");
 
-    assert_close(&format!("mlp_layer0 seq_len={seq_len}"), &got, &y_ref);
+    assert_allclose(
+        &format!("mlp_layer0 seq_len={seq_len}"),
+        &got,
+        &y_ref,
+        ATOL,
+        RTOL,
+    );
 }
 
 #[test]

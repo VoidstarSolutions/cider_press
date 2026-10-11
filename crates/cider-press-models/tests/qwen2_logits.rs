@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 
 use cider_press_models::qwen2::{Qwen2Config, Qwen2Model, load_qwen2_weights};
 use cider_press_runtime::{DType, Device, KvCache, Tensor};
-use cider_press_test_utils::{dump_mlx_op, read_bf16, read_u32, require_checkpoint_dir, tempdir};
+use cider_press_test_utils::{
+    assert_allclose, dump_mlx_op, read_bf16, read_u32, require_checkpoint_dir, tempdir,
+};
 use half::bf16;
 use safetensors::SafeTensors;
 
@@ -40,44 +42,6 @@ fn checkpoint_path() -> PathBuf {
         "CIDER_QWEN_CHECKPOINT_PATH",
         "a local Qwen2.5-0.5B-Instruct-4bit checkpoint directory",
     )
-}
-
-fn assert_close(label: &str, got: &[bf16], expected: &[bf16]) {
-    assert_eq!(got.len(), expected.len(), "{label}: length mismatch");
-    let mut worst_excess = 0.0f32;
-    let mut worst_at = 0usize;
-    let mut worst_pair = (0.0f32, 0.0f32);
-    for (i, (a, b)) in got.iter().zip(expected.iter()).enumerate() {
-        let af = a.to_f32();
-        let bfv = b.to_f32();
-        if !af.is_finite() || !bfv.is_finite() {
-            // NaN/Inf would otherwise short-circuit the tolerance math
-            // (NaN comparisons fall back to false) — force a failure.
-            worst_excess = f32::INFINITY;
-            worst_at = i;
-            worst_pair = (af, bfv);
-            break;
-        }
-        if a == b {
-            continue;
-        }
-        let diff = (af - bfv).abs();
-        let bound = ATOL + RTOL * bfv.abs();
-        let excess = diff - bound;
-        if excess > worst_excess {
-            worst_excess = excess;
-            worst_at = i;
-            worst_pair = (af, bfv);
-        }
-    }
-    assert!(
-        worst_excess <= 0.0,
-        "{label}: tolerance exceeded — worst element [{worst_at}] \
-         got={} want={} |diff|={} > atol={ATOL} + rtol={RTOL}*|want|",
-        worst_pair.0,
-        worst_pair.1,
-        (worst_pair.0 - worst_pair.1).abs(),
-    );
 }
 
 fn run_qwen2_logits(checkpoint: &Path) {
@@ -143,7 +107,13 @@ fn run_qwen2_logits(checkpoint: &Path) {
     let got: Vec<bf16> = logits.cpu_to_vec().expect("cpu_to_vec");
 
     assert_eq!(got.len(), logits_ref.len(), "rust/mlx logits length");
-    assert_close(&format!("qwen2_logits T={t}"), &got, &logits_ref);
+    assert_allclose(
+        &format!("qwen2_logits T={t}"),
+        &got,
+        &logits_ref,
+        ATOL,
+        RTOL,
+    );
 }
 
 #[test]
@@ -211,7 +181,13 @@ fn run_forward_last_matches_full(checkpoint: &Path) {
         &[1, 1, vocab_size],
         "forward_last should project a single position",
     );
-    assert_close("forward_last vs forward[:, -1, :]", &last_v, last_row);
+    assert_allclose(
+        "forward_last vs forward[:, -1, :]",
+        &last_v,
+        last_row,
+        ATOL,
+        RTOL,
+    );
 }
 
 #[test]

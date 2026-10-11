@@ -1,7 +1,7 @@
 #![cfg(target_os = "macos")]
 
 use cider_press_models::safetensors_io::ShardSet;
-use std::{fs, path::PathBuf};
+use std::fs;
 
 use cider_press_models::nn::rms_norm;
 use cider_press_models::qwen3_5::{
@@ -9,7 +9,7 @@ use cider_press_models::qwen3_5::{
     load_qwen35_weights,
 };
 use cider_press_runtime::{DType, Device, KvCache, Tensor};
-use cider_press_test_utils::{read_bf16, require_checkpoint_dir, require_file};
+use cider_press_test_utils::{assert_allclose, qwen35_4b_checkpoint_dir, read_bf16, require_file};
 use half::bf16;
 use safetensors::SafeTensors;
 
@@ -18,37 +18,10 @@ const RTOL: f32 = 5e-2;
 const FIXTURES: &str = "/tmp/qwen3_5_4b_fixtures.safetensors";
 const FIXTURES_REGEN: &str = "uv run scripts/dump_qwen35_fixtures.py";
 
-fn checkpoint_path() -> PathBuf {
-    require_checkpoint_dir(
-        "CIDER_QWEN35_CHECKPOINT_PATH",
-        "a local Qwen3.5-4B-4bit MLX checkpoint directory",
-    )
-}
-
-fn assert_close(label: &str, got: &[bf16], expected: &[bf16]) {
-    assert_eq!(got.len(), expected.len(), "{label}: length mismatch");
-    let mut max_abs = 0f32;
-    let mut max_rel = 0f32;
-    for (i, (a, b)) in got.iter().zip(expected.iter()).enumerate() {
-        let (a, b) = (a.to_f32(), b.to_f32());
-        let abs = (a - b).abs();
-        max_abs = max_abs.max(abs);
-        if b.abs() > 1e-6 {
-            max_rel = max_rel.max(abs / b.abs());
-        }
-        let bound = ATOL + RTOL * b.abs();
-        assert!(
-            abs <= bound,
-            "{label}[{i}]: got={a} want={b} > bound={bound}"
-        );
-    }
-    println!("{label}: max_abs={max_abs}, max_rel={max_rel}");
-}
-
 #[test]
 #[ignore = "requires a local checkpoint; run with --ignored (see panic message for the env var)"]
 fn gated_attention_layer3_matches_mlx() {
-    let dir = checkpoint_path();
+    let dir = qwen35_4b_checkpoint_dir();
     let fixtures = require_file(FIXTURES, FIXTURES_REGEN);
     let config =
         Qwen35Config::from_json_bytes(&fs::read(dir.join("config.json")).unwrap()).unwrap();
@@ -86,13 +59,13 @@ fn gated_attention_layer3_matches_mlx() {
     let out = attn.forward(&normed, &offset, &mut cache).unwrap();
     out.eval().unwrap();
     let got: Vec<bf16> = out.cpu_to_vec().unwrap();
-    assert_close("gated_attention layer3", &got, &expected);
+    assert_allclose("gated_attention layer3", &got, &expected, ATOL, RTOL);
 }
 
 #[test]
 #[ignore = "requires a local checkpoint; run with --ignored (see panic message for the env var)"]
 fn decoder_layer3_matches_mlx() {
-    let dir = checkpoint_path();
+    let dir = qwen35_4b_checkpoint_dir();
     let fixtures = require_file(FIXTURES, FIXTURES_REGEN);
     let config =
         Qwen35Config::from_json_bytes(&fs::read(dir.join("config.json")).unwrap()).unwrap();
@@ -124,5 +97,5 @@ fn decoder_layer3_matches_mlx() {
     let out = layer.forward(&x, &offset, &mut cache).unwrap();
     out.eval().unwrap();
     let got: Vec<bf16> = out.cpu_to_vec().unwrap();
-    assert_close("decoder layer3", &got, &expected);
+    assert_allclose("decoder layer3", &got, &expected, ATOL, RTOL);
 }

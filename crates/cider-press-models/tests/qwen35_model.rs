@@ -8,46 +8,20 @@
 //! fixture tests below.
 
 use cider_press_models::safetensors_io::ShardSet;
-use std::{fs, path::PathBuf};
+use std::fs;
 
 use cider_press_models::qwen3_5::{
     Qwen35Config, Qwen35LayerCache, Qwen35Model, load_qwen35_weights,
 };
 use cider_press_runtime::{Device, Tensor};
-use cider_press_test_utils::{read_bf16, read_u32, require_checkpoint_dir, require_file};
+use cider_press_test_utils::{
+    assert_allclose, qwen35_4b_checkpoint_dir, read_bf16, read_u32, require_file,
+};
 use half::bf16;
 use safetensors::SafeTensors;
 
 const FIXTURES: &str = "/tmp/qwen3_5_4b_fixtures.safetensors";
 const FIXTURES_REGEN: &str = "uv run scripts/dump_qwen35_fixtures.py";
-
-fn checkpoint_path() -> PathBuf {
-    require_checkpoint_dir(
-        "CIDER_QWEN35_CHECKPOINT_PATH",
-        "a local Qwen3.5-4B-4bit MLX checkpoint directory",
-    )
-}
-
-/// Combined np.allclose bound `|a-b| <= atol + rtol*|b|`. Reports max abs/rel.
-fn assert_close(label: &str, got: &[bf16], expected: &[bf16], atol: f32, rtol: f32) {
-    assert_eq!(got.len(), expected.len(), "{label}: length mismatch");
-    let mut max_abs = 0f32;
-    let mut max_rel = 0f32;
-    for (i, (a, b)) in got.iter().zip(expected.iter()).enumerate() {
-        let (a, b) = (a.to_f32(), b.to_f32());
-        let abs = (a - b).abs();
-        max_abs = max_abs.max(abs);
-        if b.abs() > 1e-6 {
-            max_rel = max_rel.max(abs / b.abs());
-        }
-        let bound = atol + rtol * b.abs();
-        assert!(
-            abs <= bound,
-            "{label}[{i}]: got={a} want={b} > bound={bound} (max_abs so far={max_abs})"
-        );
-    }
-    println!("{label}: max_abs={max_abs}, max_rel={max_rel}");
-}
 
 /// Argmax over the last `[vocab]` row of a `[1, T, vocab]` row-major buffer.
 fn last_row_argmax(buf: &[bf16], vocab: usize) -> usize {
@@ -64,7 +38,7 @@ fn last_row_argmax(buf: &[bf16], vocab: usize) -> usize {
 #[test]
 #[ignore = "requires a local checkpoint; run with --ignored (see panic message for the env var)"]
 fn qwen35_model_forward_shape() {
-    let dir = checkpoint_path();
+    let dir = qwen35_4b_checkpoint_dir();
     let config =
         Qwen35Config::from_json_bytes(&fs::read(dir.join("config.json")).unwrap()).unwrap();
     let shards = ShardSet::read(&dir).unwrap();
@@ -130,7 +104,7 @@ fn qwen35_model_forward_shape() {
 #[test]
 #[ignore = "requires a local checkpoint; run with --ignored (see panic message for the env var)"]
 fn qwen35_model_logits_match_mlx() {
-    let dir = checkpoint_path();
+    let dir = qwen35_4b_checkpoint_dir();
     let fixtures = require_file(FIXTURES, FIXTURES_REGEN);
     let config =
         Qwen35Config::from_json_bytes(&fs::read(dir.join("config.json")).unwrap()).unwrap();
@@ -156,7 +130,7 @@ fn qwen35_model_logits_match_mlx() {
     let fh_want = read_bf16(&fx, "final_hidden"); // [1, T, hidden]
     // atol 0.6 / rtol 0.1: the 32-layer bf16 residual chain (see the test
     // doc comment) — the worst post-norm element drifts ~0.5 abs.
-    assert_close("final_hidden", &fh_got, &fh_want, 0.6, 0.1);
+    assert_allclose("final_hidden", &fh_got, &fh_want, 0.6, 0.1);
 
     // (2) End-to-end: full forward incl. tied lm_head. Fresh caches — the
     // first forward consumed the backbone caches.
@@ -167,7 +141,7 @@ fn qwen35_model_logits_match_mlx() {
     let lg_want = read_bf16(&fx, "logits"); // [1, T, vocab]
     // atol 0.6 / rtol 0.1: same deep-chain accumulation, fed through the tied
     // head. The argmax assertion below is the real end-to-end gate.
-    assert_close("logits", &lg_got, &lg_want, 0.6, 0.1);
+    assert_allclose("logits", &lg_got, &lg_want, 0.6, 0.1);
 
     // The meaningful end-to-end signal: greedy decode only needs the argmax of
     // the last position. Assert it matches the fixture exactly.

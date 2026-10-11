@@ -10,13 +10,12 @@
 use cider_press_models::safetensors_io::ShardSet;
 use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
 
 use cider_press_models::generator::Generator;
 use cider_press_models::qwen3_5::{Qwen35Config, Qwen35Model, load_qwen35_weights};
 use cider_press_models::tokenizer::Tokenizer;
 use cider_press_runtime::{Device, Tensor};
-use cider_press_test_utils::require_checkpoint_dir;
+use cider_press_test_utils::qwen35_4b_checkpoint_dir;
 
 const PASSAGE: &str = "The river bends twice before it reaches the old mill, \
     where the water slows and the town keeps its records of every flood since \
@@ -24,13 +23,6 @@ const PASSAGE: &str = "The river bends twice before it reaches the old mill, \
     a ledger, and each autumn the children are taught to read them. ";
 
 const MAX_NEW: usize = 8;
-
-fn checkpoint_dir() -> PathBuf {
-    require_checkpoint_dir(
-        "CIDER_QWEN35_CHECKPOINT_PATH",
-        "a local Qwen3.5-4B-4bit MLX checkpoint directory",
-    )
-}
 
 fn load(dir: &std::path::Path) -> (Qwen35Model, Tokenizer) {
     let config =
@@ -94,7 +86,7 @@ fn generate_unchunked(model: &Qwen35Model, prompt_ids: &[u32]) -> Vec<u32> {
 #[test]
 #[ignore = "requires CIDER_QWEN35_CHECKPOINT_PATH (Qwen3.5-4B)"]
 fn long_prompt_prefills_and_decodes() {
-    let (model, tokenizer) = load(&checkpoint_dir());
+    let (model, tokenizer) = load(&qwen35_4b_checkpoint_dir());
     let prompt_ids = prompt(&tokenizer, 300);
     let ids = generate_chunked(model, &prompt_ids);
     assert_eq!(ids.len(), MAX_NEW, "got {ids:?}");
@@ -107,7 +99,7 @@ fn long_prompt_prefills_and_decodes() {
 #[test]
 #[ignore = "requires CIDER_QWEN35_CHECKPOINT_PATH (Qwen3.5-4B)"]
 fn chunked_greedy_matches_unchunked() {
-    let dir = checkpoint_dir();
+    let dir = qwen35_4b_checkpoint_dir();
     let (model, tokenizer) = load(&dir);
     // 36 = 16 + 16 + 4: two fill_cache chunks and a ragged forward_last tail,
     // yet short enough that the unchunked oracle's transient stays ~9 GB.

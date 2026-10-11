@@ -15,7 +15,7 @@
 #![cfg(target_os = "macos")]
 
 use cider_press_runtime::{Device, Quantization, QuantizedWeight, Tensor};
-use cider_press_test_utils::{dump_mlx_op, read_bf16, read_u32, tempdir};
+use cider_press_test_utils::{assert_allclose, dump_mlx_op, read_bf16, read_u32, tempdir};
 use half::bf16;
 use safetensors::SafeTensors;
 
@@ -36,42 +36,6 @@ fn u32_to_bytes(vals: &[u32]) -> Vec<u8> {
 
 fn bf16_to_bytes(vals: &[bf16]) -> Vec<u8> {
     vals.iter().flat_map(|v| v.to_le_bytes()).collect()
-}
-
-fn assert_close(label: &str, out: &[bf16], reference: &[bf16]) {
-    assert_eq!(
-        out.len(),
-        reference.len(),
-        "{label}: output length {} != reference length {}",
-        out.len(),
-        reference.len()
-    );
-    let mut worst_excess = 0.0f32;
-    let mut worst_at = 0usize;
-    let mut worst_pair = (0.0f32, 0.0f32);
-    for (i, (a, b)) in out.iter().zip(reference.iter()).enumerate() {
-        if a == b {
-            continue;
-        }
-        let af = a.to_f32();
-        let bf = b.to_f32();
-        let diff = (af - bf).abs();
-        let bound = ATOL + RTOL * bf.abs();
-        let excess = diff - bound;
-        if excess > worst_excess {
-            worst_excess = excess;
-            worst_at = i;
-            worst_pair = (af, bf);
-        }
-    }
-    assert!(
-        worst_excess <= 0.0,
-        "{label}: tolerance exceeded — worst element [{worst_at}] \
-         got={} want={} |diff|={} > atol={ATOL} + rtol={RTOL}*|want|",
-        worst_pair.0,
-        worst_pair.1,
-        (worst_pair.0 - worst_pair.1).abs(),
-    );
 }
 
 fn run_case(m: usize) {
@@ -134,7 +98,7 @@ fn run_case(m: usize) {
 
     let reference = read_bf16(&st, "y");
     let label = format!("qmm M={m} N={N} K={K}");
-    assert_close(&label, &got, &reference);
+    assert_allclose(&label, &got, &reference, ATOL, RTOL);
 }
 
 #[test]

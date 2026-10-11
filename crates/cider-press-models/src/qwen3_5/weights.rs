@@ -850,7 +850,7 @@ mod tests {
     use crate::safetensors_io::ShardSet;
     use cider_press_runtime::Device;
     use safetensors::{Dtype as StDtype, SafeTensors};
-    use std::{fs, path::PathBuf};
+    use std::fs;
 
     use crate::qwen3_5::config::Qwen35Config;
 
@@ -1017,17 +1017,10 @@ mod tests {
         assert_eq!(lin.a_log.dtype(), DType::F32);
     }
 
-    fn checkpoint_path() -> PathBuf {
-        cider_press_test_utils::require_checkpoint_dir(
-            "CIDER_QWEN35_CHECKPOINT_PATH",
-            "a local Qwen3.5-4B-4bit MLX checkpoint directory",
-        )
-    }
-
     #[test]
     #[ignore = "requires a real checkpoint via CIDER_QWEN35_CHECKPOINT_PATH"]
     fn loads_4b_checkpoint_with_validated_shapes() {
-        let dir = checkpoint_path();
+        let dir = cider_press_test_utils::qwen35_4b_checkpoint_dir();
         let config =
             Qwen35Config::from_json_bytes(&fs::read(dir.join("config.json")).unwrap()).unwrap();
         let shards = ShardSet::read(&dir).unwrap();
