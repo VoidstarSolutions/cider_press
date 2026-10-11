@@ -86,7 +86,8 @@ impl ShardSet {
     ///
     /// - [`Error::Io`] if a file cannot be read (including an index whose
     ///   existence cannot be determined); a directory with neither the
-    ///   index nor `model.safetensors` reports `NotFound` for the latter.
+    ///   index nor `model.safetensors` reports `NotFound` for the latter, and
+    ///   a dangling index symlink reports `NotFound` for the index path.
     /// - [`Error::InvalidShardName`] if a shard name in the index is not a
     ///   single plain file name (an absolute path, `..`, or a separator would
     ///   read outside `dir`).
@@ -98,6 +99,18 @@ impl ShardSet {
             source,
         })?;
         if !has_index {
+            // `try_exists` follows symlinks, so a dangling index link (e.g. an
+            // HF snapshot whose blob never finished downloading) reads as
+            // absent; it must not fall through to a co-located single file.
+            if std::fs::symlink_metadata(&index_path).is_ok() {
+                return Err(Error::Io {
+                    path: index_path,
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "index symlink target is missing",
+                    ),
+                });
+            }
             let bytes = read_file(&dir.join(Self::SINGLE_FILE))?;
             return Ok(Self {
                 shard_names: Vec::new(),
@@ -404,6 +417,26 @@ mod tests {
             read_dense_tensor(&archive, "z", &device),
             Err(Error::MissingKey { .. })
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shard_set_dangling_index_symlink_reports_index_path() {
+        for with_single in [false, true] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            if with_single {
+                write_shard(dir.path(), ShardSet::SINGLE_FILE, "x", 3.5);
+            }
+            let index_path = dir.path().join(ShardSet::INDEX_FILE);
+            std::os::unix::fs::symlink(dir.path().join("missing-blob"), &index_path)
+                .expect("symlink");
+            let err = ShardSet::read(dir.path()).unwrap_err();
+            assert!(
+                matches!(err, Error::Io { ref path, ref source }
+                    if *path == index_path && source.kind() == std::io::ErrorKind::NotFound),
+                "{err:?}"
+            );
+        }
     }
 
     #[test]
