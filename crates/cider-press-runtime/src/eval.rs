@@ -1370,6 +1370,25 @@ fn dispatch_quantized_matmul(
             group_size,
             u32::from(bits),
         )?;
+    } else if k % 64 == 0 && device.nax_available() {
+        // MLX's `qmm` gate (`quantized.cpp`): tensor-core path whenever the
+        // K tile divides K. Padded A1 weights still self-reject inside the
+        // dispatcher's buffer-length validation.
+        let nax_library = device.quantized_nax_library()?;
+        qmm::affine_qmm_t_nax_bf16(
+            commands,
+            nax_library,
+            &w_typed,
+            &scales_typed,
+            &biases_typed,
+            &x_typed,
+            &mut y_typed,
+            m,
+            n,
+            k,
+            group_size,
+            u32::from(bits),
+        )?;
     } else {
         // Padded weights are decode-only (M=1); an M>1 activation against a
         // padded weight self-rejects in `validate_qmm_buffer_lens` because

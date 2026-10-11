@@ -36,7 +36,6 @@ struct DeviceInner {
     /// ~100 ms thanks to Metal's cross-process compiled-library
     /// cache). Populated on first qmv/qmm dispatch.
     quantized_library: OnceLock<kernels::KernelLibrary>,
-    #[allow(dead_code)] // consumed by the qmm routing branch (next commit)
     quantized_nax_library: OnceLock<kernels::KernelLibrary>,
     /// JIT'd MLX `binary.metal` library. Populated on first binary
     /// op dispatch (Add / Mul today; the rest of the family lands as
@@ -336,7 +335,6 @@ impl Device {
 
     /// Lazily JIT-compile and cache MLX's `quantized_nax.metal`. Callers
     /// must check [`Device::nax_available`] first; this never does.
-    #[allow(dead_code)] // consumed by the qmm routing branch (next commit)
     pub(crate) fn quantized_nax_library(&self) -> Result<&kernels::KernelLibrary> {
         if let Some(lib) = self.inner.quantized_nax_library.get() {
             return Ok(lib);
