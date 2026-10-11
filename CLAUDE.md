@@ -309,4 +309,5 @@ MLX_DIR=../mlx ./scripts/sync_mlx_kernels.sh
 cargo test --workspace --release    # qmv/qmm parity is the canary
 ```
 
-`.github/workflows/mlx-sync.yml` does this weekly and opens a PR on drift.
+`.github/workflows/mlx-sync.yml` does this weekly and keeps a single PR
+(branch `mlx-sync/upstream`) updated to the newest upstream SHA on drift.
