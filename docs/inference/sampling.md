@@ -60,7 +60,10 @@ slices the hidden states to the last row *before* the norm/head, so only one
 position is projected — numerically identical to `forward(..)[:, -1, :]`
 because RMSNorm and the head are per-position, but without computing the `T - 1`
 discarded rows. The blocks above it still run over all `T` tokens to fill the
-caches.
+caches. A model that opts into chunked prefill
+([`LanguageModel::prefill_chunk_len`](../../crates/cider-press-models/src/language_model.rs),
+Qwen3.5 today) first runs every earlier prompt chunk through `fill_cache` with a
+synchronous `eval()` each; only the final chunk takes this `forward_last` path.
 
 Token selection is then **on-GPU**. The `[1, 1, vocab]` logits feed an in-graph
 argmax — `argmax_last_position_lazy` in

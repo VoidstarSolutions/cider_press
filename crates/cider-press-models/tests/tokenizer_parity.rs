@@ -5,7 +5,7 @@
 //! get the HF reference ids for a fixed corpus, and asserts exact-id
 //! equality plus decode round-trip on the Rust side.
 //!
-//! Skips with a PASS + `eprintln!` when the env var is unset.
+//! Marked `#[ignore]`; run with `--ignored`. Panics (rather than skips) when the env var is unset.
 
 #![cfg(target_os = "macos")]
 
@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use cider_press_models::Tokenizer;
-use cider_press_test_utils::{read_u32, tempdir, workspace_root};
+use cider_press_test_utils::{read_u32, require_checkpoint_dir, tempdir, workspace_root};
 use safetensors::SafeTensors;
 
 /// Same corpus the Python harness encodes — keep these two lists in lockstep.
@@ -27,16 +27,11 @@ const CORPUS: &[&str] = &[
     "",
 ];
 
-fn checkpoint_path() -> Option<PathBuf> {
-    let raw = std::env::var("CIDER_QWEN_CHECKPOINT_PATH").ok()?;
-    let path = fs::canonicalize(&raw)
-        .unwrap_or_else(|err| panic!("CIDER_QWEN_CHECKPOINT_PATH={raw} does not resolve: {err}"));
-    assert!(
-        path.is_dir(),
-        "CIDER_QWEN_CHECKPOINT_PATH={} is not a directory",
-        path.display(),
-    );
-    Some(path)
+fn checkpoint_path() -> PathBuf {
+    require_checkpoint_dir(
+        "CIDER_QWEN_CHECKPOINT_PATH",
+        "a local Qwen2.5-0.5B-Instruct-4bit checkpoint directory",
+    )
 }
 
 fn dump_tokenizer(checkpoint: &Path, out: &Path) {
@@ -59,14 +54,9 @@ fn dump_tokenizer(checkpoint: &Path, out: &Path) {
 }
 
 #[test]
+#[ignore = "requires a local checkpoint; run with --ignored (see panic message for the env var)"]
 fn tokenizer_parity_round_trip() {
-    let Some(checkpoint) = checkpoint_path() else {
-        eprintln!(
-            "skipped: set CIDER_QWEN_CHECKPOINT_PATH to a local \
-             Qwen2.5-0.5B-Instruct-4bit MLX checkout to run this test"
-        );
-        return;
-    };
+    let checkpoint = checkpoint_path();
 
     let tmp = tempdir("models-tokenizer-parity");
     let fixture_path = tmp.join("tokenizer-parity.safetensors");

@@ -5,18 +5,21 @@
 //! compares `Mlp::forward` to MLX's `MLP.__call__`
 //! (`down(silu(gate(x)) * up(x))`) at bf16-compose tolerance.
 //!
-//! Skips with a PASS + `eprintln!` when the env var is unset.
+//! Marked `#[ignore]`; run with `--ignored`. Panics (rather than skips) when the env var is unset.
 
 #![cfg(target_os = "macos")]
 #![allow(clippy::cast_precision_loss)]
 
+use cider_press_models::safetensors_io::ShardSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use cider_press_models::nn::{Linear, Mlp, Module};
 use cider_press_models::qwen2::{Qwen2Config, load_qwen2_weights};
 use cider_press_runtime::{Device, Tensor};
-use cider_press_test_utils::{dump_mlx_op, read_bf16, tempdir};
+use cider_press_test_utils::{
+    assert_allclose, dump_mlx_op, read_bf16, require_checkpoint_dir, tempdir,
+};
 use half::bf16;
 use safetensors::SafeTensors;
 
@@ -24,46 +27,11 @@ use safetensors::SafeTensors;
 const ATOL: f32 = 5e-2;
 const RTOL: f32 = 5e-2;
 
-fn checkpoint_path() -> Option<PathBuf> {
-    let raw = std::env::var("CIDER_QWEN_CHECKPOINT_PATH").ok()?;
-    let path = fs::canonicalize(&raw)
-        .unwrap_or_else(|err| panic!("CIDER_QWEN_CHECKPOINT_PATH={raw} does not resolve: {err}"));
-    assert!(
-        path.is_dir(),
-        "CIDER_QWEN_CHECKPOINT_PATH={} is not a directory",
-        path.display(),
-    );
-    Some(path)
-}
-
-fn assert_close(label: &str, got: &[bf16], expected: &[bf16]) {
-    assert_eq!(got.len(), expected.len(), "{label}: length mismatch");
-    let mut worst_excess = 0.0f32;
-    let mut worst_at = 0usize;
-    let mut worst_pair = (0.0f32, 0.0f32);
-    for (i, (a, b)) in got.iter().zip(expected.iter()).enumerate() {
-        if a == b {
-            continue;
-        }
-        let af = a.to_f32();
-        let bfv = b.to_f32();
-        let diff = (af - bfv).abs();
-        let bound = ATOL + RTOL * bfv.abs();
-        let excess = diff - bound;
-        if excess > worst_excess {
-            worst_excess = excess;
-            worst_at = i;
-            worst_pair = (af, bfv);
-        }
-    }
-    assert!(
-        worst_excess <= 0.0,
-        "{label}: tolerance exceeded — worst element [{worst_at}] \
-         got={} want={} |diff|={} > atol={ATOL} + rtol={RTOL}*|want|",
-        worst_pair.0,
-        worst_pair.1,
-        (worst_pair.0 - worst_pair.1).abs(),
-    );
+fn checkpoint_path() -> PathBuf {
+    require_checkpoint_dir(
+        "CIDER_QWEN_CHECKPOINT_PATH",
+        "a local Qwen2.5-0.5B-Instruct-4bit checkpoint directory",
+    )
 }
 
 fn run_layer0_mlp(checkpoint: &Path, seq_len: usize) {
@@ -91,9 +59,8 @@ fn run_layer0_mlp(checkpoint: &Path, seq_len: usize) {
     let config_bytes = fs::read(checkpoint.join("config.json")).expect("read config.json");
     let config = Qwen2Config::from_json_bytes(&config_bytes).expect("parse config.json");
 
-    let archive_bytes =
-        fs::read(checkpoint.join("model.safetensors")).expect("read model.safetensors");
-    let archive = SafeTensors::deserialize(&archive_bytes).expect("deserialize safetensors");
+    let shards = ShardSet::read(checkpoint).expect("load checkpoint");
+    let archive = shards.archive().expect("load checkpoint");
 
     let device = Device::shared().expect("system default device");
     let weights = load_qwen2_weights(&archive, &config, &device).expect("load weights");
@@ -113,29 +80,25 @@ fn run_layer0_mlp(checkpoint: &Path, seq_len: usize) {
     out.eval().expect("eval");
     let got: Vec<bf16> = out.cpu_to_vec().expect("cpu_to_vec");
 
-    assert_close(&format!("mlp_layer0 seq_len={seq_len}"), &got, &y_ref);
+    assert_allclose(
+        &format!("mlp_layer0 seq_len={seq_len}"),
+        &got,
+        &y_ref,
+        ATOL,
+        RTOL,
+    );
 }
 
 #[test]
+#[ignore = "requires a local checkpoint; run with --ignored (see panic message for the env var)"]
 fn mlp_layer0_prefill() {
-    let Some(checkpoint) = checkpoint_path() else {
-        eprintln!(
-            "skipped: set CIDER_QWEN_CHECKPOINT_PATH to a local \
-             Qwen2.5-0.5B-Instruct-4bit MLX checkout to run this test"
-        );
-        return;
-    };
+    let checkpoint = checkpoint_path();
     run_layer0_mlp(&checkpoint, 8);
 }
 
 #[test]
+#[ignore = "requires a local checkpoint; run with --ignored (see panic message for the env var)"]
 fn mlp_layer0_decode() {
-    let Some(checkpoint) = checkpoint_path() else {
-        eprintln!(
-            "skipped: set CIDER_QWEN_CHECKPOINT_PATH to a local \
-             Qwen2.5-0.5B-Instruct-4bit MLX checkout to run this test"
-        );
-        return;
-    };
+    let checkpoint = checkpoint_path();
     run_layer0_mlp(&checkpoint, 1);
 }

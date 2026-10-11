@@ -15,13 +15,14 @@
 #![cfg(target_os = "macos")]
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 
+use cider_press_models::safetensors_io::ShardSet;
 use std::fs;
 use std::path::PathBuf;
 
 use cider_press_models::nn::rms_norm;
 use cider_press_models::qwen2::{Qwen2Config, load_qwen2_weights};
 use cider_press_runtime::{Device, Tensor};
-use cider_press_test_utils::{dump_mlx_op, read_bf16, tempdir};
+use cider_press_test_utils::{dump_mlx_op, read_bf16, require_checkpoint_dir, tempdir};
 use half::bf16;
 use safetensors::SafeTensors;
 
@@ -88,19 +89,14 @@ fn rms_norm_matches_mlx_fast_rms_norm() {
 }
 
 #[test]
+#[ignore = "requires a local checkpoint; run with --ignored (see panic message for the env var)"]
 fn real_checkpoint_rms_norm_matches_cpu_reference() {
-    let Some(dir) = checkpoint_path() else {
-        eprintln!(
-            "skipped: set CIDER_QWEN_CHECKPOINT_PATH to a local Qwen2.5-0.5B-Instruct-4bit \
-             checkout to run this test"
-        );
-        return;
-    };
+    let dir = checkpoint_path();
 
     let config_bytes = fs::read(dir.join("config.json")).expect("read config.json");
     let config = Qwen2Config::from_json_bytes(&config_bytes).expect("parse config.json");
-    let archive_bytes = fs::read(dir.join("model.safetensors")).expect("read model.safetensors");
-    let archive = SafeTensors::deserialize(&archive_bytes).expect("deserialize");
+    let shards = ShardSet::read(&dir).expect("load checkpoint");
+    let archive = shards.archive().expect("load checkpoint");
 
     let device = Device::shared().expect("device");
     let weights = load_qwen2_weights(&archive, &config, &device).expect("load weights");
@@ -170,14 +166,9 @@ fn cpu_rms_norm(x: &[bf16], gamma: &[bf16], hidden: usize, eps: f32) -> Vec<bf16
     out
 }
 
-fn checkpoint_path() -> Option<PathBuf> {
-    let raw = std::env::var("CIDER_QWEN_CHECKPOINT_PATH").ok()?;
-    let path = fs::canonicalize(&raw)
-        .unwrap_or_else(|err| panic!("CIDER_QWEN_CHECKPOINT_PATH={raw} does not resolve: {err}"));
-    assert!(
-        path.is_dir(),
-        "CIDER_QWEN_CHECKPOINT_PATH={} is not a directory",
-        path.display(),
-    );
-    Some(path)
+fn checkpoint_path() -> PathBuf {
+    require_checkpoint_dir(
+        "CIDER_QWEN_CHECKPOINT_PATH",
+        "a local Qwen2.5-0.5B-Instruct-4bit checkpoint directory",
+    )
 }

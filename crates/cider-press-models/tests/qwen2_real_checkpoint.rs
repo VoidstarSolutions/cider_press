@@ -2,8 +2,9 @@
 //! `mlx-community/Qwen2.5-0.5B-Instruct-4bit` checkpoint pinned in
 //! [`cider_press_models::qwen2::HF_REVISION`].
 //!
-//! Skipped by default; runs only when `CIDER_QWEN_CHECKPOINT_PATH`
-//! points at a local checkout of the HF repo at the pinned revision.
+//! `#[ignore]`d by default; run with `--ignored` and
+//! `CIDER_QWEN_CHECKPOINT_PATH` pointing at a local checkout of the HF repo
+//! at the pinned revision.
 //! Use:
 //!
 //! ```sh
@@ -14,38 +15,27 @@
 //! The directory must contain `config.json` and `model.safetensors`.
 //! No download is performed by this test.
 
+use cider_press_models::safetensors_io::{ShardSet, TensorLookup};
+use cider_press_test_utils::require_checkpoint_dir;
 use std::fs;
 use std::path::PathBuf;
 
 use cider_press_models::qwen2::{Qwen2Config, load_qwen2_weights};
 use cider_press_runtime::Device;
-use safetensors::SafeTensors;
 
-/// Skip-or-load helper. Returns `None` if the env var isn't set,
-/// otherwise returns the canonicalized absolute path. Panics if the
-/// env var is set but the path doesn't resolve to a directory —
-/// that's almost always operator error worth surfacing immediately.
-fn checkpoint_path() -> Option<PathBuf> {
-    let raw = std::env::var("CIDER_QWEN_CHECKPOINT_PATH").ok()?;
-    let path = fs::canonicalize(&raw)
-        .unwrap_or_else(|err| panic!("CIDER_QWEN_CHECKPOINT_PATH={raw} does not resolve: {err}"));
-    assert!(
-        path.is_dir(),
-        "CIDER_QWEN_CHECKPOINT_PATH={} is not a directory",
-        path.display(),
-    );
-    Some(path)
+/// Returns the canonicalized checkpoint directory. Panics if the env var is
+/// unset or the path doesn't resolve to a directory.
+fn checkpoint_path() -> PathBuf {
+    require_checkpoint_dir(
+        "CIDER_QWEN_CHECKPOINT_PATH",
+        "a local Qwen2.5-0.5B-Instruct-4bit checkpoint directory",
+    )
 }
 
 #[test]
+#[ignore = "requires a local checkpoint; run with --ignored (see panic message for the env var)"]
 fn real_checkpoint_loads_and_byte_round_trips() {
-    let Some(dir) = checkpoint_path() else {
-        eprintln!(
-            "skipped: set CIDER_QWEN_CHECKPOINT_PATH to a local Qwen2.5-0.5B-Instruct-4bit \
-             checkout to run this test"
-        );
-        return;
-    };
+    let dir = checkpoint_path();
 
     let config_bytes = fs::read(dir.join("config.json")).expect("read config.json");
     let config = Qwen2Config::from_json_bytes(&config_bytes).expect("parse config.json");
@@ -54,8 +44,8 @@ fn real_checkpoint_loads_and_byte_round_trips() {
         "checkpoint is missing quantization metadata; expected MLX 4-bit",
     );
 
-    let archive_bytes = fs::read(dir.join("model.safetensors")).expect("read model.safetensors");
-    let archive = SafeTensors::deserialize(&archive_bytes).expect("deserialize safetensors");
+    let shards = ShardSet::read(&dir).expect("load checkpoint");
+    let archive = shards.archive().expect("load checkpoint");
 
     let device = Device::shared().expect("system default device");
     let weights = load_qwen2_weights(&archive, &config, &device).expect("load");
@@ -67,7 +57,7 @@ fn real_checkpoint_loads_and_byte_round_trips() {
     // every later op branch validates against).
     let layer0 = &weights.layers[0];
     let dense_match = |key: &str, t: &cider_press_runtime::Tensor| {
-        let arc = archive.tensor(key).expect("present");
+        let arc = archive.view(key).expect("present");
         assert_eq!(t.cpu_bytes().expect("dense bytes"), arc.data(), "{key}");
     };
     dense_match("model.norm.weight", &weights.norm);
@@ -88,17 +78,17 @@ fn real_checkpoint_loads_and_byte_round_trips() {
         let (w, s, b) = qw.component_bytes();
         assert_eq!(
             w,
-            archive.tensor(&format!("{base}.weight")).unwrap().data(),
+            archive.view(&format!("{base}.weight")).unwrap().data(),
             "{base}.weight"
         );
         assert_eq!(
             s,
-            archive.tensor(&format!("{base}.scales")).unwrap().data(),
+            archive.view(&format!("{base}.scales")).unwrap().data(),
             "{base}.scales"
         );
         assert_eq!(
             b,
-            archive.tensor(&format!("{base}.biases")).unwrap().data(),
+            archive.view(&format!("{base}.biases")).unwrap().data(),
             "{base}.biases"
         );
     };

@@ -13,6 +13,7 @@
 #![cfg(target_os = "macos")]
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 
+use cider_press_test_utils::require_file;
 use std::path::PathBuf;
 
 use approx::relative_eq;
@@ -30,13 +31,7 @@ fn fixture_path() -> PathBuf {
 #[test]
 fn parity_v_copy_f32() {
     let path = fixture_path();
-    if !path.exists() {
-        eprintln!(
-            "skipping: fixture missing at {}; run `uv run scripts/gen_copy_fixture.py`",
-            path.display(),
-        );
-        return;
-    }
+    let path = require_file(path, "uv run scripts/gen_copy_fixture.py");
 
     let bytes = std::fs::read(&path).expect("read fixture");
     let st = SafeTensors::deserialize(&bytes).expect("parse safetensors");
@@ -67,13 +62,7 @@ fn parity_v_copy_f32() {
 #[test]
 fn parity_v_copy_f16() {
     let path = fixture_path();
-    if !path.exists() {
-        eprintln!(
-            "skipping: fixture missing at {}; run `uv run scripts/gen_copy_fixture.py`",
-            path.display(),
-        );
-        return;
-    }
+    let path = require_file(path, "uv run scripts/gen_copy_fixture.py");
 
     let bytes = std::fs::read(&path).expect("read fixture");
     let st = SafeTensors::deserialize(&bytes).expect("parse safetensors");

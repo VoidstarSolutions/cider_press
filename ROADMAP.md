@@ -140,15 +140,38 @@ concrete **parity gate** (the Qwen2.5 discipline). Phases 0–5 reach *correctne
 - Deliberately match the incumbent's *naive* perf here — correctness first.
 - **Exit:** single GDN layer parity vs mlx-lm's sequential path (fp32 state honored).
 
-### Phase 4 — Assemble full model (4B), end-to-end parity
+### Phase 4 — Assemble full model (4B), end-to-end parity ✅ **LANDED**
 - 3:1 interleave, final norm, tied lm_head (4B), embedding (confirm any scaling),
   greedy decode through the `cider-press` CLI.
 - **Exit:** logits parity vs mlx-lm on 4B across a prompt; identical greedy token stream.
+- **Done (2026-06-15):** `Qwen35Model` + unified `Qwen35LayerCache` (KV / conv+fp32-
+  recurrent), GDN decode threading (prefill-decode equivalence), `LanguageModel`-generic
+  `Generator`, CLI `model_type` dispatch. Embedding = plain lookup, no √scale. Last-
+  position logits argmax matches mlx-lm; **greedy token stream bit-exact (24/24)**. The
+  4B runs end-to-end via the CLI (`--no-chat-template`; native chat template is a
+  `minijinja` follow-up).
 
-### Phase 5 — Scale to 27B (functional milestone — *it runs*)
+### Phase 5 — Scale to 27B (functional milestone — *it runs*) ✅ **LANDED**
 - Loader handles untied embeddings, 64 layers, the official quantization; memory
   profiling on the 64 GB machine; end-to-end correctness vs mlx-lm 27B.
 - **Exit:** **Qwen3.6-27B runs end-to-end in the CLI, parity-validated, fits in memory.**
+- **Done (2026-06-15):** multi-shard loader (`TensorLookup`/`ShardedArchive` over
+  `index.json`), untied `lm_head`, CLI sharded dispatch. Three 27B-only kernel/loader
+  fixes the 4B never hit: bf16 `A_log` upcast, `rms_looped` for hidden 5120 (>4096),
+  and the non-aligned `affine_qmm_t` (`alN_false`) prefill variant for the GDN N=48
+  projections (aligned path byte-identical). **Greedy stream bit-exact (8/8) vs mlx-lm**
+  on the sharded 27B; peak RSS ~31 GB (fs::read transient) on the short parity prompt.
+  That hid a prompt-length term: single-eval prefill grew ~0.75 GB/prompt-token on the
+  27B (the unrolled per-token GDN recurrence), >64 GB at ~60 tokens. Fixed by
+  **chunked prefill** (`Generator` feeds Qwen3.5 prompts in 16-token `fill_cache`
+  chunks, each evaluated before the next): the 27B 560-token prefill completes
+  with a 31.2 GB peak footprint, which equals the load-time peak (~15 GB host
+  shard bytes + ~15 GB device upload), so the chunked-prefill transient stays
+  under it (not separately isolated); decode 26.4 tok/s. The evidence that
+  prefill memory no longer grows with prompt length is the 4B: peak footprint
+  flat at ~7.4–7.5 GB at 109/217/541 tokens (was ~45 GB at 109, ~107 GB at 217).
+  Deferred: mmap (~halve peak), and perf — naive per-token GDN makes 27B decode slow
+  (the Phase-7 chunkwise GDN kernel is the lever; ~33 tok/s mlx-lm baseline).
 
 ### Phase 6 — Perf baseline + dispatch levers
 - Measure decode tok/s + prefill ms vs `mlx_lm` (27B and 4B). Apply command-buffer

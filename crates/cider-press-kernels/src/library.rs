@@ -131,6 +131,13 @@ impl Pipeline {
     pub fn metal_pipeline_state(&self) -> &ProtocolObject<dyn MTLComputePipelineState> {
         &self.0
     }
+
+    /// The maximum threads a single threadgroup may launch for this
+    /// pipeline (device- and kernel-dependent, typically 1024).
+    #[must_use]
+    pub fn max_total_threads_per_threadgroup(&self) -> usize {
+        self.0.maxTotalThreadsPerThreadgroup()
+    }
 }
 
 /// A compiled Metal library plus a pipeline-state cache keyed by
@@ -204,8 +211,8 @@ impl KernelLibrary {
     }
 
     /// JIT-compile MLX's `rms_norm.metal` (vendored under `kernels-mlx/`).
-    /// Hosts the fused last-axis `RMSNorm`: `rms<dtype>` (single-threadgroup,
-    /// axis ≤ 4096) and `rms_looped<dtype>` (axis > 4096). The forward
+    /// Hosts the fused last-axis `RMSNorm`: `rms<dtype>` (single-threadgroup)
+    /// and `rms_looped<dtype>` (wide axes). The forward
     /// kernels reference no `[[function_constant]]` slots (the `has_w`
     /// constant is used only by the VJP variants), so plain
     /// [`Self::pipeline`] suffices.

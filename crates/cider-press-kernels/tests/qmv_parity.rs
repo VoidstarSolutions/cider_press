@@ -17,7 +17,7 @@ use std::path::PathBuf;
 
 use approx::assert_relative_eq;
 use cider_press_kernels::{Buffer, Device, KernelLibrary, kernels};
-use cider_press_test_utils::{read_bf16, read_u32};
+use cider_press_test_utils::{read_bf16, read_u32, require_file};
 use half::bf16;
 use safetensors::SafeTensors;
 
@@ -37,13 +37,7 @@ fn fixture_path() -> PathBuf {
 #[test]
 fn parity_affine_qmv_fast_bf16_gs64_b4() {
     let path = fixture_path();
-    if !path.exists() {
-        eprintln!(
-            "skipping: fixture missing at {}; run `uv run scripts/gen_qmv_fixture.py`",
-            path.display(),
-        );
-        return;
-    }
+    let path = require_file(path, "uv run scripts/gen_qmv_fixture.py");
 
     let bytes = std::fs::read(&path).expect("read fixture");
     let st = SafeTensors::deserialize(&bytes).expect("parse safetensors");

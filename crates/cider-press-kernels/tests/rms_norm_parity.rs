@@ -1,8 +1,8 @@
 //! Parity test for the fused `rms_norm.metal` dispatch.
 //!
-//! Drives `rms_norm_bf16` (MLX's `rms_single_row`) against
-//! `mx.fast.rms_norm(x, gamma, eps)` at Qwen2.5-0.5B norm shapes
-//! (hidden=896) for one row (decode, T=1) and several rows (prefill).
+//! Drives `rms_norm_bf16` (both the single-row and looped kernels) against
+//! `mx.fast.rms_norm(x, gamma, eps)` for one row (decode, T=1) and several
+//! rows (prefill), including the single-row/looped boundary.
 //! The kernel reduces in fp32 and finishes with `metal::precise::rsqrt`,
 //! and it is MLX's own kernel run on the same inputs — so we hold a tight
 //! bf16-ULP tolerance (the rsqrt + lane-ordered `simd_sum` can drift a
@@ -31,6 +31,21 @@ fn parity_rms_norm_prefill_rows() {
 #[test]
 fn parity_rms_norm_small() {
     parity(2, 64);
+}
+
+#[test]
+fn parity_rms_norm_widest_single_row() {
+    parity(1, 4096);
+}
+
+#[test]
+fn parity_rms_norm_narrowest_looped() {
+    parity(1, 4097);
+}
+
+#[test]
+fn parity_rms_norm_looped_prefill_rows() {
+    parity(3, 5120);
 }
 
 /// `rms_norm_bf16` must reject `w_stride > 1`: the kernel reads
@@ -74,12 +89,18 @@ fn parity(n_rows: usize, hidden: usize) {
 
     // SAFETY: commit_and_wait synchronised; GPU is done with `dst`.
     let out: Vec<bf16> = unsafe { dst.as_mut_slice() }.to_vec();
+    // The looped regime sums a longer fp32 reduction; allow a slightly looser bound.
+    let (abs_tol, rel_tol) = if hidden > 4096 {
+        (0.01, 0.02)
+    } else {
+        (0.005, 0.01)
+    };
     assert_within_tolerance(
         &format!("rms_norm[{n_rows}x{hidden}]"),
         &out,
         &out_ref,
-        0.005,
-        0.01,
+        abs_tol,
+        rel_tol,
     );
 }
 

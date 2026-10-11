@@ -94,7 +94,10 @@ from the concept section. The block does not implement the
 [`Module`](../../crates/cider-press-models/src/nn.rs) trait: attention needs
 the RoPE `offset` and the [`KvCache`](./kv-cache.md), which the
 single-input `Module::forward` signature deliberately does not carry, so the
-block takes them through its own typed `forward` instead. The mixers
+block takes them through its own typed `forward` instead. The model derives
+that `offset` once per forward from the caches' own position
+(`KvCache::position()`, the tokens already cached — `mlx_lm` reads
+`cache.offset` the same way), so callers of the model never pass it. The mixers
 themselves are built from the same model-agnostic
 [building blocks](../../crates/cider-press-models/src/nn.rs) the rest of the
 crate uses — `Linear`, `Mlp`, `RmsNormLayer` — so the block is "just" four

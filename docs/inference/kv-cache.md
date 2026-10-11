@@ -120,15 +120,16 @@ garbage reads under the concurrent dispatch the async pipeline relies on.
 
 ## Open levers
 
-- **Chunked prefill via `fill_cache`.** Today prefill writes all `T` prompt rows
-  in one update; the MLX-faithful T−1-fill + T=1-step split was measured a
-  pessimization for the short-prompt regime and reverted, but
-  [`fill_cache`](../../crates/cider-press-models/src/qwen2/model.rs) (and its
-  equivalence test) was **kept as the building block** for chunked prefill — the
-  one regime where the split actually helps: long prompts under bounded memory,
-  where filling the cache in chunks caps peak working set. This is the
-  prefill-concurrency direction the [execution model](./execution-model.md)
-  points at, not a decode-kernel lever.
+- **Chunked prefill via `fill_cache` for Qwen2.** Qwen2 prefill writes all `T`
+  prompt rows in one update; the MLX-faithful T−1-fill + T=1-step split was
+  measured a pessimization for the short-prompt regime and reverted.
+  [`fill_cache`](../../crates/cider-press-models/src/qwen2/model.rs) is now the
+  `LanguageModel` chunk step, and the `Generator` already chunks prefill for
+  models that opt in via `prefill_chunk_len` (Qwen3.5 does, to bound its GDN
+  transient). Opting Qwen2 in would cap peak working set on long prompts — the
+  one regime where the split helps — at the cost of a synchronized boundary per
+  chunk. This is the prefill-concurrency direction the
+  [execution model](./execution-model.md) points at, not a decode-kernel lever.
 - **Quantized KV cache** for longer contexts — storing the slab at lower
   precision so a given memory budget holds more tokens. The slab is dense BF16
   today (the ~30 MiB pre-allocated to the full context window is the main

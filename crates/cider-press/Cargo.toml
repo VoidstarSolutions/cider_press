@@ -17,7 +17,8 @@ readme = "../../README.md"
 cider-press-runtime = { path = "../cider-press-runtime" }
 cider-press-models = { path = "../cider-press-models" }
 clap = { workspace = true }
-safetensors = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [features]
 # Compiles the profiling facility into the CLI so `bench` can report a

@@ -2,8 +2,7 @@
 //!
 //! `head_dim` 256, GQA 16 q / 4 kv, per-head query‖gate split, weighted QK-norm
 //! (`RMSNorm` over `head_dim`, before RoPE), partial rotary (64 of 256 dims),
-//! sigmoid output gate. Phase-2 lands the helpers + mixer; see
-//! `docs/inference/models/qwen3.6.md`.
+//! sigmoid output gate. See `docs/inference/models/qwen3.6.md`.
 
 use cider_press_runtime::{DType, Device, KvCache, Tensor};
 use half::bf16;
@@ -228,6 +227,21 @@ impl GatedAttention {
             k_norm: w.k_norm.clone(),
             config: config.clone(),
         })
+    }
+
+    /// A fresh BF16 [`KvCache`] sized for `max_tokens` positions of this
+    /// layer's K/V heads.
+    ///
+    /// # Errors
+    /// Device allocation failure.
+    pub fn make_cache(&self, max_tokens: usize, device: &Device) -> Result<KvCache> {
+        Ok(KvCache::new(
+            device,
+            max_tokens,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+            DType::BF16,
+        )?)
     }
 
     /// Run gated self-attention on `hidden` (`[1, T, hidden_size]`, dense BF16,

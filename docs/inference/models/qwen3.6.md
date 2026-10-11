@@ -130,6 +130,38 @@ and remaps `model.language_model` → `language_model.model`). Per layer:
   `mlp.{gate_proj,up_proj,down_proj}` (quantized)
 - top: `embed_tokens` (quantized, tied head on 4B), `norm.weight`, (`lm_head` on 27B)
 
+## Prefill memory: chunked prefill
+
+The per-token GDN recurrence is unrolled into the lazy graph, and `eval` keeps
+every op output alive until the whole graph completes (no within-eval buffer
+reuse). Each prompt token therefore costs ~5 fp32 state-sized temporaries per GDN
+layer for the duration of the prefill eval: ~0.75 GB/token on the 27B (48 GDN
+layers) and ~0.24 GB/token measured on the 4B. Prefilling the whole prompt in one
+eval grew without bound — the 4B's peak footprint was ~45 GB at 109 tokens and
+~107 GB at 217; the 27B would exceed 64 GB at ~60 tokens.
+
+So `Qwen35Model` opts into **chunked prefill**
+(`LanguageModel::prefill_chunk_len` → `Some(16)`): the `Generator` runs every
+16-token chunk but the last through `Qwen35Model::fill_cache` (all layers, no final
+norm / LM head) and evaluates it synchronously before building the next; the last
+chunk goes through `forward_last` as before. Evaluating the `fill_cache` handle
+commits every piece of state the next chunk reads — the KV `slice_update` writes
+and the final recurrent state are ancestors of the chunk's hidden states, and the
+conv window is a view of the conv input the layer output consumes. Chunked and
+single-forward prefill are bit-exact on the seeded synthetic model (logits and
+cache state; unit test) and produce identical greedy tokens on the 4B (8/8,
+chunked vs unchunked on a short prefix); this is separate from the cider-vs-mlx-lm
+parity above. Measured on the 4B: peak footprint ~7.4–7.5 GB at 109,
+217 and 541 prompt tokens (flat), prefill ~150 tok/s; chunk 8 → ~5.6 GB but ~7%
+slower, chunk 32 → ~11.9 GB. On the 27B (`cider-press bench --no-chat-template`,
+560-token prompt, 16-token chunks): prefill completes with a 31.2 GB peak
+footprint, which equals the load-time peak (~15 GB host shard bytes + ~15 GB
+device upload), so the chunked-prefill transient stays under it and is not
+separately isolated; decode 26.4 tok/s. The evidence that prefill memory no
+longer grows with prompt length is the 4B figure above (flat at ~7.4–7.5 GB, vs
+45 GB at 109 and ~107 GB at 217 tokens before chunking). The chunkwise-parallel GDN kernel (Phase 7) would remove
+the per-token temporaries altogether.
+
 ## Performance notes
 
 The incumbent GDN kernel (`gated_delta.py`) is **one `metal_kernel` dispatch per
@@ -170,12 +202,52 @@ Incumbent baseline to beat (mlx-lm, this machine): 27B decode **~33 tok/s** at
   whole-linear-layer parity vs mlx-lm on the 4B layer-0 fixture (mixer max_abs
   ~7.8e-3, full layer ~1.6e-2). Enabled by 4 new runtime ops (`exp`, `log`,
   `cast`, `concat`). `Qwen35DecoderLayer` now generalizes over both mixers (a
-  `Mixer::{Full, Linear}` enum) with two entry points — `forward` (full attn +
-  KV cache) and `forward_linear` (GDN prefill, no cache). Deferred: the
+  `Mixer::{Full, Linear}` enum) with a single `forward` (full attn + KV
+  cache); Phase 3 originally also had a cache-free GDN-prefill entry point,
+  `forward_linear`, which Phase 4 removed. Deferred: the
   chunkwise-parallel GDN kernel (the Phase-7 perf-lead lever vs mlx-lm's naive
   per-token recurrence), and full-model decode-cache wiring — a unified per-layer
   cache enum threaded through one `forward` — which lands in Phase 4 (full-model
   assembly). Phase 3 complete.
+- **Phase 4 (full-model assembly + greedy decode) landed — the 4B runs
+  end-to-end:** `qwen3_5/model.rs` (`Qwen35Model`: embed *no √scale* → 32 mixed
+  decoder layers → final RMSNorm → tied lm_head) + a unified per-layer
+  `Qwen35LayerCache::{Full(KvCache), Linear(conv-window + fp32 recurrent state)}`.
+  The GDN mixer now threads its two-part state (`GatedDeltaNet::forward(.., &mut
+  LinearState)`) so it decodes, proven by a prefill-decode equivalence test
+  (one-shot `[0..T]` == prefill `[0..T-1]` + decode `[T-1]`, max_abs ~2e-3);
+  `Qwen35DecoderLayer::forward` is unified over the cache enum. The `Generator` is
+  generalized over a `LanguageModel` trait (drives Qwen2 + Qwen3.5 with no Qwen2
+  regression), and the CLI dispatches on `config.json` `model_type`. **Parity:**
+  full 32-layer logits match mlx-lm (last-position argmax exact) and the **greedy
+  token stream matches mlx-lm bit-exactly (24/24 tokens)** on the 4B. Deferred:
+  27B (untied lm_head, 48 value-heads, multi-shard load) → Phase 5; the perf levers
+  → Phases 6–7; and the Qwen3.5 `chat_template.jinja` does not render in the current
+  `minijinja` engine (a `[::-1]` step-slice + `|length` arithmetic) — `--no-chat-template`
+  works; native templated chat is a follow-up. Phase 4 complete.
+- **Phase 5 (scale to the 27B) landed — the Qwen3.6-27B runs end-to-end:** the
+  multi-shard loader (`TensorLookup` trait + `ShardSet`/`ShardedArchive` over
+  `model.safetensors.index.json`; the 27B is 3 shards), the untied `lm_head`
+  (`language_model.lm_head`, loaded when `tie_word_embeddings=false`; the model
+  projects through it instead of the embedding), and the CLI dispatching sharded
+  vs single-file. The 64 layers / 48 value-heads / `value_dim 6144` are all
+  config-parameterized (no code change). Three **scale-specific** kernel/loader
+  fixes the 4B never tripped: (1) the 27B stores `A_log` **bf16** (4B was f32) —
+  upcast to f32 at load; (2) `hidden = 5120` exceeds the RMSNorm single-row limit
+  (4096) — dispatch the vendored `rms_looped` variant; (3) the GDN `in_proj_a/b`
+  have **N=48** (not a multiple of 32) — wire the vendored non-aligned
+  `affine_qmm_t` (`alN_false`) prefill variant (aligned path byte-identical). **Parity:**
+  the cider greedy token stream matches mlx-lm **bit-exactly (8/8 tokens)** on the
+  sharded 27B (env+fixture-gated, `#[ignore]`). Peak RSS ~31 GB on that short
+  parity prompt (the `fs::read` transient: ~15 GB host shard bytes + ~15 GB device
+  upload). That figure hid a prompt-length term: single-eval prefill grew ~0.75
+  GB/prompt-token on the 27B (>64 GB at ~60 tokens) until **chunked prefill**
+  bounded it (16-token chunks; measured 31.2 GB peak footprint at 560 tokens, independent of length — see
+  [Prefill memory](#prefill-memory-chunked-prefill)). Deferred: **memory** —
+  mmap'ing the shards would roughly halve the peak (~16 GB) by skipping the
+  host Vec; **perf** — cider's naive per-token GDN over 48×64 makes 27B decode
+  slow (the chunkwise-parallel GDN kernel is the Phase-7
+  perf-lead lever, ~33 tok/s mlx-lm baseline to beat). Phase 5 complete.
 - mRoPE interleave layout for text (sections `[11,11,10]` = 32 rotary pairs):
   **confirmed during Phase 2** — `rope_type=default` collapses mRoPE to plain 1-D
   partial RoPE for text, so no multi-section position handling is needed.

@@ -1,34 +1,28 @@
-//! Phase-1 loader faithfulness: every tensor the loader maps must byte-match the
-//! safetensors archive. Gated on `CIDER_QWEN35_CHECKPOINT_PATH` (skips in CI).
+//! Loader faithfulness: every tensor the loader maps must byte-match the
+//! safetensors archive. `#[ignore]`d; needs `CIDER_QWEN35_CHECKPOINT_PATH`.
 
 #![cfg(target_os = "macos")]
 
-use std::{fs, path::PathBuf};
+use cider_press_models::safetensors_io::{ShardSet, TensorLookup};
+use cider_press_test_utils::qwen35_4b_checkpoint_dir;
+use std::fs;
 
 use cider_press_models::qwen3_5::{
     Qwen35Config, Qwen35FullAttnWeights, Qwen35LinearAttnWeights, Qwen35MixerWeights,
     load_qwen35_weights,
 };
 use cider_press_runtime::Device;
-use safetensors::SafeTensors;
-
-fn checkpoint_path() -> Option<PathBuf> {
-    std::env::var_os("CIDER_QWEN35_CHECKPOINT_PATH").map(PathBuf::from)
-}
 
 #[test]
 #[ignore = "requires a real checkpoint via CIDER_QWEN35_CHECKPOINT_PATH"]
 fn real_checkpoint_loads_and_byte_round_trips() {
     const P: &str = "language_model.model";
 
-    let Some(dir) = checkpoint_path() else {
-        eprintln!("skipping: CIDER_QWEN35_CHECKPOINT_PATH unset");
-        return;
-    };
+    let dir = qwen35_4b_checkpoint_dir();
     let config =
         Qwen35Config::from_json_bytes(&fs::read(dir.join("config.json")).unwrap()).unwrap();
-    let bytes = fs::read(dir.join("model.safetensors")).unwrap();
-    let archive = SafeTensors::deserialize(&bytes).unwrap();
+    let shards = ShardSet::read(&dir).unwrap();
+    let archive = shards.archive().unwrap();
     let device = Device::shared().unwrap();
 
     let weights = load_qwen35_weights(&archive, &config, &device).unwrap();
@@ -37,24 +31,24 @@ fn real_checkpoint_loads_and_byte_round_trips() {
         let (lw, ls, lb) = w.component_bytes();
         assert_eq!(
             lw,
-            archive.tensor(&format!("{base}.weight")).unwrap().data(),
+            archive.view(&format!("{base}.weight")).unwrap().data(),
             "{base}.weight"
         );
         assert_eq!(
             ls,
-            archive.tensor(&format!("{base}.scales")).unwrap().data(),
+            archive.view(&format!("{base}.scales")).unwrap().data(),
             "{base}.scales"
         );
         assert_eq!(
             lb,
-            archive.tensor(&format!("{base}.biases")).unwrap().data(),
+            archive.view(&format!("{base}.biases")).unwrap().data(),
             "{base}.biases"
         );
     };
     let check_dense = |t: &cider_press_runtime::Tensor, key: &str| {
         assert_eq!(
             t.cpu_bytes().unwrap(),
-            archive.tensor(key).unwrap().data(),
+            archive.view(key).unwrap().data(),
             "{key}"
         );
     };

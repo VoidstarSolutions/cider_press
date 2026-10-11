@@ -7,6 +7,7 @@
 
 #![cfg(target_os = "macos")]
 
+use cider_press_models::safetensors_io::ShardSet;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,7 +18,7 @@ use cider_press_models::chat_template::{ChatTemplate, Message};
 use cider_press_models::generator::Generator;
 use cider_press_models::qwen2::{Qwen2Config, Qwen2Model, load_qwen2_weights};
 use cider_press_runtime::Device;
-use cider_press_test_utils::{read_u32, tempdir, workspace_root};
+use cider_press_test_utils::{read_u32, require_checkpoint_dir, tempdir, workspace_root};
 use safetensors::SafeTensors;
 
 const MAX_NEW_TOKENS: usize = 16;
@@ -29,16 +30,11 @@ fn fixed_messages() -> Vec<Message> {
     ]
 }
 
-fn checkpoint_path() -> Option<PathBuf> {
-    let raw = std::env::var("CIDER_QWEN_CHECKPOINT_PATH").ok()?;
-    let path = fs::canonicalize(&raw)
-        .unwrap_or_else(|err| panic!("CIDER_QWEN_CHECKPOINT_PATH={raw} does not resolve: {err}"));
-    assert!(
-        path.is_dir(),
-        "CIDER_QWEN_CHECKPOINT_PATH={} is not a directory",
-        path.display(),
-    );
-    Some(path)
+fn checkpoint_path() -> PathBuf {
+    require_checkpoint_dir(
+        "CIDER_QWEN_CHECKPOINT_PATH",
+        "a local Qwen2.5-0.5B-Instruct-4bit checkpoint directory",
+    )
 }
 
 /// What the MLX harness produced: the sampled token ids and the exact
@@ -98,13 +94,16 @@ fn run_mlx_harness(checkpoint: &Path, messages: &[Message], max_tokens: usize) -
 /// Build a fresh Generator from the checkpoint (loads weights anew each
 /// call, since `Generator::new` consumes the model). Shared by the
 /// depth-invariance test.
-fn build_generator(checkpoint: &Path, context_window: usize, eos: HashSet<u32>) -> Generator {
+fn build_generator(
+    checkpoint: &Path,
+    context_window: usize,
+    eos: HashSet<u32>,
+) -> Generator<Qwen2Model> {
     let device = Device::shared().expect("device");
     let config_bytes = fs::read(checkpoint.join("config.json")).expect("read config.json");
     let config = Qwen2Config::from_json_bytes(&config_bytes).expect("parse config.json");
-    let archive_bytes =
-        fs::read(checkpoint.join("model.safetensors")).expect("read model.safetensors");
-    let archive = SafeTensors::deserialize(&archive_bytes).expect("deserialize safetensors");
+    let shards = ShardSet::read(checkpoint).expect("load checkpoint");
+    let archive = shards.archive().expect("load checkpoint");
     let weights = load_qwen2_weights(&archive, &config, &device).expect("load weights");
     let model = Qwen2Model::from_weights(weights, config).expect("build Qwen2Model");
     Generator::new(model, context_window, eos).expect("Generator::new")
@@ -127,11 +126,9 @@ fn prompt_ids(checkpoint: &Path) -> Vec<u32> {
 /// sequence. Exercises on-GPU id chaining at depths 0, 1, 2, and 3,
 /// including depth 0 (fully synchronous) which is the regression case.
 #[test]
+#[ignore = "requires a local checkpoint; run with --ignored (see panic message for the env var)"]
 fn greedy_output_is_depth_invariant() {
-    let Some(checkpoint) = checkpoint_path() else {
-        eprintln!("skipped: set CIDER_QWEN_CHECKPOINT_PATH to run this test");
-        return;
-    };
+    let checkpoint = checkpoint_path();
     let ids = prompt_ids(&checkpoint);
     let max_new = 24usize;
     let ctx = ids.len() + max_new + 1;
@@ -163,11 +160,9 @@ fn greedy_output_is_depth_invariant() {
 /// bounded by `max_new_tokens`, so an absurd depth just means "commit
 /// everything up front" — the yielded sequence is unchanged.
 #[test]
+#[ignore = "requires a local checkpoint; run with --ignored (see panic message for the env var)"]
 fn usize_max_depth_does_not_overflow() {
-    let Some(checkpoint) = checkpoint_path() else {
-        eprintln!("skipped: set CIDER_QWEN_CHECKPOINT_PATH to run this test");
-        return;
-    };
+    let checkpoint = checkpoint_path();
     let ids = prompt_ids(&checkpoint);
     let max_new = 8usize;
     let ctx = ids.len() + max_new + 1;
@@ -195,14 +190,9 @@ fn usize_max_depth_does_not_overflow() {
 }
 
 #[test]
+#[ignore = "requires a local checkpoint; run with --ignored (see panic message for the env var)"]
 fn generator_parity_greedy_qwen2() {
-    let Some(checkpoint) = checkpoint_path() else {
-        eprintln!(
-            "skipped: set CIDER_QWEN_CHECKPOINT_PATH to a local \
-             Qwen2.5-0.5B-Instruct-4bit MLX checkout to run this test"
-        );
-        return;
-    };
+    let checkpoint = checkpoint_path();
 
     let messages = fixed_messages();
 

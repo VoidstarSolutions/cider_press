@@ -19,7 +19,7 @@
 
 use cider_press_models::nn::{Linear, Module, RmsNormLayer};
 use cider_press_runtime::{Device, Quantization, QuantizedWeight, Tensor};
-use cider_press_test_utils::{dump_mlx_op, read_bf16, read_u32, tempdir};
+use cider_press_test_utils::{assert_allclose, dump_mlx_op, read_bf16, read_u32, tempdir};
 use half::bf16;
 use safetensors::SafeTensors;
 
@@ -42,46 +42,6 @@ fn u32_to_bytes(vals: &[u32]) -> Vec<u8> {
 
 fn bf16_to_bytes(vals: &[bf16]) -> Vec<u8> {
     vals.iter().flat_map(|v| v.to_le_bytes()).collect()
-}
-
-fn assert_close(label: &str, out: &[bf16], reference: &[bf16], atol: f32, rtol: f32) {
-    assert_eq!(
-        out.len(),
-        reference.len(),
-        "{label}: output length {} != reference length {}",
-        out.len(),
-        reference.len()
-    );
-    let mut worst_excess = 0.0f32;
-    let mut worst_at = 0usize;
-    let mut worst_pair = (0.0f32, 0.0f32);
-    for (i, (a, b)) in out.iter().zip(reference.iter()).enumerate() {
-        if a == b {
-            continue;
-        }
-        let af = a.to_f32();
-        let bf = b.to_f32();
-        assert!(
-            !af.is_nan() && !bf.is_nan(),
-            "{label}: NaN at element [{i}] got={af} want={bf}"
-        );
-        let diff = (af - bf).abs();
-        let bound = atol + rtol * bf.abs();
-        let excess = diff - bound;
-        if excess > worst_excess {
-            worst_excess = excess;
-            worst_at = i;
-            worst_pair = (af, bf);
-        }
-    }
-    assert!(
-        worst_excess <= 0.0,
-        "{label}: tolerance exceeded — worst element [{worst_at}] got={} want={} |diff|={} \
-         > atol={atol} + rtol={rtol}*|want|",
-        worst_pair.0,
-        worst_pair.1,
-        (worst_pair.0 - worst_pair.1).abs(),
-    );
 }
 
 /// Load the `qmm` MLX fixture for a given `M`, returning the device,
@@ -147,7 +107,7 @@ fn run_linear_no_bias(m: usize) {
     let got: Vec<bf16> = y.cpu_to_vec().expect("cpu_to_vec");
 
     let label = format!("Linear (no bias) M={m} N={N} K={K}");
-    assert_close(&label, &got, &reference, QMM_ATOL, QMM_RTOL);
+    assert_allclose(&label, &got, &reference, QMM_ATOL, QMM_RTOL);
 }
 
 #[test]
@@ -186,7 +146,7 @@ fn linear_with_bias_matches_qmm_plus_bias() {
         }
     }
 
-    assert_close(
+    assert_allclose(
         &format!("Linear (with bias) M={m} N={N} K={K}"),
         &got,
         &expected,
@@ -241,5 +201,5 @@ fn rms_norm_layer_matches_mlx_fast_rms_norm() {
     y.eval().expect("eval");
     let got: Vec<bf16> = y.cpu_to_vec().expect("dense out");
 
-    assert_close("RmsNormLayer", &got, &out_ref, RMS_TOL, RMS_TOL);
+    assert_allclose("RmsNormLayer", &got, &out_ref, RMS_TOL, RMS_TOL);
 }

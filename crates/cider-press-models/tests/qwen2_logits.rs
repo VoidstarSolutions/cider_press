@@ -5,17 +5,20 @@
 //! `Qwen2Model::forward` and `mlx_lm.models.qwen2.Model`, and compares the
 //! [1, T, vocab] logits at bf16-compose tolerance.
 //!
-//! Skips with a PASS + `eprintln!` when the env var is unset.
+//! Marked `#[ignore]`; run with `--ignored`. Panics (rather than skips) when the env var is unset.
 
 #![cfg(target_os = "macos")]
 #![allow(clippy::cast_precision_loss)]
 
+use cider_press_models::safetensors_io::ShardSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use cider_press_models::qwen2::{Qwen2Config, Qwen2Model, load_qwen2_weights};
 use cider_press_runtime::{DType, Device, KvCache, Tensor};
-use cider_press_test_utils::{dump_mlx_op, read_bf16, read_u32, tempdir};
+use cider_press_test_utils::{
+    assert_allclose, dump_mlx_op, read_bf16, read_u32, require_checkpoint_dir, tempdir,
+};
 use half::bf16;
 use safetensors::SafeTensors;
 
@@ -34,54 +37,11 @@ const RTOL: f32 = 1.0;
 
 const PROMPT: &str = "The capital of France is";
 
-fn checkpoint_path() -> Option<PathBuf> {
-    let raw = std::env::var("CIDER_QWEN_CHECKPOINT_PATH").ok()?;
-    let path = fs::canonicalize(&raw)
-        .unwrap_or_else(|err| panic!("CIDER_QWEN_CHECKPOINT_PATH={raw} does not resolve: {err}"));
-    assert!(
-        path.is_dir(),
-        "CIDER_QWEN_CHECKPOINT_PATH={} is not a directory",
-        path.display(),
-    );
-    Some(path)
-}
-
-fn assert_close(label: &str, got: &[bf16], expected: &[bf16]) {
-    assert_eq!(got.len(), expected.len(), "{label}: length mismatch");
-    let mut worst_excess = 0.0f32;
-    let mut worst_at = 0usize;
-    let mut worst_pair = (0.0f32, 0.0f32);
-    for (i, (a, b)) in got.iter().zip(expected.iter()).enumerate() {
-        let af = a.to_f32();
-        let bfv = b.to_f32();
-        if !af.is_finite() || !bfv.is_finite() {
-            // NaN/Inf would otherwise short-circuit the tolerance math
-            // (NaN comparisons fall back to false) — force a failure.
-            worst_excess = f32::INFINITY;
-            worst_at = i;
-            worst_pair = (af, bfv);
-            break;
-        }
-        if a == b {
-            continue;
-        }
-        let diff = (af - bfv).abs();
-        let bound = ATOL + RTOL * bfv.abs();
-        let excess = diff - bound;
-        if excess > worst_excess {
-            worst_excess = excess;
-            worst_at = i;
-            worst_pair = (af, bfv);
-        }
-    }
-    assert!(
-        worst_excess <= 0.0,
-        "{label}: tolerance exceeded — worst element [{worst_at}] \
-         got={} want={} |diff|={} > atol={ATOL} + rtol={RTOL}*|want|",
-        worst_pair.0,
-        worst_pair.1,
-        (worst_pair.0 - worst_pair.1).abs(),
-    );
+fn checkpoint_path() -> PathBuf {
+    require_checkpoint_dir(
+        "CIDER_QWEN_CHECKPOINT_PATH",
+        "a local Qwen2.5-0.5B-Instruct-4bit checkpoint directory",
+    )
 }
 
 fn run_qwen2_logits(checkpoint: &Path) {
@@ -122,16 +82,14 @@ fn run_qwen2_logits(checkpoint: &Path) {
         logits_ref.len()
     );
 
-    let archive_bytes =
-        fs::read(checkpoint.join("model.safetensors")).expect("read model.safetensors");
-    let archive = SafeTensors::deserialize(&archive_bytes).expect("deserialize safetensors");
+    let shards = ShardSet::read(checkpoint).expect("load checkpoint");
+    let archive = shards.archive().expect("load checkpoint");
 
     let device = Device::shared().expect("system default device");
     let weights = load_qwen2_weights(&archive, &config, &device).expect("load weights");
     let model = Qwen2Model::from_weights(weights, config.clone()).expect("build Qwen2Model");
 
     let input_ids = Tensor::from_slice(&device, &input_ids_ref, [1usize, t]).expect("input_ids");
-    let offset_t = Tensor::from_slice(&device, &[0i32], [1usize]).expect("offset tensor");
 
     // T tokens go into the cache during prefill; size slabs accordingly with
     // a little headroom.
@@ -143,24 +101,25 @@ fn run_qwen2_logits(checkpoint: &Path) {
         .collect();
 
     let logits = model
-        .forward(&input_ids, &offset_t, &mut caches)
+        .forward(&input_ids, &mut caches)
         .expect("Qwen2Model forward");
     logits.eval().expect("eval logits");
     let got: Vec<bf16> = logits.cpu_to_vec().expect("cpu_to_vec");
 
     assert_eq!(got.len(), logits_ref.len(), "rust/mlx logits length");
-    assert_close(&format!("qwen2_logits T={t}"), &got, &logits_ref);
+    assert_allclose(
+        &format!("qwen2_logits T={t}"),
+        &got,
+        &logits_ref,
+        ATOL,
+        RTOL,
+    );
 }
 
 #[test]
+#[ignore = "requires a local checkpoint; run with --ignored (see panic message for the env var)"]
 fn qwen2_logits_prefill() {
-    let Some(checkpoint) = checkpoint_path() else {
-        eprintln!(
-            "skipped: set CIDER_QWEN_CHECKPOINT_PATH to a local \
-             Qwen2.5-0.5B-Instruct-4bit MLX checkout to run this test"
-        );
-        return;
-    };
+    let checkpoint = checkpoint_path();
     run_qwen2_logits(&checkpoint);
 }
 
@@ -180,9 +139,8 @@ fn run_forward_last_matches_full(checkpoint: &Path) {
     let n_kv_heads = config.num_key_value_heads;
     let vocab_size = config.vocab_size;
 
-    let archive_bytes =
-        fs::read(checkpoint.join("model.safetensors")).expect("read model.safetensors");
-    let archive = SafeTensors::deserialize(&archive_bytes).expect("deserialize safetensors");
+    let shards = ShardSet::read(checkpoint).expect("load checkpoint");
+    let archive = shards.archive().expect("load checkpoint");
 
     let device = Device::shared().expect("system default device");
     let weights = load_qwen2_weights(&archive, &config, &device).expect("load weights");
@@ -192,7 +150,6 @@ fn run_forward_last_matches_full(checkpoint: &Path) {
     let input_ids_ref: Vec<u32> = (0..5).collect();
     let t = input_ids_ref.len();
     let input_ids = Tensor::from_slice(&device, &input_ids_ref, [1usize, t]).expect("input_ids");
-    let offset_t = Tensor::from_slice(&device, &[0i32], [1usize]).expect("offset tensor");
 
     let max_tokens = t + 4;
     let new_caches = || -> Vec<KvCache> {
@@ -206,7 +163,7 @@ fn run_forward_last_matches_full(checkpoint: &Path) {
 
     let mut full_caches = new_caches();
     let full = model
-        .forward(&input_ids, &offset_t, &mut full_caches)
+        .forward(&input_ids, &mut full_caches)
         .expect("forward");
     full.eval().expect("eval full logits");
     let full_v: Vec<bf16> = full.cpu_to_vec().expect("cpu_to_vec full");
@@ -214,7 +171,7 @@ fn run_forward_last_matches_full(checkpoint: &Path) {
 
     let mut last_caches = new_caches();
     let last = model
-        .forward_last(&input_ids, &offset_t, &mut last_caches)
+        .forward_last(&input_ids, &mut last_caches)
         .expect("forward_last");
     last.eval().expect("eval last logits");
     let last_v: Vec<bf16> = last.cpu_to_vec().expect("cpu_to_vec last");
@@ -224,18 +181,19 @@ fn run_forward_last_matches_full(checkpoint: &Path) {
         &[1, 1, vocab_size],
         "forward_last should project a single position",
     );
-    assert_close("forward_last vs forward[:, -1, :]", &last_v, last_row);
+    assert_allclose(
+        "forward_last vs forward[:, -1, :]",
+        &last_v,
+        last_row,
+        ATOL,
+        RTOL,
+    );
 }
 
 #[test]
+#[ignore = "requires a local checkpoint; run with --ignored (see panic message for the env var)"]
 fn qwen2_forward_last_matches_full() {
-    let Some(checkpoint) = checkpoint_path() else {
-        eprintln!(
-            "skipped: set CIDER_QWEN_CHECKPOINT_PATH to a local \
-             Qwen2.5-0.5B-Instruct-4bit MLX checkout to run this test"
-        );
-        return;
-    };
+    let checkpoint = checkpoint_path();
     run_forward_last_matches_full(&checkpoint);
 }
 
@@ -253,9 +211,8 @@ fn run_split_prefill_matches_forward_last(checkpoint: &Path) {
     let n_kv_heads = config.num_key_value_heads;
     let vocab_size = config.vocab_size;
 
-    let archive_bytes =
-        fs::read(checkpoint.join("model.safetensors")).expect("read model.safetensors");
-    let archive = SafeTensors::deserialize(&archive_bytes).expect("deserialize safetensors");
+    let shards = ShardSet::read(checkpoint).expect("load checkpoint");
+    let archive = shards.archive().expect("load checkpoint");
     let device = Device::shared().expect("system default device");
     let weights = load_qwen2_weights(&archive, &config, &device).expect("load weights");
     let model = Qwen2Model::from_weights(weights, config.clone()).expect("build Qwen2Model");
@@ -281,27 +238,23 @@ fn run_split_prefill_matches_forward_last(checkpoint: &Path) {
 
     // Unified path.
     let unified_ids = Tensor::from_slice(&device, &ids, [1usize, t]).expect("ids");
-    let zero = Tensor::from_slice(&device, &[0i32], [1usize]).expect("offset");
     let mut unified_caches = new_caches();
     let unified = model
-        .forward_last(&unified_ids, &zero, &mut unified_caches)
+        .forward_last(&unified_ids, &mut unified_caches)
         .expect("forward_last");
     unified.eval().expect("eval unified");
     let unified_v: Vec<bf16> = unified.cpu_to_vec().expect("cpu_to_vec unified");
 
-    // Split path: cache-fill over T-1, eval, then T=1 step at offset T-1.
+    // Split path: cache-fill over T-1, eval, then a T=1 step (at cache position T-1).
     let mut split_caches = new_caches();
     let fill_ids = Tensor::from_slice(&device, &ids[..t - 1], [1usize, t - 1]).expect("fill ids");
     let fill_hidden = model
-        .fill_cache(&fill_ids, &zero, &mut split_caches)
+        .fill_cache(&fill_ids, &mut split_caches)
         .expect("fill_cache");
     fill_hidden.eval().expect("eval fill");
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let last_offset = (t - 1) as i32;
     let step_ids = Tensor::from_slice(&device, &[ids[t - 1]], [1usize, 1]).expect("step id");
-    let step_off = Tensor::from_slice(&device, &[last_offset], [1usize]).expect("step offset");
     let step = model
-        .forward(&step_ids, &step_off, &mut split_caches)
+        .forward(&step_ids, &mut split_caches)
         .expect("step forward");
     step.eval().expect("eval step");
     let split_v: Vec<bf16> = step.cpu_to_vec().expect("cpu_to_vec split");
@@ -319,13 +272,8 @@ fn run_split_prefill_matches_forward_last(checkpoint: &Path) {
 }
 
 #[test]
+#[ignore = "requires a local checkpoint; run with --ignored (see panic message for the env var)"]
 fn qwen2_split_prefill_matches_forward_last() {
-    let Some(checkpoint) = checkpoint_path() else {
-        eprintln!(
-            "skipped: set CIDER_QWEN_CHECKPOINT_PATH to a local \
-             Qwen2.5-0.5B-Instruct-4bit MLX checkout to run this test"
-        );
-        return;
-    };
+    let checkpoint = checkpoint_path();
     run_split_prefill_matches_forward_last(&checkpoint);
 }

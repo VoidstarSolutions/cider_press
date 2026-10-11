@@ -193,6 +193,5 @@ fn fill_cache_rejects_empty_ids() {
     // but a 0-length slice of a real tensor is — the shape the guard defends.
     let one = Tensor::from_slice(&device, &[1u32], [1usize, 1]).expect("one id");
     let empty = one.slice(&[0..1, 0..0]).expect("empty slice");
-    let offset = Tensor::from_slice(&device, &[0i32], [1usize]).expect("offset");
-    assert!(model.fill_cache(&empty, &offset, &mut []).is_err());
+    assert!(model.fill_cache(&empty, &mut []).is_err());
 }

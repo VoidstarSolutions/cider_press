@@ -5,20 +5,20 @@
 #   "mlx-lm>=0.31",
 # ]
 # ///
-"""Phase-0/1 golden fixtures for the Qwen3.5/3.6 Gated-DeltaNet port.
+"""Golden fixtures for the Qwen3.5/3.6 Gated-DeltaNet port.
 
 Runs the **prefill forward** (cache=None, T>1) of the reference mlx-lm model on a
 fixed prompt and captures stage-by-stage activations from the *same* checkpoint
 cider-press loads — so the Rust parity tests compare bit-for-bit (bf16) against
-the incumbent. Granularity matches the roadmap phase gates:
+the incumbent. Granularity matches the Rust parity-test stages:
 
   - embed              : embedding output            (loader / embed step)
-  - layer0_in/out      : one **GDN** layer (linear)  (Phase 3 gate)
-  - layer0_attn_out    : isolated GDN (linear) mixer  (Phase 3 mixer gate)
-  - layer3_in/out      : one **gated-attention** layer (Phase 2 gate)
-  - layer3_attn_out    : isolated gated-attn mixer    (Phase 2 mixer gate)
+  - layer0_in/out      : one **GDN** layer (linear)
+  - layer0_attn_out    : isolated GDN (linear) mixer
+  - layer3_in/out      : one **gated-attention** layer
+  - layer3_attn_out    : isolated gated-attn mixer
   - final_hidden       : post final-norm             (assembly)
-  - logits             : lm_head output (tied on 4B, separate on 27B) (Phase 4 gate)
+  - logits             : lm_head output (tied on 4B, separate on 27B)
 
 Saved with ``mx.save_safetensors`` (bf16 preserved; cider reads it directly).
 
@@ -64,7 +64,7 @@ def main() -> None:
         if i in (0, 3):
             caps[f"layer{i}_in"] = x
         if i == 0:
-            # Isolated Gated-DeltaNet mixer (Phase-3 parity gate): pre-residual.
+            # Isolated Gated-DeltaNet mixer (parity gate): pre-residual.
             # cache=None => prefill; same ssm_mask the full layer uses. Mirrors
             # DecoderLayer.__call__: r = self.linear_attn(input_layernorm(x), mask, cache).
             normed0 = layer.input_layernorm(x)
@@ -74,7 +74,7 @@ def main() -> None:
             # layout drift fails with a clear message instead of an opaque
             # AttributeError on a linear (GDN) layer that has no `self_attn`.
             assert not layer.is_linear, "layer 3 expected to be a full-attention layer"
-            # Isolated gated-attention mixer (Phase-2 parity gate): pre-residual.
+            # Isolated gated-attention mixer (parity gate): pre-residual.
             # cache=None => prefill; same fa_mask the full layer uses. Mirrors
             # DecoderLayer.__call__: r = self.self_attn(input_layernorm(x), mask, cache).
             normed = layer.input_layernorm(x)

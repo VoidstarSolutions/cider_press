@@ -1,11 +1,12 @@
 //! Qwen3.5 / Qwen3.6 text-model weights: load + shape-validate every per-layer
-//! tensor from a (single-shard) safetensors archive. Raw keys live under
+//! tensor from any [`TensorLookup`] (a single archive or a shard set). Raw keys live under
 //! `language_model.model.` (the `model.` remap is mlx-lm's in-memory `sanitize`,
 //! not present on disk). Vision (`vision_tower.*`) is skipped. Loader only —
 //! no forward.
 //!
 //! ```text
 //! language_model.model.embed_tokens.{weight, scales, biases}      # quant, [V, D]
+//! language_model.lm_head.{weight, scales, biases}                 # quant, [V, D]  (untied 27B only)
 //! language_model.model.norm.weight                                # bf16,  [D]
 //! language_model.model.layers.{i}.input_layernorm.weight          # bf16,  [D]
 //! language_model.model.layers.{i}.post_attention_layernorm.weight # bf16,  [D]
@@ -15,18 +16,17 @@
 //! [`Qwen35Config::layer_types`]:
 //!
 //! - **Linear attention** (Gated-DeltaNet): split `in_proj_{qkv,z,a,b}`,
-//!   an f32 `A_log`, a `dt_bias`, a depthwise `conv1d.weight`, a head-dim
+//!   an `A_log` (f32 or bf16, upcast to f32), a `dt_bias`, a depthwise `conv1d.weight`, a head-dim
 //!   `norm`, and an `out_proj`.
 //! - **Full (gated) attention**: `q_proj` (query‖gate), `k_proj`, `v_proj`,
 //!   QK `RMSNorm` gammas, and `o_proj`. `attention_bias = false`, so there
 //!   are no additive q/k/v biases on disk.
 
 use cider_press_runtime::{DType, Device, Layout, Quantization, QuantizedWeight, Tensor};
-use safetensors::SafeTensors;
 
 use crate::error::{Error, Result};
 use crate::qwen3_5::config::{LayerType, Qwen35Config};
-use crate::safetensors_io::{read_dense_tensor, read_quantized_weight};
+use crate::safetensors_io::{TensorLookup, read_dense_tensor, read_quantized_weight};
 
 /// On-disk key prefix for every text-model tensor. The `model.`-only form is
 /// mlx-lm's in-memory remap and is *not* what the checkpoint stores.
@@ -38,9 +38,14 @@ const TEXT_PREFIX: &str = "language_model.model";
 pub struct Qwen35Weights {
     /// Token embedding table, quantized. Logical shape `[vocab_size,
     /// hidden_size]`. On the 4B dev vehicle the LM head is tied to this table;
-    /// the 27B target ships a separate `lm_head` — TODO(27B): load it as an
-    /// `Option<QuantizedWeight>` when `tie_word_embeddings == false`.
+    /// the 27B target ships a separate [`Qwen35Weights::lm_head`].
     pub embed: QuantizedWeight,
+    /// Separate (untied) LM head, quantized. Logical shape `[vocab_size,
+    /// hidden_size]`. The loader decides tying from
+    /// `config.tie_word_embeddings`: `None` means the head is tied to
+    /// [`Qwen35Weights::embed`] (4B); `Some` is the separately loaded
+    /// `language_model.lm_head` (27B). Consumers use it as-is.
+    pub lm_head: Option<QuantizedWeight>,
     /// Final `RMSNorm` gamma. Dense bf16, shape `[hidden_size]`.
     pub norm: Tensor,
     /// Per-block weights. Length equals
@@ -133,7 +138,7 @@ pub struct Qwen35FullAttnWeights {
 /// [`Error::UnsupportedDtype`] with the offending key. Vision tensors are
 /// never referenced.
 pub fn load_qwen35_weights(
-    archive: &SafeTensors<'_>,
+    archive: &impl TensorLookup,
     config: &Qwen35Config,
     device: &Device,
 ) -> Result<Qwen35Weights> {
@@ -166,15 +171,27 @@ pub fn load_qwen35_weights(
         layers.push(load_layer(archive, config, quant, device, i)?);
     }
 
+    // The tied 4B reuses `embed` as its head; the untied 27B ships a separate
+    // `language_model.lm_head` (note: under `language_model.`, not the
+    // `language_model.model.` text prefix).
+    let lm_head = if config.tie_word_embeddings {
+        None
+    } else {
+        let h = read_quantized_weight(archive, "language_model.lm_head", quant, device)?;
+        expect_q_shape("lm_head", &h, config.vocab_size, hidden)?;
+        Some(h)
+    };
+
     Ok(Qwen35Weights {
         embed,
+        lm_head,
         norm,
         layers,
     })
 }
 
 fn load_layer(
-    archive: &SafeTensors<'_>,
+    archive: &impl TensorLookup,
     config: &Qwen35Config,
     quant: Quantization,
     device: &Device,
@@ -232,7 +249,7 @@ fn load_layer(
 }
 
 fn load_mlp(
-    archive: &SafeTensors<'_>,
+    archive: &impl TensorLookup,
     config: &Qwen35Config,
     quant: Quantization,
     device: &Device,
@@ -266,7 +283,7 @@ fn load_mlp(
 }
 
 fn load_linear_attn(
-    archive: &SafeTensors<'_>,
+    archive: &impl TensorLookup,
     config: &Qwen35Config,
     quant: Quantization,
     device: &Device,
@@ -305,15 +322,22 @@ fn load_linear_attn(
         hidden,
     )?;
 
-    let a_log = read_dense_tensor(archive, &format!("{prefix}.A_log"), device)?;
-    // The 4B dev vehicle stores `A_log` as f32; the 27B target stores it bf16
-    // (both upcast to fp32 in `compute_g`). TODO(27B): accept BF16 here too.
-    expect_dense(
-        &format!("{prefix}.A_log"),
-        &a_log,
-        DType::F32,
-        &[value_heads],
-    )?;
+    let a_log_key = format!("{prefix}.A_log");
+    let a_log_raw = read_dense_tensor(archive, &a_log_key, device)?;
+    // The 4B dev vehicle stores `A_log` as f32; the 27B target stores it bf16.
+    // `compute_g` requires f32, so upcast bf16 -> f32 at load (exact widening;
+    // identical to mlx-lm's `A_log.astype(float32)`).
+    let a_log = match a_log_raw.dtype() {
+        DType::F32 => a_log_raw,
+        DType::BF16 => a_log_raw.cast(DType::F32)?,
+        other => {
+            return Err(Error::UnsupportedDtype {
+                key: a_log_key,
+                dtype: format!("{other:?}"),
+            });
+        }
+    };
+    expect_dense(&a_log_key, &a_log, DType::F32, &[value_heads])?;
     let dt_bias = read_dense_tensor(archive, &format!("{prefix}.dt_bias"), device)?;
     expect_dense(
         &format!("{prefix}.dt_bias"),
@@ -360,7 +384,7 @@ fn load_linear_attn(
 }
 
 fn load_full_attn(
-    archive: &SafeTensors<'_>,
+    archive: &impl TensorLookup,
     config: &Qwen35Config,
     quant: Quantization,
     device: &Device,
@@ -458,19 +482,21 @@ fn expect_dense(key: &str, t: &Tensor, dtype: DType, shape: &[usize]) -> Result<
     Ok(())
 }
 
+/// Synthetic-archive builders shared by this module's loader tests and the
+/// model-level tests that need a tiny, fully-loaded `Qwen35Model`.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use cider_press_runtime::Device;
-    use safetensors::{Dtype as StDtype, SafeTensors, tensor::TensorView};
-    use std::{fs, path::PathBuf};
+pub(crate) mod test_support {
+    use half::bf16;
+    use safetensors::{Dtype as StDtype, tensor::TensorView};
 
-    use crate::qwen3_5::config::Qwen35Config;
+    use crate::qwen3_5::config::{LayerType, Qwen35Config};
+
+    use super::TEXT_PREFIX;
 
     /// Tiny Qwen3.5 config that satisfies every quantization divisibility
     /// constraint (hidden=64 divisible by `group_size=64`; one head each),
     /// with a `[linear_attention, full_attention]` layer pair.
-    const TINY_CONFIG_JSON: &str = r#"{
+    pub(crate) const TINY_CONFIG_JSON: &str = r#"{
   "model_type": "qwen3_5",
   "quantization": { "group_size": 64, "bits": 4, "mode": "affine" },
   "text_config": {
@@ -488,73 +514,164 @@ mod tests {
 
     type Entry = (String, StDtype, Vec<usize>, Vec<u8>);
 
-    fn dense_entry(key: &str, dtype: StDtype, shape: Vec<usize>) -> Entry {
+    /// How synthesized tensors are filled: all-zero bytes (shape/loader tests)
+    /// or deterministic pseudo-random values in numerically sane ranges (tests
+    /// that run a forward and need non-degenerate activations).
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum Fill {
+        Zeros,
+        Seeded(u64),
+    }
+
+    struct Filler {
+        state: Option<u64>,
+    }
+
+    impl Filler {
+        fn new(fill: Fill) -> Self {
+            Self {
+                state: match fill {
+                    Fill::Zeros => None,
+                    Fill::Seeded(seed) => Some(seed | 1),
+                },
+            }
+        }
+
+        /// xorshift64*; `None` when zero-filling.
+        fn next_u64(&mut self) -> Option<u64> {
+            let s = self.state.as_mut()?;
+            *s ^= *s >> 12;
+            *s ^= *s << 25;
+            *s ^= *s >> 27;
+            Some(s.wrapping_mul(0x2545_F491_4F6C_DD1D))
+        }
+
+        /// Uniform in `[lo, hi)`, or `0.0` when zero-filling.
+        #[allow(clippy::cast_precision_loss)]
+        fn uniform(&mut self, lo: f32, hi: f32) -> f32 {
+            self.next_u64().map_or(0.0, |x| {
+                lo + (hi - lo) * ((x >> 40) as f32 / (1u64 << 24) as f32)
+            })
+        }
+
+        fn bf16_bytes(&mut self, count: usize, lo: f32, hi: f32) -> Vec<u8> {
+            bf16_le((0..count).map(|_| self.uniform(lo, hi)))
+        }
+    }
+
+    fn bf16_le(vals: impl Iterator<Item = f32>) -> Vec<u8> {
+        vals.flat_map(|v| bf16::from_f32(v).to_le_bytes()).collect()
+    }
+
+    /// A dense tensor. Seeded: RMSNorm gammas near 1, `A_log` (the only f32)
+    /// in `[-1, 0.5)`, everything else (conv taps, `dt_bias`) in `[-0.5, 0.5)`.
+    fn dense_entry(filler: &mut Filler, key: &str, dtype: StDtype, shape: Vec<usize>) -> Entry {
         let count: usize = shape.iter().product();
-        let elem = match dtype {
-            StDtype::F32 => 4,
-            StDtype::BF16 => 2,
+        let bytes = match dtype {
+            StDtype::F32 => (0..count)
+                .flat_map(|_| filler.uniform(-1.0, 0.5).to_le_bytes())
+                .collect(),
+            StDtype::BF16 if key.ends_with("norm.weight") => filler.bf16_bytes(count, 0.9, 1.1),
+            StDtype::BF16 => filler.bf16_bytes(count, -0.5, 0.5),
             other => panic!("unexpected dense dtype {other:?}"),
         };
-        (key.into(), dtype, shape, vec![0u8; count * elem])
+        (key.into(), dtype, shape, bytes)
     }
 
     /// Push the three component entries for a quantized linear at `base`
     /// with logical `[n, k]`, q4-gs64: `.weight` U32 `[n, k/8]`,
-    /// `.scales`/`.biases` BF16 `[n, k/64]`.
-    fn push_quantized(entries: &mut Vec<Entry>, base: &str, n: usize, k: usize) {
+    /// `.scales`/`.biases` BF16 `[n, k/64]`. Seeded: random nibbles with
+    /// `bias = -7.5 * scale`, so each dequantized group is zero-mean.
+    fn push_quantized(
+        filler: &mut Filler,
+        entries: &mut Vec<Entry>,
+        base: &str,
+        n: usize,
+        k: usize,
+    ) {
         let packed_k = k / 8;
         let groups = k / 64;
+        let weight: Vec<u8> = (0..n * packed_k)
+            .flat_map(|_| {
+                #[allow(clippy::cast_possible_truncation)]
+                let word = filler.next_u64().map_or(0, |x| (x >> 32) as u32);
+                word.to_le_bytes()
+            })
+            .collect();
+        let scales: Vec<f32> = (0..n * groups)
+            .map(|_| filler.uniform(0.01, 0.03))
+            .collect();
         entries.push((
             format!("{base}.weight"),
             StDtype::U32,
             vec![n, packed_k],
-            vec![0u8; n * packed_k * 4],
+            weight,
         ));
         entries.push((
             format!("{base}.scales"),
             StDtype::BF16,
             vec![n, groups],
-            vec![0u8; n * groups * 2],
+            bf16_le(scales.iter().copied()),
         ));
         entries.push((
             format!("{base}.biases"),
             StDtype::BF16,
             vec![n, groups],
-            vec![0u8; n * groups * 2],
+            bf16_le(scales.iter().map(|s| -7.5 * s)),
         ));
     }
 
     /// Synthesize an in-memory safetensors archive holding every key the
-    /// loader reads for `cfg`, under the `language_model.model.` prefix.
-    fn synthesize_archive_bytes(cfg: &Qwen35Config) -> Vec<u8> {
-        synthesize_archive_bytes_with(cfg, |_, _| None)
-    }
-
-    /// Same, but `override_shape(key, default)` may return a replacement
-    /// logical shape for a dense tensor (used by the negative test).
+    /// loader reads for `cfg`, under the `language_model.model.` prefix, filled
+    /// per `fill`. `with_lm_head` adds the untied `language_model.lm_head`
+    /// quantized triple (`[vocab, hidden]`); `override_dense(key,
+    /// default_shape)` may return a full replacement `(dtype, shape, bytes)`
+    /// for a dense tensor (used by the wrong-shape negative test and the
+    /// bf16-`A_log` test).
     #[allow(clippy::too_many_lines)]
-    fn synthesize_archive_bytes_with(
+    pub(crate) fn synthesize_archive_bytes_with(
         cfg: &Qwen35Config,
-        override_shape: impl Fn(&str, &[usize]) -> Option<Vec<usize>>,
+        with_lm_head: bool,
+        fill: Fill,
+        override_dense: impl Fn(&str, &[usize]) -> Option<(StDtype, Vec<usize>, Vec<u8>)>,
     ) -> Vec<u8> {
+        let mut filler = Filler::new(fill);
+        let filler = &mut filler;
         let hidden = cfg.hidden_size;
         let intermediate = cfg.intermediate_size;
         let value_heads = cfg.linear_num_value_heads;
         let p = TEXT_PREFIX;
 
         let mut entries: Vec<Entry> = Vec::new();
-        let dense = |entries: &mut Vec<Entry>, key: &str, dtype: StDtype, shape: Vec<usize>| {
-            let shape = override_shape(key, &shape).unwrap_or(shape);
-            entries.push(dense_entry(key, dtype, shape));
+        let dense = |filler: &mut Filler,
+                     entries: &mut Vec<Entry>,
+                     key: &str,
+                     dtype: StDtype,
+                     shape: Vec<usize>| {
+            match override_dense(key, &shape) {
+                Some((dt, sh, bytes)) => entries.push((key.into(), dt, sh, bytes)),
+                None => entries.push(dense_entry(filler, key, dtype, shape)),
+            }
         };
 
         push_quantized(
+            filler,
             &mut entries,
             &format!("{p}.embed_tokens"),
             cfg.vocab_size,
             hidden,
         );
+        if with_lm_head {
+            push_quantized(
+                filler,
+                &mut entries,
+                "language_model.lm_head",
+                cfg.vocab_size,
+                hidden,
+            );
+        }
         dense(
+            filler,
             &mut entries,
             &format!("{p}.norm.weight"),
             StDtype::BF16,
@@ -564,30 +681,35 @@ mod tests {
         for li in 0..cfg.num_hidden_layers {
             let lp = format!("{p}.layers.{li}");
             dense(
+                filler,
                 &mut entries,
                 &format!("{lp}.input_layernorm.weight"),
                 StDtype::BF16,
                 vec![hidden],
             );
             dense(
+                filler,
                 &mut entries,
                 &format!("{lp}.post_attention_layernorm.weight"),
                 StDtype::BF16,
                 vec![hidden],
             );
             push_quantized(
+                filler,
                 &mut entries,
                 &format!("{lp}.mlp.gate_proj"),
                 intermediate,
                 hidden,
             );
             push_quantized(
+                filler,
                 &mut entries,
                 &format!("{lp}.mlp.up_proj"),
                 intermediate,
                 hidden,
             );
             push_quantized(
+                filler,
                 &mut entries,
                 &format!("{lp}.mlp.down_proj"),
                 hidden,
@@ -598,54 +720,63 @@ mod tests {
                 LayerType::LinearAttention => {
                     let ap = format!("{lp}.linear_attn");
                     push_quantized(
+                        filler,
                         &mut entries,
                         &format!("{ap}.in_proj_qkv"),
                         cfg.conv_dim(),
                         hidden,
                     );
                     push_quantized(
+                        filler,
                         &mut entries,
                         &format!("{ap}.in_proj_z"),
                         cfg.value_dim(),
                         hidden,
                     );
                     push_quantized(
+                        filler,
                         &mut entries,
                         &format!("{ap}.in_proj_a"),
                         value_heads,
                         hidden,
                     );
                     push_quantized(
+                        filler,
                         &mut entries,
                         &format!("{ap}.in_proj_b"),
                         value_heads,
                         hidden,
                     );
                     dense(
+                        filler,
                         &mut entries,
                         &format!("{ap}.A_log"),
                         StDtype::F32,
                         vec![value_heads],
                     );
                     dense(
+                        filler,
                         &mut entries,
                         &format!("{ap}.dt_bias"),
                         StDtype::BF16,
                         vec![value_heads],
                     );
                     dense(
+                        filler,
                         &mut entries,
                         &format!("{ap}.conv1d.weight"),
                         StDtype::BF16,
                         vec![cfg.conv_dim(), cfg.linear_conv_kernel_dim, 1],
                     );
                     dense(
+                        filler,
                         &mut entries,
                         &format!("{ap}.norm.weight"),
                         StDtype::BF16,
                         vec![cfg.linear_value_head_dim],
                     );
                     push_quantized(
+                        filler,
                         &mut entries,
                         &format!("{ap}.out_proj"),
                         hidden,
@@ -655,26 +786,42 @@ mod tests {
                 LayerType::FullAttention => {
                     let ap = format!("{lp}.self_attn");
                     push_quantized(
+                        filler,
                         &mut entries,
                         &format!("{ap}.q_proj"),
                         cfg.q_proj_out_dim(),
                         hidden,
                     );
-                    push_quantized(&mut entries, &format!("{ap}.k_proj"), cfg.kv_dim(), hidden);
-                    push_quantized(&mut entries, &format!("{ap}.v_proj"), cfg.kv_dim(), hidden);
+                    push_quantized(
+                        filler,
+                        &mut entries,
+                        &format!("{ap}.k_proj"),
+                        cfg.kv_dim(),
+                        hidden,
+                    );
+                    push_quantized(
+                        filler,
+                        &mut entries,
+                        &format!("{ap}.v_proj"),
+                        cfg.kv_dim(),
+                        hidden,
+                    );
                     dense(
+                        filler,
                         &mut entries,
                         &format!("{ap}.q_norm.weight"),
                         StDtype::BF16,
                         vec![cfg.head_dim],
                     );
                     dense(
+                        filler,
                         &mut entries,
                         &format!("{ap}.k_norm.weight"),
                         StDtype::BF16,
                         vec![cfg.head_dim],
                     );
                     push_quantized(
+                        filler,
                         &mut entries,
                         &format!("{ap}.o_proj"),
                         hidden,
@@ -694,6 +841,23 @@ mod tests {
         let pairs: Vec<(&String, &TensorView<'_>)> = views.iter().map(|(n, v)| (n, v)).collect();
         safetensors::serialize(pairs, None).expect("serialize")
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::{Fill, TINY_CONFIG_JSON, synthesize_archive_bytes_with};
+    use super::*;
+    use crate::safetensors_io::ShardSet;
+    use cider_press_runtime::Device;
+    use safetensors::{Dtype as StDtype, SafeTensors};
+    use std::fs;
+
+    use crate::qwen3_5::config::Qwen35Config;
+
+    /// A zero-filled tied-head archive for `cfg`.
+    fn synthesize_archive_bytes(cfg: &Qwen35Config) -> Vec<u8> {
+        synthesize_archive_bytes_with(cfg, false, Fill::Zeros, |_, _| None)
+    }
 
     #[test]
     fn loads_synthetic_archive() {
@@ -706,6 +870,8 @@ mod tests {
 
         assert_eq!(weights.layers.len(), 2);
         assert_eq!(weights.embed.shape().dims(), &[256, 64]);
+        // Tied config (default): the head reuses `embed`, no separate lm_head.
+        assert!(weights.lm_head.is_none());
 
         let Qwen35MixerWeights::LinearAttn(lin) = &weights.layers[0].mixer else {
             panic!("layer 0 must be LinearAttn");
@@ -724,29 +890,141 @@ mod tests {
         let config = Qwen35Config::from_json_bytes(TINY_CONFIG_JSON.as_bytes()).expect("config");
         // Synthesize the same archive but with `norm.weight` at [63] instead of [64].
         let bad_key = format!("{TEXT_PREFIX}.norm.weight");
-        let archive_bytes = synthesize_archive_bytes_with(&config, |key, _default| {
-            (key == bad_key).then(|| vec![63])
-        });
+        let archive_bytes =
+            synthesize_archive_bytes_with(&config, false, Fill::Zeros, |key, _default| {
+                (key == bad_key).then(|| (StDtype::BF16, vec![63], vec![0u8; 63 * 2]))
+            });
         let archive = SafeTensors::deserialize(&archive_bytes).expect("deserialize");
 
         assert!(load_qwen35_weights(&archive, &config, &device).is_err());
     }
 
-    fn checkpoint_path() -> Option<PathBuf> {
-        std::env::var_os("CIDER_QWEN35_CHECKPOINT_PATH").map(PathBuf::from)
+    /// The tiny config with `tie_word_embeddings` flipped to `false` — the
+    /// 27B's untied case, which makes the loader require a separate
+    /// `language_model.lm_head`. Built from [`TINY_CONFIG_JSON`] so the two
+    /// stay in sync.
+    fn tiny_config_untied() -> Qwen35Config {
+        let json = TINY_CONFIG_JSON.replace(
+            "\"tie_word_embeddings\": true",
+            "\"tie_word_embeddings\": false",
+        );
+        Qwen35Config::from_json_bytes(json.as_bytes()).expect("config")
+    }
+
+    #[test]
+    fn loads_untied_lm_head() {
+        let device = Device::shared().expect("device");
+        let config = tiny_config_untied();
+        assert!(!config.tie_word_embeddings);
+        // Archive includes the separate `language_model.lm_head` triple.
+        let archive_bytes = synthesize_archive_bytes_with(&config, true, Fill::Zeros, |_, _| None);
+        let archive = SafeTensors::deserialize(&archive_bytes).expect("deserialize");
+
+        let weights = load_qwen35_weights(&archive, &config, &device).expect("load");
+
+        let lm_head = weights
+            .lm_head
+            .expect("untied config must load a separate lm_head");
+        assert_eq!(lm_head.shape().dims(), &[256, 64]);
+    }
+
+    #[test]
+    fn untied_missing_lm_head_errors() {
+        let device = Device::shared().expect("device");
+        let config = tiny_config_untied();
+        // Untied config, but the archive LACKS `language_model.lm_head.*`.
+        let archive_bytes = synthesize_archive_bytes_with(&config, false, Fill::Zeros, |_, _| None);
+        let archive = SafeTensors::deserialize(&archive_bytes).expect("deserialize");
+
+        let err = load_qwen35_weights(&archive, &config, &device)
+            .expect_err("untied config without lm_head must error");
+        assert!(matches!(err, Error::MissingKey { ref key } if key.contains("lm_head")));
+    }
+
+    /// Truncate an f32 to bf16 (drop the low 16 mantissa bits), returning the
+    /// little-endian bf16 bytes and the value widened back to f32. The widened
+    /// value is exactly the bf16 (low 16 bits zero), so an `A_log` built from
+    /// these bytes must load bit-identically to `widened` after the upcast.
+    fn f32_to_bf16_le(v: f32) -> ([u8; 2], f32) {
+        let bits = v.to_bits();
+        let hi = (bits >> 16) as u16;
+        let widened = f32::from_bits(u32::from(hi) << 16);
+        (hi.to_le_bytes(), widened)
+    }
+
+    /// The 27B stores `A_log` bf16; the loader must accept it and upcast to f32
+    /// (`compute_g`'s invariant). Build an archive whose `A_log` is bf16 with
+    /// known values and assert it loads as f32 with the exactly-widened values.
+    #[test]
+    fn bf16_a_log_upcasts_to_f32() {
+        let device = Device::shared().expect("device");
+        let config = Qwen35Config::from_json_bytes(TINY_CONFIG_JSON.as_bytes()).expect("config");
+        let value_heads = config.linear_num_value_heads;
+        // Layer 0 is LinearAttention in the tiny config.
+        let a_log_key = format!("{TEXT_PREFIX}.layers.0.linear_attn.A_log");
+
+        // Distinct, exactly-bf16-representable-after-truncation source values.
+        let src: Vec<f32> = (0..u16::try_from(value_heads).unwrap())
+            .map(|i| -1.5 - f32::from(i))
+            .collect();
+        let mut bf16_bytes = Vec::with_capacity(value_heads * 2);
+        let mut widened = Vec::with_capacity(value_heads);
+        for &v in &src {
+            let (le, w) = f32_to_bf16_le(v);
+            bf16_bytes.extend_from_slice(&le);
+            widened.push(w);
+        }
+
+        let key = a_log_key.clone();
+        let bytes = bf16_bytes.clone();
+        let archive_bytes =
+            synthesize_archive_bytes_with(&config, false, Fill::Zeros, |k, _default| {
+                (k == key).then(|| (StDtype::BF16, vec![value_heads], bytes.clone()))
+            });
+        let archive = SafeTensors::deserialize(&archive_bytes).expect("deserialize");
+
+        let weights = load_qwen35_weights(&archive, &config, &device).expect("load bf16 A_log");
+
+        let Qwen35MixerWeights::LinearAttn(lin) = &weights.layers[0].mixer else {
+            panic!("layer 0 must be LinearAttn");
+        };
+        assert_eq!(
+            lin.a_log.dtype(),
+            DType::F32,
+            "bf16 A_log must be upcast to f32 at load"
+        );
+        assert_eq!(lin.a_log.shape().dims(), &[value_heads]);
+        lin.a_log.eval().expect("eval a_log");
+        let host = lin.a_log.cpu_to_vec::<f32>().expect("pull a_log to host");
+        assert_eq!(
+            host, widened,
+            "upcast values must equal the bf16 source widened to f32 (exact)"
+        );
+    }
+
+    /// The 4B path (f32 `A_log`) stays byte-identical: loaded as-is, no cast.
+    #[test]
+    fn f32_a_log_loads_as_f32() {
+        let device = Device::shared().expect("device");
+        let config = Qwen35Config::from_json_bytes(TINY_CONFIG_JSON.as_bytes()).expect("config");
+        let archive_bytes = synthesize_archive_bytes(&config);
+        let archive = SafeTensors::deserialize(&archive_bytes).expect("deserialize");
+
+        let weights = load_qwen35_weights(&archive, &config, &device).expect("load");
+        let Qwen35MixerWeights::LinearAttn(lin) = &weights.layers[0].mixer else {
+            panic!("layer 0 must be LinearAttn");
+        };
+        assert_eq!(lin.a_log.dtype(), DType::F32);
     }
 
     #[test]
     #[ignore = "requires a real checkpoint via CIDER_QWEN35_CHECKPOINT_PATH"]
     fn loads_4b_checkpoint_with_validated_shapes() {
-        let Some(dir) = checkpoint_path() else {
-            eprintln!("skipping: CIDER_QWEN35_CHECKPOINT_PATH unset");
-            return;
-        };
+        let dir = cider_press_test_utils::qwen35_4b_checkpoint_dir();
         let config =
             Qwen35Config::from_json_bytes(&fs::read(dir.join("config.json")).unwrap()).unwrap();
-        let bytes = fs::read(dir.join("model.safetensors")).unwrap();
-        let archive = SafeTensors::deserialize(&bytes).unwrap();
+        let shards = ShardSet::read(&dir).unwrap();
+        let archive = shards.archive().unwrap();
         let device = Device::shared().unwrap();
 
         let weights = load_qwen35_weights(&archive, &config, &device).unwrap();

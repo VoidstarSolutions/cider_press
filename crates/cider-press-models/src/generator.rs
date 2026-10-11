@@ -1,33 +1,37 @@
-//! Greedy-decode driver over [`Qwen2Model`] + [`KvCache`].
+//! Greedy-decode driver over a [`LanguageModel`] + its per-layer caches.
 //!
-//! Concrete-on-Qwen2Model for now; lifting to a `LanguageModel`
-//! trait waits until a second architecture arrives. The iterator
-//! yields `Result<u32>` ids; UTF-8 detokenization is the caller's
-//! problem (compose `Tokenizer::decode_stream` on top).
+//! Generic over the model: [`Generator<M>`] drives any
+//! [`LanguageModel`] (currently [`Qwen2Model`](crate::qwen2::Qwen2Model) with
+//! [`KvCache`](cider_press_runtime::KvCache) and
+//! [`Qwen35Model`](crate::qwen3_5::Qwen35Model) with
+//! [`Qwen35LayerCache`](crate::qwen3_5::Qwen35LayerCache)) — the async-
+//! pipelined decode loop is cache-type-agnostic. The iterator yields
+//! `Result<u32>` ids; UTF-8 detokenization is the caller's problem (compose
+//! `Tokenizer::decode_stream` on top).
 
 #![doc = include_str!("../../../docs/inference/sampling.md")]
 
 use std::collections::{HashSet, VecDeque};
 
-use cider_press_runtime::{DType, Device, KvCache, PendingEval, Tensor};
+use cider_press_runtime::{Device, PendingEval, Tensor};
 
 use crate::error::{Error, Result};
-use crate::qwen2::Qwen2Model;
+use crate::language_model::LanguageModel;
 
-/// Owns a model + pre-allocated `KvCache`s + the EOS set. One instance
+/// Owns a model + pre-allocated per-layer caches + the EOS set. One instance
 /// drives one or more `generate` calls; caches are reset on every
 /// call so previous runs don't leak into the next prompt.
 #[derive(Debug)]
-pub struct Generator {
-    model: Qwen2Model,
-    caches: Vec<KvCache>,
+pub struct Generator<M: LanguageModel> {
+    model: M,
+    caches: Vec<M::Cache>,
     eos_ids: HashSet<u32>,
     context_window: usize,
     inflight_depth: usize,
 }
 
-impl Generator {
-    /// Construct a Generator. Pre-allocates one [`KvCache`] per layer
+impl<M: LanguageModel> Generator<M> {
+    /// Construct a Generator. Pre-allocates one cache per layer
     /// sized to `context_window` tokens.
     ///
     /// # Errors
@@ -35,7 +39,7 @@ impl Generator {
     /// - `eos_ids.is_empty()` — without an EOS the loop has no
     ///   natural terminator besides `max_new_tokens`; we reject so a
     ///   caller can't accidentally rely on that.
-    pub fn new(model: Qwen2Model, context_window: usize, eos_ids: HashSet<u32>) -> Result<Self> {
+    pub fn new(model: M, context_window: usize, eos_ids: HashSet<u32>) -> Result<Self> {
         if context_window == 0 {
             return Err(Error::InvalidArgument(
                 "Generator::new: context_window must be > 0".into(),
@@ -47,19 +51,7 @@ impl Generator {
             ));
         }
         let device = Device::shared()?;
-        let cfg = model.config();
-        let head_dim = cfg.head_dim()?;
-        let caches = (0..cfg.num_hidden_layers)
-            .map(|_| {
-                KvCache::new(
-                    &device,
-                    context_window,
-                    cfg.num_key_value_heads,
-                    head_dim,
-                    DType::BF16,
-                )
-            })
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let caches = model.make_caches(context_window, &device)?;
         Ok(Self {
             model,
             caches,
@@ -85,54 +77,42 @@ impl Generator {
         self.inflight_depth = depth;
     }
 
-    /// Reset all `KvCache`s to position 0. Called automatically at the
+    /// Reset all per-layer caches to position 0. Called automatically at the
     /// start of [`Self::generate`].
     ///
+    /// Recovers from a failed forward: a forward or eval that errored after
+    /// scheduling cache writes leaves them unevaluated, which an in-place cache
+    /// reset refuses. The caches are then replaced with fresh ones.
+    ///
     /// # Errors
-    /// Propagates [`KvCache::reset`] if a cache's last update has not been
-    /// evaluated (it must be, to keep outstanding K/V views from replaying
-    /// stale writes into the reused slab).
+    /// Device acquisition or cache allocation failure while replacing the
+    /// caches; the next `reset` retries.
     pub fn reset(&mut self) -> Result<()> {
-        for cache in &mut self.caches {
-            cache.reset()?;
+        // An empty vector is a replacement that failed to allocate (every
+        // model has at least one layer), not a valid reset state.
+        if !self.caches.is_empty() && self.model.reset_caches(&mut self.caches).is_ok() {
+            return Ok(());
         }
-        Ok(())
-    }
-
-    /// Run one decode-step forward (`T = 1`, offset = the current
-    /// cache position) through the profiling-only [`Tensor::profiled_eval`],
-    /// recording per-OpKind GPU time into the `profile` GPU store.
-    ///
-    /// `last_id` is the most recently sampled token; the caches must hold
-    /// the full preceding context (call this *after* draining a
-    /// [`GenerateIter`]), so the graph is a realistic full-context decode
-    /// step rather than a cold `T = 1`. Note this advances the caches by one
-    /// row as a side effect — intended for one-shot profiling, not resumable
-    /// generation.
-    ///
-    /// # Errors
-    /// Tensor construction, forward, or `profiled_eval` failure.
-    #[doc(hidden)]
-    pub fn profiled_decode_step(&mut self, last_id: u32) -> Result<()> {
+        // Discarding the caches is safe here and only here: they are private,
+        // so no caller holds a view of them, and a failed forward has dropped
+        // its graph — the caches hold the only refs to the unevaluated writes,
+        // which die with them. Every command buffer an eval submitted was waited
+        // (eval's own wait, or the blocking drop of its handles), so nothing
+        // still writes the old slabs. Drop before allocating so peak memory
+        // stays at one set of caches.
+        self.caches = Vec::new();
         let device = Device::shared()?;
-        let pos = self.caches.first().map_or(0, KvCache::position);
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let pos_i32 = pos as i32;
-        let ids = Tensor::from_slice(&device, &[last_id], [1, 1])?;
-        let offset = Tensor::from_slice(&device, &[pos_i32], [1])?;
-        let logits = self.model.forward(&ids, &offset, &mut self.caches)?;
-        logits.profiled_eval()?;
+        self.caches = self.model.make_caches(self.context_window, &device)?;
         Ok(())
     }
 
     /// Shared prefill graph builder for the profiling/timing entry points:
-    /// resets the caches, then runs one forward at `T = input_ids.len()`,
-    /// offset 0 (causal via the fused sdpa kernel). Returns the lazy
-    /// **last-position** logits (`[1, 1, vocab]`) via
-    /// [`Qwen2Model::forward_last`] — the blocks still run over all `T`
-    /// tokens, but only the final token is projected through the LM head, as
-    /// greedy generation (and `mlx_lm`'s prefill) does. Advances the caches to
-    /// `input_ids.len()` as a side effect.
+    /// resets the caches, then prefills `input_ids` from offset 0 via
+    /// [`prefill_last_logits`] (chunked when the model asks for it). Returns
+    /// the lazy **last-position** logits (`[1, 1, vocab]`) — the blocks still
+    /// run over all `T` tokens, but only the final token is projected through
+    /// the LM head, as greedy generation (and `mlx_lm`'s prefill) does.
+    /// Advances the caches to `input_ids.len()` as a side effect.
     fn prefill_logits(&mut self, input_ids: &[u32]) -> Result<Tensor> {
         if input_ids.is_empty() {
             return Err(Error::InvalidArgument(
@@ -141,24 +121,20 @@ impl Generator {
         }
         self.reset()?;
         let device = Device::shared()?;
-        let prefill_len = input_ids.len();
-        let ids_tensor = Tensor::from_slice(&device, input_ids, [1, prefill_len])?;
-        let offset = Tensor::from_slice(&device, &[0i32], [1])?;
-        self.model
-            .forward_last(&ids_tensor, &offset, &mut self.caches)
+        let chunk_len = self.model.prefill_chunk_len();
+        prefill_last_logits(&self.model, &mut self.caches, &device, input_ids, chunk_len)
     }
 
-    /// Run one **prefill** forward (`T = input_ids.len()`, offset = 0,
-    /// causal via the fused sdpa kernel) through the profiling-only
-    /// [`Tensor::profiled_eval`],
-    /// recording per-OpKind GPU time into the `profile` GPU store.
+    /// Run a **prefill** (`T = input_ids.len()`, offset = 0, causal via the
+    /// fused sdpa kernel; chunked when the model asks for it, in which case
+    /// earlier chunks fill the caches unprofiled and only the final chunk's
+    /// forward is profiled) through the profiling-only
+    /// [`Tensor::profiled_eval`], recording per-OpKind GPU time into the
+    /// `profile` GPU store.
     ///
-    /// The T>1 analog of [`Self::profiled_decode_step`]: it exercises the
-    /// **composed** attention path (the fused vector kernel is T=1 only), so
-    /// the recorded breakdown surfaces the prefill copy / score-matmul /
-    /// softmax dispatches. Resets the caches first; advances them to
-    /// `input_ids.len()` as a side effect — intended for one-shot profiling,
-    /// not resumable generation.
+    /// The T>1 analog of [`Self::profiled_decode_step`]. Resets the caches
+    /// first; advances them to `input_ids.len()` as a side effect — intended
+    /// for one-shot profiling, not resumable generation.
     ///
     /// # Errors
     /// `input_ids` empty, or device / forward / `profiled_eval` failure.
@@ -169,9 +145,9 @@ impl Generator {
         Ok(())
     }
 
-    /// Run one prefill forward (`T = input_ids.len()`, offset 0, causal via
-    /// the fused sdpa kernel) and **synchronously** `eval()` the
-    /// last-position `[1, 1, vocab]` logits (see `prefill_logits`),
+    /// Run a prefill (`T = input_ids.len()`, offset 0, causal via the fused
+    /// sdpa kernel; chunked when the model asks for it) and **synchronously**
+    /// `eval()` the last-position `[1, 1, vocab]` logits (see `prefill_logits`),
     /// waiting for GPU completion. Mirrors `mlx_lm`'s prefill, which evals
     /// only the KV cache for the prompt and projects the LM head for a single
     /// token — so this is an apples-to-apples prefill wall-clock measurement
@@ -189,8 +165,10 @@ impl Generator {
     /// Greedy-decode up to `max_new_tokens` ids from `input_ids`.
     ///
     /// Runs prefill (one forward at `T = input_ids.len()`, offset=0,
-    /// causal via the fused sdpa kernel) then yields sampled ids one at a
-    /// time. Iterator
+    /// causal via the fused sdpa kernel — or, for a model with a
+    /// [`prefill_chunk_len`](LanguageModel::prefill_chunk_len), synchronously
+    /// evaluated chunks followed by that forward over the last chunk) then
+    /// yields sampled ids one at a time. Iterator
     /// terminates on EOS or after `max_new_tokens` items.
     ///
     /// # Errors
@@ -214,7 +192,7 @@ impl Generator {
         &mut self,
         input_ids: &[u32],
         max_new_tokens: usize,
-    ) -> Result<GenerateIter<'_>> {
+    ) -> Result<GenerateIter<'_, M>> {
         if input_ids.is_empty() {
             return Err(Error::InvalidArgument(
                 "Generator::generate: input_ids must be non-empty".into(),
@@ -240,21 +218,9 @@ impl Generator {
                 self.context_window,
             )));
         }
-        self.reset()?;
-        let device = Device::shared()?;
-        let prefill_len = input_ids.len();
+        let logits = self.prefill_logits(input_ids)?;
 
-        // Prefill: [1, T] ids, offset=0. Causal via the fused sdpa kernel's
-        // do_causal — no materialized mask.
-        let ids_tensor = Tensor::from_slice(&device, input_ids, [1, prefill_len])?;
-        let offset = Tensor::from_slice(&device, &[0i32], [1])?;
-        // Only the last token's logits drive the first sampled id; project the
-        // LM head for that position alone (the blocks still cache all T K/V).
-        let logits = self
-            .model
-            .forward_last(&ids_tensor, &offset, &mut self.caches)?;
-
-        let vocab = self.model.config().vocab_size;
+        let vocab = self.model.vocab_size();
         let idx0 = argmax_last_position_lazy(&logits, vocab)?;
         let pending0 = idx0.eval_async()?;
 
@@ -264,17 +230,37 @@ impl Generator {
 
         Ok(GenerateIter {
             owner: self,
-            device,
-            prefill_len,
             next_id_gpu: idx0,
             inflight,
             depth,
-            committed: 0,
             yielded: 0,
             done: false,
             deferred_err: None,
             max_new_tokens,
         })
+    }
+
+    /// Run one decode-step forward (`T = 1`, at the caches' current position)
+    /// through the profiling-only
+    /// [`Tensor::profiled_eval`], recording per-OpKind GPU time into the
+    /// `profile` GPU store.
+    ///
+    /// `last_id` is the most recently sampled token; the caches must hold
+    /// the full preceding context (call this *after* draining a
+    /// [`GenerateIter`]), so the graph is a realistic full-context decode
+    /// step rather than a cold `T = 1`. Note this advances the caches by one
+    /// row as a side effect — intended for one-shot profiling, not resumable
+    /// generation.
+    ///
+    /// # Errors
+    /// Tensor construction, forward, or `profiled_eval` failure.
+    #[doc(hidden)]
+    pub fn profiled_decode_step(&mut self, last_id: u32) -> Result<()> {
+        let device = Device::shared()?;
+        let ids = Tensor::from_slice(&device, &[last_id], [1, 1])?;
+        let logits = self.model.forward_last(&ids, &mut self.caches)?;
+        logits.profiled_eval()?;
+        Ok(())
     }
 }
 
@@ -286,10 +272,8 @@ impl Generator {
 /// committed token. Ids are chained on-GPU — the argmax tensor feeds the
 /// next forward's embedding gather directly, never round-tripping the CPU.
 #[derive(Debug)]
-pub struct GenerateIter<'a> {
-    owner: &'a mut Generator,
-    device: Device,
-    prefill_len: usize,
+pub struct GenerateIter<'a, M: LanguageModel> {
+    owner: &'a mut Generator<M>,
     /// Most recent argmax tensor (`[1, 1]` U32), fed into the next forward.
     /// Persists across the in-flight queue draining (needed at depth 0,
     /// where the queue empties between commits), so it is the chain source
@@ -299,8 +283,6 @@ pub struct GenerateIter<'a> {
     inflight: VecDeque<(PendingEval, Tensor)>,
     /// Lookahead distance; target in-flight count is `depth + 1`.
     depth: usize,
-    /// Decode forwards committed so far (the `RoPE` / cache offset source).
-    committed: usize,
     /// Tokens handed back so far (caps at `max_new_tokens`).
     yielded: usize,
     /// EOS seen or max hit — stop committing further lookaheads.
@@ -314,7 +296,7 @@ pub struct GenerateIter<'a> {
     max_new_tokens: usize,
 }
 
-impl Iterator for GenerateIter<'_> {
+impl<M: LanguageModel> Iterator for GenerateIter<'_, M> {
     type Item = Result<u32>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -346,7 +328,6 @@ impl Iterator for GenerateIter<'_> {
                 Ok((pending, idx)) => {
                     self.next_id_gpu = idx.clone();
                     self.inflight.push_back((pending, idx));
-                    self.committed += 1;
                 }
                 // Stash, don't surface: earlier committed tokens are still
                 // valid, and a deeper pipeline must not hide tokens depth 0
@@ -380,23 +361,55 @@ impl Iterator for GenerateIter<'_> {
     }
 }
 
-impl GenerateIter<'_> {
+impl<M: LanguageModel> GenerateIter<'_, M> {
     /// One decode forward from the on-GPU `feed` id tensor: build the graph,
     /// commit it async, and return the handle plus the lazy next-argmax
     /// tensor. Does not block — readback happens later in `next()`.
+    ///
+    /// The step is `T = 1`, so `forward_last` projects the whole (single-row)
+    /// sequence — identical to a full `forward` but routed through the one
+    /// forward entry point the trait exposes.
     fn advance(&mut self, feed: &Tensor) -> Result<(PendingEval, Tensor)> {
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let pos = (self.prefill_len + self.committed) as i32;
-        let offset = Tensor::from_slice(&self.device, &[pos], [1])?;
         let logits = self
             .owner
             .model
-            .forward(feed, &offset, &mut self.owner.caches)?;
-        let vocab = self.owner.model.config().vocab_size;
+            .forward_last(feed, &mut self.owner.caches)?;
+        let vocab = self.owner.model.vocab_size();
         let idx = argmax_last_position_lazy(&logits, vocab)?;
         let pending = idx.eval_async()?;
         Ok((pending, idx))
     }
+}
+
+/// Prefill `input_ids` into `caches` (which must be at position 0) and return
+/// the lazy last-position logits `[1, 1, vocab]`.
+///
+/// With `chunk_len = Some(c)` and a prompt longer than `c`, every chunk but
+/// the last runs through [`LanguageModel::fill_cache`] and is evaluated
+/// synchronously before the next is built, so peak memory tracks `c` rather
+/// than the prompt length. The last chunk (a full `c` tokens when the prompt is
+/// an exact multiple) goes through [`LanguageModel::forward_last`] like an
+/// unchunked prefill. `None`, `Some(0)`, or a prompt of at most `c` tokens is a
+/// single `forward_last` over the whole prompt. Causality comes from the fused
+/// sdpa kernel's `do_causal` — no materialized mask.
+fn prefill_last_logits<M: LanguageModel>(
+    model: &M,
+    caches: &mut [M::Cache],
+    device: &Device,
+    input_ids: &[u32],
+    chunk_len: Option<usize>,
+) -> Result<Tensor> {
+    let mut start = 0;
+    if let Some(chunk) = chunk_len.filter(|&c| c > 0) {
+        while input_ids.len() - start > chunk {
+            let ids = Tensor::from_slice(device, &input_ids[start..start + chunk], [1, chunk])?;
+            model.fill_cache(&ids, caches)?.eval()?;
+            start += chunk;
+        }
+    }
+    let tail = &input_ids[start..];
+    let ids = Tensor::from_slice(device, tail, [1, tail.len()])?;
+    model.forward_last(&ids, caches)
 }
 
 fn id_is_terminal(id: u32, eos_ids: &HashSet<u32>) -> bool {
@@ -407,9 +420,9 @@ fn id_is_terminal(id: u32, eos_ids: &HashSet<u32>) -> bool {
 /// tensor, returning a `[1, 1]` U32 index tensor **without** evaluating it —
 /// the caller commits it via `eval_async` and reads it back after waiting.
 ///
-/// Both callers feed last-position-only logits: decode runs `forward` on a
-/// `T = 1` token and prefill projects the LM head for the final position alone
-/// (`Qwen2Model::forward_last`). `vocab` is accepted to validate that shape.
+/// Both callers feed last-position-only logits: decode runs a `T = 1` token
+/// and prefill projects the LM head for the final position alone
+/// ([`LanguageModel::forward_last`]). `vocab` is accepted to validate that shape.
 fn argmax_last_position_lazy(logits: &Tensor, vocab: usize) -> Result<Tensor> {
     // A real runtime check, not `debug_assert_eq!`: release builds (the perf
     // test/bench path) compile that out, which would let a non-`[1,1,vocab]`
@@ -435,4 +448,313 @@ fn read_id(idx: &Tensor) -> Result<u32> {
         )
     })?;
     Ok(ids[0])
+}
+
+#[cfg(test)]
+mod tests {
+    use half::bf16;
+    use safetensors::SafeTensors;
+
+    use super::*;
+    use crate::qwen3_5::test_support::{Fill, TINY_CONFIG_JSON, synthesize_archive_bytes_with};
+    use crate::qwen3_5::{Qwen35Config, Qwen35LayerCache, Qwen35Model, load_qwen35_weights};
+
+    fn tiny_seeded_qwen35(device: &Device) -> Qwen35Model {
+        let config = Qwen35Config::from_json_bytes(TINY_CONFIG_JSON.as_bytes()).expect("config");
+        let bytes =
+            synthesize_archive_bytes_with(&config, false, Fill::Seeded(0x5eed), |_, _| None);
+        let archive = SafeTensors::deserialize(&bytes).expect("deserialize");
+        let weights = load_qwen35_weights(&archive, &config, device).expect("load");
+        Qwen35Model::from_weights(weights, config).expect("model")
+    }
+
+    fn host<T: cider_press_runtime::Scalar>(t: &Tensor) -> Vec<T> {
+        let dense = t.copy().expect("copy");
+        dense.eval().expect("eval");
+        dense.cpu_to_vec::<T>().expect("host read")
+    }
+
+    /// Every piece of per-layer state as `(position, values widened to f32)`;
+    /// GDN states carry position 0.
+    type CacheSnapshot = Vec<(usize, Vec<f32>)>;
+
+    fn cache_snapshot(caches: &[Qwen35LayerCache]) -> CacheSnapshot {
+        let widen = |v: Vec<bf16>| v.into_iter().map(bf16::to_f32).collect::<Vec<_>>();
+        caches
+            .iter()
+            .flat_map(|cache| match cache {
+                Qwen35LayerCache::Full(kv) => vec![
+                    (kv.position(), widen(host(&kv.keys_view()))),
+                    (kv.position(), widen(host(&kv.values_view()))),
+                ],
+                Qwen35LayerCache::Linear(st) => vec![
+                    (0, widen(host(st.conv_state()))),
+                    (0, host::<f32>(st.recurrent_state())),
+                ],
+            })
+            .collect()
+    }
+
+    /// Prefill `ids` with and without chunking from fresh caches; return the
+    /// last-position logits and the resulting cache state of each run.
+    fn prefill_both_ways(
+        model: &Qwen35Model,
+        device: &Device,
+        ids: &[u32],
+        chunk_len: usize,
+    ) -> [(Vec<f32>, CacheSnapshot); 2] {
+        [None, Some(chunk_len)].map(|chunk| {
+            let mut caches = model.make_caches(32, device).expect("caches");
+            let logits =
+                prefill_last_logits(model, &mut caches, device, ids, chunk).expect("prefill");
+            assert_eq!(logits.shape().dims(), &[1, 1, model.vocab_size()]);
+            let logits: Vec<f32> = host::<bf16>(&logits)
+                .into_iter()
+                .map(bf16::to_f32)
+                .collect();
+            (logits, cache_snapshot(&caches))
+        })
+    }
+
+    /// Evaluating the `fill_cache` handle alone must materialize every piece of
+    /// state the next chunk reads; anything left lazy would be recomputed (or,
+    /// for a `KvCache` write, dropped) by the next chunk's graph.
+    #[test]
+    fn fill_cache_eval_commits_every_cache_state() {
+        let device = Device::shared().expect("device");
+        let model = tiny_seeded_qwen35(&device);
+        let mut caches = model.make_caches(32, &device).expect("caches");
+        let ids = Tensor::from_slice(&device, &[3u32, 1, 4, 1, 5], [1, 5]).expect("ids");
+        model
+            .fill_cache(&ids, &mut caches)
+            .expect("fill_cache")
+            .eval()
+            .expect("eval");
+        for (i, cache) in caches.iter().enumerate() {
+            let states = match cache {
+                Qwen35LayerCache::Full(kv) => [kv.keys_view(), kv.values_view()],
+                Qwen35LayerCache::Linear(st) => {
+                    [st.conv_state().clone(), st.recurrent_state().clone()]
+                }
+            };
+            for state in &states {
+                assert!(state.is_materialized(), "layer {i}: state left lazy");
+            }
+        }
+    }
+
+    #[test]
+    fn chunked_prefill_matches_single_forward() {
+        let device = Device::shared().expect("device");
+        let model = tiny_seeded_qwen35(&device);
+        // 11 = 4 + 4 + 3 (ragged last chunk); 12 = 4 + 4 + 4 (exact multiple:
+        // the last chunk is a full chunk through forward_last).
+        for len in [11u32, 12] {
+            let ids: Vec<u32> = (0..len).map(|i| (i * 37 + 5) % 256).collect();
+            let [(plain_logits, plain_state), (chunked_logits, chunked_state)] =
+                prefill_both_ways(&model, &device, &ids, 4);
+
+            let spread = plain_logits
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max)
+                - plain_logits.iter().copied().fold(f32::INFINITY, f32::min);
+            assert!(
+                spread > 0.0,
+                "len {len}: degenerate logits, the test proves nothing"
+            );
+
+            assert_eq!(
+                chunked_logits, plain_logits,
+                "len {len}: last-position logits"
+            );
+            assert_eq!(chunked_state.len(), plain_state.len());
+            for (i, (c, p)) in chunked_state.iter().zip(&plain_state).enumerate() {
+                assert_eq!(c.0, p.0, "len {len}: state {i} position");
+                assert_eq!(c.1, p.1, "len {len}: state {i} contents");
+            }
+        }
+    }
+
+    fn full_cache_positions(caches: &[Qwen35LayerCache]) -> Vec<usize> {
+        caches
+            .iter()
+            .filter_map(|cache| match cache {
+                Qwen35LayerCache::Full(kv) => Some(kv.position()),
+                Qwen35LayerCache::Linear(_) => None,
+            })
+            .collect()
+    }
+
+    /// The caches' position is the model's `RoPE` offset, so prefill must
+    /// advance it by exactly the prompt length and `reset` must rewind it.
+    #[test]
+    fn cache_position_tracks_prefill_and_reset() {
+        let device = Device::shared().expect("device");
+        let mut generator =
+            Generator::new(tiny_seeded_qwen35(&device), 32, HashSet::from([u32::MAX]))
+                .expect("generator");
+        let ids: Vec<u32> = (0..6).map(|i| (i * 37 + 5) % 256).collect();
+        let at = |n: usize, g: &Generator<Qwen35Model>| {
+            let positions = full_cache_positions(&g.caches);
+            assert!(
+                !positions.is_empty(),
+                "tiny model has no full-attention layer"
+            );
+            assert!(positions.iter().all(|&p| p == n), "{positions:?} != {n}");
+        };
+
+        generator.prefill_sync(&ids).expect("prefill");
+        at(6, &generator);
+
+        generator.reset().expect("reset");
+        at(0, &generator);
+        // max_new_tokens = 1 yields the prefill argmax with no decode forward.
+        assert_eq!(generator.generate(&ids, 1).expect("generate").count(), 1);
+        at(6, &generator);
+
+        generator.reset().expect("reset");
+        at(0, &generator);
+    }
+
+    /// Delegates to the tiny Qwen3.5 model, except that the cache-writing call
+    /// numbered `fail_on_call` (counting `forward_last` and `fill_cache`
+    /// together, from 0) builds a real two-token forward into the caches, drops
+    /// it unevaluated, and errors — the state any forward that fails after
+    /// scheduling its cache writes leaves behind.
+    #[derive(Debug)]
+    struct FailingModel {
+        inner: Qwen35Model,
+        chunk_len: Option<usize>,
+        fail_on_call: Option<usize>,
+        calls: std::cell::Cell<usize>,
+    }
+
+    const INJECTED: &str = "injected forward failure";
+
+    impl FailingModel {
+        fn maybe_fail(&self, caches: &mut [Qwen35LayerCache]) -> Result<()> {
+            let call = self.calls.get();
+            self.calls.set(call + 1);
+            if self.fail_on_call != Some(call) {
+                return Ok(());
+            }
+            let device = Device::shared()?;
+            let ids = Tensor::from_slice(&device, &[7u32, 9], [1, 2])?;
+            drop(self.inner.fill_cache(&ids, caches)?);
+            Err(Error::InvalidArgument(INJECTED.into()))
+        }
+    }
+
+    impl LanguageModel for FailingModel {
+        type Cache = Qwen35LayerCache;
+
+        fn make_caches(&self, max_tokens: usize, device: &Device) -> Result<Vec<Self::Cache>> {
+            self.inner.make_caches(max_tokens, device)
+        }
+
+        fn forward_last(&self, input_ids: &Tensor, caches: &mut [Self::Cache]) -> Result<Tensor> {
+            self.maybe_fail(caches)?;
+            self.inner.forward_last(input_ids, caches)
+        }
+
+        fn fill_cache(&self, input_ids: &Tensor, caches: &mut [Self::Cache]) -> Result<Tensor> {
+            self.maybe_fail(caches)?;
+            self.inner.fill_cache(input_ids, caches)
+        }
+
+        fn prefill_chunk_len(&self) -> Option<usize> {
+            self.chunk_len
+        }
+
+        fn reset_caches(&self, caches: &mut [Self::Cache]) -> Result<()> {
+            self.inner.reset_caches(caches)
+        }
+
+        fn vocab_size(&self) -> usize {
+            self.inner.vocab_size()
+        }
+    }
+
+    fn failing_generator(
+        device: &Device,
+        chunk_len: Option<usize>,
+        fail_on_call: Option<usize>,
+    ) -> Generator<FailingModel> {
+        let model = FailingModel {
+            inner: tiny_seeded_qwen35(device),
+            chunk_len,
+            fail_on_call,
+            calls: std::cell::Cell::new(0),
+        };
+        Generator::new(model, 32, HashSet::from([u32::MAX])).expect("generator")
+    }
+
+    fn assert_injected<T: std::fmt::Debug>(result: Result<T>) {
+        let err = result.expect_err("the injected failure did not fire");
+        assert!(
+            err.to_string().contains(INJECTED),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Ids from a one-token `generate` (the prefill argmax; the tiny model's
+    /// `T = 1` decode is not exercised) plus every cache state it leaves.
+    fn generate_one(
+        generator: &mut Generator<FailingModel>,
+        ids: &[u32],
+    ) -> (Vec<u32>, CacheSnapshot) {
+        let out = generator
+            .generate(ids, 1)
+            .expect("generate")
+            .collect::<Result<Vec<_>>>()
+            .expect("tokens");
+        (out, cache_snapshot(&generator.caches))
+    }
+
+    /// A forward that fails after scheduling cache writes leaves every cache
+    /// with an unevaluated write. The generator must recover on the next
+    /// `generate` and match a fresh generator exactly — prefill, chunked
+    /// prefill, and decode failures alike.
+    #[test]
+    fn generator_recovers_from_a_failed_forward() {
+        let device = Device::shared().expect("device");
+        let ids: Vec<u32> = (0..11).map(|i| (i * 37 + 5) % 256).collect();
+        let expected = generate_one(&mut failing_generator(&device, Some(4), None), &ids);
+
+        let prefill_fail = |chunk_len, call| {
+            let mut generator = failing_generator(&device, chunk_len, Some(call));
+            assert_injected(generator.generate(&ids, 1));
+            generator
+        };
+        let mut failed = vec![
+            ("unchunked prefill", prefill_fail(None, 0)),
+            ("first prefill chunk", prefill_fail(Some(4), 0)),
+            ("later prefill chunk", prefill_fail(Some(4), 1)),
+            ("final prefill chunk", prefill_fail(Some(4), 2)),
+        ];
+
+        let mut sync = failing_generator(&device, Some(4), Some(1));
+        assert_injected(sync.prefill_sync(&ids));
+        failed.push(("prefill_sync", sync));
+
+        // Calls 0..=2 are the prefill chunks; call 3 is the first decode step.
+        let mut decode = failing_generator(&device, Some(4), Some(3));
+        let mut iter = decode.generate(&ids, 3).expect("generate");
+        assert!(iter.next().expect("prefill token").is_ok());
+        assert_injected(iter.next().expect("decode step"));
+        drop(iter);
+        failed.push(("decode step", decode));
+
+        for (case, mut generator) in failed {
+            let caches = &mut generator.caches;
+            let stuck = generator.model.inner.reset_caches(caches);
+            assert!(
+                stuck.is_err(),
+                "{case}: failure left no uncommitted cache write"
+            );
+            assert_eq!(generate_one(&mut generator, &ids), expected, "{case}");
+            generator.reset().expect("reset after recovery");
+        }
+    }
 }

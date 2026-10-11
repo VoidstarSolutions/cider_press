@@ -83,7 +83,7 @@ the ones below it, never the reverse:
   (the synchronous dispatch boundary), plus the `KvCache` and the
   feature-gated profiling facility. Owns dtypes, layouts/views, and
   quantized weights.
-- **`cider-press-models`** — transformer architectures (Qwen2) composed
+- **`cider-press-models`** — transformer architectures (Qwen2, Qwen3.5/3.6) composed
   from runtime ops, plus the tokenizer, chat template, and the greedy
   `Generator`.
 - **`cider-press`** — the facade and CLI (`chat` and `bench` subcommands).
@@ -114,8 +114,10 @@ above. The page also collects "Model variations" notes — the small
 architectural knobs (GQA ratio, norm placement, activation, tied vs.
 untied embeddings) that distinguish one model family from another.
 
-- [Qwen2.5](./models/qwen2.5.md) — the current worked example
+- [Qwen2.5](./models/qwen2.5.md) — the worked example
   (Qwen2.5-0.5B-Instruct-4bit).
+- [Qwen3.5 / Qwen3.6](./models/qwen3.6.md) — the Gated-DeltaNet hybrid
+  (Qwen3.5-4B dev vehicle, Qwen3.6-27B target).
 
 More models land as a new per-model page plus any "Model variations" notes
 they introduce.

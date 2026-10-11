@@ -3,13 +3,14 @@
 
 #![doc = include_str!("../../../../docs/inference/embedding.md")]
 
-use cider_press_runtime::{KvCache, QuantizedWeight, Tensor};
+use cider_press_runtime::{DType, Device, KvCache, QuantizedWeight, Tensor};
 
 use super::block::TransformerBlock;
 use super::config::Qwen2Config;
 use super::weights::Qwen2Weights;
 use crate::error::{Error, Result};
-use crate::nn::{Module, RmsNormLayer, embed_tokens};
+use crate::language_model::LanguageModel;
+use crate::nn::{Module, RmsNormLayer, embed_tokens, rope_offset};
 
 /// Qwen2-family causal language model.
 ///
@@ -67,19 +68,13 @@ impl Qwen2Model {
     /// - `input_ids`: `[1, T]` U32 token ids. Flattened to rank-1 for the
     ///   embedding gather, then reshaped back to `[1, T, hidden_size]`
     ///   before the transformer blocks.
-    /// - `offset`: length-1 I32 — the number of tokens already in each
-    ///   layer's cache (the `RoPE` base / starting attention position).
     /// - `caches`: one [`KvCache`] per layer; length must equal
-    ///   `self.config().num_hidden_layers`.
+    ///   `self.config().num_hidden_layers`. Their shared position — the
+    ///   number of tokens already cached — is the `RoPE` offset.
     ///
     /// Returns `[1, T, vocab_size]` BF16, lazy.
-    pub fn forward(
-        &self,
-        input_ids: &Tensor,
-        offset: &Tensor,
-        caches: &mut [KvCache],
-    ) -> Result<Tensor> {
-        let hidden = self.hidden_states(input_ids, offset, caches)?;
+    pub fn forward(&self, input_ids: &Tensor, caches: &mut [KvCache]) -> Result<Tensor> {
+        let hidden = self.hidden_states(input_ids, caches)?;
         self.project_logits(&hidden)
     }
 
@@ -94,19 +89,14 @@ impl Qwen2Model {
     /// it evals only the KV cache during prompt processing and runs the head
     /// on one token. Numerically identical to `forward(..)[:, -1, :]` because
     /// `RMSNorm` and the LM head are per-position.
-    pub fn forward_last(
-        &self,
-        input_ids: &Tensor,
-        offset: &Tensor,
-        caches: &mut [KvCache],
-    ) -> Result<Tensor> {
+    pub fn forward_last(&self, input_ids: &Tensor, caches: &mut [KvCache]) -> Result<Tensor> {
         let t = input_ids.elem_count();
         if t == 0 {
             return Err(Error::InvalidArgument(
                 "Qwen2Model::forward_last: empty input_ids (need at least one token)".into(),
             ));
         }
-        let hidden = self.hidden_states(input_ids, offset, caches)?;
+        let hidden = self.hidden_states(input_ids, caches)?;
         let last = if t == 1 {
             hidden
         } else {
@@ -136,29 +126,19 @@ impl Qwen2Model {
     ///
     /// # Errors
     /// `input_ids` empty, or device / forward failure.
-    pub fn fill_cache(
-        &self,
-        input_ids: &Tensor,
-        offset: &Tensor,
-        caches: &mut [KvCache],
-    ) -> Result<Tensor> {
+    pub fn fill_cache(&self, input_ids: &Tensor, caches: &mut [KvCache]) -> Result<Tensor> {
         if input_ids.elem_count() == 0 {
             return Err(Error::InvalidArgument(
                 "Qwen2Model::fill_cache: empty input_ids (need at least one token)".into(),
             ));
         }
-        self.hidden_states(input_ids, offset, caches)
+        self.hidden_states(input_ids, caches)
     }
 
     /// Embed `input_ids` and run every transformer block, returning the final
     /// hidden states `[1, T, hidden_size]` (before the final norm / LM head).
     /// Writes each layer's K/V for all `T` positions into `caches`.
-    fn hidden_states(
-        &self,
-        input_ids: &Tensor,
-        offset: &Tensor,
-        caches: &mut [KvCache],
-    ) -> Result<Tensor> {
+    fn hidden_states(&self, input_ids: &Tensor, caches: &mut [KvCache]) -> Result<Tensor> {
         if caches.len() != self.layers.len() {
             return Err(Error::InvalidArgument(format!(
                 "Qwen2Model::hidden_states: got {} caches, expected one per layer ({})",
@@ -166,6 +146,8 @@ impl Qwen2Model {
                 self.layers.len()
             )));
         }
+
+        let offset = rope_offset(caches.iter(), "Qwen2Model")?;
 
         // embed_tokens takes rank-1 ids and returns [T, hidden]; the blocks
         // require [1, T, hidden]. Flatten on the way in, restore the leading
@@ -180,7 +162,7 @@ impl Qwen2Model {
             .reshape([1usize, t, self.config.hidden_size])?
             .copy()?;
         for (block, cache) in self.layers.iter().zip(caches.iter_mut()) {
-            hidden = block.forward(&hidden, offset, cache)?;
+            hidden = block.forward(&hidden, &offset, cache)?;
         }
         Ok(hidden)
     }
@@ -193,5 +175,45 @@ impl Qwen2Model {
         // y = x @ W^T direction (transpose=true) projects hidden states to
         // vocab-size logits without a separate weight.
         Ok(normed.quantized_matmul(&self.embed, true)?)
+    }
+}
+
+impl LanguageModel for Qwen2Model {
+    type Cache = KvCache;
+
+    fn make_caches(&self, max_tokens: usize, device: &Device) -> Result<Vec<KvCache>> {
+        let cfg = &self.config;
+        let head_dim = cfg.head_dim()?;
+        (0..cfg.num_hidden_layers)
+            .map(|_| {
+                KvCache::new(
+                    device,
+                    max_tokens,
+                    cfg.num_key_value_heads,
+                    head_dim,
+                    DType::BF16,
+                )
+                .map_err(Into::into)
+            })
+            .collect()
+    }
+
+    fn forward_last(&self, input_ids: &Tensor, caches: &mut [KvCache]) -> Result<Tensor> {
+        Qwen2Model::forward_last(self, input_ids, caches)
+    }
+
+    fn fill_cache(&self, input_ids: &Tensor, caches: &mut [KvCache]) -> Result<Tensor> {
+        Qwen2Model::fill_cache(self, input_ids, caches)
+    }
+
+    fn reset_caches(&self, caches: &mut [KvCache]) -> Result<()> {
+        for cache in caches {
+            cache.reset()?;
+        }
+        Ok(())
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.config.vocab_size
     }
 }

@@ -307,9 +307,9 @@ pub enum OpKind {
     /// rank ≥ 1, `w` a weight matching `x`'s trailing axis (rank-1
     /// `[hidden]` when `w_stride == 1`; a 1-element `[1.0]` scalar when
     /// `w_stride == 0`, the weightless / `weight=None` case). Output has the
-    /// same shape and dtype as `x`. Single-row kernel only (trailing axis ≤
-    /// 4096). Replaces the composed square→mean→rsqrt→mul→mul chain with one
-    /// dispatch.
+    /// same shape and dtype as `x`. The kernels layer picks the single-row or
+    /// looped kernel from the trailing axis width. Replaces
+    /// the composed square→mean→rsqrt→mul→mul chain with one dispatch.
     RmsNorm {
         /// Variance-stabilising epsilon added before the `rsqrt`
         /// (`1e-6` for Qwen2.5). Carried as `f32` — the reason this enum
@@ -1855,11 +1855,12 @@ impl Tensor {
     /// Schedule a fused last-axis `RMSNorm`:
     /// `out = w * x * rsqrt(mean(x²) + eps)`, reduced per row in fp32.
     ///
-    /// One dispatch of MLX's `rms_single_row`, replacing the composed
-    /// square→mean→rsqrt→mul→mul chain. Preconditions:
+    /// One dispatch of MLX's fused `RMSNorm`, replacing the composed
+    /// square→mean→rsqrt→mul→mul chain; the kernels layer selects the
+    /// single-row or looped variant from the trailing axis width.
+    /// Preconditions:
     ///
     /// - `self` (x) is dense, contiguous, [`DType::BF16`], rank ≥ 1.
-    /// - The trailing axis is ≤ 4096 (the single-row kernel limit).
     /// - `eps` is finite and non-negative.
     ///
     /// `weight` selects the gamma (mirroring `mx.fast.rms_norm`'s optional
@@ -1902,11 +1903,6 @@ impl Tensor {
             return Err(Error::InvalidArgument(
                 "rms_norm: trailing axis must be non-zero".into(),
             ));
-        }
-        if hidden > 4096 {
-            return Err(Error::InvalidArgument(format!(
-                "rms_norm: trailing axis {hidden} exceeds the single-row kernel limit (4096)"
-            )));
         }
         if !eps.is_finite() || eps < 0.0 {
             return Err(Error::InvalidArgument(format!(
@@ -2131,22 +2127,6 @@ impl Tensor {
         if x_k != k_logical {
             return Err(Error::InvalidArgument(format!(
                 "quantized_matmul: inner dim mismatch: activation last dim {x_k} != weight K {k_logical}",
-            )));
-        }
-        // The M>1 prefill path dispatches `affine_qmm_t`, whose wired
-        // instantiation is aligned-only (N % 32 == 0). Reject the
-        // unaligned M>1 case here rather than letting eval fail late;
-        // M=1 decode routes to the generic `affine_qmv`, which has no
-        // such constraint.
-        let m: usize = if x_dims.len() == 1 {
-            1
-        } else {
-            x_dims[..x_dims.len() - 1].iter().product::<usize>()
-        };
-        if m > 1 && n % 32 != 0 {
-            return Err(Error::InvalidArgument(format!(
-                "quantized_matmul: weight N ({n}) must be a multiple of 32 for the M>1 \
-                 (prefill) path; only the aligned affine_qmm_t variant is wired",
             )));
         }
         let q = weight.quantization();
@@ -4871,22 +4851,22 @@ mod tests {
     }
 
     #[test]
-    fn quantized_matmul_rejects_unaligned_n_for_prefill() {
+    fn quantized_matmul_accepts_unaligned_n_for_prefill() {
         let device = Device::shared().expect("device");
-        // make_test_qw has N=4, which is not a multiple of 32.
+        // make_test_qw has N=4, which is not a multiple of BN=32. The M>1
+        // prefill path dispatches the non-aligned `affine_qmm_t` variant, so
+        // the graph build must succeed (no N-alignment reject).
         let qw = make_test_qw(&device);
 
-        // M=2 (>1) prefill path, K matches — only N alignment is wrong.
         let m = 2;
         let x_bytes = m * QMM_K * 2; // bf16
         let x = Tensor::from_bytes(&device, &vec![0u8; x_bytes], [m, QMM_K], DType::BF16)
             .expect("build prefill activation");
 
-        let err = x.quantized_matmul(&qw, true).unwrap_err();
-        assert!(
-            matches!(&err, Error::InvalidArgument(msg) if msg.contains("multiple of 32")),
-            "expected aligned-N rejection, got {err:?}"
-        );
+        let out = x
+            .quantized_matmul(&qw, true)
+            .expect("unaligned-N M>1 qmm must build");
+        assert_eq!(out.shape().dims(), [m, 4]);
     }
 
     #[test]
@@ -5181,11 +5161,10 @@ mod tests {
     #[test]
     fn rope_accepts_canonical_view_matches_leaf() {
         // rope must accept a *canonical* view (view.is_some() AND
-        // is_dense_contiguous) — that is exactly what copy()'s elision (Task 3)
+        // is_dense_contiguous) — that is exactly what copy()'s elision
         // produces for a degenerate decode permute. It must read identically to
-        // the equivalent dense leaf. (The raw permute view is non-canonical and
-        // is exercised in Task 3; here we test the canonical-view input rope
-        // will actually receive.)
+        // the equivalent dense leaf. (The raw permute view is non-canonical;
+        // here we test the canonical-view input rope will actually receive.)
         let device = Device::shared().expect("system default device");
         let data: Vec<half::bf16> = (0..8_u8)
             .map(|i| half::bf16::from_f32(f32::from(i) + 1.0))

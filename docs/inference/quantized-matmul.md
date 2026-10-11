@@ -63,9 +63,9 @@ Both take a
 three-buffer newtype that carries the packed lanes, scales, and biases together
 — so a dense tensor can't be handed to the quantized path by accident. The
 constructor validates the activation is `bf16`, dense, and contiguous, that its
-inner dim matches the weight's logical `K`, and (for the `M > 1` qmm path only)
-that `N` is a multiple of 32, since the wired `affine_qmm_t` instantiation is
-the aligned variant.
+inner dim matches the weight's logical `K`. Any `N` is accepted: the `M > 1`
+qmm path picks the aligned `affine_qmm_t` instantiation when `N % 32 == 0` and
+the non-aligned one otherwise (see "Open levers" below).
 
 **The `qmv_fast` vs. generic variant.** `qmv.rs` mirrors MLX's dispatcher: it
 selects the faster `affine_qmv_fast` kernel when `K % 512 == 0 && N % 8 == 0`,
@@ -186,9 +186,13 @@ near-roofline.
   ([`tensor.rs`](../../crates/cider-press-runtime/src/tensor.rs)). The tied head
   reuses the embedding table *transposed*, so the existing direction covers the
   whole Qwen2.5 forward pass — this is deferred to its first real consumer.
-- **The generic non-aligned `affine_qmm` is unimplemented.** `qmm.rs` wires only
-  the `transpose=true, aligned (N % 32 == 0), B=1` variant; the `_alN_false` and
-  non-transposed variants land when a consumer needs them.
+- **`affine_qmm` non-aligned (`_alN_false`) is now wired; non-transposed is not.**
+  `qmm.rs` picks `_alN_true` when `N % 32 == 0` (the aligned hot path) and
+  `_alN_false` otherwise — the Qwen3.6-27B's GDN `in_proj_a`/`in_proj_b` (N = 48)
+  exercise the non-aligned variant in the M>1 prefill path (matches
+  `mx.quantized_matmul` within the tested tolerance, `max_relative` 1e-2 /
+  `epsilon` 5e-2; an exact-equality check differed by 2 bf16 ULP on one element).
+  The non-transposed (`transpose=false`) variant lands when a consumer needs it.
 - **Dense `matmul` is now production-unused** — every projection routes through
   the quantized path, so the dense `Tensor::matmul` is retained only as
   scaffolding plus its parity test, not on any live forward path.

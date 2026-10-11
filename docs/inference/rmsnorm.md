@@ -101,10 +101,12 @@ per call. Same math, fewer bytes, mlx-faithful.
 
 `Tensor::rms_norm` carries the precondition checks: `x` dense, contiguous, and
 bf16 with the hidden dimension last; a `Some` `gamma` a rank-1 bf16 vector
-matching that last axis; `eps` finite and non-negative. The single fused kernel handles
-Qwen2.5-0.5B's `hidden = 896` comfortably — it is well within the single-row
-regime (`rms_single_row` handles axes up to 4096; wider axes would need the
-looped variant, which is not wired because no supported model needs it).
+matching that last axis; `eps` finite and non-negative. Two fused kernels back
+it. `rms_norm_bf16` picks `rms_single_row` (one threadgroup reduces the whole
+row in-block) or `rms_looped` (the threadgroup loops the row) from the trailing
+axis width, and both honor the weighted / weightless `w_stride` contract.
+Qwen2.5-0.5B's `hidden = 896` and Qwen3.5-4B's `2560` take the single-row path;
+Qwen3.6-27B's `hidden = 5120` takes the looped path.
 
 **Model variations.** RMSNorm is one point in a small design space:
 

@@ -111,9 +111,110 @@ pub fn dump_mlx_op(out: &Path, args: &[&str]) {
     assert!(status.success(), "dump_mlx_op.py {args:?} exited {status}");
 }
 
+/// Directory named by the env var `var`, for tests that only run when
+/// opted in with `--ignored`. Panics with an actionable message instead
+/// of skipping: a skipped parity check reports as a pass, which is how a
+/// misconfigured run goes unnoticed. `what` describes the expected
+/// checkpoint (e.g. "a local Qwen3.5-4B-4bit MLX checkpoint directory").
+///
+/// # Panics
+///
+/// If the variable is unset, does not resolve to a path, or the path is
+/// not a directory.
+#[must_use]
+pub fn require_checkpoint_dir(var: &str, what: &str) -> PathBuf {
+    let raw = std::env::var(var)
+        .unwrap_or_else(|_| panic!("{var} is unset; set it to {what} to run this test"));
+    let dir = std::fs::canonicalize(&raw)
+        .unwrap_or_else(|err| panic!("{var}={raw} does not resolve: {err}"));
+    assert!(dir.is_dir(), "{var}={} is not a directory", dir.display());
+    dir
+}
+
+/// `path`, asserted to exist. `regen` is the command that regenerates
+/// it, quoted in the panic message.
+///
+/// # Panics
+///
+/// If `path` does not exist.
+#[must_use]
+pub fn require_file(path: impl AsRef<Path>, regen: &str) -> PathBuf {
+    let path = path.as_ref();
+    assert!(
+        path.exists(),
+        "missing fixture {}; regenerate it with `{regen}`",
+        path.display(),
+    );
+    path.to_path_buf()
+}
+
+/// Qwen3.5-4B-4bit checkpoint directory from `CIDER_QWEN35_CHECKPOINT_PATH`.
+///
+/// # Panics
+///
+/// If the variable is unset or does not name a directory.
+#[must_use]
+pub fn qwen35_4b_checkpoint_dir() -> PathBuf {
+    require_checkpoint_dir(
+        "CIDER_QWEN35_CHECKPOINT_PATH",
+        "a local Qwen3.5-4B-4bit MLX checkpoint directory",
+    )
+}
+
+/// Qwen3.6-27B-4bit checkpoint directory from
+/// `CIDER_QWEN35_27B_CHECKPOINT_PATH`.
+///
+/// # Panics
+///
+/// If the variable is unset or does not name a directory.
+#[must_use]
+pub fn qwen35_27b_checkpoint_dir() -> PathBuf {
+    require_checkpoint_dir(
+        "CIDER_QWEN35_27B_CHECKPOINT_PATH",
+        "a local Qwen3.6-27B-4bit MLX checkpoint directory",
+    )
+}
+
+/// Asserts `|got - expected| <= atol + rtol * |expected|` element-wise and
+/// panics naming the element with the largest excess over that bound. A
+/// non-finite value on either side always fails.
+///
+/// # Panics
+///
+/// If the lengths differ, any element is non-finite, or any element
+/// exceeds the bound.
+pub fn assert_allclose(label: &str, got: &[bf16], expected: &[bf16], atol: f32, rtol: f32) {
+    assert_eq!(got.len(), expected.len(), "{label}: length mismatch");
+    let mut worst_excess = 0.0f32;
+    let mut worst_at = 0usize;
+    let mut worst_pair = (0.0f32, 0.0f32);
+    for (i, (a, b)) in got.iter().zip(expected).enumerate() {
+        let (a, b) = (a.to_f32(), b.to_f32());
+        assert!(
+            a.is_finite() && b.is_finite(),
+            "{label}: non-finite at element [{i}] got={a} want={b}"
+        );
+        let excess = (a - b).abs() - (atol + rtol * b.abs());
+        if excess > worst_excess {
+            worst_excess = excess;
+            worst_at = i;
+            worst_pair = (a, b);
+        }
+    }
+    assert!(
+        worst_excess <= 0.0,
+        "{label}: tolerance exceeded — worst element [{worst_at}] \
+         got={} want={} |diff|={} > atol={atol} + rtol={rtol}*|want|",
+        worst_pair.0,
+        worst_pair.1,
+        (worst_pair.0 - worst_pair.1).abs(),
+    );
+}
+
 #[cfg(test)]
 mod tests {
-    use super::tempdir;
+    use super::{assert_allclose, tempdir};
+    use half::bf16;
     use std::collections::HashSet;
 
     /// Rapid same-tag calls must yield distinct directories. A
@@ -150,5 +251,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn bf(v: &[f32]) -> Vec<bf16> {
+        v.iter().copied().map(bf16::from_f32).collect()
+    }
+
+    #[test]
+    fn allclose_accepts_within_combined_bound() {
+        assert_allclose("ok", &bf(&[1.0, 2.0]), &bf(&[1.0, 2.0625]), 0.01, 0.05);
+    }
+
+    #[test]
+    #[should_panic(expected = "worst element [1]")]
+    fn allclose_reports_worst_element() {
+        assert_allclose("bad", &bf(&[1.0, 5.0]), &bf(&[1.0, 2.0]), 0.01, 0.05);
+    }
+
+    #[test]
+    #[should_panic(expected = "non-finite")]
+    fn allclose_rejects_nan() {
+        assert_allclose("nan", &bf(&[f32::NAN]), &bf(&[f32::NAN]), 1.0, 1.0);
     }
 }
