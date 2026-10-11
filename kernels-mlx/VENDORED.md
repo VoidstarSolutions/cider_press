@@ -54,6 +54,23 @@ MLX's own `indexing.cpp` / `softmax.cpp` / etc.):
 System includes (`<metal_stdlib>`, `<metal_simdgroup>`, etc.) are *not*
 vendored — they're resolved by Apple's Metal compiler at JIT time.
 
+## Compile options
+
+The vendored kernels are parity-tested **bit-exact** against MLX fixtures.
+That only holds if both sides hand the Metal compiler the same policy, so
+`KernelLibrary::compile_options()` (`crates/cider-press-kernels/src/library.rs`)
+mirrors MLX's `Device::build_library_` in `mlx/backend/metal/device.cpp`:
+
+- `fastMathEnabled = false`
+- `languageVersion` = `get_metal_version()`: 4.0 on macOS 26+, 3.2 on
+  macOS 15+, else 3.1
+- `enableLogging` only in debug builds (`#ifndef NDEBUG`)
+
+`device.cpp` is **not** vendored (it is C++ dispatch code, not a kernel), so
+the sync script prints MLX's current block at the end of every sync. If it
+differs from the bullets above, update `compile_options()` in the same PR as
+the kernel bump and re-run the full parity suite.
+
 ## Sync procedure
 
 `scripts/sync_mlx_kernels.sh` copies the canonical file list from a

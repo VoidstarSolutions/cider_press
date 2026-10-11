@@ -95,4 +95,10 @@ cp "$MLX_DIR/LICENSE" "$DEST/COPYING"
 SHA=$(cd "$MLX_DIR" && git rev-parse HEAD)
 DATE=$(cd "$MLX_DIR" && git log -1 --format=%cs)
 echo "synced ${#FILES[@]} files from MLX $SHA ($DATE)"
-echo "next: update kernels-mlx/VENDORED.md upstream-commit SHA, then run cargo test --workspace --release"
+echo
+echo "MLX compile options (mlx/backend/metal/device.cpp) — must match KernelLibrary::compile_options():"
+grep -n "CompileOptions::alloc\|setFastMathEnabled\|setLanguageVersion\|setEnableLogging\|setMathMode\|LanguageVersion[0-9]_[0-9]" \
+    "$MLX_DIR/mlx/backend/metal/device.cpp" | sed 's/^/    /'
+echo
+echo "next: update kernels-mlx/VENDORED.md upstream-commit SHA, check the compile-options block above against"
+echo "      kernels-mlx/VENDORED.md 'Compile options', then run cargo test --workspace --release"

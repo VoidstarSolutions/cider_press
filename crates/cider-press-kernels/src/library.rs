@@ -26,9 +26,10 @@ use std::sync::Mutex;
 use objc2::Message;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::NSString;
+use objc2_foundation::{NSOperatingSystemVersion, NSProcessInfo, NSString};
 use objc2_metal::{
-    MTLComputePipelineState, MTLDataType, MTLDevice, MTLFunctionConstantValues, MTLLibrary,
+    MTLCompileOptions, MTLComputePipelineState, MTLDataType, MTLDevice, MTLFunctionConstantValues,
+    MTLLanguageVersion, MTLLibrary,
 };
 
 use crate::device::Device;
@@ -149,6 +150,50 @@ pub struct KernelLibrary {
 }
 
 impl KernelLibrary {
+    /// The compile options every library is built with, mirroring MLX's
+    /// `Device::build_library_` (`mlx/backend/metal/device.cpp`): fast math
+    /// **off** and the highest Metal language version the running OS
+    /// supports ([`metal_language_version`](Self::metal_language_version)),
+    /// with shader logging only in debug builds. The vendored kernels are
+    /// parity-tested bit-exact against MLX fixtures; that only holds under
+    /// MLX's policy, so this block must track upstream at every kernel bump
+    /// (`kernels-mlx/VENDORED.md`, "Compile options").
+    #[must_use]
+    pub fn compile_options() -> Retained<MTLCompileOptions> {
+        let options = MTLCompileOptions::new();
+        // MLX calls the (deprecated) flag rather than `mathMode`; mirror it
+        // exactly so the two compilers see the same request.
+        #[allow(deprecated)]
+        options.setFastMathEnabled(false);
+        options.setLanguageVersion(Self::metal_language_version());
+        if cfg!(debug_assertions)
+            && Self::metal_language_version() >= MTLLanguageVersion::Version3_2
+        {
+            options.setEnableLogging(true);
+        }
+        options
+    }
+
+    /// MLX's `get_metal_version()`: Metal 4.0 on macOS 26+, 3.2 on macOS 15+,
+    /// else 3.1.
+    #[must_use]
+    pub fn metal_language_version() -> MTLLanguageVersion {
+        let at_least = |major: isize| {
+            NSProcessInfo::processInfo().isOperatingSystemAtLeastVersion(NSOperatingSystemVersion {
+                majorVersion: major,
+                minorVersion: 0,
+                patchVersion: 0,
+            })
+        };
+        if at_least(26) {
+            MTLLanguageVersion::Version4_0
+        } else if at_least(15) {
+            MTLLanguageVersion::Version3_2
+        } else {
+            MTLLanguageVersion::Version3_1
+        }
+    }
+
     /// Compile MSL source into a library on `device`.
     ///
     /// For the MLX-vendored kernels, prefer [`KernelLibrary::copy`] /
@@ -156,9 +201,10 @@ impl KernelLibrary {
     /// pre-flattened source already embedded.
     pub fn from_source(device: &Device, source: &str) -> Result<Self> {
         let ns_source = NSString::from_str(source);
+        let options = Self::compile_options();
         let library = device
             .metal_device()
-            .newLibraryWithSource_options_error(&ns_source, None)
+            .newLibraryWithSource_options_error(&ns_source, Some(&options))
             .map_err(|err| Error::Compile(err.localizedDescription().to_string()))?;
         Ok(Self {
             library,
