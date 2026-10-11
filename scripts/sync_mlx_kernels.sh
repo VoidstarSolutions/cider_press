@@ -95,4 +95,12 @@ cp "$MLX_DIR/LICENSE" "$DEST/COPYING"
 SHA=$(cd "$MLX_DIR" && git rev-parse HEAD)
 DATE=$(cd "$MLX_DIR" && git log -1 --format=%cs)
 echo "synced ${#FILES[@]} files from MLX $SHA ($DATE)"
-echo "next: update kernels-mlx/VENDORED.md upstream-commit SHA, then run cargo test --workspace --release"
+echo
+echo "MLX compile policy — must match KernelLibrary::compile_options() (see kernels-mlx/VENDORED.md 'Compile options'):"
+echo "--- kernels/CMakeLists.txt METAL_FLAGS (ahead-of-time metallib, what the pip wheel ships):"
+grep -n "fast-math\|enable-logging\|std=metal\|MLX_METAL_VERSION GREATER_EQUAL" "$MLX_DIR/mlx/backend/metal/kernels/CMakeLists.txt" | sed 's/^/    /'
+echo "--- device.cpp get_metal_version() + build_library_() (JIT path):"
+sed -n '/^auto get_metal_version()/,/^}/p; /Device::build_library_(/,/newLibrary(/p' "$MLX_DIR/mlx/backend/metal/device.cpp" | sed 's/^/    /'
+echo
+echo "next: update kernels-mlx/VENDORED.md upstream-commit SHA, check the compile-options block above against"
+echo "      kernels-mlx/VENDORED.md 'Compile options', then run cargo test --workspace --release"

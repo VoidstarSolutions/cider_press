@@ -211,10 +211,15 @@ let prefill chunks grow); `.metallib` precompile. Step docs under
   for a fused kernel MLX itself doesn't ship; do use the fused path where
   MLX has one.
 - **Parity tolerances.** Bit-exact where achievable (pure data movers,
-  qmv/qmm, per-row dequantize). For kernels carrying `exp`/`cos`/`sin`
+  qmv/qmm, per-row dequantize). Bit-exactness presumes the **same compiler
+  policy as MLX** (fast math off): every library compiles through
+  `KernelLibrary::compile_options()`, re-checked at every kernel bump — see
+  `kernels-mlx/VENDORED.md` "Compile options". For kernels carrying `exp`/`cos`/`sin`
   (sigmoid, softmax, RoPE), bf16-ULP tolerance (~0.005 abs / 0.01 rel) —
   `metal::exp`/`cos`/`sin` drift 1–2 bf16 ULPs across Apple-Silicon
-  generations. For long composed chains (SDPA, full logits), the
+  generations (same-generation fixtures measure **0** drift under MLX's
+  compile policy; precise softmax is bit-exact — its old 0.0046 rel drift was
+  fast math, not hardware). For long composed chains (SDPA, full logits), the
   np.allclose combined bound `|a-b| ≤ atol + rtol*|b|`.
 - **Kernel-name gotchas.** `instantiate_kernel` stringifies the C++ type
   token literally — bf16 kernels are named `..._bfloat16_t_...` (with
