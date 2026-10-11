@@ -202,8 +202,9 @@ Incumbent baseline to beat (mlx-lm, this machine): 27B decode **~33 tok/s** at
   whole-linear-layer parity vs mlx-lm on the 4B layer-0 fixture (mixer max_abs
   ~7.8e-3, full layer ~1.6e-2). Enabled by 4 new runtime ops (`exp`, `log`,
   `cast`, `concat`). `Qwen35DecoderLayer` now generalizes over both mixers (a
-  `Mixer::{Full, Linear}` enum) with two entry points — `forward` (full attn +
-  KV cache) and `forward_linear` (GDN prefill, no cache). Deferred: the
+  `Mixer::{Full, Linear}` enum) with a single `forward` (full attn + KV
+  cache); Phase 3 originally also had a cache-free GDN-prefill entry point,
+  `forward_linear`, which Phase 4 removed. Deferred: the
   chunkwise-parallel GDN kernel (the Phase-7 perf-lead lever vs mlx-lm's naive
   per-token recurrence), and full-model decode-cache wiring — a unified per-layer
   cache enum threaded through one `forward` — which lands in Phase 4 (full-model

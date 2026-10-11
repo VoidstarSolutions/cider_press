@@ -60,7 +60,10 @@ GPU. Three pieces live in the models crate:
   to a sibling `chat_template.jinja` for newer `transformers` layouts),
   compiles it once with `minijinja`, and renders a `&[Message]` list into
   the prompt string. It also resolves the EOS token(s) from the same config
-  (`eos_token` and/or `eos_token_id`) into the `HashSet<u32>` the
+  (`eos_token` and/or `eos_token_id`) into a `HashSet<u32>`; the CLI unions in the top-level
+  `eos_token_id` of `config.json` and `generation_config.json`
+  ([`config_eos_ids`](../../crates/cider-press-models/src/eos.rs), as `mlx_lm`
+  does) to form the stop set the
   [`Generator`](../../crates/cider-press-models/src/generator.rs) uses as
   its stop set. So the input flow is: messages → `render` → `encode` →
   token IDs into prefill.

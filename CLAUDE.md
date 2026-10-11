@@ -175,8 +175,7 @@ passed in. `ShardSet::read(dir)` loads either checkpoint layout (single
 `model.safetensors` or a sharded index).
 
 **Known gaps:** the Qwen3.5 `chat_template` doesn't render under minijinja
-(use `--no-chat-template`); EOS ids come only from `tokenizer_config.json`
-(the 27B's `config.json` also lists `<|endoftext|>`); `rms_norm` and similar
+(use `--no-chat-template`); `rms_norm` and similar
 ops reject copy-elided unit-dim views (hits a tiny synthetic config at
 `T = 1`, not real checkpoints).
 
