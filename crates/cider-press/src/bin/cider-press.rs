@@ -16,6 +16,7 @@ use std::time::Instant;
 use clap::{Args, Parser, Subcommand};
 
 use cider_press_models::chat_template::{ChatTemplate, Message};
+use cider_press_models::config_eos_ids;
 use cider_press_models::generator::Generator;
 use cider_press_models::language_model::LanguageModel;
 use cider_press_models::qwen2::{Qwen2Config, Qwen2Model, load_qwen2_weights};
@@ -192,7 +193,8 @@ fn load(checkpoint: &Path, device: &Device) -> Result<Loaded, BoxError> {
     let tokenizer = Tokenizer::from_file(&checkpoint.join("tokenizer.json"))?;
     let chat_template =
         ChatTemplate::from_file(&checkpoint.join("tokenizer_config.json"), &tokenizer)?;
-    let eos_ids: HashSet<u32> = chat_template.eos_ids().collect();
+    let mut eos_ids: HashSet<u32> = chat_template.eos_ids().collect();
+    eos_ids.extend(config_eos_ids(checkpoint)?);
     Ok(Loaded {
         model,
         tokenizer,
@@ -418,9 +420,11 @@ fn bench_generic<M: LanguageModel>(
     }
 
     // Synchronous prefill timing (mlx-comparable): forward + eval-wait, warm.
-    // The production prefill above is async (eval_async, no GPU wait), so it
-    // is not comparable to mlx_lm's synchronous model(x)+mx.eval. This runs
-    // the same shape synchronously for an apples-to-apples wall-clock. It
+    // The production prefill above only async-evaluates its last (or only)
+    // chunk, and chunked models evaluate every earlier chunk synchronously
+    // inside generate(), so it is not comparable to mlx_lm's synchronous
+    // model(x)+mx.eval. This runs the same shape synchronously for an
+    // apples-to-apples wall-clock. It
     // resets the caches, so it runs after the decode profile above.
     let prefill_iters = args.prefill_iters.max(1);
     let (prefill_sync_dur, prefill_spans) = {

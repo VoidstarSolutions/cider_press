@@ -16,6 +16,7 @@ compile_error!(
 );
 
 pub mod chat_template;
+mod eos;
 mod error;
 pub mod generator;
 pub mod language_model;
@@ -25,6 +26,7 @@ pub mod qwen3_5;
 pub mod safetensors_io;
 pub mod tokenizer;
 
+pub use eos::config_eos_ids;
 pub use error::{Error, Result};
 pub use language_model::LanguageModel;
 pub use tokenizer::Tokenizer;
