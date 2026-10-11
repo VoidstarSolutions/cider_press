@@ -117,6 +117,7 @@ untied embeddings) that distinguish one model family from another.
 - [Qwen2.5](./models/qwen2.5.md) — the worked example
   (Qwen2.5-0.5B-Instruct-4bit).
 - [Qwen3.5 / Qwen3.6](./models/qwen3.6.md) — the Gated-DeltaNet hybrid
+- [Qwen3-Embedding](./models/qwen3-embedding.md) — last-token-pooled embedder (phase 0: measured ceilings)
   (Qwen3.5-4B dev vehicle, Qwen3.6-27B target).
 
 More models land as a new per-model page plus any "Model variations" notes
