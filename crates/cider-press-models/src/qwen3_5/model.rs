@@ -15,7 +15,7 @@ use super::cache::Qwen35LayerCache;
 use super::config::Qwen35Config;
 use super::weights::Qwen35Weights;
 use crate::error::{Error, Result};
-use crate::nn::{Module, RmsNormLayer, embed_tokens};
+use crate::nn::{Module, RmsNormLayer, embed_tokens, rope_offset};
 
 /// Prompt tokens per prefill chunk. The per-token Gated-DeltaNet recurrence
 /// keeps ~5 fp32 state-sized temporaries per token per GDN layer alive until
@@ -106,23 +106,19 @@ impl Qwen35Model {
     /// - `input_ids`: `[1, T]` U32 token ids. Flattened to rank-1 for the
     ///   embedding gather, then reshaped back to `[1, T, hidden_size]`
     ///   before the decoder layers.
-    /// - `offset`: length-1 I32 — the number of tokens already in each
-    ///   layer's cache (the `RoPE` base / starting attention position).
     /// - `caches`: one [`Qwen35LayerCache`] per layer; length must equal
-    ///   `self.config().num_hidden_layers`.
+    ///   `self.config().num_hidden_layers`. The full-attention caches' shared
+    ///   position — the number of tokens already cached — is the `RoPE`
+    ///   offset.
     ///
     /// Returns `[1, T, vocab_size]` BF16, lazy.
     ///
     /// # Errors
-    /// `caches.len()` disagrees with the layer count, or any layer / projection
-    /// op fails.
-    pub fn forward(
-        &self,
-        input_ids: &Tensor,
-        offset: &Tensor,
-        caches: &mut [Qwen35LayerCache],
-    ) -> Result<Tensor> {
-        let hidden = self.hidden_states(input_ids, offset, caches)?;
+    /// `caches.len()` disagrees with the layer count, the full-attention caches
+    /// are absent or disagree on their position, or any layer / projection op
+    /// fails.
+    pub fn forward(&self, input_ids: &Tensor, caches: &mut [Qwen35LayerCache]) -> Result<Tensor> {
+        let hidden = self.hidden_states(input_ids, caches)?;
         self.project_logits(&hidden)
     }
 
@@ -138,11 +134,10 @@ impl Qwen35Model {
     /// per-position.
     ///
     /// # Errors
-    /// `input_ids` is empty, or any underlying op fails.
+    /// `input_ids` is empty, or as for [`forward`](Self::forward).
     pub fn forward_last(
         &self,
         input_ids: &Tensor,
-        offset: &Tensor,
         caches: &mut [Qwen35LayerCache],
     ) -> Result<Tensor> {
         let t = input_ids.elem_count();
@@ -151,7 +146,7 @@ impl Qwen35Model {
                 "Qwen35Model::forward_last: empty input_ids (need at least one token)".into(),
             ));
         }
-        let hidden = self.hidden_states(input_ids, offset, caches)?;
+        let hidden = self.hidden_states(input_ids, caches)?;
         let last = if t == 1 {
             hidden
         } else {
@@ -164,7 +159,7 @@ impl Qwen35Model {
         self.project_logits(&last)
     }
 
-    /// Run every decoder layer over `input_ids` at `offset`, advancing all
+    /// Run every decoder layer over `input_ids`, advancing all
     /// `caches` by `T`, **without** the final norm / LM head — the
     /// non-final-chunk step of chunked prefill.
     ///
@@ -178,12 +173,12 @@ impl Qwen35Model {
     /// dropped by the next update).
     ///
     /// # Errors
-    /// `input_ids` is empty, `caches.len()` disagrees with the layer count, or
-    /// any underlying op fails.
+    /// `input_ids` is empty, `caches.len()` disagrees with the layer count, the
+    /// full-attention caches are absent or disagree on their position, or any
+    /// underlying op fails.
     pub fn fill_cache(
         &self,
         input_ids: &Tensor,
-        offset: &Tensor,
         caches: &mut [Qwen35LayerCache],
     ) -> Result<Tensor> {
         if input_ids.elem_count() == 0 {
@@ -191,7 +186,7 @@ impl Qwen35Model {
                 "Qwen35Model::fill_cache: empty input_ids (need at least one token)".into(),
             ));
         }
-        self.hidden_states(input_ids, offset, caches)
+        self.hidden_states(input_ids, caches)
     }
 
     /// Post-final-norm hidden states `[1, T, hidden_size]` (before the
@@ -200,27 +195,21 @@ impl Qwen35Model {
     /// LM head, exercised only by [`forward`](Self::forward)).
     ///
     /// # Errors
-    /// `caches.len()` disagrees with the layer count, or any layer / norm op
-    /// fails.
+    /// `caches.len()` disagrees with the layer count, the full-attention caches
+    /// are absent or disagree on their position, or any layer / norm op fails.
     pub fn forward_hidden(
         &self,
         input_ids: &Tensor,
-        offset: &Tensor,
         caches: &mut [Qwen35LayerCache],
     ) -> Result<Tensor> {
-        let hidden = self.hidden_states(input_ids, offset, caches)?;
+        let hidden = self.hidden_states(input_ids, caches)?;
         self.final_norm.forward(&hidden)
     }
 
     /// Embed `input_ids` and run every decoder layer, returning the final
     /// hidden states `[1, T, hidden_size]` (before the final norm / LM head).
     /// Writes each layer's mixer state for all `T` positions into `caches`.
-    fn hidden_states(
-        &self,
-        input_ids: &Tensor,
-        offset: &Tensor,
-        caches: &mut [Qwen35LayerCache],
-    ) -> Result<Tensor> {
+    fn hidden_states(&self, input_ids: &Tensor, caches: &mut [Qwen35LayerCache]) -> Result<Tensor> {
         if caches.len() != self.layers.len() {
             return Err(Error::InvalidArgument(format!(
                 "Qwen35Model::hidden_states: got {} caches, expected one per layer ({})",
@@ -237,13 +226,20 @@ impl Qwen35Model {
         // reshape returns a view; gather and the downstream unary/reduce
         // dispatchers read inputs as dense leaves and don't resolve view
         // chains, so materialise both ends with copy().
+        let offset = rope_offset(
+            caches.iter().filter_map(|cache| match cache {
+                Qwen35LayerCache::Full(kv) => Some(kv),
+                Qwen35LayerCache::Linear(_) => None,
+            }),
+            "Qwen35Model",
+        )?;
         let flat_ids = input_ids.reshape([t])?.copy()?;
         let embedded = embed_tokens(&flat_ids, &self.embed)?;
         let mut hidden = embedded
             .reshape([1usize, t, self.config.hidden_size])?
             .copy()?;
         for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
-            hidden = layer.forward(&hidden, offset, cache)?;
+            hidden = layer.forward(&hidden, &offset, cache)?;
         }
         Ok(hidden)
     }

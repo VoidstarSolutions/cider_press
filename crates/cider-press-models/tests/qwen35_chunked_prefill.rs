@@ -75,21 +75,17 @@ fn generate_unchunked(model: &Qwen35Model, prompt_ids: &[u32]) -> Vec<u32> {
         .make_caches(prompt_ids.len() + MAX_NEW, &device)
         .expect("caches");
     let mut feed = prompt_ids.to_vec();
-    let mut pos = 0usize;
     let mut out = Vec::with_capacity(MAX_NEW);
     while out.len() < MAX_NEW {
         let ids = Tensor::from_slice(&device, &feed, [1, feed.len()]).expect("ids");
-        let offset =
-            Tensor::from_slice(&device, &[i32::try_from(pos).expect("pos")], [1]).expect("offset");
         let next = model
-            .forward_last(&ids, &offset, &mut caches)
+            .forward_last(&ids, &mut caches)
             .expect("forward_last")
             .argmax(2)
             .expect("argmax");
         next.eval().expect("eval");
         let id = next.cpu_slice::<u32>().expect("host id")[0];
         out.push(id);
-        pos += feed.len();
         feed = vec![id];
     }
     out

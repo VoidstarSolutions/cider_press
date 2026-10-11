@@ -28,9 +28,6 @@ pub struct Generator<M: LanguageModel> {
     eos_ids: HashSet<u32>,
     context_window: usize,
     inflight_depth: usize,
-    /// Tokens fed through the caches so far — the `RoPE` / cache offset of
-    /// the next forward. Advanced by every path that feeds tokens.
-    position: usize,
 }
 
 impl<M: LanguageModel> Generator<M> {
@@ -61,7 +58,6 @@ impl<M: LanguageModel> Generator<M> {
             eos_ids,
             context_window,
             inflight_depth: 1,
-            position: 0,
         })
     }
 
@@ -90,7 +86,6 @@ impl<M: LanguageModel> Generator<M> {
     /// replaying stale writes into the reused slab).
     pub fn reset(&mut self) -> Result<()> {
         self.model.reset_caches(&mut self.caches)?;
-        self.position = 0;
         Ok(())
     }
 
@@ -110,10 +105,7 @@ impl<M: LanguageModel> Generator<M> {
         self.reset()?;
         let device = Device::shared()?;
         let chunk_len = self.model.prefill_chunk_len();
-        let logits =
-            prefill_last_logits(&self.model, &mut self.caches, &device, input_ids, chunk_len)?;
-        self.position = input_ids.len();
-        Ok(logits)
+        prefill_last_logits(&self.model, &mut self.caches, &device, input_ids, chunk_len)
     }
 
     /// Run a **prefill** (`T = input_ids.len()`, offset = 0, causal via the
@@ -211,11 +203,9 @@ impl<M: LanguageModel> Generator<M> {
         }
         self.reset()?;
         let device = Device::shared()?;
-        let prefill_len = input_ids.len();
         let chunk_len = self.model.prefill_chunk_len();
         let logits =
             prefill_last_logits(&self.model, &mut self.caches, &device, input_ids, chunk_len)?;
-        self.position = prefill_len;
 
         let vocab = self.model.vocab_size();
         let idx0 = argmax_last_position_lazy(&logits, vocab)?;
@@ -227,7 +217,6 @@ impl<M: LanguageModel> Generator<M> {
 
         Ok(GenerateIter {
             owner: self,
-            device,
             next_id_gpu: idx0,
             inflight,
             depth,
@@ -238,8 +227,8 @@ impl<M: LanguageModel> Generator<M> {
         })
     }
 
-    /// Run one decode-step forward (`T = 1`, offset = the generator's
-    /// committed position) through the profiling-only
+    /// Run one decode-step forward (`T = 1`, at the caches' current position)
+    /// through the profiling-only
     /// [`Tensor::profiled_eval`], recording per-OpKind GPU time into the
     /// `profile` GPU store.
     ///
@@ -256,9 +245,7 @@ impl<M: LanguageModel> Generator<M> {
     pub fn profiled_decode_step(&mut self, last_id: u32) -> Result<()> {
         let device = Device::shared()?;
         let ids = Tensor::from_slice(&device, &[last_id], [1, 1])?;
-        let offset = position_tensor(&device, self.position)?;
-        let logits = self.model.forward_last(&ids, &offset, &mut self.caches)?;
-        self.position += 1;
+        let logits = self.model.forward_last(&ids, &mut self.caches)?;
         logits.profiled_eval()?;
         Ok(())
     }
@@ -274,7 +261,6 @@ impl<M: LanguageModel> Generator<M> {
 #[derive(Debug)]
 pub struct GenerateIter<'a, M: LanguageModel> {
     owner: &'a mut Generator<M>,
-    device: Device,
     /// Most recent argmax tensor (`[1, 1]` U32), fed into the next forward.
     /// Persists across the in-flight queue draining (needed at depth 0,
     /// where the queue empties between commits), so it is the chain source
@@ -371,12 +357,10 @@ impl<M: LanguageModel> GenerateIter<'_, M> {
     /// sequence — identical to a full `forward` but routed through the one
     /// forward entry point the trait exposes.
     fn advance(&mut self, feed: &Tensor) -> Result<(PendingEval, Tensor)> {
-        let offset = position_tensor(&self.device, self.owner.position)?;
         let logits = self
             .owner
             .model
-            .forward_last(feed, &offset, &mut self.owner.caches)?;
-        self.owner.position += 1;
+            .forward_last(feed, &mut self.owner.caches)?;
         let vocab = self.owner.model.vocab_size();
         let idx = argmax_last_position_lazy(&logits, vocab)?;
         let pending = idx.eval_async()?;
@@ -402,26 +386,17 @@ fn prefill_last_logits<M: LanguageModel>(
     input_ids: &[u32],
     chunk_len: Option<usize>,
 ) -> Result<Tensor> {
-    let offset_tensor = |start: usize| position_tensor(device, start);
     let mut start = 0;
     if let Some(chunk) = chunk_len.filter(|&c| c > 0) {
         while input_ids.len() - start > chunk {
             let ids = Tensor::from_slice(device, &input_ids[start..start + chunk], [1, chunk])?;
-            model
-                .fill_cache(&ids, &offset_tensor(start)?, caches)?
-                .eval()?;
+            model.fill_cache(&ids, caches)?.eval()?;
             start += chunk;
         }
     }
     let tail = &input_ids[start..];
     let ids = Tensor::from_slice(device, tail, [1, tail.len()])?;
-    model.forward_last(&ids, &offset_tensor(start)?, caches)
-}
-
-fn position_tensor(device: &Device, position: usize) -> Result<Tensor> {
-    let position = i32::try_from(position)
-        .map_err(|_| Error::InvalidArgument(format!("offset {position} overflows i32")))?;
-    Ok(Tensor::from_slice(device, &[position], [1])?)
+    model.forward_last(&ids, caches)
 }
 
 fn id_is_terminal(id: u32, eos_ids: &HashSet<u32>) -> bool {
@@ -537,9 +512,8 @@ mod tests {
         let model = tiny_seeded_qwen35(&device);
         let mut caches = model.make_caches(32, &device).expect("caches");
         let ids = Tensor::from_slice(&device, &[3u32, 1, 4, 1, 5], [1, 5]).expect("ids");
-        let offset = Tensor::from_slice(&device, &[0i32], [1]).expect("offset");
         model
-            .fill_cache(&ids, &offset, &mut caches)
+            .fill_cache(&ids, &mut caches)
             .expect("fill_cache")
             .eval()
             .expect("eval");
@@ -589,24 +563,44 @@ mod tests {
         }
     }
 
+    fn full_cache_positions(caches: &[Qwen35LayerCache]) -> Vec<usize> {
+        caches
+            .iter()
+            .filter_map(|cache| match cache {
+                Qwen35LayerCache::Full(kv) => Some(kv.position()),
+                Qwen35LayerCache::Linear(_) => None,
+            })
+            .collect()
+    }
+
+    /// The caches' position is the model's `RoPE` offset, so prefill must
+    /// advance it by exactly the prompt length and `reset` must rewind it.
     #[test]
-    fn position_tracks_prefill_and_reset() {
+    fn cache_position_tracks_prefill_and_reset() {
         let device = Device::shared().expect("device");
         let mut generator =
             Generator::new(tiny_seeded_qwen35(&device), 32, HashSet::from([u32::MAX]))
                 .expect("generator");
         let ids: Vec<u32> = (0..6).map(|i| (i * 37 + 5) % 256).collect();
+        let at = |n: usize, g: &Generator<Qwen35Model>| {
+            let positions = full_cache_positions(&g.caches);
+            assert!(
+                !positions.is_empty(),
+                "tiny model has no full-attention layer"
+            );
+            assert!(positions.iter().all(|&p| p == n), "{positions:?} != {n}");
+        };
 
         generator.prefill_sync(&ids).expect("prefill");
-        assert_eq!(generator.position, 6);
+        at(6, &generator);
 
         generator.reset().expect("reset");
-        assert_eq!(generator.position, 0);
+        at(0, &generator);
         // max_new_tokens = 1 yields the prefill argmax with no decode forward.
         assert_eq!(generator.generate(&ids, 1).expect("generate").count(), 1);
-        assert_eq!(generator.position, 6);
+        at(6, &generator);
 
         generator.reset().expect("reset");
-        assert_eq!(generator.position, 0);
+        at(0, &generator);
     }
 }

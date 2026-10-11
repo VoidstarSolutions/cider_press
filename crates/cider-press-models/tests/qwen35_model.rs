@@ -78,11 +78,10 @@ fn qwen35_model_forward_shape() {
     let ids: Vec<u32> = (0..5u32).collect();
     let t = ids.len();
     let input_ids = Tensor::from_slice(&device, &ids, [1usize, t]).unwrap();
-    let offset = Tensor::from_slice(&device, &[0i32], [1usize]).unwrap();
 
     let mut caches: Vec<Qwen35LayerCache> = model.make_caches(t, &device).unwrap();
 
-    let logits = model.forward(&input_ids, &offset, &mut caches).unwrap();
+    let logits = model.forward(&input_ids, &mut caches).unwrap();
     logits.eval().unwrap();
 
     assert_eq!(
@@ -93,9 +92,7 @@ fn qwen35_model_forward_shape() {
 
     // forward_last projects only the final position: [1, 1, vocab_size].
     let mut last_caches: Vec<Qwen35LayerCache> = model.make_caches(t, &device).unwrap();
-    let last = model
-        .forward_last(&input_ids, &offset, &mut last_caches)
-        .unwrap();
+    let last = model.forward_last(&input_ids, &mut last_caches).unwrap();
     last.eval().unwrap();
     assert_eq!(
         last.shape().dims(),
@@ -147,13 +144,12 @@ fn qwen35_model_logits_match_mlx() {
     let input_ids = read_u32(&fx, "input_ids"); // [1, T]
     let t = input_ids.len();
     let ids = Tensor::from_slice(&device, &input_ids, [1usize, t]).unwrap();
-    let offset = Tensor::from_slice(&device, &[0i32], [1usize]).unwrap();
 
     let build_caches = || -> Vec<Qwen35LayerCache> { model.make_caches(t, &device).unwrap() };
 
     // (1) Backbone: post-final-norm hidden. Tighter — localizes layer vs head.
     let mut caches = build_caches();
-    let fh = model.forward_hidden(&ids, &offset, &mut caches).unwrap();
+    let fh = model.forward_hidden(&ids, &mut caches).unwrap();
     fh.eval().unwrap();
     let fh_got: Vec<bf16> = fh.cpu_to_vec().unwrap();
     let fh_want = read_bf16(&fx, "final_hidden"); // [1, T, hidden]
@@ -164,7 +160,7 @@ fn qwen35_model_logits_match_mlx() {
     // (2) End-to-end: full forward incl. tied lm_head. Fresh caches — the
     // first forward consumed the backbone caches.
     let mut caches2 = build_caches();
-    let logits = model.forward(&ids, &offset, &mut caches2).unwrap();
+    let logits = model.forward(&ids, &mut caches2).unwrap();
     logits.eval().unwrap();
     let lg_got: Vec<bf16> = logits.cpu_to_vec().unwrap();
     let lg_want = read_bf16(&fx, "logits"); // [1, T, vocab]

@@ -9,7 +9,7 @@ use super::block::TransformerBlock;
 use super::config::Qwen2Config;
 use super::weights::Qwen2Weights;
 use crate::error::{Error, Result};
-use crate::nn::{Module, RmsNormLayer, embed_tokens};
+use crate::nn::{Module, RmsNormLayer, embed_tokens, rope_offset};
 
 /// Qwen2-family causal language model.
 ///
@@ -67,19 +67,13 @@ impl Qwen2Model {
     /// - `input_ids`: `[1, T]` U32 token ids. Flattened to rank-1 for the
     ///   embedding gather, then reshaped back to `[1, T, hidden_size]`
     ///   before the transformer blocks.
-    /// - `offset`: length-1 I32 — the number of tokens already in each
-    ///   layer's cache (the `RoPE` base / starting attention position).
     /// - `caches`: one [`KvCache`] per layer; length must equal
-    ///   `self.config().num_hidden_layers`.
+    ///   `self.config().num_hidden_layers`. Their shared position — the
+    ///   number of tokens already cached — is the `RoPE` offset.
     ///
     /// Returns `[1, T, vocab_size]` BF16, lazy.
-    pub fn forward(
-        &self,
-        input_ids: &Tensor,
-        offset: &Tensor,
-        caches: &mut [KvCache],
-    ) -> Result<Tensor> {
-        let hidden = self.hidden_states(input_ids, offset, caches)?;
+    pub fn forward(&self, input_ids: &Tensor, caches: &mut [KvCache]) -> Result<Tensor> {
+        let hidden = self.hidden_states(input_ids, caches)?;
         self.project_logits(&hidden)
     }
 
@@ -94,19 +88,14 @@ impl Qwen2Model {
     /// it evals only the KV cache during prompt processing and runs the head
     /// on one token. Numerically identical to `forward(..)[:, -1, :]` because
     /// `RMSNorm` and the LM head are per-position.
-    pub fn forward_last(
-        &self,
-        input_ids: &Tensor,
-        offset: &Tensor,
-        caches: &mut [KvCache],
-    ) -> Result<Tensor> {
+    pub fn forward_last(&self, input_ids: &Tensor, caches: &mut [KvCache]) -> Result<Tensor> {
         let t = input_ids.elem_count();
         if t == 0 {
             return Err(Error::InvalidArgument(
                 "Qwen2Model::forward_last: empty input_ids (need at least one token)".into(),
             ));
         }
-        let hidden = self.hidden_states(input_ids, offset, caches)?;
+        let hidden = self.hidden_states(input_ids, caches)?;
         let last = if t == 1 {
             hidden
         } else {
@@ -136,29 +125,19 @@ impl Qwen2Model {
     ///
     /// # Errors
     /// `input_ids` empty, or device / forward failure.
-    pub fn fill_cache(
-        &self,
-        input_ids: &Tensor,
-        offset: &Tensor,
-        caches: &mut [KvCache],
-    ) -> Result<Tensor> {
+    pub fn fill_cache(&self, input_ids: &Tensor, caches: &mut [KvCache]) -> Result<Tensor> {
         if input_ids.elem_count() == 0 {
             return Err(Error::InvalidArgument(
                 "Qwen2Model::fill_cache: empty input_ids (need at least one token)".into(),
             ));
         }
-        self.hidden_states(input_ids, offset, caches)
+        self.hidden_states(input_ids, caches)
     }
 
     /// Embed `input_ids` and run every transformer block, returning the final
     /// hidden states `[1, T, hidden_size]` (before the final norm / LM head).
     /// Writes each layer's K/V for all `T` positions into `caches`.
-    fn hidden_states(
-        &self,
-        input_ids: &Tensor,
-        offset: &Tensor,
-        caches: &mut [KvCache],
-    ) -> Result<Tensor> {
+    fn hidden_states(&self, input_ids: &Tensor, caches: &mut [KvCache]) -> Result<Tensor> {
         if caches.len() != self.layers.len() {
             return Err(Error::InvalidArgument(format!(
                 "Qwen2Model::hidden_states: got {} caches, expected one per layer ({})",
@@ -174,13 +153,14 @@ impl Qwen2Model {
         // reshape returns a view; gather and the downstream unary/reduce
         // dispatchers read inputs as dense leaves and don't resolve view
         // chains, so materialise both ends with copy().
+        let offset = rope_offset(caches.iter(), "Qwen2Model")?;
         let flat_ids = input_ids.reshape([t])?.copy()?;
         let embedded = embed_tokens(&flat_ids, &self.embed)?;
         let mut hidden = embedded
             .reshape([1usize, t, self.config.hidden_size])?
             .copy()?;
         for (block, cache) in self.layers.iter().zip(caches.iter_mut()) {
-            hidden = block.forward(&hidden, offset, cache)?;
+            hidden = block.forward(&hidden, &offset, cache)?;
         }
         Ok(hidden)
     }

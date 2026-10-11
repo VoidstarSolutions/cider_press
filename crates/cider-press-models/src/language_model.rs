@@ -38,32 +38,26 @@ pub trait LanguageModel {
     /// Cache allocation failure.
     fn make_caches(&self, max_tokens: usize, device: &Device) -> Result<Vec<Self::Cache>>;
 
-    /// Forward over `input_ids` `[1, T]` at `offset` (length-1 I32 = the number
-    /// of tokens already in each cache), writing all `T` positions' state into
+    /// Forward over `input_ids` `[1, T]`, writing all `T` positions' state into
     /// `caches` and returning the **last-position** logits `[1, 1, vocab]`.
+    /// The model derives the `RoPE` / attention offset from the caches' own
+    /// position (the tokens already fed), so the caller never supplies it.
     ///
     /// # Errors
-    /// Empty `input_ids`, a cache-count mismatch, or any underlying op failure.
-    fn forward_last(
-        &self,
-        input_ids: &Tensor,
-        offset: &Tensor,
-        caches: &mut [Self::Cache],
-    ) -> Result<Tensor>;
+    /// Empty `input_ids`, a cache-count mismatch, caches that disagree on
+    /// their position, or any underlying op failure.
+    fn forward_last(&self, input_ids: &Tensor, caches: &mut [Self::Cache]) -> Result<Tensor>;
 
-    /// Run every layer over `input_ids` `[1, T]` at `offset`, advancing all
-    /// `caches` by `T`, without the final norm / LM head. Returns a lazy handle
-    /// whose `eval()` commits every cache write for the chunk; the caller must
-    /// evaluate it before the next cache-writing call.
+    /// Run every layer over `input_ids` `[1, T]` at the caches' current
+    /// position, advancing all `caches` by `T`, without the final norm / LM
+    /// head. Returns a lazy handle whose `eval()` commits every cache write for
+    /// the chunk; the caller must evaluate it before the next cache-writing
+    /// call.
     ///
     /// # Errors
-    /// Empty `input_ids`, a cache-count mismatch, or any underlying op failure.
-    fn fill_cache(
-        &self,
-        input_ids: &Tensor,
-        offset: &Tensor,
-        caches: &mut [Self::Cache],
-    ) -> Result<Tensor>;
+    /// Empty `input_ids`, a cache-count mismatch, caches that disagree on
+    /// their position, or any underlying op failure.
+    fn fill_cache(&self, input_ids: &Tensor, caches: &mut [Self::Cache]) -> Result<Tensor>;
 
     /// Maximum prompt tokens per prefill eval, or `None` to prefill the whole
     /// prompt in one forward. A model whose prefill transient grows with `T`
@@ -104,22 +98,12 @@ impl LanguageModel for Qwen2Model {
             .collect()
     }
 
-    fn forward_last(
-        &self,
-        input_ids: &Tensor,
-        offset: &Tensor,
-        caches: &mut [Self::Cache],
-    ) -> Result<Tensor> {
-        Qwen2Model::forward_last(self, input_ids, offset, caches)
+    fn forward_last(&self, input_ids: &Tensor, caches: &mut [Self::Cache]) -> Result<Tensor> {
+        Qwen2Model::forward_last(self, input_ids, caches)
     }
 
-    fn fill_cache(
-        &self,
-        input_ids: &Tensor,
-        offset: &Tensor,
-        caches: &mut [Self::Cache],
-    ) -> Result<Tensor> {
-        Qwen2Model::fill_cache(self, input_ids, offset, caches)
+    fn fill_cache(&self, input_ids: &Tensor, caches: &mut [Self::Cache]) -> Result<Tensor> {
+        Qwen2Model::fill_cache(self, input_ids, caches)
     }
 
     fn reset_caches(&self, caches: &mut [Self::Cache]) -> Result<()> {
@@ -141,22 +125,12 @@ impl LanguageModel for Qwen35Model {
         Qwen35Model::make_caches(self, max_tokens, device)
     }
 
-    fn forward_last(
-        &self,
-        input_ids: &Tensor,
-        offset: &Tensor,
-        caches: &mut [Self::Cache],
-    ) -> Result<Tensor> {
-        Qwen35Model::forward_last(self, input_ids, offset, caches)
+    fn forward_last(&self, input_ids: &Tensor, caches: &mut [Self::Cache]) -> Result<Tensor> {
+        Qwen35Model::forward_last(self, input_ids, caches)
     }
 
-    fn fill_cache(
-        &self,
-        input_ids: &Tensor,
-        offset: &Tensor,
-        caches: &mut [Self::Cache],
-    ) -> Result<Tensor> {
-        Qwen35Model::fill_cache(self, input_ids, offset, caches)
+    fn fill_cache(&self, input_ids: &Tensor, caches: &mut [Self::Cache]) -> Result<Tensor> {
+        Qwen35Model::fill_cache(self, input_ids, caches)
     }
 
     fn prefill_chunk_len(&self) -> Option<usize> {

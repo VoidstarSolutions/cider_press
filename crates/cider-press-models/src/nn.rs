@@ -17,7 +17,7 @@
 #![doc = include_str!("../../../docs/inference/rmsnorm.md")]
 #![doc = include_str!("../../../docs/inference/feed-forward.md")]
 
-use cider_press_runtime::{DType, Device, QuantizedWeight, Tensor};
+use cider_press_runtime::{DType, Device, KvCache, QuantizedWeight, Tensor};
 use half::{bf16, f16};
 
 use crate::error::{Error, Result};
@@ -375,6 +375,35 @@ pub(crate) fn scalar_tensor(device: &Device, dtype: DType, value: f32) -> Result
     }
 }
 
+/// The `RoPE` offset of the next forward — the shared position of `caches` —
+/// as the length-1 I32 tensor [`Tensor::rope`] reads. `caches` must be
+/// non-empty and agree on their position; `model` names the caller in errors.
+///
+/// `KvCache::update` advances the position when the write is *scheduled*, not
+/// when it is evaluated, so this is correct for a forward built on top of
+/// still-lazy earlier forwards (the async decode lookahead).
+pub(crate) fn rope_offset<'a>(
+    caches: impl IntoIterator<Item = &'a KvCache>,
+    model: &str,
+) -> Result<Tensor> {
+    let mut caches = caches.into_iter();
+    let first = caches.next().ok_or_else(|| {
+        Error::InvalidArgument(format!(
+            "{model}: no KV cache to derive the RoPE offset from"
+        ))
+    })?;
+    let position = first.position();
+    if let Some(other) = caches.find(|c| c.position() != position) {
+        return Err(Error::InvalidArgument(format!(
+            "{model}: KV caches disagree on position ({position} vs {})",
+            other.position()
+        )));
+    }
+    let position = i32::try_from(position)
+        .map_err(|_| Error::InvalidArgument(format!("{model}: offset {position} overflows i32")))?;
+    Ok(Tensor::from_slice(first.device(), &[position], [1])?)
+}
+
 /// Interleaved repeat along `axis`: insert a unit axis after `axis`, broadcast
 /// it by `factor`, then fold it back so each index `i` along `axis` maps to the
 /// `factor` contiguous output indices `i*factor .. (i+1)*factor` — `mx.repeat`
@@ -412,4 +441,36 @@ pub(crate) fn repeat_axis_interleaved(x: &Tensor, axis: usize, factor: usize) ->
         .broadcast_to(broadcast)?
         .copy()?
         .reshape(folded)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cache_at(device: &Device, position: usize) -> KvCache {
+        let mut cache = KvCache::new(device, 8, 1, 2, DType::BF16).expect("cache");
+        if position > 0 {
+            let rows = vec![bf16::ZERO; position * 2];
+            let k = Tensor::from_slice(device, &rows, [position, 1, 2]).expect("k");
+            cache.update(&k, &k).expect("update");
+        }
+        cache
+    }
+
+    #[test]
+    fn rope_offset_is_the_shared_cache_position() {
+        let device = Device::shared().expect("device");
+        let caches = [cache_at(&device, 3), cache_at(&device, 3)];
+        let offset = rope_offset(&caches, "test").expect("offset");
+        assert_eq!(offset.shape().dims(), &[1]);
+        assert_eq!(offset.cpu_slice::<i32>().expect("host i32"), &[3]);
+    }
+
+    #[test]
+    fn rope_offset_rejects_empty_and_disagreeing_caches() {
+        let device = Device::shared().expect("device");
+        assert!(rope_offset(&[], "test").is_err());
+        let caches = [cache_at(&device, 3), cache_at(&device, 2)];
+        assert!(rope_offset(&caches, "test").is_err());
+    }
 }

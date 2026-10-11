@@ -126,7 +126,6 @@ fn run_qwen2_logits(checkpoint: &Path) {
     let model = Qwen2Model::from_weights(weights, config.clone()).expect("build Qwen2Model");
 
     let input_ids = Tensor::from_slice(&device, &input_ids_ref, [1usize, t]).expect("input_ids");
-    let offset_t = Tensor::from_slice(&device, &[0i32], [1usize]).expect("offset tensor");
 
     // T tokens go into the cache during prefill; size slabs accordingly with
     // a little headroom.
@@ -138,7 +137,7 @@ fn run_qwen2_logits(checkpoint: &Path) {
         .collect();
 
     let logits = model
-        .forward(&input_ids, &offset_t, &mut caches)
+        .forward(&input_ids, &mut caches)
         .expect("Qwen2Model forward");
     logits.eval().expect("eval logits");
     let got: Vec<bf16> = logits.cpu_to_vec().expect("cpu_to_vec");
@@ -182,7 +181,6 @@ fn run_forward_last_matches_full(checkpoint: &Path) {
     let input_ids_ref: Vec<u32> = (0..5).collect();
     let t = input_ids_ref.len();
     let input_ids = Tensor::from_slice(&device, &input_ids_ref, [1usize, t]).expect("input_ids");
-    let offset_t = Tensor::from_slice(&device, &[0i32], [1usize]).expect("offset tensor");
 
     let max_tokens = t + 4;
     let new_caches = || -> Vec<KvCache> {
@@ -196,7 +194,7 @@ fn run_forward_last_matches_full(checkpoint: &Path) {
 
     let mut full_caches = new_caches();
     let full = model
-        .forward(&input_ids, &offset_t, &mut full_caches)
+        .forward(&input_ids, &mut full_caches)
         .expect("forward");
     full.eval().expect("eval full logits");
     let full_v: Vec<bf16> = full.cpu_to_vec().expect("cpu_to_vec full");
@@ -204,7 +202,7 @@ fn run_forward_last_matches_full(checkpoint: &Path) {
 
     let mut last_caches = new_caches();
     let last = model
-        .forward_last(&input_ids, &offset_t, &mut last_caches)
+        .forward_last(&input_ids, &mut last_caches)
         .expect("forward_last");
     last.eval().expect("eval last logits");
     let last_v: Vec<bf16> = last.cpu_to_vec().expect("cpu_to_vec last");
@@ -266,27 +264,23 @@ fn run_split_prefill_matches_forward_last(checkpoint: &Path) {
 
     // Unified path.
     let unified_ids = Tensor::from_slice(&device, &ids, [1usize, t]).expect("ids");
-    let zero = Tensor::from_slice(&device, &[0i32], [1usize]).expect("offset");
     let mut unified_caches = new_caches();
     let unified = model
-        .forward_last(&unified_ids, &zero, &mut unified_caches)
+        .forward_last(&unified_ids, &mut unified_caches)
         .expect("forward_last");
     unified.eval().expect("eval unified");
     let unified_v: Vec<bf16> = unified.cpu_to_vec().expect("cpu_to_vec unified");
 
-    // Split path: cache-fill over T-1, eval, then T=1 step at offset T-1.
+    // Split path: cache-fill over T-1, eval, then a T=1 step (at cache position T-1).
     let mut split_caches = new_caches();
     let fill_ids = Tensor::from_slice(&device, &ids[..t - 1], [1usize, t - 1]).expect("fill ids");
     let fill_hidden = model
-        .fill_cache(&fill_ids, &zero, &mut split_caches)
+        .fill_cache(&fill_ids, &mut split_caches)
         .expect("fill_cache");
     fill_hidden.eval().expect("eval fill");
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let last_offset = (t - 1) as i32;
     let step_ids = Tensor::from_slice(&device, &[ids[t - 1]], [1usize, 1]).expect("step id");
-    let step_off = Tensor::from_slice(&device, &[last_offset], [1usize]).expect("step offset");
     let step = model
-        .forward(&step_ids, &step_off, &mut split_caches)
+        .forward(&step_ids, &mut split_caches)
         .expect("step forward");
     step.eval().expect("eval step");
     let split_v: Vec<bf16> = step.cpu_to_vec().expect("cpu_to_vec split");
