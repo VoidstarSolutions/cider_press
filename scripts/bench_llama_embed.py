@@ -82,12 +82,16 @@ def get_json(url: str) -> dict:
         return json.loads(resp.read())
 
 
-def embed_batch(base: str, model: str, batch: list[str], self_check: bool) -> int:
+def embed_batch(base: str, model: str, batch: list[str], check_norms: bool) -> int:
+    """One request. The vector-count check is unconditional (a short response
+    would silently inflate texts/s, as omniscient's own guard notes); the
+    per-vector norm check is pure-Python work and runs only when asked, i.e.
+    outside the timed passes."""
     out = post_json(f"{base}/v1/embeddings", {"model": model, "input": batch})
     data = out.get("data", [])
-    if self_check and len(data) != len(batch):
+    if len(data) != len(batch):
         raise SystemExit(f"server returned {len(data)} vectors for a batch of {len(batch)}")
-    if self_check:
+    if check_norms:
         for row in data:
             v = row["embedding"]
             norm = sum(x * x for x in v) ** 0.5
@@ -112,7 +116,7 @@ def main() -> int:
     p.add_argument("--max-batch-chunks", type=int, default=64)
     p.add_argument("--max-batch-bytes", type=int, default=32000)
     p.add_argument("--single-texts", type=int, default=50)
-    p.add_argument("--self-check", action="store_true")
+    p.add_argument("--self-check", action="store_true", help="also verify every warm-up vector is L2-normalised")
     args = p.parse_args()
 
     base = args.base_url.rstrip("/")
@@ -122,19 +126,19 @@ def main() -> int:
     tokens_gguf = count_tokens(base, texts)
 
     plan = list(batches(texts, args.max_batch_chunks, args.max_batch_bytes))
-    dim = embed_batch(base, args.model, plan[0], args.self_check)  # warm-up
+    dim = embed_batch(base, args.model, plan[0], args.self_check)  # warm-up; norms checked here only
 
     run_secs: list[float] = []
     for _ in range(args.runs):
         t0 = time.perf_counter()
         for b in plan:
-            embed_batch(base, args.model, b, args.self_check)
+            embed_batch(base, args.model, b, False)
         run_secs.append(time.perf_counter() - t0)
 
     single_ms: list[float] = []
     for t in texts[: args.single_texts]:
         t0 = time.perf_counter()
-        embed_batch(base, args.model, [t], args.self_check)
+        embed_batch(base, args.model, [t], False)
         single_ms.append((time.perf_counter() - t0) * 1e3)
 
     med = statistics.median(run_secs)
