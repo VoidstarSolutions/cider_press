@@ -11,8 +11,9 @@
 //!
 //! Analogue of `mlx::core::metal::qmv()` in
 //! `mlx/backend/metal/quantized.cpp`. Picks the fast variant
-//! (`affine_qmv_fast`) when `K % 512 == 0 && N % bn == 0`, generic
-//! (`affine_qmv`) otherwise, matching MLX's dispatcher.
+//! (`affine_qmv_fast`) when `K` meets its bit-width alignment (512 for
+//! 4-bit) — its partial-rows instantiation when `N % bn != 0` — and the
+//! generic `affine_qmv` otherwise, matching MLX's dispatcher.
 //!
 //! Explained in the inference guide: `docs/inference/quantized-matmul.md`.
 
@@ -40,6 +41,17 @@ use crate::library::KernelLibrary;
 const BN: i32 = 8;
 const BK: i32 = 32;
 
+/// `K` alignment the `affine_qmv_fast` tiling requires, from
+/// `quantized.cpp::qmv_fast_k_alignment` (512 for 4-bit).
+fn qmv_fast_k_alignment(bits: u32) -> u32 {
+    let pack_factor = match bits {
+        3 | 5 => 8,
+        6 => 4,
+        b => 32 / b,
+    };
+    pack_factor * if bits == 2 { 1 } else { 2 } * 32
+}
+
 /// Quantized matvec: `y = x · dequant(w_q)ᵀ`, all bf16-typed.
 ///
 /// `library` must be a [`KernelLibrary::quantized`]. Encodes one
@@ -61,7 +73,7 @@ const BK: i32 = 32;
 /// - `biases.len() == N * K / group_size`
 ///
 /// `group_size` must be in `{32, 64, 128}` and `bits` must be in
-/// `{2, 3, 4, 5, 6, 8}` — these are the combinations MLX's
+/// `{1, 2, 3, 4, 5, 6, 8}` — these are the combinations MLX's
 /// `instantiate_quantized_all` macro emits. Calling with other values
 /// returns [`Error::KernelNotFound`] at
 /// the pipeline lookup, because the matching kernel was never
@@ -135,6 +147,11 @@ pub fn affine_qmv_bf16(
             "affine_qmv: group_size must be positive".to_owned(),
         ));
     }
+    if bits == 0 {
+        return Err(Error::InvalidArgument(
+            "affine_qmv: bits must be positive".to_owned(),
+        ));
+    }
     if k as u32 % group_size != 0 {
         return Err(Error::InvalidArgument(format!(
             "affine_qmv: K ({k}) must be a multiple of group_size ({group_size})"
@@ -162,14 +179,20 @@ pub fn affine_qmv_bf16(
         )));
     }
 
-    // Mirror MLX's dispatcher: fast variant when both K is a 512-multiple
-    // and N is a bn-multiple. See quantized.cpp::qmv.
-    let fast = n % BN == 0 && k % 512 == 0;
+    // Mirror MLX's dispatcher (quantized.cpp::qmv): the fast variant is
+    // chosen on K alignment alone; an N that isn't a bn-multiple selects
+    // its partial-rows instantiation rather than the generic kernel.
+    let fast = k as u32 % qmv_fast_k_alignment(bits) == 0;
+    let partial_rows = fast && n % BN != 0;
     let variant = if fast { "qmv_fast" } else { "qmv" };
     // For batch=1 the kernel-name suffix is `_batch_0`; batched dispatch
     // (B > 1) would use `_batch_1` and bind shape/stride buffers. We
-    // only do single-batch here for now.
-    let kernel_name = format!("affine_{variant}_bfloat16_t_gs_{group_size}_b_{bits}_batch_0");
+    // only do single-batch here for now. `_hgs_0` is the no-global-scale
+    // (affine) case; `_r_4` is MLX's results-per-simdgroup for affine.
+    let kernel_name = format!(
+        "affine_{variant}_bfloat16_t_gs_{group_size}_b_{bits}_batch_0_pr_{}_hgs_0_r_4",
+        u8::from(partial_rows),
+    );
     let pipeline = library.pipeline(&kernel_name)?;
 
     {

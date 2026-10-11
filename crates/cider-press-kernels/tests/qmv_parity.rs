@@ -85,3 +85,47 @@ fn parity_affine_qmv_fast_bf16_gs64_b4() {
         assert_relative_eq!(af, ef, max_relative = 1e-2, epsilon = 5e-2);
     }
 }
+
+/// `N % 8 != 0` with an aligned `K` selects the `qmv_fast` partial-rows
+/// instantiation. Row-truncating the fixture keeps MLX's reference valid
+/// for the surviving rows.
+#[test]
+fn parity_affine_qmv_fast_partial_rows() {
+    const N_PARTIAL: usize = N - 3;
+    let path = require_file(fixture_path(), "uv run scripts/gen_qmv_fixture.py");
+
+    let bytes = std::fs::read(&path).expect("read fixture");
+    let st = SafeTensors::deserialize(&bytes).expect("parse safetensors");
+
+    let w_row = K * BITS as usize / 32;
+    let groups_row = K / GROUP_SIZE as usize;
+    let w_q = &read_u32(&st, "w_q")[..N_PARTIAL * w_row];
+    let scales = &read_bf16(&st, "scales")[..N_PARTIAL * groups_row];
+    let biases = &read_bf16(&st, "biases")[..N_PARTIAL * groups_row];
+    let x = read_bf16(&st, "x");
+    let y_ref = read_bf16(&st, "y_ref");
+
+    let device = Device::system_default().expect("Metal device");
+    let library = KernelLibrary::quantized(&device).expect("compile quantized.metal");
+
+    let w_buf: Buffer<u32> = device.upload(w_q).expect("upload w_q");
+    let s_buf: Buffer<bf16> = device.upload(scales).expect("upload scales");
+    let b_buf: Buffer<bf16> = device.upload(biases).expect("upload biases");
+    let x_buf: Buffer<bf16> = device.upload(&x).expect("upload x");
+    let mut y_buf: Buffer<bf16> = device.alloc_buffer(N_PARTIAL).expect("alloc y");
+
+    let mut cmds = device.commands().expect("commands");
+    kernels::qmv::affine_qmv_bf16(
+        &mut cmds, &library, &w_buf, &s_buf, &b_buf, &x_buf, &mut y_buf, K, GROUP_SIZE, BITS,
+    )
+    .expect("dispatch");
+    cmds.commit_and_wait().expect("commit");
+
+    // SAFETY: commit_and_wait blocked until the GPU finished writing y_buf.
+    let y_out: Vec<bf16> = unsafe { y_buf.as_mut_slice() }.to_vec();
+
+    assert_eq!(y_out.len(), N_PARTIAL);
+    for (a, e) in y_out.iter().zip(&y_ref[..N_PARTIAL]) {
+        assert_relative_eq!(a.to_f32(), e.to_f32(), max_relative = 1e-2, epsilon = 5e-2);
+    }
+}
