@@ -1,5 +1,6 @@
 //! `eos_token_id` stop ids declared by a checkpoint's `config.json` and
-//! `generation_config.json`, which `mlx_lm` merges into its stop set.
+//! `generation_config.json`. `mlx_lm` lets `generation_config` override
+//! `config.json`; unioning them instead yields a superset of its stop set.
 
 use std::collections::HashSet;
 use std::fs;
@@ -12,6 +13,10 @@ use crate::{Error, Result};
 /// Union of the top-level `eos_token_id` in `config.json` (when present) and
 /// in `generation_config.json` (when that file exists). Each may be an int, a
 /// list of ints, or null/absent (contributing nothing).
+///
+/// # Errors
+/// [`Error::Io`] when a present file can't be read, a JSON parse error, or
+/// [`Error::InvalidArgument`] for an `eos_token_id` entry that isn't a `u32`.
 pub fn config_eos_ids(checkpoint_dir: &Path) -> Result<HashSet<u32>> {
     let mut ids = HashSet::new();
     for name in ["config.json", "generation_config.json"] {
@@ -19,12 +24,7 @@ pub fn config_eos_ids(checkpoint_dir: &Path) -> Result<HashSet<u32>> {
         let bytes = match fs::read(&path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => {
-                return Err(Error::InvalidArgument(format!(
-                    "config_eos_ids({}): {e}",
-                    path.display()
-                )));
-            }
+            Err(source) => return Err(Error::Io { path, source }),
         };
         let cfg: Value = serde_json::from_slice(&bytes)?;
         if let Some(v) = cfg.get("eos_token_id") {
