@@ -201,11 +201,7 @@ impl<M: LanguageModel> Generator<M> {
                 self.context_window,
             )));
         }
-        self.reset()?;
-        let device = Device::shared()?;
-        let chunk_len = self.model.prefill_chunk_len();
-        let logits =
-            prefill_last_logits(&self.model, &mut self.caches, &device, input_ids, chunk_len)?;
+        let logits = self.prefill_logits(input_ids)?;
 
         let vocab = self.model.vocab_size();
         let idx0 = argmax_last_position_lazy(&logits, vocab)?;
