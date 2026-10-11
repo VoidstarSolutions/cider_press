@@ -26,7 +26,7 @@ impl LinearState {
     ///
     /// # Errors
     /// Device allocation failure.
-    pub fn zeros(config: &Qwen35Config, device: &Device) -> Result<Self> {
+    pub(crate) fn zeros(config: &Qwen35Config, device: &Device) -> Result<Self> {
         let conv_window = config.linear_conv_kernel_dim - 1;
         let hv = config.linear_num_value_heads;
         let dv = config.linear_value_head_dim;

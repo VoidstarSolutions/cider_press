@@ -81,7 +81,7 @@ impl Qwen35DecoderLayer {
     pub fn make_cache(&self, max_tokens: usize, device: &Device) -> Result<Qwen35LayerCache> {
         Ok(match &self.mixer {
             Mixer::Full(attn) => Qwen35LayerCache::Full(attn.make_cache(max_tokens, device)?),
-            Mixer::Linear(gdn) => Qwen35LayerCache::Linear(gdn.make_state(device)?),
+            Mixer::Linear(gdn) => Qwen35LayerCache::Linear(gdn.make_cache(device)?),
         })
     }
 
@@ -97,9 +97,11 @@ impl Qwen35DecoderLayer {
     ///   [`Linear`](Qwen35LayerCache::Linear) threads the GDN conv-window +
     ///   recurrent state.
     ///
-    /// Returns `[1, T, hidden_size]`, lazy. Errors on a mixer/cache variant
-    /// mismatch, possible only with a cache not built by
-    /// [`make_cache`](Self::make_cache).
+    /// Returns `[1, T, hidden_size]`, lazy.
+    ///
+    /// # Errors
+    /// The mixer and `cache` variants disagree (possible only with a cache not
+    /// built by [`make_cache`](Self::make_cache)), or the mixer forward fails.
     pub fn forward(
         &self,
         hidden: &Tensor,

@@ -478,7 +478,7 @@ pub(crate) fn recurrence(
 ///
 /// Every call threads a [`LinearState`]: the incoming conv window and
 /// recurrent state are read in, and the updated states are written back. A
-/// fresh [`make_state`](Self::make_state) is the prefill-from-zero start.
+/// fresh [`make_cache`](Self::make_cache) is the prefill-from-zero start.
 #[derive(Debug)]
 pub struct GatedDeltaNet {
     in_proj_qkv: Linear,
@@ -518,7 +518,7 @@ impl GatedDeltaNet {
     ///
     /// # Errors
     /// Device allocation failure.
-    pub fn make_state(&self, device: &Device) -> Result<LinearState> {
+    pub fn make_cache(&self, device: &Device) -> Result<LinearState> {
         LinearState::zeros(&self.config, device)
     }
 
@@ -531,6 +531,10 @@ impl GatedDeltaNet {
     /// the updated states are written back into it (lazily — evaluate them, or
     /// an output that depends on them, before a dependent call in a later
     /// command buffer).
+    ///
+    /// # Errors
+    /// `hidden` is not rank-3 `[1, T, hidden_size]` BF16, or a kernel
+    /// dispatch / tensor op fails.
     #[allow(clippy::many_single_char_names)]
     pub fn forward(&self, hidden: &Tensor, state: &mut LinearState) -> Result<Tensor> {
         let config = &self.config;

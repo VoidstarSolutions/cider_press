@@ -5,8 +5,7 @@ use std::{fs, path::PathBuf};
 
 use cider_press_models::nn::rms_norm;
 use cider_press_models::qwen3_5::{
-    GatedDeltaNet, LinearState, Qwen35Config, Qwen35DecoderLayer, Qwen35MixerWeights,
-    load_qwen35_weights,
+    GatedDeltaNet, Qwen35Config, Qwen35DecoderLayer, Qwen35MixerWeights, load_qwen35_weights,
 };
 use cider_press_runtime::{Device, Tensor};
 use cider_press_test_utils::{read_bf16, require_checkpoint_dir, require_file};
@@ -76,7 +75,7 @@ fn gated_deltanet_layer0_matches_mlx() {
         panic!("layer 0 must be linear");
     };
     let gdn = GatedDeltaNet::from_weights(la, &config).unwrap();
-    let mut state = LinearState::zeros(&config, &device).unwrap();
+    let mut state = gdn.make_cache(&device).unwrap();
     let out = gdn.forward(&normed, &mut state).unwrap();
     out.eval().unwrap();
     let got: Vec<bf16> = out.cpu_to_vec().unwrap();
@@ -152,14 +151,14 @@ fn gated_deltanet_prefill_decode_equivalence() {
     let gdn = GatedDeltaNet::from_weights(la, &config).unwrap();
 
     // (1) One-shot from a fresh state.
-    let mut st_full = LinearState::zeros(&config, &device).unwrap();
+    let mut st_full = gdn.make_cache(&device).unwrap();
     let y_full = gdn.forward(&normed, &mut st_full).unwrap();
     y_full.eval().unwrap();
     assert_eq!(y_full.shape().dims(), [1, t, config.hidden_size]);
     let full: Vec<bf16> = y_full.cpu_to_vec().unwrap();
 
     // (2) Split: prefill [0..T-1] then decode [T-1..T], threading a cache.
-    let mut st = LinearState::zeros(&config, &device).unwrap();
+    let mut st = gdn.make_cache(&device).unwrap();
 
     // Build compact prefill/decode inputs from the host rows. (A device-side
     // row-prefix slice+copy elides to a zero-copy view over the full backing
