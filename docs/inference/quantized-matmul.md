@@ -63,9 +63,9 @@ Both take a
 three-buffer newtype that carries the packed lanes, scales, and biases together
 — so a dense tensor can't be handed to the quantized path by accident. The
 constructor validates the activation is `bf16`, dense, and contiguous, that its
-inner dim matches the weight's logical `K`, and (for the `M > 1` qmm path only)
-that `N` is a multiple of 32, since the wired `affine_qmm_t` instantiation is
-the aligned variant.
+inner dim matches the weight's logical `K`. Any `N` is accepted: the `M > 1`
+qmm path picks the aligned `affine_qmm_t` instantiation when `N % 32 == 0` and
+the non-aligned one otherwise (see "Open levers" below).
 
 **The `qmv_fast` vs. generic variant.** `qmv.rs` mirrors MLX's dispatcher: it
 selects the faster `affine_qmv_fast` kernel when `K % 512 == 0 && N % 8 == 0`,
