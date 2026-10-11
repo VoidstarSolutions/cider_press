@@ -134,7 +134,7 @@ cider-press/
 ├── crates/
 │   ├── cider-press-kernels/            # vendored MLX dispatch surface (build.rs flattens .metal)
 │   ├── cider-press-runtime/            # lazy Tensor + graph + eval + KvCache + profiling
-│   ├── cider-press-models/             # transformer architectures (Qwen2), tokenizer, generator
+│   ├── cider-press-models/             # transformer architectures (Qwen2, Qwen3.5/3.6), tokenizer, generator
 │   ├── cider-press-test-utils/         # dev-only: shared MLX-parity test helpers
 │   └── cider-press/                    # facade + CLI (chat / bench)
 ├── scripts/                            # one-shot uv scripts (fixtures, MLX sync, perf)
@@ -151,35 +151,40 @@ each member uses `lints.workspace = true` and `dep.workspace = true`.
 
 ## Current state
 
-Runs **Qwen2.5-0.5B-Instruct-4bit** end-to-end: load checkpoint →
-tokenize → chat-template → greedy decode, streamed via the `cider-press`
-CLI. The runtime is a lazy `Tensor` graph over vendored MLX Metal
-kernels, with `eval()` as the synchronous dispatch boundary; the models
-crate composes Qwen2 from runtime ops. Performance is measured and decode
-now **leads `mlx_lm`** (~599 vs ~568 tok/s, ~1.05×) after qmv fast-path
-padding (A1), built on the encoder/sync-model port that first reached
-parity (~561 vs ~564, ~1.00×) (`docs/inference/execution-model.md`). Prefill now runs the
-**fused steel `sdpa_full` attention** kernel (the composed prefill chain is
-deleted): synchronous prefill **~9.3 ms** (was 10.19), gap vs mlx **~1.19×**
-(was 1.30×); decode unchanged.
+Runs two model families end-to-end via the `cider-press` CLI (load
+checkpoint → tokenize → chat-template → greedy decode, streamed):
 
-**Remaining perf work is prefill- and memory-side**, not decode kernels: A2
-(small-N `qmv` for k/v, backlog #4) was measured and **closed as a no-go**
-(+1.07% ceiling, hidden by the decode pipeline — see
-`docs/inference/quantized-matmul.md`). The encode/dispatch trace (#2, PR #38 tooling)
-localized the prefill gap to a ~2.2 ms GPU bubble and the **copy elimination
-then ran** (`perf/prefill-dispatch-reduction`): 120 copies removed via strided
-RoPE + KV-cache write (`gpu.copy` 146 → 26), parity unchanged — **but the
-bubble did not recover** (GPU-wait flat, prefill 9.32 → ~9.18 ms). **The
-dispatch-count → bubble hypothesis is refuted** (copies off the critical path,
-PR #37 redux); the change is kept but the gap is ~unchanged. **Next prefill
-diagnostic: the `OPS_PER_COMMAND_BUFFER` cadence probe** — if the gaps aren't at
-commit boundaries, prefill is near its floor (structural: synchronous per-eval
-+ <50% occupancy → needs concurrency). Also open: within-eval reuse for RSS and
-`.metallib` precompile. See `docs/inference/execution-model.md` for the
-copy-elimination measurement, `docs/inference/models/qwen2.5.md` for the forward
-pass, and the **"Open levers"** sections of the step docs under `docs/inference/`
-for what was the prioritized backlog.
+- **Qwen2.5-0.5B-Instruct-4bit** (`model_type: qwen2`). Decode **leads
+  `mlx_lm`** (~599 vs ~568 tok/s, ~1.05×) after qmv fast-path padding (A1)
+  on top of the encoder/sync-model port (`docs/inference/execution-model.md`).
+  Prefill uses the fused steel `sdpa_full` kernel and the last-position LM
+  head; the prefill-gap investigation is **closed** (cider's ~7.76 ms already
+  matches `mlx`'s real prefill structure-for-structure).
+- **Qwen3.5 / Qwen3.6** (`model_type: qwen3_5`, text-only) — the hybrid
+  Gated DeltaNet (linear attention, fp32 recurrent state) + gated full
+  attention stack (3:1). **Qwen3.5-4B-4bit** (dev vehicle) and the sharded
+  **Qwen3.6-27B-4bit** (target) both match `mlx_lm` greedy token-for-token.
+  The GDN recurrence is the naive sequential form (like `mlx_lm`'s); prefill
+  is **chunked at 16 tokens** to bound memory (see design notes). See
+  `docs/inference/models/qwen3.6.md` and `ROADMAP.md`.
+
+The models crate exposes a `LanguageModel` trait (`make_caches` /
+`forward_last` / `fill_cache` / `prefill_chunk_len`) that the generic
+`Generator<M>` drives; the RoPE offset is derived from the caches, never
+passed in. `ShardSet::read(dir)` loads either checkpoint layout (single
+`model.safetensors` or a sharded index).
+
+**Known gaps:** the Qwen3.5 `chat_template` doesn't render under minijinja
+(use `--no-chat-template`); EOS ids come only from `tokenizer_config.json`
+(the 27B's `config.json` also lists `<|endoftext|>`); `rms_norm` and similar
+ops reject copy-elided unit-dim views (hits a tiny synthetic config at
+`T = 1`, not real checkpoints).
+
+**Next levers:** Qwen3.5 performance — a perf baseline vs `mlx_lm`, then a
+chunkwise-parallel GDN kernel (the planned lead over `mlx_lm`'s per-token
+recurrence; ROADMAP Phases 6–7); within-eval buffer reuse (RSS, and would
+let prefill chunks grow); `.metallib` precompile. Step docs under
+`docs/inference/` carry per-stage **"Open levers"** sections.
 
 ---
 
@@ -225,11 +230,26 @@ for what was the prioritized backlog.
   shipping concern, not a dev-loop one.
 - **KvCache** writes are **lazy in-graph `slice_update`** ops into
   pre-allocated slabs (`kv_cache.rs`), landing in the same command buffer as
-  the consuming attention — *not* eager host `memcpy`s. An un-committed prior
-  write is dropped by the next `update`, so a producer→consumer pair split
-  across two evals (e.g. a cache-fill forward followed by a dependent step)
-  must `eval` between them to commit the first write. Callers drop K/V views
+  the consuming attention — *not* eager host `memcpy`s. Each `update` bases on the
+  raw slab, so it would drop an un-committed prior write — it fails loudly
+  instead. Successive cache-writing forwards (e.g. prefill chunks, then a
+  decode step) must `eval`/`eval_async` between them. Callers drop K/V views
   before the next `update` (aliasing contract, enforced at runtime).
+  `update` advances `position()` at graph-build time, which is what lets
+  models derive the RoPE offset from their caches under the async decode
+  pipeline.
+- **Eval keeps every transient alive until the graph completes** (no
+  within-eval buffer reuse). An op unrolled over `T` therefore costs memory
+  linear in `T`: the naive GDN recurrence was ~16 MB/token/layer (>64 GB
+  at ~60 prompt tokens on the 27B) until prefill was chunked
+  (`QWEN35_PREFILL_CHUNK = 16`, each chunk evaluated via `fill_cache`).
+  Check peak RSS at a few prompt lengths whenever a forward adds a per-token
+  loop.
+- **Real-checkpoint tests are `#[ignore]` and opt-in**, gated by env vars
+  (`CIDER_QWEN35_CHECKPOINT_PATH`, `CIDER_QWEN35_27B_CHECKPOINT_PATH`, …)
+  via `cider-press-test-utils`; once opted in they **fail loudly** on a
+  missing input rather than skipping. Run them after any change to the
+  forward/prefill/decode path — the default suite doesn't load a real model.
 - **Loader footgun.** `q_proj.bias` (singular, dense bf16, additive
   Linear bias) is distinct from `q_proj.biases` (plural, per-group
   quantization bias on the qmv ABI). Only Q/K/V have `.bias`; O has only
