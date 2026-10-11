@@ -27,8 +27,11 @@ use crate::error::{Error, Result};
 /// loader code serves the single-archive checkpoints (Qwen2, the 4B dev
 /// vehicle) and the 3-shard 27B checkpoint without branching.
 pub trait TensorLookup {
-    /// Return the [`TensorView`] for `key`, or [`Error::MissingKey`] if no
-    /// source holds it.
+    /// Return the [`TensorView`] for `key`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::MissingKey`] if no source holds `key`.
     fn view(&self, key: &str) -> Result<TensorView<'_>>;
 }
 
@@ -39,8 +42,9 @@ impl TensorLookup for SafeTensors<'_> {
     }
 }
 
-/// An owned multi-shard checkpoint read from a directory holding
-/// `model.safetensors.index.json`.
+/// An owned checkpoint read from a directory, in either layout: sharded
+/// (`model.safetensors.index.json` plus the shards it names) or a single
+/// `model.safetensors`.
 ///
 /// Owns the shard names and bytes together so they cannot drift apart; borrow
 /// a [`ShardedArchive`] from it with [`ShardSet::archive`] for the load.
@@ -69,13 +73,33 @@ impl ShardSet {
     /// Name of the index file that marks a directory as a sharded checkpoint.
     pub const INDEX_FILE: &'static str = "model.safetensors.index.json";
 
-    /// Read `dir/model.safetensors.index.json` and every shard it references.
+    /// Name of the weights file in a single-file checkpoint.
+    pub const SINGLE_FILE: &'static str = "model.safetensors";
+
+    /// Read a checkpoint directory.
     ///
-    /// Errors if a referenced shard name is not a single plain filename (an
-    /// absolute path, `..`, or a separator would read outside `dir`), or if
-    /// any file cannot be read or parsed.
+    /// If `dir/model.safetensors.index.json` exists, reads it and every shard
+    /// it references. Otherwise reads `dir/model.safetensors` as a one-shard
+    /// set.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Io`] if a file cannot be read; a directory with neither the
+    ///   index nor `model.safetensors` reports `NotFound` for the latter.
+    /// - [`Error::InvalidShardName`] if a shard name in the index is not a
+    ///   single plain file name (an absolute path, `..`, or a separator would
+    ///   read outside `dir`).
+    /// - [`Error::Json`] if the index is malformed.
     pub fn read(dir: &Path) -> Result<Self> {
         let index_path = dir.join(Self::INDEX_FILE);
+        if !index_path.exists() {
+            let bytes = read_file(&dir.join(Self::SINGLE_FILE))?;
+            return Ok(Self {
+                shard_names: Vec::new(),
+                shard_bytes: vec![bytes],
+                weight_map: HashMap::new(),
+            });
+        }
         let index: SafetensorsIndex = serde_json::from_slice(&read_file(&index_path)?)?;
 
         let mut shard_names: Vec<String> = index.weight_map.values().cloned().collect();
@@ -97,6 +121,10 @@ impl ShardSet {
     }
 
     /// Deserialize the shards and index every tensor key to its shard.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Safetensors`] if a shard's header is malformed.
     pub fn archive(&self) -> Result<ShardedArchive<'_>> {
         let name_to_index: HashMap<&str, usize> = self
             .shard_names
@@ -111,11 +139,18 @@ impl ShardSet {
             .map(|bytes| SafeTensors::deserialize(bytes).map_err(Error::from))
             .collect::<Result<Vec<_>>>()?;
 
-        let key_to_shard = self
-            .weight_map
-            .iter()
-            .map(|(key, shard)| (key.clone(), name_to_index[shard.as_str()]))
-            .collect();
+        let key_to_shard = if self.weight_map.is_empty() {
+            archives
+                .iter()
+                .enumerate()
+                .flat_map(|(i, a)| a.names().into_iter().map(move |k| (k.to_string(), i)))
+                .collect()
+        } else {
+            self.weight_map
+                .iter()
+                .map(|(key, shard)| (key.clone(), name_to_index[shard.as_str()]))
+                .collect()
+        };
 
         Ok(ShardedArchive {
             archives,
@@ -125,19 +160,17 @@ impl ShardSet {
 }
 
 fn read_file(path: &Path) -> Result<Vec<u8>> {
-    std::fs::read(path)
-        .map_err(|e| Error::InvalidArgument(format!("failed to read {}: {e}", path.display())))
+    std::fs::read(path).map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 fn validate_shard_name(name: &str) -> Result<()> {
     let mut components = Path::new(name).components();
     match (components.next(), components.next()) {
         (Some(Component::Normal(_)), None) => Ok(()),
-        _ => Err(Error::InvalidArgument(format!(
-            "shard name {name:?} in {} must be a plain filename \
-             (no separators, `..`, or absolute path)",
-            ShardSet::INDEX_FILE,
-        ))),
+        _ => Err(Error::InvalidShardName { name: name.into() }),
     }
 }
 
@@ -353,6 +386,32 @@ mod tests {
     }
 
     #[test]
+    fn shard_set_reads_single_file_checkpoint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_shard(dir.path(), ShardSet::SINGLE_FILE, "x", 3.5);
+
+        let set = ShardSet::read(dir.path()).expect("read");
+        let archive = set.archive().expect("archive");
+        let device = Device::shared().expect("device");
+        let x = read_dense_tensor(&archive, "x", &device).expect("x");
+        assert_eq!(x.cpu_slice::<f32>().unwrap(), &[3.5]);
+        assert!(matches!(
+            read_dense_tensor(&archive, "z", &device),
+            Err(Error::MissingKey { .. })
+        ));
+    }
+
+    #[test]
+    fn shard_set_empty_dir_is_not_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = ShardSet::read(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, Error::Io { ref source, .. } if source.kind() == std::io::ErrorKind::NotFound),
+            "{err:?}"
+        );
+    }
+
+    #[test]
     fn shard_set_rejects_non_plain_shard_names() {
         for bad in [
             "../x.safetensors",
@@ -366,7 +425,7 @@ mod tests {
             write_index(dir.path(), &format!(r#"{{"x":"{bad}"}}"#));
             let err = ShardSet::read(dir.path()).unwrap_err();
             assert!(
-                matches!(err, Error::InvalidArgument(ref m) if m.contains("plain filename")),
+                matches!(err, Error::InvalidShardName { ref name } if name == bad),
                 "{bad:?} -> {err:?}"
             );
         }

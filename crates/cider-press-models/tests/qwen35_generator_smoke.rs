@@ -5,6 +5,7 @@
 
 #![cfg(target_os = "macos")]
 
+use cider_press_models::safetensors_io::ShardSet;
 use cider_press_test_utils::require_checkpoint_dir;
 use std::collections::HashSet;
 use std::{fs, path::PathBuf};
@@ -12,7 +13,6 @@ use std::{fs, path::PathBuf};
 use cider_press_models::generator::Generator;
 use cider_press_models::qwen3_5::{Qwen35Config, Qwen35Model, load_qwen35_weights};
 use cider_press_runtime::Device;
-use safetensors::SafeTensors;
 
 fn checkpoint_path() -> PathBuf {
     require_checkpoint_dir(
@@ -28,8 +28,8 @@ fn qwen35_generator_yields_requested_tokens() {
 
     let config =
         Qwen35Config::from_json_bytes(&fs::read(dir.join("config.json")).unwrap()).unwrap();
-    let bytes = fs::read(dir.join("model.safetensors")).unwrap();
-    let archive = SafeTensors::deserialize(&bytes).unwrap();
+    let shards = ShardSet::read(&dir).unwrap();
+    let archive = shards.archive().unwrap();
     let device = Device::shared().unwrap();
     let weights = load_qwen35_weights(&archive, &config, &device).unwrap();
     let model = Qwen35Model::from_weights(weights, config).expect("build Qwen35Model");

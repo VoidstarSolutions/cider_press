@@ -23,7 +23,6 @@ use cider_press_models::qwen3_5::{Qwen35Config, Qwen35Model, load_qwen35_weights
 use cider_press_models::safetensors_io::ShardSet;
 use cider_press_models::tokenizer::Tokenizer;
 use cider_press_runtime::{Device, profile};
-use safetensors::SafeTensors;
 use serde::Deserialize;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -52,7 +51,8 @@ enum Command {
 #[derive(Args, Debug)]
 struct ChatArgs {
     /// Checkpoint directory holding config.json, tokenizer.json,
-    /// `tokenizer_config.json`, and a single-file model.safetensors.
+    /// `tokenizer_config.json`, and either a single `model.safetensors` or a
+    /// sharded `model.safetensors.index.json` layout.
     /// Falls back to `$CIDER_PRESS_CHECKPOINT` when the flag is omitted.
     #[arg(long, env = "CIDER_PRESS_CHECKPOINT")]
     checkpoint: PathBuf,
@@ -170,29 +170,15 @@ fn load(checkpoint: &Path, device: &Device) -> Result<Loaded, BoxError> {
 
     let model = match (model_type.as_str(), text_model_type.as_deref()) {
         ("qwen2", _) => {
-            let archive_bytes = std::fs::read(checkpoint.join("model.safetensors"))?;
-            let archive = SafeTensors::deserialize(&archive_bytes)?;
+            let shards = ShardSet::read(checkpoint)?;
             let config = Qwen2Config::from_json_bytes(&config_bytes)?;
-            let weights = load_qwen2_weights(&archive, &config, device)?;
+            let weights = load_qwen2_weights(&shards.archive()?, &config, device)?;
             LoadedModel::Qwen2(Qwen2Model::from_weights(weights, config)?)
         }
         ("qwen3_5", _) | (_, Some("qwen3_5_text")) => {
+            let shards = ShardSet::read(checkpoint)?;
             let config = Qwen35Config::from_json_bytes(&config_bytes)?;
-            // Multi-shard checkpoints (the 27B) ship a
-            // `model.safetensors.index.json` routing each tensor key to one of
-            // N shards; single-file checkpoints (the 4B dev vehicle) have only
-            // `model.safetensors`. `load_qwen35_weights` uploads each tensor to
-            // the device immediately and returns device-resident weights, so the
-            // shard byte buffers only need to outlive the load — they drop at the
-            // end of this block.
-            let weights = if checkpoint.join(ShardSet::INDEX_FILE).exists() {
-                let shards = ShardSet::read(checkpoint)?;
-                load_qwen35_weights(&shards.archive()?, &config, device)?
-            } else {
-                let archive_bytes = std::fs::read(checkpoint.join("model.safetensors"))?;
-                let archive = SafeTensors::deserialize(&archive_bytes)?;
-                load_qwen35_weights(&archive, &config, device)?
-            };
+            let weights = load_qwen35_weights(&shards.archive()?, &config, device)?;
             LoadedModel::Qwen35(Qwen35Model::from_weights(weights, config)?)
         }
         (other, _) => {

@@ -847,6 +847,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::{Fill, TINY_CONFIG_JSON, synthesize_archive_bytes_with};
     use super::*;
+    use crate::safetensors_io::ShardSet;
     use cider_press_runtime::Device;
     use safetensors::{Dtype as StDtype, SafeTensors};
     use std::{fs, path::PathBuf};
@@ -1029,8 +1030,8 @@ mod tests {
         let dir = checkpoint_path();
         let config =
             Qwen35Config::from_json_bytes(&fs::read(dir.join("config.json")).unwrap()).unwrap();
-        let bytes = fs::read(dir.join("model.safetensors")).unwrap();
-        let archive = SafeTensors::deserialize(&bytes).unwrap();
+        let shards = ShardSet::read(&dir).unwrap();
+        let archive = shards.archive().unwrap();
         let device = Device::shared().unwrap();
 
         let weights = load_qwen35_weights(&archive, &config, &device).unwrap();

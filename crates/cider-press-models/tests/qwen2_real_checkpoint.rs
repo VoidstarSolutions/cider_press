@@ -15,13 +15,13 @@
 //! The directory must contain `config.json` and `model.safetensors`.
 //! No download is performed by this test.
 
+use cider_press_models::safetensors_io::{ShardSet, TensorLookup};
 use cider_press_test_utils::require_checkpoint_dir;
 use std::fs;
 use std::path::PathBuf;
 
 use cider_press_models::qwen2::{Qwen2Config, load_qwen2_weights};
 use cider_press_runtime::Device;
-use safetensors::SafeTensors;
 
 /// Returns the canonicalized checkpoint directory. Panics if the env var is
 /// unset or the path doesn't resolve to a directory.
@@ -44,8 +44,8 @@ fn real_checkpoint_loads_and_byte_round_trips() {
         "checkpoint is missing quantization metadata; expected MLX 4-bit",
     );
 
-    let archive_bytes = fs::read(dir.join("model.safetensors")).expect("read model.safetensors");
-    let archive = SafeTensors::deserialize(&archive_bytes).expect("deserialize safetensors");
+    let shards = ShardSet::read(&dir).expect("load checkpoint");
+    let archive = shards.archive().expect("load checkpoint");
 
     let device = Device::shared().expect("system default device");
     let weights = load_qwen2_weights(&archive, &config, &device).expect("load");
@@ -57,7 +57,7 @@ fn real_checkpoint_loads_and_byte_round_trips() {
     // every later op branch validates against).
     let layer0 = &weights.layers[0];
     let dense_match = |key: &str, t: &cider_press_runtime::Tensor| {
-        let arc = archive.tensor(key).expect("present");
+        let arc = archive.view(key).expect("present");
         assert_eq!(t.cpu_bytes().expect("dense bytes"), arc.data(), "{key}");
     };
     dense_match("model.norm.weight", &weights.norm);
@@ -78,17 +78,17 @@ fn real_checkpoint_loads_and_byte_round_trips() {
         let (w, s, b) = qw.component_bytes();
         assert_eq!(
             w,
-            archive.tensor(&format!("{base}.weight")).unwrap().data(),
+            archive.view(&format!("{base}.weight")).unwrap().data(),
             "{base}.weight"
         );
         assert_eq!(
             s,
-            archive.tensor(&format!("{base}.scales")).unwrap().data(),
+            archive.view(&format!("{base}.scales")).unwrap().data(),
             "{base}.scales"
         );
         assert_eq!(
             b,
-            archive.tensor(&format!("{base}.biases")).unwrap().data(),
+            archive.view(&format!("{base}.biases")).unwrap().data(),
             "{base}.biases"
         );
     };

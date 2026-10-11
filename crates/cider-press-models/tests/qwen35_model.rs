@@ -7,6 +7,7 @@
 //! `[1, T, vocab_size]`; numeric parity against mlx-lm is covered by the
 //! fixture tests below.
 
+use cider_press_models::safetensors_io::ShardSet;
 use std::{fs, path::PathBuf};
 
 use cider_press_models::qwen3_5::{
@@ -66,8 +67,8 @@ fn qwen35_model_forward_shape() {
     let dir = checkpoint_path();
     let config =
         Qwen35Config::from_json_bytes(&fs::read(dir.join("config.json")).unwrap()).unwrap();
-    let archive_bytes = fs::read(dir.join("model.safetensors")).unwrap();
-    let archive = SafeTensors::deserialize(&archive_bytes).unwrap();
+    let shards = ShardSet::read(&dir).unwrap();
+    let archive = shards.archive().unwrap();
     let device = Device::shared().unwrap();
     let weights = load_qwen35_weights(&archive, &config, &device).unwrap();
 
@@ -133,8 +134,8 @@ fn qwen35_model_logits_match_mlx() {
     let fixtures = require_file(FIXTURES, FIXTURES_REGEN);
     let config =
         Qwen35Config::from_json_bytes(&fs::read(dir.join("config.json")).unwrap()).unwrap();
-    let archive_bytes = fs::read(dir.join("model.safetensors")).unwrap();
-    let archive = SafeTensors::deserialize(&archive_bytes).unwrap();
+    let shards = ShardSet::read(&dir).unwrap();
+    let archive = shards.archive().unwrap();
     let device = Device::shared().unwrap();
     let weights = load_qwen35_weights(&archive, &config, &device).unwrap();
     let model = Qwen35Model::from_weights(weights, config.clone()).unwrap();

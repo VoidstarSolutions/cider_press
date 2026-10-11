@@ -15,6 +15,7 @@
 #![cfg(target_os = "macos")]
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 
+use cider_press_models::safetensors_io::ShardSet;
 use std::fs;
 use std::path::PathBuf;
 
@@ -94,8 +95,8 @@ fn real_checkpoint_rms_norm_matches_cpu_reference() {
 
     let config_bytes = fs::read(dir.join("config.json")).expect("read config.json");
     let config = Qwen2Config::from_json_bytes(&config_bytes).expect("parse config.json");
-    let archive_bytes = fs::read(dir.join("model.safetensors")).expect("read model.safetensors");
-    let archive = SafeTensors::deserialize(&archive_bytes).expect("deserialize");
+    let shards = ShardSet::read(&dir).expect("load checkpoint");
+    let archive = shards.archive().expect("load checkpoint");
 
     let device = Device::shared().expect("device");
     let weights = load_qwen2_weights(&archive, &config, &device).expect("load weights");

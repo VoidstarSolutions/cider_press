@@ -39,11 +39,10 @@
 #![doc = include_str!("../../../../docs/inference/weights-and-quantization.md")]
 
 use cider_press_runtime::{DType, Device, Layout, Quantization, QuantizedWeight, Tensor};
-use safetensors::SafeTensors;
 
 use crate::error::{Error, Result};
 use crate::qwen2::config::Qwen2Config;
-use crate::safetensors_io::{read_dense_tensor, read_quantized_weight};
+use crate::safetensors_io::{TensorLookup, read_dense_tensor, read_quantized_weight};
 
 /// All weights for one Qwen2-family model.
 #[derive(Debug)]
@@ -123,7 +122,7 @@ pub struct Qwen2MlpWeights {
 /// contract from the `ARCHITECTURE` doc: anything that passes here is
 /// observably identical (byte-for-byte) to what's in the archive.
 pub fn load_qwen2_weights(
-    archive: &SafeTensors<'_>,
+    archive: &impl TensorLookup,
     config: &Qwen2Config,
     device: &Device,
 ) -> Result<Qwen2Weights> {
@@ -175,7 +174,7 @@ pub fn load_qwen2_weights(
 
 #[allow(clippy::too_many_arguments)]
 fn load_layer(
-    archive: &SafeTensors<'_>,
+    archive: &impl TensorLookup,
     device: &Device,
     quant: Quantization,
     i: usize,
@@ -232,7 +231,7 @@ fn load_layer(
 }
 
 fn load_attention(
-    archive: &SafeTensors<'_>,
+    archive: &impl TensorLookup,
     device: &Device,
     quant: Quantization,
     prefix: &str,
@@ -376,7 +375,7 @@ fn pad_quantized_k(
 }
 
 fn load_mlp(
-    archive: &SafeTensors<'_>,
+    archive: &impl TensorLookup,
     device: &Device,
     quant: Quantization,
     prefix: &str,
@@ -457,7 +456,7 @@ mod tests {
     use super::*;
     use crate::qwen2::config::Qwen2QuantizationConfig;
     use half::bf16;
-    use safetensors::{Dtype as StDtype, tensor::TensorView};
+    use safetensors::{Dtype as StDtype, SafeTensors, tensor::TensorView};
 
     // ---------- pad_quantized_k unit tests (no Device needed) ----------
 

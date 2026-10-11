@@ -1,5 +1,6 @@
 #![cfg(target_os = "macos")]
 
+use cider_press_models::safetensors_io::ShardSet;
 use std::{fs, path::PathBuf};
 
 use cider_press_models::nn::rms_norm;
@@ -54,8 +55,8 @@ fn gated_deltanet_layer0_matches_mlx() {
     let fixtures = require_file(FIXTURES, FIXTURES_REGEN);
     let config =
         Qwen35Config::from_json_bytes(&fs::read(dir.join("config.json")).unwrap()).unwrap();
-    let archive_bytes = fs::read(dir.join("model.safetensors")).unwrap();
-    let archive = SafeTensors::deserialize(&archive_bytes).unwrap();
+    let shards = ShardSet::read(&dir).unwrap();
+    let archive = shards.archive().unwrap();
     let device = Device::shared().unwrap();
     let weights = load_qwen35_weights(&archive, &config, &device).unwrap();
 
@@ -94,8 +95,8 @@ fn decoder_layer0_matches_mlx() {
     let fixtures = require_file(FIXTURES, FIXTURES_REGEN);
     let config =
         Qwen35Config::from_json_bytes(&fs::read(dir.join("config.json")).unwrap()).unwrap();
-    let archive_bytes = fs::read(dir.join("model.safetensors")).unwrap();
-    let archive = SafeTensors::deserialize(&archive_bytes).unwrap();
+    let shards = ShardSet::read(&dir).unwrap();
+    let archive = shards.archive().unwrap();
     let device = Device::shared().unwrap();
     let weights = load_qwen35_weights(&archive, &config, &device).unwrap();
 
@@ -129,8 +130,8 @@ fn gated_deltanet_prefill_decode_equivalence() {
     let fixtures = require_file(FIXTURES, FIXTURES_REGEN);
     let config =
         Qwen35Config::from_json_bytes(&fs::read(dir.join("config.json")).unwrap()).unwrap();
-    let archive_bytes = fs::read(dir.join("model.safetensors")).unwrap();
-    let archive = SafeTensors::deserialize(&archive_bytes).unwrap();
+    let shards = ShardSet::read(&dir).unwrap();
+    let archive = shards.archive().unwrap();
     let device = Device::shared().unwrap();
     let weights = load_qwen35_weights(&archive, &config, &device).unwrap();
 

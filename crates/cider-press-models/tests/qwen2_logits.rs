@@ -10,6 +10,7 @@
 #![cfg(target_os = "macos")]
 #![allow(clippy::cast_precision_loss)]
 
+use cider_press_models::safetensors_io::ShardSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -117,9 +118,8 @@ fn run_qwen2_logits(checkpoint: &Path) {
         logits_ref.len()
     );
 
-    let archive_bytes =
-        fs::read(checkpoint.join("model.safetensors")).expect("read model.safetensors");
-    let archive = SafeTensors::deserialize(&archive_bytes).expect("deserialize safetensors");
+    let shards = ShardSet::read(checkpoint).expect("load checkpoint");
+    let archive = shards.archive().expect("load checkpoint");
 
     let device = Device::shared().expect("system default device");
     let weights = load_qwen2_weights(&archive, &config, &device).expect("load weights");
@@ -169,9 +169,8 @@ fn run_forward_last_matches_full(checkpoint: &Path) {
     let n_kv_heads = config.num_key_value_heads;
     let vocab_size = config.vocab_size;
 
-    let archive_bytes =
-        fs::read(checkpoint.join("model.safetensors")).expect("read model.safetensors");
-    let archive = SafeTensors::deserialize(&archive_bytes).expect("deserialize safetensors");
+    let shards = ShardSet::read(checkpoint).expect("load checkpoint");
+    let archive = shards.archive().expect("load checkpoint");
 
     let device = Device::shared().expect("system default device");
     let weights = load_qwen2_weights(&archive, &config, &device).expect("load weights");
@@ -236,9 +235,8 @@ fn run_split_prefill_matches_forward_last(checkpoint: &Path) {
     let n_kv_heads = config.num_key_value_heads;
     let vocab_size = config.vocab_size;
 
-    let archive_bytes =
-        fs::read(checkpoint.join("model.safetensors")).expect("read model.safetensors");
-    let archive = SafeTensors::deserialize(&archive_bytes).expect("deserialize safetensors");
+    let shards = ShardSet::read(checkpoint).expect("load checkpoint");
+    let archive = shards.archive().expect("load checkpoint");
     let device = Device::shared().expect("system default device");
     let weights = load_qwen2_weights(&archive, &config, &device).expect("load weights");
     let model = Qwen2Model::from_weights(weights, config.clone()).expect("build Qwen2Model");

@@ -3,6 +3,7 @@
 
 #![cfg(target_os = "macos")]
 
+use cider_press_models::safetensors_io::{ShardSet, TensorLookup};
 use cider_press_test_utils::require_checkpoint_dir;
 use std::{fs, path::PathBuf};
 
@@ -11,7 +12,6 @@ use cider_press_models::qwen3_5::{
     load_qwen35_weights,
 };
 use cider_press_runtime::Device;
-use safetensors::SafeTensors;
 
 fn checkpoint_path() -> PathBuf {
     require_checkpoint_dir(
@@ -28,8 +28,8 @@ fn real_checkpoint_loads_and_byte_round_trips() {
     let dir = checkpoint_path();
     let config =
         Qwen35Config::from_json_bytes(&fs::read(dir.join("config.json")).unwrap()).unwrap();
-    let bytes = fs::read(dir.join("model.safetensors")).unwrap();
-    let archive = SafeTensors::deserialize(&bytes).unwrap();
+    let shards = ShardSet::read(&dir).unwrap();
+    let archive = shards.archive().unwrap();
     let device = Device::shared().unwrap();
 
     let weights = load_qwen35_weights(&archive, &config, &device).unwrap();
@@ -38,24 +38,24 @@ fn real_checkpoint_loads_and_byte_round_trips() {
         let (lw, ls, lb) = w.component_bytes();
         assert_eq!(
             lw,
-            archive.tensor(&format!("{base}.weight")).unwrap().data(),
+            archive.view(&format!("{base}.weight")).unwrap().data(),
             "{base}.weight"
         );
         assert_eq!(
             ls,
-            archive.tensor(&format!("{base}.scales")).unwrap().data(),
+            archive.view(&format!("{base}.scales")).unwrap().data(),
             "{base}.scales"
         );
         assert_eq!(
             lb,
-            archive.tensor(&format!("{base}.biases")).unwrap().data(),
+            archive.view(&format!("{base}.biases")).unwrap().data(),
             "{base}.biases"
         );
     };
     let check_dense = |t: &cider_press_runtime::Tensor, key: &str| {
         assert_eq!(
             t.cpu_bytes().unwrap(),
-            archive.tensor(key).unwrap().data(),
+            archive.view(key).unwrap().data(),
             "{key}"
         );
     };

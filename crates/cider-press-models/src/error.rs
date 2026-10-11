@@ -3,6 +3,8 @@
 //! mismatches in safetensors, JSON parse failures) don't leak into
 //! the runtime's narrower contract.
 
+use std::path::PathBuf;
+
 use thiserror::Error;
 
 /// Error type for everything in `cider-press-models`.
@@ -48,6 +50,23 @@ pub enum Error {
     /// through the loader path.
     #[error("runtime: {0}")]
     Runtime(#[from] cider_press_runtime::Error),
+    /// A checkpoint file could not be read.
+    #[error("failed to read {path}: {source}")]
+    Io {
+        /// The file that could not be read.
+        path: PathBuf,
+        /// The underlying I/O failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// A shard name in `model.safetensors.index.json` was not a plain file name.
+    #[error(
+        "shard name {name:?} must be a plain file name (no separators, `..`, or absolute path)"
+    )]
+    InvalidShardName {
+        /// The offending name from the index.
+        name: String,
+    },
     /// Catch-all for argument-validation failures the loader raises
     /// itself (mismatched expectations, malformed config, …).
     #[error("invalid argument: {0}")]

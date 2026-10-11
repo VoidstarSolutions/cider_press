@@ -7,6 +7,7 @@
 
 #![cfg(target_os = "macos")]
 
+use cider_press_models::safetensors_io::ShardSet;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -101,9 +102,8 @@ fn build_generator(
     let device = Device::shared().expect("device");
     let config_bytes = fs::read(checkpoint.join("config.json")).expect("read config.json");
     let config = Qwen2Config::from_json_bytes(&config_bytes).expect("parse config.json");
-    let archive_bytes =
-        fs::read(checkpoint.join("model.safetensors")).expect("read model.safetensors");
-    let archive = SafeTensors::deserialize(&archive_bytes).expect("deserialize safetensors");
+    let shards = ShardSet::read(checkpoint).expect("load checkpoint");
+    let archive = shards.archive().expect("load checkpoint");
     let weights = load_qwen2_weights(&archive, &config, &device).expect("load weights");
     let model = Qwen2Model::from_weights(weights, config).expect("build Qwen2Model");
     Generator::new(model, context_window, eos).expect("Generator::new")

@@ -12,6 +12,7 @@
 
 #![cfg(target_os = "macos")]
 
+use cider_press_models::safetensors_io::ShardSet;
 use cider_press_test_utils::{require_checkpoint_dir, require_file};
 use std::collections::HashSet;
 use std::{fs, path::PathBuf};
@@ -20,7 +21,6 @@ use cider_press_models::generator::Generator;
 use cider_press_models::qwen3_5::{Qwen35Config, Qwen35Model, load_qwen35_weights};
 use cider_press_models::tokenizer::Tokenizer;
 use cider_press_runtime::Device;
-use safetensors::SafeTensors;
 
 const REFERENCE_JSON: &str = "/tmp/qwen3_5_4b_greedy.json";
 const REFERENCE_REGEN: &str = "uv run scripts/dump_qwen35_greedy.py";
@@ -73,8 +73,8 @@ fn qwen35_greedy_stream_matches_mlx() {
     // Load model.
     let config =
         Qwen35Config::from_json_bytes(&fs::read(dir.join("config.json")).unwrap()).unwrap();
-    let bytes = fs::read(dir.join("model.safetensors")).unwrap();
-    let archive = SafeTensors::deserialize(&bytes).unwrap();
+    let shards = ShardSet::read(&dir).unwrap();
+    let archive = shards.archive().unwrap();
     let device = Device::shared().unwrap();
     let weights = load_qwen35_weights(&archive, &config, &device).unwrap();
     let model = Qwen35Model::from_weights(weights, config).expect("build Qwen35Model");

@@ -23,6 +23,7 @@
 #![cfg(target_os = "macos")]
 #![allow(clippy::cast_precision_loss)]
 
+use cider_press_models::safetensors_io::ShardSet;
 use std::fs;
 use std::path::PathBuf;
 
@@ -137,8 +138,8 @@ fn real_checkpoint_layernorm_add_broadcast() {
 
     let config_bytes = fs::read(dir.join("config.json")).expect("read config.json");
     let config = Qwen2Config::from_json_bytes(&config_bytes).expect("parse config.json");
-    let archive_bytes = fs::read(dir.join("model.safetensors")).expect("read model.safetensors");
-    let archive = SafeTensors::deserialize(&archive_bytes).expect("deserialize safetensors");
+    let shards = ShardSet::read(&dir).expect("load checkpoint");
+    let archive = shards.archive().expect("load checkpoint");
 
     let device = Device::shared().expect("system default device");
     let weights = load_qwen2_weights(&archive, &config, &device).expect("load weights");

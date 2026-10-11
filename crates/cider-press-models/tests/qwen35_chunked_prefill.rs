@@ -7,6 +7,7 @@
 
 #![cfg(target_os = "macos")]
 
+use cider_press_models::safetensors_io::ShardSet;
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
@@ -16,7 +17,6 @@ use cider_press_models::qwen3_5::{Qwen35Config, Qwen35Model, load_qwen35_weights
 use cider_press_models::tokenizer::Tokenizer;
 use cider_press_runtime::{Device, Tensor};
 use cider_press_test_utils::require_checkpoint_dir;
-use safetensors::SafeTensors;
 
 const PASSAGE: &str = "The river bends twice before it reaches the old mill, \
     where the water slows and the town keeps its records of every flood since \
@@ -36,8 +36,8 @@ fn load(dir: &std::path::Path) -> (Qwen35Model, Tokenizer) {
     let config =
         Qwen35Config::from_json_bytes(&fs::read(dir.join("config.json")).expect("config.json"))
             .expect("config");
-    let bytes = fs::read(dir.join("model.safetensors")).expect("model.safetensors");
-    let archive = SafeTensors::deserialize(&bytes).expect("deserialize");
+    let shards = ShardSet::read(dir).expect("load checkpoint");
+    let archive = shards.archive().expect("load checkpoint");
     let device = Device::shared().expect("device");
     let weights = load_qwen35_weights(&archive, &config, &device).expect("load weights");
     let model = Qwen35Model::from_weights(weights, config).expect("build Qwen35Model");

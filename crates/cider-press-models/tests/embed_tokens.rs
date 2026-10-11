@@ -19,6 +19,7 @@
     clippy::cast_precision_loss
 )]
 
+use cider_press_models::safetensors_io::ShardSet;
 use std::fs;
 use std::path::PathBuf;
 
@@ -67,9 +68,8 @@ fn real_checkpoint_embed_tokens_matches_cpu_dequantize() {
     let device = Device::system_default().expect("device");
     let config_bytes = fs::read(dir.join("config.json")).expect("read config.json");
     let config = Qwen2Config::from_json_bytes(&config_bytes).expect("parse config");
-    let archive_path = dir.join("model.safetensors");
-    let archive_bytes = fs::read(&archive_path).expect("read safetensors");
-    let archive = SafeTensors::deserialize(&archive_bytes).expect("parse archive");
+    let shards = ShardSet::read(&dir).expect("load checkpoint");
+    let archive = shards.archive().expect("load checkpoint");
     let weights = load_qwen2_weights(&archive, &config, &device).expect("load weights");
 
     // A few token IDs chosen to cover a span of the vocabulary.
