@@ -74,10 +74,10 @@ fn qmv_fast_k_alignment(bits: u32) -> u32 {
 ///
 /// `group_size` must be in `{32, 64, 128}` and `bits` must be in
 /// `{1, 2, 3, 4, 5, 6, 8}` — these are the combinations MLX's
-/// `instantiate_quantized_all` macro emits. Calling with other values
-/// returns [`Error::KernelNotFound`] at
-/// the pipeline lookup, because the matching kernel was never
-/// instantiated.
+/// `instantiate_quantized_all` macro emits. Any other `bits` returns
+/// [`Error::InvalidArgument`]; any other `group_size` returns
+/// [`Error::KernelNotFound`] at the pipeline lookup, because the matching
+/// kernel was never instantiated.
 ///
 /// # Notes
 ///
@@ -147,10 +147,10 @@ pub fn affine_qmv_bf16(
             "affine_qmv: group_size must be positive".to_owned(),
         ));
     }
-    if bits == 0 {
-        return Err(Error::InvalidArgument(
-            "affine_qmv: bits must be positive".to_owned(),
-        ));
+    if !matches!(bits, 1..=6 | 8) {
+        return Err(Error::InvalidArgument(format!(
+            "affine_qmv: bits ({bits}) must be one of 1, 2, 3, 4, 5, 6, 8"
+        )));
     }
     if k as u32 % group_size != 0 {
         return Err(Error::InvalidArgument(format!(

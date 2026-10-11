@@ -129,3 +129,32 @@ fn parity_affine_qmv_fast_partial_rows() {
         assert_relative_eq!(a.to_f32(), e.to_f32(), max_relative = 1e-2, epsilon = 5e-2);
     }
 }
+
+/// Bit widths outside MLX's instantiated set are a typed argument error,
+/// not a panic in the fast-path alignment math or a late `KernelNotFound`.
+#[test]
+fn affine_qmv_rejects_uninstantiated_bits() {
+    const K_SMALL: usize = 64;
+    const N_SMALL: usize = 8;
+    let device = Device::system_default().expect("Metal device");
+    let library = KernelLibrary::quantized(&device).expect("compile quantized.metal");
+    let groups = N_SMALL * K_SMALL / GROUP_SIZE as usize;
+    let scales: Buffer<bf16> = device.alloc_buffer(groups).expect("alloc scales");
+    let biases: Buffer<bf16> = device.alloc_buffer(groups).expect("alloc biases");
+    let x: Buffer<bf16> = device.alloc_buffer(K_SMALL).expect("alloc x");
+
+    for bits in [0, 7, 33] {
+        let w_len = (N_SMALL * K_SMALL * bits as usize / 32).max(1);
+        let w_q: Buffer<u32> = device.alloc_buffer(w_len).expect("alloc w_q");
+        let mut y: Buffer<bf16> = device.alloc_buffer(N_SMALL).expect("alloc y");
+        let mut cmds = device.commands().expect("commands");
+        let err = kernels::qmv::affine_qmv_bf16(
+            &mut cmds, &library, &w_q, &scales, &biases, &x, &mut y, K_SMALL, GROUP_SIZE, bits,
+        )
+        .expect_err("uninstantiated bit width must be rejected");
+        assert!(
+            matches!(err, cider_press_kernels::Error::InvalidArgument(_)),
+            "bits={bits}: expected InvalidArgument, got {err:?}"
+        );
+    }
+}
