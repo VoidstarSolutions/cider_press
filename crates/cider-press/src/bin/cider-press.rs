@@ -1,7 +1,7 @@
 //! `cider-press` CLI.
 //!
 //! Two subcommands:
-//! - `chat`  — load a Qwen2 checkpoint, render the prompt through its
+//! - `chat`  — load a Qwen2 or Qwen3.5/3.6 checkpoint, render the prompt through its
 //!   chat template, greedy-decode with streamed detokenization.
 //! - `bench` — same load + greedy-decode path, but measure prefill and
 //!   decode throughput, peak RSS, and (with `--features profiling`) a
@@ -65,7 +65,7 @@ struct ChatArgs {
     /// Maximum new tokens to generate.
     #[arg(long, default_value_t = 256)]
     max_tokens: usize,
-    /// Pre-allocated `KvCache` window in tokens.
+    /// Maximum context in tokens (prompt + generated) the caches are sized for.
     #[arg(long, default_value_t = 4096)]
     context_window: usize,
     /// Skip `ChatTemplate` rendering; encode the bare --prompt.
@@ -89,7 +89,7 @@ struct BenchArgs {
     /// New tokens to generate (the decode workload).
     #[arg(long, default_value_t = 128)]
     max_tokens: usize,
-    /// Pre-allocated `KvCache` window in tokens.
+    /// Maximum context in tokens (prompt + generated) the caches are sized for.
     #[arg(long, default_value_t = 4096)]
     context_window: usize,
     /// Decode steps to discard before timing (warm caches / JIT).
@@ -225,13 +225,11 @@ macro_rules! with_generator {
     ($loaded:ident, $context_window:expr, |$generator:ident| $body:expr) => {
         match $loaded.model {
             LoadedModel::Qwen2(model) => {
-                #[allow(unused_mut)]
-                let mut $generator = Generator::new(model, $context_window, $loaded.eos_ids)?;
+                let $generator = Generator::new(model, $context_window, $loaded.eos_ids)?;
                 $body
             }
             LoadedModel::Qwen35(model) => {
-                #[allow(unused_mut)]
-                let mut $generator = Generator::new(model, $context_window, $loaded.eos_ids)?;
+                let $generator = Generator::new(model, $context_window, $loaded.eos_ids)?;
                 $body
             }
         }
@@ -340,7 +338,6 @@ fn run_bench(args: &BenchArgs) -> Result<(), BoxError> {
     let ids = loaded.tokenizer.encode(&prompt)?;
 
     with_generator!(loaded, args.context_window, |generator| {
-        generator.set_inflight_depth(args.inflight_depth);
         bench_generic(
             generator,
             args,
@@ -367,6 +364,7 @@ fn bench_generic<M: LanguageModel>(
     device: &Device,
 ) -> Result<(), BoxError> {
     let prompt_len = ids.len();
+    generator.set_inflight_depth(args.inflight_depth);
 
     // Prefill is performed inside generate() before it returns the iterator.
     let t_prefill = Instant::now();
