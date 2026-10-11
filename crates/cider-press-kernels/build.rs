@@ -36,6 +36,10 @@ const ENTRY_POINTS: &[(&str, &str)] = &[
     ("mlx/backend/metal/kernels/softmax.metal", "softmax"),
     ("mlx/backend/metal/kernels/quantized.metal", "quantized"),
     (
+        "mlx/backend/metal/kernels/quantized_nax.metal",
+        "quantized_nax",
+    ),
+    (
         "mlx/backend/metal/kernels/sdpa_vector_only.metal",
         "sdpa_vector",
     ),

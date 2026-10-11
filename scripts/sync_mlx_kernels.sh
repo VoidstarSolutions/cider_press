@@ -52,6 +52,10 @@ FILES=(
     mlx/backend/metal/kernels/quantized.metal
     mlx/backend/metal/kernels/quantized.h
     mlx/backend/metal/kernels/quantized_utils.h
+    mlx/backend/metal/kernels/quantized_nax.metal
+    mlx/backend/metal/kernels/quantized_nax.h
+    mlx/backend/metal/kernels/steel/gemm/nax.h
+    mlx/backend/metal/kernels/steel/gemm/gemm_nax.h
     mlx/backend/metal/kernels/utils.h
     mlx/backend/metal/kernels/sdpa_vector.h
     mlx/backend/metal/kernels/bf16.h

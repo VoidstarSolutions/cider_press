@@ -36,6 +36,8 @@ struct DeviceInner {
     /// ~100 ms thanks to Metal's cross-process compiled-library
     /// cache). Populated on first qmv/qmm dispatch.
     quantized_library: OnceLock<kernels::KernelLibrary>,
+    #[allow(dead_code)] // consumed by the qmm routing branch (next commit)
+    quantized_nax_library: OnceLock<kernels::KernelLibrary>,
     /// JIT'd MLX `binary.metal` library. Populated on first binary
     /// op dispatch (Add / Mul today; the rest of the family lands as
     /// the runtime asks for it).
@@ -118,6 +120,7 @@ impl Device {
                 kernels: kernels::Device::system_default()?,
                 copy_library: OnceLock::new(),
                 quantized_library: OnceLock::new(),
+                quantized_nax_library: OnceLock::new(),
                 binary_library: OnceLock::new(),
                 unary_library: OnceLock::new(),
                 reduce_library: OnceLock::new(),
@@ -156,6 +159,7 @@ impl Device {
             kernels: kernels::Device::system_default()?,
             copy_library: OnceLock::new(),
             quantized_library: OnceLock::new(),
+            quantized_nax_library: OnceLock::new(),
             binary_library: OnceLock::new(),
             unary_library: OnceLock::new(),
             reduce_library: OnceLock::new(),
@@ -328,6 +332,17 @@ impl Device {
         }
         let lib = kernels::KernelLibrary::quantized(&self.inner.kernels)?;
         Ok(self.inner.quantized_library.get_or_init(|| lib))
+    }
+
+    /// Lazily JIT-compile and cache MLX's `quantized_nax.metal`. Callers
+    /// must check [`Device::nax_available`] first; this never does.
+    #[allow(dead_code)] // consumed by the qmm routing branch (next commit)
+    pub(crate) fn quantized_nax_library(&self) -> Result<&kernels::KernelLibrary> {
+        if let Some(lib) = self.inner.quantized_nax_library.get() {
+            return Ok(lib);
+        }
+        let lib = kernels::KernelLibrary::quantized_nax(&self.inner.kernels)?;
+        Ok(self.inner.quantized_nax_library.get_or_init(|| lib))
     }
 
     /// Lazily JIT-compile and cache MLX's `binary.metal` library.

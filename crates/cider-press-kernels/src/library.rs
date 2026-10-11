@@ -66,6 +66,10 @@ const SOFTMAX_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/softmax_inl
 
 /// Pre-flattened MLX `quantized.metal`, produced by `build.rs`.
 const QUANTIZED_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/quantized_inlined.metal"));
+/// Pre-flattened MLX `quantized_nax.metal` (tensor-core quantized matmul
+/// family; needs Metal 4.0 and a NAX GPU), produced by `build.rs`.
+const QUANTIZED_NAX_SOURCE: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/quantized_nax_inlined.metal"));
 
 /// Pre-flattened MLX `sdpa_vector_only.metal`, produced by `build.rs`.
 const SDPA_VECTOR_SOURCE: &str =
@@ -293,6 +297,18 @@ impl KernelLibrary {
     /// `kernels-mlx/`).
     pub fn quantized(device: &Device) -> Result<Self> {
         Self::from_source(device, QUANTIZED_SOURCE)
+    }
+
+    /// JIT-compile MLX's `quantized_nax.metal` — the tensor-core (`nax`)
+    /// quantized matmul kernels. Only meaningful where
+    /// [`Device::nax_available`] is true; elsewhere the Metal 4.0 source
+    /// fails to compile (or the kernels fail to run), so callers gate on it.
+    /// First-ever compile is ~11 s (540 kernels); cached on disk after.
+    ///
+    /// # Errors
+    /// [`Error::Compile`] if the Metal compiler rejects the source.
+    pub fn quantized_nax(device: &Device) -> Result<Self> {
+        Self::from_source(device, QUANTIZED_NAX_SOURCE)
     }
 
     /// Compile the vendored `sdpa_vector` kernels (single-pass vector

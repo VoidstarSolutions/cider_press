@@ -31,16 +31,17 @@ Entry points (compiled to JITed `MTLLibrary`s by cider-press-kernels):
 - `mlx/backend/metal/kernels/rms_norm.metal`
 - `mlx/backend/metal/kernels/softmax.metal`
 - `mlx/backend/metal/kernels/quantized.metal`
+- `mlx/backend/metal/kernels/quantized_nax.metal` (tensor-core `qmm_t_nax` family; Metal 4.0, NAX GPUs only)
 - `mlx/backend/metal/kernels/sdpa_vector_only.metal` (cider-press entry point; upstream uses `scaled_dot_product_attention.metal`)
 - `mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.metal` (fused `sdpa_full` prefill path)
 
 Transitive headers reached from those entry points (kept in sync by the
 sync workflow below):
 
-- `mlx/backend/metal/kernels/{copy,binary,binary_ops,unary,unary_ops,reduce,reduce_utils,quantized,quantized_utils,sdpa_vector,softmax,utils,bf16,bf16_math,complex,defines,logging,atomic,cexpf,erf,expm1f,fp8}.h`
+- `mlx/backend/metal/kernels/{copy,binary,binary_ops,unary,unary_ops,reduce,reduce_utils,quantized,quantized_utils,quantized_nax,sdpa_vector,softmax,utils,bf16,bf16_math,complex,defines,logging,atomic,cexpf,erf,expm1f,fp8}.h`
 - `mlx/backend/metal/kernels/reduction/{ops,reduce_all,reduce_col,reduce_init,reduce_row}.h`
 - `mlx/backend/metal/kernels/steel/{defines,utils}.h`
-- `mlx/backend/metal/kernels/steel/gemm/{gemm,loader,mma,params,transforms}.h`
+- `mlx/backend/metal/kernels/steel/gemm/{gemm,loader,mma,params,transforms,nax,gemm_nax}.h`
 - `mlx/backend/metal/kernels/steel/attn/{attn,loader,mma,params,transforms}.h`
 - `mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h`
 - `mlx/backend/metal/kernels/steel/utils/{integral_constant,type_traits}.h`
